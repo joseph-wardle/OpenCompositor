@@ -10,3 +10,11 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+wgpu = "30"
+
+[dev-dependencies]
+pollster = "1.0.1"
+winit = "0.30.13"
