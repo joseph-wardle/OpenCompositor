@@ -3,6 +3,7 @@
 mod geometry;
 mod graph;
 mod input;
+mod render;
 mod view;
 
 pub use geometry::Rect;
@@ -11,4 +12,5 @@ pub use graph::{
     Side,
 };
 pub use input::{Button, InputEvent, Key, Modifiers, PhysicalPoint};
+pub use render::{Renderer, ViewBuffers};
 pub use view::{Response, SelectionChange, View, Viewport};

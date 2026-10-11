@@ -88,7 +88,6 @@ pub(crate) fn node_rect(record: &NodeRecord, centre: Point) -> Rect {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the renderer"))]
 pub(crate) fn input_position(record: &NodeRecord, centre: Point, index: usize) -> Point {
     let side = record.inputs[index].side;
     let rank = count_on(&record.inputs[..index], side);
@@ -96,7 +95,6 @@ pub(crate) fn input_position(record: &NodeRecord, centre: Point, index: usize) -
 }
 
 /// Outputs follow inputs on a side they share.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the renderer"))]
 pub(crate) fn output_position(record: &NodeRecord, centre: Point, index: usize) -> Point {
     let side = record.outputs[index].side;
     let rank = count_on(&record.inputs, side) + count_on(&record.outputs[..index], side);
@@ -105,7 +103,6 @@ pub(crate) fn output_position(record: &NodeRecord, centre: Point, index: usize) 
 
 /// The control points of the cubic Bézier for a wire, which leaves each port along its side's
 /// outward normal.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the renderer"))]
 pub(crate) fn wire(start: Point, start_side: Side, end: Point, end_side: Side) -> [Point; 4] {
     let reach = (end.x - start.x).hypot(end.y - start.y) / 2.0;
     let pull = |point: Point, side: Side| {

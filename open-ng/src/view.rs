@@ -219,8 +219,12 @@ impl View {
         }
     }
 
+    /// The graph point at the viewport's centre.
+    pub(crate) fn centre(&self) -> Point {
+        self.centre
+    }
+
     /// Where a node is drawn: its committed position, offset while it is being dragged.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the renderer"))]
     pub(crate) fn drawn_position(&self, graph: &Graph, id: NodeId) -> Option<Point> {
         let position = graph.node(id)?.position;
         if let Some(Gesture::Move {
@@ -239,7 +243,6 @@ impl View {
     }
 
     /// The selection as drawn: the graph's, with the gesture's selection preview applied.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the renderer"))]
     pub(crate) fn drawn_selection(&self, graph: &Graph) -> Vec<NodeId> {
         match &self.gesture {
             None | Some(Gesture::Pan { .. }) => graph.selection().to_vec(),
@@ -251,6 +254,15 @@ impl View {
                 .box_selection(graph, *from, *combine)
                 .apply(graph, graph.add_count()),
         }
+    }
+
+    /// The box being dragged out to select nodes.
+    pub(crate) fn drawn_box(&self) -> Option<Rect> {
+        let Some(Gesture::BoxSelect { from, .. }) = self.gesture else {
+            return None;
+        };
+        let to = self.to_graph(self.pointer.expect("a box selection follows a press"));
+        Some(Rect::from_corners(from, to))
     }
 
     fn pointer_moved(&mut self, graph: &Graph, position: PhysicalPoint) -> Response {
@@ -509,7 +521,7 @@ impl View {
         (to.x - from.x).abs() > threshold || (to.y - from.y).abs() > threshold
     }
 
-    fn physical_per_unit(&self) -> f32 {
+    pub(crate) fn physical_per_unit(&self) -> f32 {
         self.viewport.scale_factor * self.zoom
     }
 
