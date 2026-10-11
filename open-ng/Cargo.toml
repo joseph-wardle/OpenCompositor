@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "A programmable node editor library for native and browser applications."
 edition.workspace = true
 license.workspace = true
+repository = "https://github.com/joseph-wardle/OpenCompositor"
 readme = "README.md"
 publish = false
 

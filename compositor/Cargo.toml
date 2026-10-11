@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "A node-based compositor."
 edition.workspace = true
 license.workspace = true
+repository = "https://github.com/joseph-wardle/OpenCompositor"
 publish = false
 
 [dependencies]
