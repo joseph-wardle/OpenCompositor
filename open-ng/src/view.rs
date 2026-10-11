@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::geometry::Rect;
-use crate::graph::{Graph, NodeId, Point};
+use crate::graph::{AddStamp, Graph, NodeId, Point};
 use crate::input::{Button, InputEvent, Key, Modifiers, PhysicalPoint};
 
 const MIN_ZOOM: f32 = 0.1;
@@ -47,22 +47,17 @@ impl Viewport {
 ///
 /// The host applies the requests to its document and then to the [`Graph`], or ignores them to
 /// reject them, before the view draws again. A completed gesture produces one response, which
-/// is one undo step.
+/// is one undo step; what it replaces is still in the graph until the host applies it.
 #[must_use]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Response {
-    /// New committed positions for the moved nodes.
-    pub move_nodes: Option<Vec<(NodeId, Point)>>,
-    pub selection: Option<SelectionChange>,
-    /// The view used the event, so the host should not pass it on and should redraw.
+    /// New committed positions for the moved nodes. Empty if nothing moved.
+    pub positions: Vec<(NodeId, Point)>,
+    /// The new selection, if it selects different nodes. Empty deselects all.
+    pub selection: Option<Vec<NodeId>>,
+    /// The view used the event: the host should redraw and should not also treat it as its own
+    /// shortcut.
     pub handled: bool,
-}
-
-/// A requested selection, with the selection it replaces for undo.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SelectionChange {
-    pub before: Vec<NodeId>,
-    pub after: Vec<NodeId>,
 }
 
 /// One view of a [`Graph`], with its own navigation and gesture.
@@ -91,14 +86,12 @@ enum Gesture {
         from: Point,
         node: Option<NodeId>,
         combine: Combine,
-        preview: SelectionEdit,
-        adds: u64,
+        since: AddStamp,
     },
     Move {
         from: Point,
         nodes: HashSet<NodeId>,
         selection: SelectionEdit,
-        adds: u64,
     },
     BoxSelect {
         from: Point,
@@ -130,17 +123,43 @@ impl Combine {
 struct SelectionEdit {
     combine: Combine,
     nodes: Vec<NodeId>,
+    /// When `nodes` were found. Any of them gone or replaced since are skipped.
+    since: AddStamp,
 }
 
 impl SelectionEdit {
-    /// The graph's current selection with this edit applied, skipping nodes that are gone or
-    /// were added after the add count was `adds`.
-    fn apply(&self, graph: &Graph, adds: u64) -> Vec<NodeId> {
+    fn click(node: Option<NodeId>, combine: Combine, since: AddStamp) -> SelectionEdit {
+        SelectionEdit {
+            combine,
+            nodes: node.into_iter().collect(),
+            since,
+        }
+    }
+
+    /// What a press shows before release: its click, except that pressing an already selected
+    /// node changes nothing until release, so that a drag moves the whole selection.
+    fn press(
+        graph: &Graph,
+        node: Option<NodeId>,
+        combine: Combine,
+        since: AddStamp,
+    ) -> SelectionEdit {
+        let combine = match node {
+            Some(id) if combine == Combine::Replace && graph.selection().contains(&id) => {
+                Combine::Add
+            }
+            _ => combine,
+        };
+        SelectionEdit::click(node, combine, since)
+    }
+
+    /// The graph's current selection with this edit applied.
+    fn apply(&self, graph: &Graph) -> Vec<NodeId> {
         let nodes = self
             .nodes
             .iter()
             .copied()
-            .filter(|&id| graph.still_has(id, adds));
+            .filter(|&id| graph.has_node_since(id, self.since));
         match self.combine {
             Combine::Replace => nodes.collect(),
             Combine::Add => {
@@ -228,10 +247,12 @@ impl View {
     pub(crate) fn drawn_position(&self, graph: &Graph, id: NodeId) -> Option<Point> {
         let position = graph.node(id)?.position;
         if let Some(Gesture::Move {
-            from, nodes, adds, ..
+            from,
+            nodes,
+            selection,
         }) = &self.gesture
             && nodes.contains(&id)
-            && graph.still_has(id, *adds)
+            && graph.has_node_since(id, selection.since)
         {
             let offset = self.drag_offset(*from);
             return Some(Point {
@@ -246,13 +267,16 @@ impl View {
     pub(crate) fn drawn_selection(&self, graph: &Graph) -> Vec<NodeId> {
         match &self.gesture {
             None | Some(Gesture::Pan { .. }) => graph.selection().to_vec(),
-            Some(Gesture::Press { preview, adds, .. }) => preview.apply(graph, *adds),
-            Some(Gesture::Move {
-                selection, adds, ..
-            }) => selection.apply(graph, *adds),
-            Some(Gesture::BoxSelect { from, combine }) => self
-                .box_selection(graph, *from, *combine)
-                .apply(graph, graph.add_count()),
+            Some(Gesture::Press {
+                node,
+                combine,
+                since,
+                ..
+            }) => SelectionEdit::press(graph, *node, *combine, *since).apply(graph),
+            Some(Gesture::Move { selection, .. }) => selection.apply(graph),
+            Some(Gesture::BoxSelect { from, combine }) => {
+                self.box_selection(graph, *from, *combine).apply(graph)
+            }
         }
     }
 
@@ -285,19 +309,20 @@ impl View {
                 from,
                 node,
                 combine,
-                preview,
-                adds,
+                since,
             }) if self.beyond_drag_threshold(at, position)
                 && (node.is_none() || combine == Combine::Replace) =>
             {
                 Some(match node {
                     None => Gesture::BoxSelect { from, combine },
-                    Some(_) => Gesture::Move {
-                        from,
-                        nodes: preview.apply(graph, adds).into_iter().collect(),
-                        selection: preview,
-                        adds,
-                    },
+                    Some(_) => {
+                        let selection = SelectionEdit::press(graph, node, combine, since);
+                        Gesture::Move {
+                            from,
+                            nodes: selection.apply(graph).into_iter().collect(),
+                            selection,
+                        }
+                    }
                 })
             }
             // Moves and box selections follow the pointer when drawn.
@@ -332,28 +357,12 @@ impl View {
             }
         } else {
             let from = self.to_graph(position);
-            let node = graph.node_at(from);
-            let combine = Combine::from_modifiers(modifiers);
-            let preview = match node {
-                // Adding an already selected node leaves the selection unchanged.
-                Some(id) if combine == Combine::Replace && graph.selection().contains(&id) => {
-                    SelectionEdit {
-                        combine: Combine::Add,
-                        nodes: vec![id],
-                    }
-                }
-                _ => SelectionEdit {
-                    combine,
-                    nodes: node.into_iter().collect(),
-                },
-            };
             Gesture::Press {
                 at: position,
                 from,
-                node,
-                combine,
-                preview,
-                adds: graph.add_count(),
+                node: graph.node_at(from),
+                combine: Combine::from_modifiers(modifiers),
+                since: graph.add_stamp(),
             }
         });
         Response {
@@ -375,55 +384,50 @@ impl View {
                 ..Response::default()
             };
         };
-        let (move_nodes, after) = match gesture {
-            Gesture::Pan { .. } => (None, None),
+        let (positions, after) = match gesture {
+            Gesture::Pan { .. } => (Vec::new(), None),
             Gesture::Press {
                 node,
                 combine,
-                adds,
+                since,
                 ..
             } => {
-                let click = SelectionEdit {
-                    combine,
-                    nodes: node.into_iter().collect(),
-                };
-                (None, Some(click.apply(graph, adds)))
+                let click = SelectionEdit::click(node, combine, since);
+                (Vec::new(), Some(click.apply(graph)))
             }
             Gesture::Move {
                 from,
                 nodes,
                 selection,
-                adds,
             } => {
                 let offset = self.drag_offset(from);
-                let moved: Vec<_> = graph
-                    .nodes()
-                    .filter(|&(id, _)| nodes.contains(&id) && graph.still_has(id, adds))
-                    .map(|(id, record)| {
-                        let position = Point {
-                            x: record.position.x + offset.x,
-                            y: record.position.y + offset.y,
-                        };
-                        (id, position)
-                    })
-                    .collect();
-                let moved = (offset != Point::default() && !moved.is_empty()).then_some(moved);
-                (moved, Some(selection.apply(graph, adds)))
+                let positions = if offset == Point::default() {
+                    Vec::new()
+                } else {
+                    graph
+                        .nodes()
+                        .filter(|&(id, _)| {
+                            nodes.contains(&id) && graph.has_node_since(id, selection.since)
+                        })
+                        .map(|(id, record)| {
+                            let position = Point {
+                                x: record.position.x + offset.x,
+                                y: record.position.y + offset.y,
+                            };
+                            (id, position)
+                        })
+                        .collect()
+                };
+                (positions, Some(selection.apply(graph)))
             }
             Gesture::BoxSelect { from, combine } => {
                 let edit = self.box_selection(graph, from, combine);
-                (None, Some(edit.apply(graph, graph.add_count())))
+                (Vec::new(), Some(edit.apply(graph)))
             }
         };
-        let selection = after
-            .filter(|after| after != graph.selection())
-            .map(|after| SelectionChange {
-                before: graph.selection().to_vec(),
-                after,
-            });
         Response {
-            move_nodes,
-            selection,
+            positions,
+            selection: after.filter(|after| selects_other_nodes(graph, after)),
             handled: true,
         }
     }
@@ -431,7 +435,7 @@ impl View {
     /// Zooms about the pointer, keeping the graph point under it in place.
     fn scrolled(&mut self, position: PhysicalPoint, lines: f32) -> Response {
         self.pointer = Some(position);
-        if self.gesture.is_none() && !self.viewport.contains(position) {
+        if !self.viewport.contains(position) {
             return Response::default();
         }
         let anchor = self.to_graph(position);
@@ -504,6 +508,7 @@ impl View {
         SelectionEdit {
             combine,
             nodes: graph.nodes_touching(Rect::from_corners(from, to)).collect(),
+            since: graph.add_stamp(),
         }
     }
 
@@ -533,6 +538,12 @@ impl View {
             y: self.centre.y + (point.y - centre.y) / per_unit,
         }
     }
+}
+
+/// Whether `after` selects different nodes from the graph's selection. Order alone is no change.
+fn selects_other_nodes(graph: &Graph, after: &[NodeId]) -> bool {
+    let current: HashSet<_> = graph.selection().iter().collect();
+    after.len() != current.len() || after.iter().any(|id| !current.contains(id))
 }
 
 impl Gesture {
@@ -615,6 +626,10 @@ mod tests {
         shift: false,
         ctrl: true,
     };
+    const SHIFT_CTRL: Modifiers = Modifiers {
+        shift: true,
+        ctrl: true,
+    };
 
     /// Sends the events in order and returns the last response.
     fn send(view: &mut View, graph: &Graph, events: &[InputEvent]) -> Response {
@@ -627,11 +642,9 @@ mod tests {
 
     /// Applies a response the way a host that accepts everything would.
     fn accept(graph: &mut Graph, response: Response) {
-        if let Some(positions) = response.move_nodes {
-            graph.set_node_positions(&positions).unwrap();
-        }
-        if let Some(change) = response.selection {
-            graph.set_selection(&change.after).unwrap();
+        graph.set_node_positions(&response.positions).unwrap();
+        if let Some(selection) = response.selection {
+            graph.set_selection(&selection).unwrap();
         }
     }
 
@@ -649,14 +662,8 @@ mod tests {
             &graph,
             &[press(400.0, 300.0), release(400.0, 300.0)],
         );
-        assert_eq!(
-            response.selection,
-            Some(SelectionChange {
-                before: vec![],
-                after: ids(&[1]),
-            })
-        );
-        assert_eq!(response.move_nodes, None);
+        assert_eq!(response.selection, Some(ids(&[1])));
+        assert_eq!(response.positions, []);
         accept(&mut graph, response);
 
         let click = [press_with(600.0, 300.0, SHIFT), release(600.0, 300.0)];
@@ -668,6 +675,11 @@ mod tests {
         let response = send(&mut view, &graph, &click);
         accept(&mut graph, response);
         assert_eq!(graph.selection(), ids(&[2]));
+
+        let click = [press_with(780.0, 300.0, SHIFT_CTRL), release(780.0, 300.0)];
+        let response = send(&mut view, &graph, &click);
+        accept(&mut graph, response);
+        assert_eq!(graph.selection(), ids(&[2, 3]), "Shift wins over Ctrl");
 
         let click = [press(500.0, 300.0), release(500.0, 300.0)];
         let response = send(&mut view, &graph, &click);
@@ -691,7 +703,7 @@ mod tests {
         assert_eq!(view.drawn_selection(&graph), ids(&[1, 2]));
 
         let response = view.handle_input(&graph, release(400.0, 300.0));
-        assert_eq!(response.selection.unwrap().after, ids(&[1]));
+        assert_eq!(response.selection, Some(ids(&[1])));
     }
 
     #[test]
@@ -715,13 +727,30 @@ mod tests {
 
         let response = view.handle_input(&graph, release(430.0, 340.0));
         assert_eq!(
-            response.move_nodes,
-            Some(vec![
-                (NodeId(1), at(30.0, 40.0)),
-                (NodeId(2), at(230.0, 40.0))
-            ])
+            response.positions,
+            [(NodeId(1), at(30.0, 40.0)), (NodeId(2), at(230.0, 40.0))]
         );
         assert_eq!(response.selection, None);
+
+        // Ignoring the response rejects it.
+        assert!(!view.has_active_gesture());
+        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
+    }
+
+    #[test]
+    fn a_drag_back_to_its_start_requests_no_move() {
+        let graph = three_nodes();
+        let mut view = View::new(WHOLE);
+
+        let drag = [
+            press(400.0, 300.0),
+            move_to(450.0, 300.0),
+            move_to(400.0, 300.0),
+            release(400.0, 300.0),
+        ];
+        let response = send(&mut view, &graph, &drag);
+        assert_eq!(response.positions, []);
+        assert_eq!(response.selection, Some(ids(&[1])));
     }
 
     #[test]
@@ -739,17 +768,8 @@ mod tests {
                 release(600.0, 320.0),
             ],
         );
-        assert_eq!(
-            response.move_nodes,
-            Some(vec![(NodeId(2), at(200.0, 20.0))])
-        );
-        assert_eq!(
-            response.selection,
-            Some(SelectionChange {
-                before: ids(&[1]),
-                after: ids(&[2]),
-            })
-        );
+        assert_eq!(response.positions, [(NodeId(2), at(200.0, 20.0))]);
+        assert_eq!(response.selection, Some(ids(&[2])));
     }
 
     #[test]
@@ -763,8 +783,8 @@ mod tests {
             release(450.0, 300.0),
         ];
         let response = send(&mut view, &graph, &drag);
-        assert_eq!(response.move_nodes, None);
-        assert_eq!(response.selection.unwrap().after, ids(&[1]));
+        assert_eq!(response.positions, []);
+        assert_eq!(response.selection, Some(ids(&[1])));
     }
 
     #[test]
@@ -782,7 +802,7 @@ mod tests {
         );
         assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
         let response = view.handle_input(&graph, release(406.0, 294.0));
-        assert_eq!(response.move_nodes, None);
+        assert_eq!(response.positions, []);
 
         let _ = send(
             &mut view,
@@ -790,24 +810,6 @@ mod tests {
             &[press(400.0, 300.0), move_to(400.0, 307.0)],
         );
         assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 3.5)));
-    }
-
-    #[test]
-    fn a_rejected_move_leaves_the_committed_positions_drawn() {
-        let graph = three_nodes();
-        let mut view = View::new(WHOLE);
-
-        let drag = [
-            press(400.0, 300.0),
-            move_to(450.0, 300.0),
-            release(450.0, 300.0),
-        ];
-        let response = send(&mut view, &graph, &drag);
-        assert!(response.move_nodes.is_some());
-
-        assert!(!view.has_active_gesture());
-        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
-        assert_eq!(view.drawn_selection(&graph), []);
     }
 
     #[test]
@@ -900,9 +902,104 @@ mod tests {
 
         let response = view.handle_input(&graph, release(440.0, 300.0));
         assert_eq!(
-            response.move_nodes, None,
+            response.positions,
+            [],
             "the left release no longer ends anything"
         );
+    }
+
+    #[test]
+    fn a_press_outside_the_view_cancels_its_gesture() {
+        let graph = three_nodes();
+        let mut view = View::new(Viewport {
+            width: 400,
+            ..WHOLE
+        });
+
+        let _ = send(
+            &mut view,
+            &graph,
+            &[press(200.0, 300.0), move_to(250.0, 300.0)],
+        );
+        let middle_release = InputEvent::PointerReleased {
+            position: px(250.0, 300.0),
+            button: Button::Middle,
+        };
+        let response = view.handle_input(&graph, middle_release);
+        assert!(response.handled && view.has_active_gesture());
+
+        let response = view.handle_input(&graph, press(600.0, 300.0));
+        assert!(response.handled && !view.has_active_gesture());
+        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
+        let response = view.handle_input(&graph, release(600.0, 300.0));
+        assert_eq!(response, Response::default());
+    }
+
+    #[test]
+    fn zoom_keeps_the_graph_point_under_the_pointer() {
+        let graph = three_nodes();
+        let mut view = View::new(Viewport {
+            scale_factor: 2.0,
+            ..WHOLE
+        });
+        let pointer = px(700.0, 100.0);
+        let under = view.to_graph(pointer);
+
+        for lines in [1.0, 2.5, -4.0] {
+            let scroll = InputEvent::Scrolled {
+                position: pointer,
+                lines,
+            };
+            let response = view.handle_input(&graph, scroll);
+            assert!(response.handled);
+            let now = view.to_graph(pointer);
+            assert!((now.x - under.x).abs() < 1e-3 && (now.y - under.y).abs() < 1e-3);
+        }
+        assert!((view.zoom - 1.2f32.powf(-0.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_scroll_outside_the_view_is_ignored_even_during_a_gesture() {
+        let graph = three_nodes();
+        let mut view = View::new(Viewport {
+            width: 400,
+            ..WHOLE
+        });
+
+        let _ = send(
+            &mut view,
+            &graph,
+            &[press(200.0, 300.0), move_to(250.0, 300.0)],
+        );
+        let scroll = InputEvent::Scrolled {
+            position: px(600.0, 300.0),
+            lines: 1.0,
+        };
+        assert!(!view.handle_input(&graph, scroll).handled);
+        assert_eq!(view.zoom, 1.0);
+    }
+
+    #[test]
+    fn framing_fits_the_nodes_in_logical_pixels() {
+        let mut graph = three_nodes();
+        graph.set_selection(&ids(&[3])).unwrap();
+        // 400 × 300 logical pixels.
+        let mut view = View::new(Viewport {
+            scale_factor: 2.0,
+            ..WHOLE
+        });
+        let _ = view.handle_input(&graph, move_to(10.0, 10.0));
+
+        // All three span 480 × 30 units, so the width limits the zoom to 0.9 × 400 / 480.
+        let response = view.handle_input(&graph, InputEvent::KeyPressed(Key::H));
+        assert!(response.handled);
+        assert_eq!(view.centre, at(200.0, 0.0));
+        assert!((view.zoom - 0.75).abs() < 1e-6);
+
+        // Node 3 alone would need 4.5×, beyond the maximum.
+        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::G));
+        assert_eq!(view.centre, at(400.0, 0.0));
+        assert_eq!(view.zoom, MAX_ZOOM);
     }
 
     #[test]
@@ -919,13 +1016,7 @@ mod tests {
         );
         assert_eq!(view.drawn_selection(&graph), ids(&[1, 2]));
         let response = view.handle_input(&graph, release(570.0, 300.0));
-        assert_eq!(
-            response.selection,
-            Some(SelectionChange {
-                before: ids(&[3]),
-                after: ids(&[1, 2]),
-            })
-        );
+        assert_eq!(response.selection, Some(ids(&[1, 2])));
         accept(&mut graph, response);
 
         let shift_box = [
@@ -945,6 +1036,34 @@ mod tests {
         let response = send(&mut view, &graph, &ctrl_box);
         accept(&mut graph, response);
         assert_eq!(graph.selection(), ids(&[3]));
+
+        let shift_ctrl_box = [
+            press_with(350.0, 250.0, SHIFT_CTRL),
+            move_to(570.0, 300.0),
+            release(570.0, 300.0),
+        ];
+        let response = send(&mut view, &graph, &shift_ctrl_box);
+        accept(&mut graph, response);
+        assert_eq!(graph.selection(), ids(&[3, 1, 2]), "Shift wins over Ctrl");
+    }
+
+    #[test]
+    fn reselecting_the_same_nodes_in_another_order_is_no_request() {
+        let mut graph = three_nodes();
+        graph.set_selection(&ids(&[2, 1])).unwrap();
+        let mut view = View::new(WHOLE);
+
+        let response = send(
+            &mut view,
+            &graph,
+            &[
+                press(350.0, 250.0),
+                move_to(570.0, 300.0),
+                release(570.0, 300.0),
+            ],
+        );
+        assert_eq!(response.selection, None);
+        assert!(response.handled);
     }
 
     #[test]
@@ -955,13 +1074,7 @@ mod tests {
         let _ = view.handle_input(&graph, press_with(400.0, 300.0, SHIFT));
         graph.set_selection(&ids(&[3])).unwrap();
         let response = view.handle_input(&graph, release(400.0, 300.0));
-        assert_eq!(
-            response.selection,
-            Some(SelectionChange {
-                before: ids(&[3]),
-                after: ids(&[3, 1]),
-            })
-        );
+        assert_eq!(response.selection, Some(ids(&[3, 1])));
     }
 
     #[test]
@@ -980,7 +1093,7 @@ mod tests {
         assert_eq!(view.drawn_selection(&graph), ids(&[1]));
 
         let response = view.handle_input(&graph, release(400.0, 350.0));
-        assert_eq!(response.move_nodes, Some(vec![(NodeId(1), at(0.0, 50.0))]));
+        assert_eq!(response.positions, [(NodeId(1), at(0.0, 50.0))]);
     }
 
     #[test]
@@ -1001,7 +1114,7 @@ mod tests {
         assert_eq!(view.drawn_position(&graph, NodeId(2)), Some(at(200.0, 0.0)));
         assert_eq!(view.drawn_selection(&graph), []);
         let response = view.handle_input(&graph, release(600.0, 350.0));
-        assert_eq!(response.move_nodes, None);
+        assert_eq!(response.positions, []);
         assert_eq!(response.selection, None);
     }
 

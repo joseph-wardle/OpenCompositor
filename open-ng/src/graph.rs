@@ -130,17 +130,20 @@ pub struct Graph {
     index_of: HashMap<NodeId, usize>,
     connections: Vec<Connection>,
     selection: Vec<NodeId>,
-    /// How many nodes have ever been added. Views record it when a gesture starts, so a node
-    /// added since, even under a reused ID, is not mistaken for one the gesture refers to.
+    /// How many nodes have ever been added.
     add_count: u64,
 }
+
+/// The graph's add count at one moment. Views take one when a gesture starts, so a node added
+/// since, even under a reused ID, is not mistaken for one the gesture refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AddStamp(u64);
 
 #[derive(Debug)]
 struct Entry {
     id: NodeId,
     record: NodeRecord,
-    /// The add count once this node was added.
-    added: u64,
+    added: AddStamp,
 }
 
 impl Graph {
@@ -154,7 +157,7 @@ impl Graph {
         self.nodes.push(Entry {
             id,
             record,
-            added: self.add_count,
+            added: AddStamp(self.add_count),
         });
         Ok(())
     }
@@ -260,15 +263,15 @@ impl Graph {
         &self.selection
     }
 
-    pub(crate) fn add_count(&self) -> u64 {
-        self.add_count
+    pub(crate) fn add_stamp(&self) -> AddStamp {
+        AddStamp(self.add_count)
     }
 
-    /// Whether `id` names a node that was already present when the add count was `then`.
-    pub(crate) fn still_has(&self, id: NodeId, then: u64) -> bool {
+    /// Whether `id` names a node that has been in the graph since `stamp` was taken.
+    pub(crate) fn has_node_since(&self, id: NodeId, stamp: AddStamp) -> bool {
         self.index_of
             .get(&id)
-            .is_some_and(|&index| self.nodes[index].added <= then)
+            .is_some_and(|&index| self.nodes[index].added <= stamp)
     }
 
     fn index(&self, id: NodeId) -> Result<usize, GraphError> {
@@ -408,6 +411,11 @@ mod tests {
 
         assert_eq!(
             graph.update_node(NodeId(2), wider),
+            Err(GraphError::PortCountChanged(NodeId(2)))
+        );
+        let more_outputs = NodeRecord::vertical(Point { x: 50.0, y: 0.0 }, GREY, 1, 2);
+        assert_eq!(
+            graph.update_node(NodeId(2), more_outputs),
             Err(GraphError::PortCountChanged(NodeId(2)))
         );
         assert_eq!(graph.node(NodeId(2)), Some(&node(2.0)));

@@ -388,7 +388,11 @@ impl History {
             before: State::default(),
             after: State::default(),
         };
-        for (id, position) in response.move_nodes.unwrap_or_default() {
+        if let Some(selection) = response.selection {
+            edit.before.selection = Some(graph.selection().to_vec());
+            edit.after.selection = Some(selection);
+        }
+        for (id, position) in response.positions {
             let current = graph
                 .node(id)
                 .expect("views request only nodes that exist")
@@ -401,10 +405,6 @@ impl History {
                 edit.before.positions.push((id, current));
                 edit.after.positions.push((id, snapped));
             }
-        }
-        if let Some(change) = response.selection {
-            edit.before.selection = Some(change.before);
-            edit.after.selection = Some(change.after);
         }
         if edit.after.positions.is_empty() && edit.after.selection.is_none() {
             return false;

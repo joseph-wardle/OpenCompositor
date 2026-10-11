@@ -13,4 +13,4 @@ pub use graph::{
 };
 pub use input::{Button, InputEvent, Key, Modifiers, PhysicalPoint};
 pub use render::{Renderer, ViewBuffers};
-pub use view::{Response, SelectionChange, View, Viewport};
+pub use view::{Response, View, Viewport};
