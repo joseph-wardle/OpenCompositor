@@ -1,0 +1,13 @@
+[package]
+name = "opencompositor"
+version = "0.0.0"
+description = "A node-based compositor."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+open-ng = { path = "../open-ng", version = "0.0.0" }
+
+[lints]
+workspace = true

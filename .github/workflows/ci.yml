@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo build --workspace --all-targets --locked
+      - run: cargo test --workspace --locked
+
+  open-ng:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - run: cargo build -p open-ng --all-targets --locked
+      - run: cargo clippy -p open-ng --target wasm32-unknown-unknown --locked -- -D warnings
+      - run: cargo package -p open-ng --locked
