@@ -126,10 +126,21 @@ impl std::error::Error for GraphError {}
 #[derive(Debug, Default)]
 pub struct Graph {
     /// In draw order: later nodes are drawn above earlier ones.
-    nodes: Vec<(NodeId, NodeRecord)>,
+    nodes: Vec<Entry>,
     index_of: HashMap<NodeId, usize>,
     connections: Vec<Connection>,
     selection: Vec<NodeId>,
+    /// How many nodes have ever been added. Views record it when a gesture starts, so a node
+    /// added since, even under a reused ID, is not mistaken for one the gesture refers to.
+    add_count: u64,
+}
+
+#[derive(Debug)]
+struct Entry {
+    id: NodeId,
+    record: NodeRecord,
+    /// The add count once this node was added.
+    added: u64,
 }
 
 impl Graph {
@@ -138,15 +149,20 @@ impl Graph {
         if self.index_of.contains_key(&id) {
             return Err(GraphError::DuplicateNode(id));
         }
+        self.add_count += 1;
         self.index_of.insert(id, self.nodes.len());
-        self.nodes.push((id, record));
+        self.nodes.push(Entry {
+            id,
+            record,
+            added: self.add_count,
+        });
         Ok(())
     }
 
     /// Replaces a node's record. The number of inputs and outputs must not change.
     pub fn update_node(&mut self, id: NodeId, record: NodeRecord) -> Result<(), GraphError> {
         let index = self.index(id)?;
-        let current = &mut self.nodes[index].1;
+        let current = &mut self.nodes[index].record;
         if record.inputs.len() != current.inputs.len()
             || record.outputs.len() != current.outputs.len()
         {
@@ -162,10 +178,10 @@ impl Graph {
         let index = self.index(id)?;
         self.nodes.remove(index);
         self.index_of.remove(&id);
-        for (later_id, _) in &self.nodes[index..] {
+        for later in &self.nodes[index..] {
             *self
                 .index_of
-                .get_mut(later_id)
+                .get_mut(&later.id)
                 .expect("every node is indexed") -= 1;
         }
         self.connections
@@ -181,7 +197,7 @@ impl Graph {
         }
         for &(id, position) in positions {
             let index = self.index_of[&id];
-            self.nodes[index].1.position = position;
+            self.nodes[index].record.position = position;
         }
         Ok(())
     }
@@ -228,12 +244,12 @@ impl Graph {
 
     pub fn node(&self, id: NodeId) -> Option<&NodeRecord> {
         let &index = self.index_of.get(&id)?;
-        Some(&self.nodes[index].1)
+        Some(&self.nodes[index].record)
     }
 
     /// All nodes in draw order, bottom first.
     pub fn nodes(&self) -> impl Iterator<Item = (NodeId, &NodeRecord)> {
-        self.nodes.iter().map(|(id, record)| (*id, record))
+        self.nodes.iter().map(|entry| (entry.id, &entry.record))
     }
 
     pub fn connections(&self) -> &[Connection] {
@@ -242,6 +258,17 @@ impl Graph {
 
     pub fn selection(&self) -> &[NodeId] {
         &self.selection
+    }
+
+    pub(crate) fn add_count(&self) -> u64 {
+        self.add_count
+    }
+
+    /// Whether `id` names a node that was already present when the add count was `then`.
+    pub(crate) fn still_has(&self, id: NodeId, then: u64) -> bool {
+        self.index_of
+            .get(&id)
+            .is_some_and(|&index| self.nodes[index].added <= then)
     }
 
     fn index(&self, id: NodeId) -> Result<usize, GraphError> {
