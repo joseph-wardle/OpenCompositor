@@ -188,14 +188,15 @@ impl Editor {
         for view in &mut self.views {
             let response = view.handle_input(&self.graph, input);
             redraw |= response.handled;
-            redraw |= self.history.record(&mut self.graph, response);
+            redraw |= self.history.apply(&mut self.graph, response);
         }
         if redraw {
             self.window.request_redraw();
         }
     }
 
-    /// Handles undo and redo, and translates the keys the views use.
+    /// Handles undo and redo, and translates the keys the views use. Undo and redo wait for a
+    /// gesture to finish, as other keys do.
     fn key(&mut self, event: KeyEvent) -> Option<InputEvent> {
         let pressed = event.state == ElementState::Pressed;
         let key = match event.logical_key {
@@ -204,7 +205,8 @@ impl Editor {
             WinitKey::Character(c) if c.eq_ignore_ascii_case("h") => Key::H,
             WinitKey::Character(c) if c.eq_ignore_ascii_case("g") => Key::G,
             WinitKey::Character(c) if c.eq_ignore_ascii_case("z") => {
-                if pressed && self.modifiers.ctrl {
+                let gesture_active = self.views.iter().any(View::has_active_gesture);
+                if pressed && self.modifiers.ctrl && !gesture_active {
                     let changed = if self.modifiers.shift {
                         self.history.redo(&mut self.graph)
                     } else {
@@ -383,7 +385,7 @@ impl State {
 impl History {
     /// Applies what the host accepts of a response as one undo step. Returns whether the graph
     /// changed.
-    fn record(&mut self, graph: &mut Graph, response: Response) -> bool {
+    fn apply(&mut self, graph: &mut Graph, response: Response) -> bool {
         let mut edit = Edit {
             before: State::default(),
             after: State::default(),
