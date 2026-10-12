@@ -88,3 +88,5 @@ Licensed under either of
 at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+The bundled font, Geist Regular in [fonts/](fonts/), is a subset of the [Geist font](https://github.com/vercel/geist-font) and is licensed under the SIL Open Font License, Version 1.1 ([fonts/OFL.txt](fonts/OFL.txt)).

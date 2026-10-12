@@ -4,6 +4,11 @@ mod geometry;
 mod graph;
 mod input;
 mod render;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "node layout will measure with it")
+)]
+mod text;
 mod view;
 
 pub use geometry::Rect;
