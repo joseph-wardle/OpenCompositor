@@ -2,7 +2,8 @@ struct ViewTransform {
     // The graph point at the viewport's centre.
     centre: vec2<f32>,
     clip_per_unit: vec2<f32>,
-    pixels_per_unit: f32,
+    // WebGL2 needs uniform blocks in multiples of 16 bytes.
+    @size(16) pixels_per_unit: f32,
 }
 
 @group(0) @binding(0) var<uniform> view: ViewTransform;
