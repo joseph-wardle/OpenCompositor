@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenNG: two views</title>
+  <link data-trunk rel="rust" href="../..">
+  <style>
+    body { margin: 2rem; font: 1rem system-ui, sans-serif; background: #111; color: #ddd; }
+    #editor { display: block; width: 100%; height: 70vh; touch-action: none; outline: none; }
+    .error { color: #f77; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>OpenNG: two views</h1>
+  <p id="status">Starting…</p>
+  <canvas id="editor" tabindex="-1"></canvas>
+  <p>Drag nodes or a box with the left button; pan with the middle button or Space; zoom with
+    the wheel. H frames every node and G the selection. Ctrl+Z and Ctrl+Shift+Z undo and redo.
+    Moves snap to a grid and the bottom node is locked.</p>
+</body>
+</html>

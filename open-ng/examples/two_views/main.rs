@@ -6,9 +6,15 @@
 //!
 //! This file is what every platform shares; each platform's module starts the GPU, translates its
 //! events and schedules redraws.
+//!
+//! Run it natively with `cargo run -p open-ng --example two_views`. For the browser, install
+//! [Trunk](https://trunkrs.dev) and run `trunk serve --example two_views
+//! examples/two_views/index.html` from the `open-ng` directory, then open the address it prints.
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 use open_ng::{
     Color, Connection, Graph, InputEvent, InputRef, NodeId, NodeRecord, OutputRef, Point, Renderer,
@@ -23,6 +29,8 @@ const LOCKED: NodeId = NodeId(5);
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     native::main();
+    #[cfg(target_arch = "wasm32")]
+    web::main();
 }
 
 /// The document and the views onto it.
