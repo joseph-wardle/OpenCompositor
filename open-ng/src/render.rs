@@ -34,12 +34,15 @@ pub struct Renderer {
 #[derive(Debug)]
 pub struct ViewBuffers {
     viewport: Viewport,
+    // Per view rather than in the renderer: uploads take effect at the next submit, so one shared
+    // transform would draw every view in the pass with the last one prepared.
     transform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     wires: InstanceBuffer,
     shapes: InstanceBuffer,
 }
 
+/// Per-instance data in a vertex buffer. Not a storage buffer, because WebGL2 has none.
 #[derive(Debug)]
 struct InstanceBuffer {
     label: &'static str,
