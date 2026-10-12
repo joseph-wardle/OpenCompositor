@@ -30,12 +30,17 @@ const SELECTED_BORDER: [u8; 3] = [255, 200, 40];
 async fn webgl2_draws_each_view_inside_its_viewport() {
     let (device, queue) = webgl2_device().await;
 
-    // Each view is 200 pixels wide with the graph origin at its centre. Node 1 sits there, and
-    // node 2 straddles the right view's left edge: the right view is drawn last, so anything it
-    // draws outside itself stays on top.
+    // Each view is 200 pixels wide with the graph origin at its centre. Node 1 is centred there,
+    // and node 2 straddles the right view's left edge: the right view is drawn last, so anything
+    // it draws outside itself stays on top. An untitled node with no rows is 100 × 30.
     let mut graph = Graph::default();
-    for (id, x) in [(1, 0.0), (2, -100.0)] {
-        let record = NodeRecord::vertical(Point { x, y: 0.0 }, FILL, 1, 1);
+    for (id, x) in [(1, -50.0), (2, -150.0)] {
+        let record = NodeRecord {
+            position: Point { x, y: -15.0 },
+            title: String::new(),
+            color: FILL,
+            rows: Vec::new(),
+        };
         graph.add_node(NodeId(id), record).unwrap();
     }
     graph.set_selection(&[NodeId(1)]).unwrap();
@@ -54,7 +59,7 @@ async fn webgl2_draws_each_view_inside_its_viewport() {
     for left in [0, WIDTH / 2] {
         assert_eq!(pixel(&pixels, left + 5, 5), BACKGROUND, "background");
         assert_eq!(pixel(&pixels, left + 80, 50), fill, "fill");
-        assert_eq!(pixel(&pixels, left + 61, 50), SELECTED_BORDER, "border");
+        assert_eq!(pixel(&pixels, left + 51, 50), SELECTED_BORDER, "border");
     }
     // The viewport alone clips here: SwiftShader rasterizes nothing outside it, so this cannot
     // show that the scissor is set, which GPUs with guard-band clipping need.

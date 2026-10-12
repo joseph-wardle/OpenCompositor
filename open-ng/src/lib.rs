@@ -4,17 +4,13 @@ mod geometry;
 mod graph;
 mod input;
 mod render;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "node layout will measure with it")
-)]
 mod text;
 mod view;
 
 pub use geometry::Rect;
 pub use graph::{
-    Color, Connection, Graph, GraphError, InputRef, NodeId, NodeRecord, OutputRef, Point, Port,
-    Side,
+    Color, Connection, Direction, Graph, GraphError, Group, GroupId, NodeId, NodeRecord, Pin,
+    PinId, PinRef, Point, Row,
 };
 pub use input::{Button, InputEvent, Key, Modifiers, PhysicalPoint};
 pub use render::{Renderer, ViewBuffers};

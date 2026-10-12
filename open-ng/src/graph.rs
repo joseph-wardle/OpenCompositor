@@ -1,6 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use ab_glyph::FontRef;
+
+use crate::geometry::NodeLayout;
+use crate::text::bundled_font;
+
 /// Host-supplied node identity. Unique among the nodes currently in a [`Graph`]; an ID may be
 /// reused after its node is removed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -21,73 +26,102 @@ pub struct Color {
     pub b: u8,
 }
 
-/// The side of a node a port attaches to. Wires leave a port along this side's outward normal.
+/// Host-chosen pin identity, unique within its node across both directions and all groups.
+/// Connections refer to pins by it, so renaming, reordering or regrouping a pin keeps its wires.
+/// Pins added at run time, such as a merge's extra inputs, need fresh IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PinId(pub u64);
+
+/// Host-chosen group identity, unique among the groups of its node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GroupId(pub u64);
+
+/// Which way data flows through a pin. Inputs sit on a node's left edge, outputs on its right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    Top,
-    Bottom,
-    Left,
-    Right,
+pub enum Direction {
+    Input,
+    Output,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Port {
-    pub side: Side,
+/// One input or output, drawn as a row with a port and a label. Labels may repeat.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pin {
+    pub id: PinId,
+    pub label: String,
+    pub direction: Direction,
+}
+
+/// A header row followed by its pins, which may be inputs and outputs in any order. Groups do
+/// not nest. A folded group hides its pins; their wires end at the header instead.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Group {
+    pub id: GroupId,
+    pub label: String,
+    pub folded: bool,
+    pub pins: Vec<Pin>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Row {
+    Pin(Pin),
+    Group(Group),
 }
 
 /// What the editor needs to draw and interact with one node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeRecord {
-    /// The centre of the node.
+    /// The top-left corner of the node. It grows and shrinks down and to the right, so its title
+    /// and inputs stay put.
     pub position: Point,
+    pub title: String,
     pub color: Color,
-    pub inputs: Vec<Port>,
-    pub outputs: Vec<Port>,
+    /// From top to bottom below the title.
+    pub rows: Vec<Row>,
 }
 
 impl NodeRecord {
-    /// A node with its inputs along the top and its outputs along the bottom.
-    pub fn vertical(position: Point, color: Color, inputs: usize, outputs: usize) -> Self {
-        NodeRecord {
-            position,
-            color,
-            inputs: vec![Port { side: Side::Top }; inputs],
-            outputs: vec![Port { side: Side::Bottom }; outputs],
-        }
+    /// Every pin, grouped or not, from top to bottom.
+    pub(crate) fn pins(&self) -> impl Iterator<Item = &Pin> {
+        self.rows.iter().flat_map(|row| match row {
+            Row::Pin(pin) => std::slice::from_ref(pin),
+            Row::Group(group) => &group.pins[..],
+        })
+    }
+
+    pub(crate) fn pin(&self, id: PinId) -> Option<&Pin> {
+        self.pins().find(|pin| pin.id == id)
     }
 }
 
-/// An output port, identified by its index in the node's output list.
+/// A pin of a node in the graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OutputRef {
+pub struct PinRef {
     pub node: NodeId,
-    pub index: usize,
+    pub pin: PinId,
 }
 
-/// An input port, identified by its index in the node's input list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct InputRef {
-    pub node: NodeId,
-    pub index: usize,
-}
-
-/// A wire from an output port to an input port. A connection is identified by its endpoints.
+/// A wire from an output pin to an input pin. A connection is identified by its endpoints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Connection {
-    pub from: OutputRef,
-    pub to: InputRef,
+    pub from: PinRef,
+    pub to: PinRef,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphError {
     DuplicateNode(NodeId),
     MissingNode(NodeId),
-    MissingOutput(OutputRef),
-    MissingInput(InputRef),
+    /// A record gives two pins this ID.
+    DuplicatePin(PinRef),
+    /// A record gives two groups this ID.
+    DuplicateGroup {
+        node: NodeId,
+        group: GroupId,
+    },
+    MissingPin(PinRef),
+    /// A connection must run from an output to an input.
+    NotOutputToInput(Connection),
     MissingConnection(Connection),
-    /// Ports are identified by index, so changing how many a node has would silently re-point
-    /// its connections.
-    PortCountChanged(NodeId),
     RepeatedInSelection(NodeId),
 }
 
@@ -96,20 +130,25 @@ impl fmt::Display for GraphError {
         match self {
             GraphError::DuplicateNode(id) => write!(f, "node {} already exists", id.0),
             GraphError::MissingNode(id) => write!(f, "node {} does not exist", id.0),
-            GraphError::MissingOutput(port) => {
-                write!(f, "node {} has no output {}", port.node.0, port.index)
+            GraphError::DuplicatePin(pin) => {
+                write!(f, "node {} has more than one pin {}", pin.node.0, pin.pin.0)
             }
-            GraphError::MissingInput(port) => {
-                write!(f, "node {} has no input {}", port.node.0, port.index)
+            GraphError::DuplicateGroup { node, group } => {
+                write!(f, "node {} has more than one group {}", node.0, group.0)
             }
+            GraphError::MissingPin(pin) => {
+                write!(f, "node {} has no pin {}", pin.node.0, pin.pin.0)
+            }
+            GraphError::NotOutputToInput(c) => write!(
+                f,
+                "node {} pin {} to node {} pin {} is not from an output to an input",
+                c.from.node.0, c.from.pin.0, c.to.node.0, c.to.pin.0
+            ),
             GraphError::MissingConnection(c) => write!(
                 f,
-                "no connection from node {} output {} to node {} input {}",
-                c.from.node.0, c.from.index, c.to.node.0, c.to.index
+                "no connection from node {} pin {} to node {} pin {}",
+                c.from.node.0, c.from.pin.0, c.to.node.0, c.to.pin.0
             ),
-            GraphError::PortCountChanged(id) => {
-                write!(f, "node {} cannot change its number of ports", id.0)
-            }
             GraphError::RepeatedInSelection(id) => {
                 write!(f, "node {} appears more than once in the selection", id.0)
             }
@@ -123,7 +162,7 @@ impl std::error::Error for GraphError {}
 ///
 /// The host keeps it in step with its own document. Each method validates its whole input
 /// first and leaves the graph unchanged on error.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Graph {
     /// In draw order: later nodes are drawn above earlier ones.
     nodes: Vec<Entry>,
@@ -132,6 +171,8 @@ pub struct Graph {
     selection: Vec<NodeId>,
     /// How many nodes have ever been added.
     add_count: u64,
+    /// Measures titles and labels when a record is laid out.
+    font: FontRef<'static>,
 }
 
 /// The graph's add count at one moment. Views take one when a gesture starts, so a node added
@@ -143,7 +184,21 @@ pub(crate) struct AddStamp(u64);
 struct Entry {
     id: NodeId,
     record: NodeRecord,
+    layout: NodeLayout,
     added: AddStamp,
+}
+
+impl Default for Graph {
+    fn default() -> Graph {
+        Graph {
+            nodes: Vec::new(),
+            index_of: HashMap::new(),
+            connections: Vec::new(),
+            selection: Vec::new(),
+            add_count: 0,
+            font: bundled_font(),
+        }
+    }
 }
 
 impl Graph {
@@ -152,26 +207,35 @@ impl Graph {
         if self.index_of.contains_key(&id) {
             return Err(GraphError::DuplicateNode(id));
         }
+        check_ids(id, &record)?;
         self.add_count += 1;
         self.index_of.insert(id, self.nodes.len());
         self.nodes.push(Entry {
             id,
+            layout: NodeLayout::new(&self.font, &record),
             record,
             added: AddStamp(self.add_count),
         });
         Ok(())
     }
 
-    /// Replaces a node's record. The number of inputs and outputs must not change.
+    /// Replaces a node's record. Wires follow their pins wherever the record now places them;
+    /// connections to pins it no longer has, or that now face the other way, are removed. To undo
+    /// an update, restore the old record and then the removed connections.
     pub fn update_node(&mut self, id: NodeId, record: NodeRecord) -> Result<(), GraphError> {
         let index = self.index(id)?;
-        let current = &mut self.nodes[index].record;
-        if record.inputs.len() != current.inputs.len()
-            || record.outputs.len() != current.outputs.len()
-        {
-            return Err(GraphError::PortCountChanged(id));
-        }
-        *current = record;
+        check_ids(id, &record)?;
+        let faces = |pin: PinRef, direction: Direction| {
+            pin.node != id
+                || record
+                    .pin(pin.pin)
+                    .is_some_and(|p| p.direction == direction)
+        };
+        self.connections
+            .retain(|c| faces(c.from, Direction::Output) && faces(c.to, Direction::Input));
+        let entry = &mut self.nodes[index];
+        entry.layout = NodeLayout::new(&self.font, &record);
+        entry.record = record;
         Ok(())
     }
 
@@ -205,15 +269,13 @@ impl Graph {
         Ok(())
     }
 
-    /// Adds a connection between existing ports. Adding an existing connection does nothing.
+    /// Adds a connection from an existing output to an existing input. Adding an existing
+    /// connection does nothing.
     pub fn add_connection(&mut self, connection: Connection) -> Result<(), GraphError> {
-        let from = self.node_record(connection.from.node)?;
-        if connection.from.index >= from.outputs.len() {
-            return Err(GraphError::MissingOutput(connection.from));
-        }
-        let to = self.node_record(connection.to.node)?;
-        if connection.to.index >= to.inputs.len() {
-            return Err(GraphError::MissingInput(connection.to));
+        let from = self.pin(connection.from)?;
+        let to = self.pin(connection.to)?;
+        if from.direction != Direction::Output || to.direction != Direction::Input {
+            return Err(GraphError::NotOutputToInput(connection));
         }
         if !self.connections.contains(&connection) {
             self.connections.push(connection);
@@ -263,6 +325,20 @@ impl Graph {
         &self.selection
     }
 
+    pub(crate) fn node_layout(&self, id: NodeId) -> Option<&NodeLayout> {
+        let &index = self.index_of.get(&id)?;
+        Some(&self.nodes[index].layout)
+    }
+
+    /// All nodes in draw order with their layouts.
+    pub(crate) fn laid_out_nodes(
+        &self,
+    ) -> impl Iterator<Item = (NodeId, &NodeRecord, &NodeLayout)> {
+        self.nodes
+            .iter()
+            .map(|entry| (entry.id, &entry.record, &entry.layout))
+    }
+
     pub(crate) fn add_stamp(&self) -> AddStamp {
         AddStamp(self.add_count)
     }
@@ -281,9 +357,32 @@ impl Graph {
             .ok_or(GraphError::MissingNode(id))
     }
 
-    fn node_record(&self, id: NodeId) -> Result<&NodeRecord, GraphError> {
-        self.node(id).ok_or(GraphError::MissingNode(id))
+    fn pin(&self, pin: PinRef) -> Result<&Pin, GraphError> {
+        let record = self
+            .node(pin.node)
+            .ok_or(GraphError::MissingNode(pin.node))?;
+        record.pin(pin.pin).ok_or(GraphError::MissingPin(pin))
     }
+}
+
+/// Checks that the record's pin IDs, and separately its group IDs, are unique.
+fn check_ids(node: NodeId, record: &NodeRecord) -> Result<(), GraphError> {
+    let mut pins = HashSet::new();
+    if let Some(pin) = record.pins().find(|pin| !pins.insert(pin.id)) {
+        return Err(GraphError::DuplicatePin(PinRef { node, pin: pin.id }));
+    }
+    let mut groups = HashSet::new();
+    for row in &record.rows {
+        if let Row::Group(group) = row
+            && !groups.insert(group.id)
+        {
+            return Err(GraphError::DuplicateGroup {
+                node,
+                group: group.id,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -296,20 +395,39 @@ mod tests {
         b: 128,
     };
 
-    fn node(x: f32) -> NodeRecord {
-        NodeRecord::vertical(Point { x, y: 0.0 }, GREY, 1, 1)
+    fn pin(id: u64, label: &str, direction: Direction) -> Pin {
+        Pin {
+            id: PinId(id),
+            label: label.to_owned(),
+            direction,
+        }
     }
 
+    /// A node with input pin 1 and output pin 2.
+    fn node(x: f32) -> NodeRecord {
+        NodeRecord {
+            position: Point { x, y: 0.0 },
+            title: "Blur".to_owned(),
+            color: GREY,
+            rows: vec![
+                Row::Pin(pin(1, "Image", Direction::Input)),
+                Row::Pin(pin(2, "Image", Direction::Output)),
+            ],
+        }
+    }
+
+    fn pin_ref(node: u64, pin: u64) -> PinRef {
+        PinRef {
+            node: NodeId(node),
+            pin: PinId(pin),
+        }
+    }
+
+    /// From one node's output pin 2 to another's input pin 1.
     fn wire(from: u64, to: u64) -> Connection {
         Connection {
-            from: OutputRef {
-                node: NodeId(from),
-                index: 0,
-            },
-            to: InputRef {
-                node: NodeId(to),
-                index: 0,
-            },
+            from: pin_ref(from, 2),
+            to: pin_ref(to, 1),
         }
     }
 
@@ -358,41 +476,35 @@ mod tests {
     }
 
     #[test]
-    fn connections_need_existing_ports_and_are_added_once() {
+    fn connections_run_from_existing_outputs_to_existing_inputs_and_are_added_once() {
         let mut graph = chain();
-        let past_last_output = Connection {
-            from: OutputRef {
-                node: NodeId(1),
-                index: 1,
-            },
-            to: InputRef {
-                node: NodeId(3),
-                index: 0,
-            },
+        let missing_pin = Connection {
+            from: pin_ref(1, 2),
+            to: pin_ref(3, 9),
         };
-        let past_last_input = Connection {
-            from: OutputRef {
-                node: NodeId(1),
-                index: 0,
-            },
-            to: InputRef {
-                node: NodeId(3),
-                index: 1,
-            },
+        let backwards = Connection {
+            from: pin_ref(3, 1),
+            to: pin_ref(1, 2),
+        };
+        let output_to_output = Connection {
+            from: pin_ref(1, 2),
+            to: pin_ref(3, 2),
         };
 
         assert_eq!(
-            graph.add_connection(past_last_output),
-            Err(GraphError::MissingOutput(past_last_output.from))
-        );
-        assert_eq!(
-            graph.add_connection(past_last_input),
-            Err(GraphError::MissingInput(past_last_input.to))
+            graph.add_connection(missing_pin),
+            Err(GraphError::MissingPin(pin_ref(3, 9)))
         );
         assert_eq!(
             graph.add_connection(wire(1, 9)),
             Err(GraphError::MissingNode(NodeId(9)))
         );
+        for wrong_way in [backwards, output_to_output] {
+            assert_eq!(
+                graph.add_connection(wrong_way),
+                Err(GraphError::NotOutputToInput(wrong_way))
+            );
+        }
         graph.add_connection(wire(1, 2)).unwrap();
         assert_eq!(graph.connections(), [wire(1, 2), wire(2, 3)]);
 
@@ -405,26 +517,84 @@ mod tests {
     }
 
     #[test]
-    fn update_rejects_a_port_count_change_and_keeps_the_old_record() {
+    fn renaming_reordering_regrouping_and_inserting_pins_keeps_their_wires() {
         let mut graph = chain();
-        let wider = NodeRecord::vertical(Point { x: 50.0, y: 0.0 }, GREY, 2, 1);
+        let mut changed = node(2.0);
+        changed.rows = vec![
+            Row::Pin(pin(2, "Result", Direction::Output)),
+            Row::Pin(pin(3, "Mask", Direction::Input)),
+            Row::Group(Group {
+                id: GroupId(1),
+                label: "Sources".to_owned(),
+                folded: true,
+                pins: vec![pin(1, "Source", Direction::Input)],
+            }),
+        ];
+
+        graph.update_node(NodeId(2), changed.clone()).unwrap();
+        assert_eq!(graph.node(NodeId(2)), Some(&changed));
+        assert_eq!(graph.connections(), [wire(1, 2), wire(2, 3)]);
+    }
+
+    #[test]
+    fn removing_or_reversing_a_pin_drops_its_connections() {
+        let mut graph = chain();
+        let mut without_input = node(2.0);
+        without_input.rows.remove(0);
+        graph.update_node(NodeId(2), without_input).unwrap();
+        assert_eq!(graph.connections(), [wire(2, 3)]);
+
+        let mut reversed_output = node(2.0);
+        reversed_output.rows[1] = Row::Pin(pin(2, "Image", Direction::Input));
+        graph.update_node(NodeId(2), reversed_output).unwrap();
+        assert_eq!(graph.connections(), []);
+    }
+
+    #[test]
+    fn a_record_with_repeated_ids_changes_nothing() {
+        let mut graph = chain();
+        let group = |id: u64, pins: Vec<Pin>| {
+            Row::Group(Group {
+                id: GroupId(id),
+                label: "Options".to_owned(),
+                folded: false,
+                pins,
+            })
+        };
+        let mut repeated_pin = node(50.0);
+        repeated_pin
+            .rows
+            .push(group(1, vec![pin(1, "Mask", Direction::Input)]));
+        let mut repeated_group = node(50.0);
+        repeated_group
+            .rows
+            .extend([group(1, vec![]), group(1, vec![])]);
 
         assert_eq!(
-            graph.update_node(NodeId(2), wider),
-            Err(GraphError::PortCountChanged(NodeId(2)))
+            graph.update_node(NodeId(2), repeated_pin.clone()),
+            Err(GraphError::DuplicatePin(pin_ref(2, 1)))
         );
-        let more_outputs = NodeRecord::vertical(Point { x: 50.0, y: 0.0 }, GREY, 1, 2);
         assert_eq!(
-            graph.update_node(NodeId(2), more_outputs),
-            Err(GraphError::PortCountChanged(NodeId(2)))
+            graph.update_node(NodeId(2), repeated_group.clone()),
+            Err(GraphError::DuplicateGroup {
+                node: NodeId(2),
+                group: GroupId(1)
+            })
+        );
+        assert_eq!(
+            graph.add_node(NodeId(4), repeated_pin),
+            Err(GraphError::DuplicatePin(pin_ref(4, 1)))
         );
         assert_eq!(graph.node(NodeId(2)), Some(&node(2.0)));
-
-        let mut side_input = node(50.0);
-        side_input.inputs[0].side = Side::Left;
-        graph.update_node(NodeId(2), side_input.clone()).unwrap();
-        assert_eq!(graph.node(NodeId(2)), Some(&side_input));
+        assert_eq!(graph.node(NodeId(4)), None);
         assert_eq!(graph.connections(), [wire(1, 2), wire(2, 3)]);
+
+        // Labels may repeat, and pins and groups have separate IDs.
+        let mut shared = node(50.0);
+        shared
+            .rows
+            .push(group(1, vec![pin(3, "Image", Direction::Input)]));
+        graph.update_node(NodeId(2), shared).unwrap();
     }
 
     #[test]

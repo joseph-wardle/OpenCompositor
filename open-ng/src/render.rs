@@ -5,8 +5,8 @@ use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::geometry::{self, NodeLayout, Rect};
-use crate::graph::{Color, Graph, Point};
+use crate::geometry::{self, Rect};
+use crate::graph::{Color, Graph, PinRef, Point};
 use crate::view::{View, Viewport};
 
 const WIRE_SEGMENTS: u32 = 32;
@@ -304,27 +304,19 @@ impl InstanceBuffer {
 
 /// The wires as drawn, following any nodes being dragged.
 fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
-    let drawn = |id| {
-        view.drawn_position(graph, id)
-            .expect("connections join nodes in the graph")
+    let end = |pin: PinRef| {
+        let top_left = view.drawn_position(graph, pin.node);
+        let layout = graph.node_layout(pin.node);
+        top_left
+            .zip(layout)
+            .and_then(|(top_left, layout)| layout.port(top_left, pin.pin))
+            .expect("connections join pins in the graph")
     };
     graph
         .connections()
         .iter()
         .map(|connection| {
-            let (from, to) = (connection.from, connection.to);
-            let output = graph
-                .node(from.node)
-                .expect("connections join nodes in the graph");
-            let input = graph
-                .node(to.node)
-                .expect("connections join nodes in the graph");
-            let points = geometry::wire(
-                NodeLayout::new(output, drawn(from.node)).output(from.index),
-                output.outputs[from.index].side,
-                NodeLayout::new(input, drawn(to.node)).input(to.index),
-                input.inputs[to.index].side,
-            );
+            let points = geometry::wire(end(connection.from), end(connection.to));
             Wire {
                 points: points.map(|point| [point.x, point.y]),
             }
@@ -336,8 +328,8 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
 fn shapes(graph: &Graph, view: &View) -> Vec<Shape> {
     let selected: HashSet<_> = view.drawn_selection(graph).into_iter().collect();
     let mut shapes = Vec::new();
-    for (id, record) in graph.nodes() {
-        let centre = view
+    for (id, record, layout) in graph.laid_out_nodes() {
+        let top_left = view
             .drawn_position(graph, id)
             .expect("the node is in the graph");
         let (border, border_width) = if selected.contains(&id) {
@@ -345,15 +337,14 @@ fn shapes(graph: &Graph, view: &View) -> Vec<Shape> {
         } else {
             (NODE_BORDER, NODE_BORDER_WIDTH)
         };
-        let layout = NodeLayout::new(record, centre);
         shapes.push(Shape {
             radius: NODE_CORNER_RADIUS,
             border_width,
             fill: opaque(record.color),
             border,
-            ..rectangle(layout.rect)
+            ..rectangle(layout.rect(top_left))
         });
-        shapes.extend(layout.ports().map(|port| Shape {
+        shapes.extend(layout.ports(top_left).map(|port| Shape {
             centre: [port.x, port.y],
             half_size: [PORT_RADIUS; 2],
             radius: PORT_RADIUS,
@@ -395,7 +386,8 @@ fn opaque(color: Color) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Connection, InputRef, NodeId, NodeRecord, OutputRef};
+    use crate::geometry::{MIN_WIDTH, ROW_HEIGHT, TITLE_HEIGHT};
+    use crate::graph::{Connection, Direction, NodeId, NodeRecord, Pin, PinId, Row};
     use crate::input::{Button, InputEvent, Modifiers, PhysicalPoint};
 
     const GREY: Color = Color {
@@ -437,24 +429,33 @@ mod tests {
     #[test]
     fn a_wire_end_follows_its_port_during_a_drag() {
         let mut graph = Graph::default();
+        let pin = |id, direction| {
+            Row::Pin(Pin {
+                id: PinId(id),
+                label: "Image".to_owned(),
+                direction,
+            })
+        };
         for (id, y) in [(1, 0.0), (2, 100.0)] {
-            let record = NodeRecord::vertical(at(0.0, y), GREY, 1, 1);
+            let record = NodeRecord {
+                position: at(0.0, y),
+                title: String::new(),
+                color: GREY,
+                rows: vec![pin(1, Direction::Input), pin(2, Direction::Output)],
+            };
             graph.add_node(NodeId(id), record).unwrap();
         }
-        let output = OutputRef {
-            node: NodeId(1),
-            index: 0,
+        let connection = Connection {
+            from: PinRef {
+                node: NodeId(1),
+                pin: PinId(2),
+            },
+            to: PinRef {
+                node: NodeId(2),
+                pin: PinId(1),
+            },
         };
-        let input = InputRef {
-            node: NodeId(2),
-            index: 0,
-        };
-        graph
-            .add_connection(Connection {
-                from: output,
-                to: input,
-            })
-            .unwrap();
+        graph.add_connection(connection).unwrap();
         let mut view = View::new(Viewport {
             x: 0,
             y: 0,
@@ -463,14 +464,15 @@ mod tests {
             scale_factor: 1.0,
         });
 
+        // Press node 2, which spans graph (0, 100) to (100, 170), and drag it by (30, -20).
         for event in [
             InputEvent::PointerPressed {
-                position: PhysicalPoint { x: 400.0, y: 400.0 },
+                position: PhysicalPoint { x: 450.0, y: 410.0 },
                 button: Button::Left,
                 modifiers: Modifiers::default(),
             },
             InputEvent::PointerMoved {
-                position: PhysicalPoint { x: 430.0, y: 380.0 },
+                position: PhysicalPoint { x: 480.0, y: 390.0 },
             },
         ] {
             let _ = view.handle_input(&graph, event);
@@ -479,14 +481,19 @@ mod tests {
         let [wire] = wires(&graph, &view)[..] else {
             panic!("one connection draws one wire");
         };
-        assert_eq!(wire.points[0], [0.0, 15.0]);
-        assert_eq!(wire.points[3], [30.0, 65.0]);
+        let row_middle = |index: f32| TITLE_HEIGHT + (index + 0.5) * ROW_HEIGHT;
+        assert_eq!(wire.points[0], [MIN_WIDTH, row_middle(1.0)]);
+        assert_eq!(wire.points[3], [30.0, 80.0 + row_middle(0.0)]);
         let shapes = shapes(&graph, &view);
         let [_, _, _, node, input_port, output_port] = &shapes[..] else {
             panic!("each node draws with its two ports");
         };
-        assert_eq!(node.centre, [30.0, 80.0]);
+        assert_eq!(node.centre[0] - node.half_size[0], 30.0);
+        assert_eq!(node.centre[1] - node.half_size[1], 80.0);
         assert_eq!(input_port.centre, wire.points[3]);
-        assert_eq!(output_port.centre, [30.0, 95.0]);
+        assert_eq!(
+            output_port.centre,
+            [30.0 + MIN_WIDTH, 80.0 + row_middle(1.0)]
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! Two views of one graph, side by side in one window.
 //!
 //! The example is the host: it owns the graph and a small history, and decides what each
-//! response from a view does. Moves snap to a 10-unit grid, the bottom node is locked in place,
+//! response from a view does. Moves snap to a 10-unit grid, the Write node is locked in place,
 //! and Ctrl+Z and Ctrl+Shift+Z undo and redo moves and selection changes.
 //!
 //! This file is what every platform shares; each platform's module starts the GPU, translates its
@@ -17,8 +17,8 @@ mod native;
 mod web;
 
 use open_ng::{
-    Color, Connection, Graph, InputEvent, InputRef, NodeId, NodeRecord, OutputRef, Point, Renderer,
-    Response, View, ViewBuffers, Viewport,
+    Color, Connection, Direction, Graph, InputEvent, NodeId, NodeRecord, Pin, PinId, PinRef, Point,
+    Renderer, Response, Row, View, ViewBuffers, Viewport,
 };
 
 /// The physical pixels between the two views.
@@ -245,37 +245,64 @@ fn viewports(width: u32, height: u32, scale_factor: f32) -> [Viewport; 2] {
     ]
 }
 
-/// Two sources merged, blurred and written, laid out around the graph origin where new views
-/// are centred.
+/// Two sources merged, blurred and written, from left to right around the graph origin where
+/// new views are centred. Every node's input is pin 1 and its output pin 2, except the merge's
+/// second input, pin 3.
 fn network() -> Graph {
-    let node = |x, y, (r, g, b), inputs, outputs| {
-        NodeRecord::vertical(Point { x, y }, Color { r, g, b }, inputs, outputs)
+    let pin = |id, label: &str, direction| {
+        Row::Pin(Pin {
+            id: PinId(id),
+            label: label.to_owned(),
+            direction,
+        })
+    };
+    let input = |label| pin(1, label, Direction::Input);
+    let output = pin(2, "Image", Direction::Output);
+    let node = |title: &str, x, y, (r, g, b), rows| NodeRecord {
+        position: Point { x, y },
+        title: title.to_owned(),
+        color: Color { r, g, b },
+        rows,
     };
     let source = (70, 120, 170);
     let mut graph = Graph::default();
     let nodes = [
-        node(-80.0, -160.0, source, 0, 1),
-        node(80.0, -160.0, source, 0, 1),
-        node(0.0, -60.0, (150, 110, 60), 2, 1),
-        node(0.0, 40.0, (90, 140, 90), 1, 1),
-        node(0.0, 140.0, (150, 70, 70), 1, 0),
+        node("Read", -340.0, -90.0, source, vec![output.clone()]),
+        node("Read", -340.0, 20.0, source, vec![output.clone()]),
+        node(
+            "Merge",
+            -180.0,
+            -40.0,
+            (150, 110, 60),
+            vec![output.clone(), input("A"), pin(3, "B", Direction::Input)],
+        ),
+        node(
+            "Blur",
+            -20.0,
+            -40.0,
+            (90, 140, 90),
+            vec![input("Image"), output],
+        ),
+        node("Write", 140.0, -40.0, (150, 70, 70), vec![input("Image")]),
     ];
     for (id, record) in (1..).map(NodeId).zip(nodes) {
         graph.add_node(id, record).expect("a new node ID");
     }
-    let wires = [(1, 3, 0), (2, 3, 1), (3, 4, 0), (4, 5, 0)];
+    let wires = [(1, 3, 1), (2, 3, 3), (3, 4, 1), (4, 5, 1)];
     for (from, to, input) in wires {
         let connection = Connection {
-            from: OutputRef {
+            from: PinRef {
                 node: NodeId(from),
-                index: 0,
+                pin: PinId(2),
             },
-            to: InputRef {
+            to: PinRef {
                 node: NodeId(to),
-                index: input,
+                pin: PinId(input),
             },
         };
-        graph.add_connection(connection).expect("ports that exist");
+        graph
+            .add_connection(connection)
+            .expect("an output and an input that exist");
     }
     graph
 }

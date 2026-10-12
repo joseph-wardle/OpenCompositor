@@ -250,7 +250,7 @@ impl View {
         self.centre
     }
 
-    /// Where a node is drawn: its committed position, offset while it is being dragged.
+    /// Where a node's top-left is drawn: its committed position, offset while it is being dragged.
     pub(crate) fn drawn_position(&self, graph: &Graph, id: NodeId) -> Option<Point> {
         let position = graph.node(id)?.position;
         if let Some(Gesture::Move {
@@ -573,6 +573,7 @@ impl Gesture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::{BOTTOM_PADDING, MIN_WIDTH, TITLE_HEIGHT};
     use crate::graph::{Color, NodeRecord};
 
     const GREY: Color = Color {
@@ -598,11 +599,31 @@ mod tests {
         PhysicalPoint { x, y }
     }
 
-    /// Nodes 1, 2 and 3 at graph x = 0, 200 and 400, each 80 × 30.
+    /// The size of an untitled node with no rows: 100 × 30.
+    const SIZE: Point = Point {
+        x: MIN_WIDTH,
+        y: TITLE_HEIGHT + BOTTOM_PADDING,
+    };
+
+    /// The top-left of an untitled node with no rows centred on (x, y).
+    fn centred(x: f32, y: f32) -> Point {
+        at(x - SIZE.x / 2.0, y - SIZE.y / 2.0)
+    }
+
+    fn untitled(position: Point) -> NodeRecord {
+        NodeRecord {
+            position,
+            title: String::new(),
+            color: GREY,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Nodes 1, 2 and 3 centred at graph x = 0, 200 and 400, each 100 × 30.
     fn three_nodes() -> Graph {
         let mut graph = Graph::default();
         for id in 1..=3 {
-            let record = NodeRecord::vertical(at((id - 1) as f32 * 200.0, 0.0), GREY, 1, 1);
+            let record = untitled(centred((id - 1) as f32 * 200.0, 0.0));
             graph.add_node(NodeId(id), record).unwrap();
         }
         graph
@@ -730,24 +751,36 @@ mod tests {
             &graph,
             &[press(400.0, 300.0), move_to(430.0, 340.0)],
         );
-        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(30.0, 40.0)));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(1)),
+            Some(centred(30.0, 40.0))
+        );
         assert_eq!(
             view.drawn_position(&graph, NodeId(2)),
-            Some(at(230.0, 40.0))
+            Some(centred(230.0, 40.0))
         );
-        assert_eq!(view.drawn_position(&graph, NodeId(3)), Some(at(400.0, 0.0)));
-        assert_eq!(graph.node(NodeId(1)).unwrap().position, at(0.0, 0.0));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(3)),
+            Some(centred(400.0, 0.0))
+        );
+        assert_eq!(graph.node(NodeId(1)).unwrap().position, centred(0.0, 0.0));
 
         let response = view.handle_input(&graph, release(430.0, 340.0));
         assert_eq!(
             response.positions,
-            [(NodeId(1), at(30.0, 40.0)), (NodeId(2), at(230.0, 40.0))]
+            [
+                (NodeId(1), centred(30.0, 40.0)),
+                (NodeId(2), centred(230.0, 40.0))
+            ]
         );
         assert_eq!(response.selection, None);
 
         // Ignoring the response rejects it.
         assert!(!view.has_active_gesture());
-        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(1)),
+            Some(centred(0.0, 0.0))
+        );
     }
 
     #[test]
@@ -781,7 +814,7 @@ mod tests {
                 release(600.0, 320.0),
             ],
         );
-        assert_eq!(response.positions, [(NodeId(2), at(200.0, 20.0))]);
+        assert_eq!(response.positions, [(NodeId(2), centred(200.0, 20.0))]);
         assert_eq!(response.selection, Some(ids(&[2])));
     }
 
@@ -813,7 +846,10 @@ mod tests {
             &graph,
             &[press(400.0, 300.0), move_to(406.0, 294.0)],
         );
-        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(1)),
+            Some(centred(0.0, 0.0))
+        );
         let response = view.handle_input(&graph, release(406.0, 294.0));
         assert_eq!(response.positions, []);
 
@@ -822,7 +858,10 @@ mod tests {
             &graph,
             &[press(400.0, 300.0), move_to(400.0, 307.0)],
         );
-        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 3.5)));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(1)),
+            Some(centred(0.0, 3.5))
+        );
     }
 
     #[test]
@@ -853,7 +892,10 @@ mod tests {
                 ..Response::default()
             }
         );
-        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(1)),
+            Some(centred(0.0, 0.0))
+        );
         assert_eq!(view.drawn_selection(&graph), ids(&[3]));
         assert_eq!(view.zoom, 1.2);
 
@@ -910,7 +952,10 @@ mod tests {
                 move_to(440.0, 300.0),
             ],
         );
-        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(1)),
+            Some(centred(0.0, 0.0))
+        );
         assert_eq!(view.centre, at(10.0, 0.0));
 
         let response = view.handle_input(&graph, release(440.0, 300.0));
@@ -943,7 +988,10 @@ mod tests {
 
         let response = view.handle_input(&graph, press(600.0, 300.0));
         assert!(response.handled && !view.has_active_gesture());
-        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(1)),
+            Some(centred(0.0, 0.0))
+        );
         let response = view.handle_input(&graph, release(600.0, 300.0));
         assert_eq!(response, Response::default());
     }
@@ -1003,15 +1051,23 @@ mod tests {
         });
         let _ = view.handle_input(&graph, move_to(10.0, 10.0));
 
-        // All three span 480 × 30 units, so the width limits the zoom to 0.9 × 400 / 480.
+        // All three span 500 × 30 units, so the width limits the zoom to 0.9 × 400 / 500.
         let response = view.handle_input(&graph, InputEvent::KeyPressed(Key::H));
         assert!(response.handled);
         assert_eq!(view.centre, at(200.0, 0.0));
-        assert!((view.zoom - 0.75).abs() < 1e-6);
+        assert!((view.zoom - 0.72).abs() < 1e-6);
 
-        // Node 3 alone would need 4.5×, beyond the maximum.
+        // Node 3 alone fits at 0.9 × 400 / 100.
         let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::G));
         assert_eq!(view.centre, at(400.0, 0.0));
+        assert!((view.zoom - 3.6).abs() < 1e-6);
+
+        // A wide view would fit it at 7.2×, beyond the maximum.
+        view.set_viewport(Viewport {
+            scale_factor: 1.0,
+            ..WHOLE
+        });
+        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::G));
         assert_eq!(view.zoom, MAX_ZOOM);
     }
 
@@ -1044,14 +1100,17 @@ mod tests {
             &[press(400.0, 300.0), move_to(420.0, 300.0)],
         );
         let _ = view.handle_input(&graph, InputEvent::PointerLeft);
-        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(20.0, 0.0)));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(1)),
+            Some(centred(20.0, 0.0))
+        );
 
         let response = send(
             &mut view,
             &graph,
             &[move_to(900.0, 300.0), release(900.0, 300.0)],
         );
-        assert_eq!(response.positions, [(NodeId(1), at(500.0, 0.0))]);
+        assert_eq!(response.positions, [(NodeId(1), centred(500.0, 0.0))]);
 
         let _ = send(
             &mut view,
@@ -1153,7 +1212,7 @@ mod tests {
         assert_eq!(view.drawn_selection(&graph), ids(&[1]));
 
         let response = view.handle_input(&graph, release(400.0, 350.0));
-        assert_eq!(response.positions, [(NodeId(1), at(0.0, 50.0))]);
+        assert_eq!(response.positions, [(NodeId(1), centred(0.0, 50.0))]);
     }
 
     #[test]
@@ -1168,10 +1227,13 @@ mod tests {
             &[press(600.0, 300.0), move_to(600.0, 350.0)],
         );
         graph.remove_node(NodeId(2)).unwrap();
-        let returned = NodeRecord::vertical(at(200.0, 0.0), GREY, 1, 1);
+        let returned = untitled(centred(200.0, 0.0));
         graph.add_node(NodeId(2), returned).unwrap();
 
-        assert_eq!(view.drawn_position(&graph, NodeId(2)), Some(at(200.0, 0.0)));
+        assert_eq!(
+            view.drawn_position(&graph, NodeId(2)),
+            Some(centred(200.0, 0.0))
+        );
         assert_eq!(view.drawn_selection(&graph), []);
         let response = view.handle_input(&graph, release(600.0, 350.0));
         assert_eq!(response.positions, []);
@@ -1205,18 +1267,24 @@ mod tests {
         broadcast(&mut graph, &mut views, move_to(220.0, 300.0));
         let [left, right] = &views;
         assert!(left.has_active_gesture() && !right.has_active_gesture());
-        assert_eq!(left.drawn_position(&graph, NodeId(1)), Some(at(20.0, 0.0)));
-        assert_eq!(right.drawn_position(&graph, NodeId(1)), Some(at(0.0, 0.0)));
+        assert_eq!(
+            left.drawn_position(&graph, NodeId(1)),
+            Some(centred(20.0, 0.0))
+        );
+        assert_eq!(
+            right.drawn_position(&graph, NodeId(1)),
+            Some(centred(0.0, 0.0))
+        );
         assert_eq!(left.drawn_selection(&graph), ids(&[1]));
         assert_eq!(right.drawn_selection(&graph), []);
 
         // Released over the right view, which ignores it.
         broadcast(&mut graph, &mut views, release(620.0, 300.0));
         let [_, right] = &views;
-        assert_eq!(graph.node(NodeId(1)).unwrap().position, at(420.0, 0.0));
+        assert_eq!(graph.node(NodeId(1)).unwrap().position, centred(420.0, 0.0));
         assert_eq!(
             right.drawn_position(&graph, NodeId(1)),
-            Some(at(420.0, 0.0))
+            Some(centred(420.0, 0.0))
         );
         assert_eq!(right.drawn_selection(&graph), ids(&[1]));
 
