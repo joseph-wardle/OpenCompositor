@@ -19,3 +19,10 @@ wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
 pollster = "1.0.1"
 wgpu = "30"
 winit = "0.30.13"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+js-sys = "0.3.106"
+wasm-bindgen-futures = "0.4.79"
+wasm-bindgen-test = "0.3"
+web-sys = { version = "0.3.106", features = ["OffscreenCanvas", "Window"] }
+wgpu = { version = "30", features = ["webgl"] }

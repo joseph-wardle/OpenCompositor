@@ -25,4 +25,10 @@ jobs:
       - run: rustup toolchain install
       - run: cargo build -p open-ng --all-targets --locked
       - run: cargo clippy -p open-ng --target wasm32-unknown-unknown --features wgpu/webgpu --locked -- -D warnings
+      - run: cargo clippy -p open-ng --target wasm32-unknown-unknown --tests --locked -- -D warnings
+      - run: cargo install wasm-bindgen-cli --locked --version "$(cargo pkgid wasm-bindgen | cut -d@ -f2)"
+      # The runner has no GPU: Chrome draws WebGL2 with SwiftShader, which webdriver.json enables.
+      - run: CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver" cargo test -p open-ng --target wasm32-unknown-unknown --test web --locked
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
       - run: cargo package -p open-ng --locked
