@@ -13,6 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --workspace --all-targets --locked
@@ -23,12 +24,29 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
       - run: cargo build -p open-ng --all-targets --locked
       - run: cargo clippy -p open-ng --target wasm32-unknown-unknown --features wgpu/webgpu --locked -- -D warnings
+      - run: cargo package -p open-ng --locked
+
+  open-ng-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p open-ng --target wasm32-unknown-unknown --tests --locked -- -D warnings
-      - run: cargo install wasm-bindgen-cli --locked --version "$(cargo pkgid wasm-bindgen | cut -d@ -f2)"
+      - name: Install the wasm-bindgen CLI matching Cargo.lock
+        run: |
+          version="$(cargo pkgid wasm-bindgen | cut -d@ -f2)"
+          release="wasm-bindgen-$version-x86_64-unknown-linux-musl"
+          url="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$version/$release.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -fsSL "$url" -o "$release.tar.gz"
+          echo "$(curl -fsSL "$url.sha256sum" | cut -d' ' -f1)  $release.tar.gz" | sha256sum -c
+          tar xzf "$release.tar.gz"
+          echo "$RUNNER_TEMP/$release" >> "$GITHUB_PATH"
       # The runner has no GPU: Chrome draws WebGL2 with SwiftShader, which webdriver.json enables.
       - run: CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver" cargo test -p open-ng --target wasm32-unknown-unknown --test web --locked
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-      - run: cargo package -p open-ng --locked
