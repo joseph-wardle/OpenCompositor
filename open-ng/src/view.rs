@@ -69,7 +69,9 @@ pub struct View {
     /// The graph point at the viewport's centre.
     centre: Point,
     zoom: f32,
+    /// The last pointer position, which gestures follow even after the pointer leaves.
     pointer: Option<PhysicalPoint>,
+    pointer_in_target: bool,
     space_held: bool,
     gesture: Option<Gesture>,
 }
@@ -189,6 +191,7 @@ impl View {
             centre: Point::default(),
             zoom: 1.0,
             pointer: None,
+            pointer_in_target: false,
             space_held: false,
             gesture: None,
         }
@@ -233,6 +236,10 @@ impl View {
                 if key == Key::Space {
                     self.space_held = false;
                 }
+                Response::default()
+            }
+            InputEvent::PointerLeft => {
+                self.pointer_in_target = false;
                 Response::default()
             }
         }
@@ -290,7 +297,7 @@ impl View {
     }
 
     fn pointer_moved(&mut self, graph: &Graph, position: PhysicalPoint) -> Response {
-        self.pointer = Some(position);
+        self.track_pointer(position);
         self.gesture = match self.gesture.take() {
             None => return Response::default(),
             Some(Gesture::Pan { button, last }) => {
@@ -341,7 +348,7 @@ impl View {
         button: Button,
         modifiers: Modifiers,
     ) -> Response {
-        self.pointer = Some(position);
+        self.track_pointer(position);
         // A press during a gesture means its release was lost.
         let cancelled = self.gesture.take().is_some();
         if !self.viewport.contains(position) {
@@ -377,7 +384,7 @@ impl View {
         position: PhysicalPoint,
         button: Button,
     ) -> Response {
-        self.pointer = Some(position);
+        self.track_pointer(position);
         let Some(gesture) = self.gesture.take_if(|gesture| gesture.button() == button) else {
             return Response {
                 handled: self.gesture.is_some(),
@@ -434,7 +441,7 @@ impl View {
 
     /// Zooms about the pointer, keeping the graph point under it in place.
     fn scrolled(&mut self, position: PhysicalPoint, lines: f32) -> Response {
-        self.pointer = Some(position);
+        self.track_pointer(position);
         if !self.viewport.contains(position) {
             return Response::default();
         }
@@ -452,8 +459,14 @@ impl View {
         }
     }
 
+    fn track_pointer(&mut self, position: PhysicalPoint) {
+        self.pointer = Some(position);
+        self.pointer_in_target = true;
+    }
+
     fn key_pressed(&mut self, graph: &Graph, key: Key) -> Response {
-        let pointer_inside = self.pointer.is_some_and(|p| self.viewport.contains(p));
+        let pointer_inside =
+            self.pointer_in_target && self.pointer.is_some_and(|p| self.viewport.contains(p));
         let handled = match key {
             Key::Space => {
                 self.space_held = true;
@@ -1000,6 +1013,53 @@ mod tests {
         let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::G));
         assert_eq!(view.centre, at(400.0, 0.0));
         assert_eq!(view.zoom, MAX_ZOOM);
+    }
+
+    #[test]
+    fn keys_act_only_while_the_pointer_is_in_the_target() {
+        let graph = three_nodes();
+        let mut view = View::new(WHOLE);
+        let _ = view.handle_input(&graph, move_to(10.0, 10.0));
+        let _ = view.handle_input(&graph, InputEvent::PointerLeft);
+
+        for key in [Key::H, Key::G, Key::Space] {
+            let response = view.handle_input(&graph, InputEvent::KeyPressed(key));
+            assert!(!response.handled, "{key:?}");
+        }
+        assert_eq!(view.centre, at(0.0, 0.0));
+
+        let _ = view.handle_input(&graph, move_to(10.0, 10.0));
+        let response = view.handle_input(&graph, InputEvent::KeyPressed(Key::H));
+        assert!(response.handled);
+        assert_eq!(view.centre, at(200.0, 0.0));
+    }
+
+    #[test]
+    fn leaving_the_target_does_not_end_a_gesture() {
+        let graph = three_nodes();
+        let mut view = View::new(WHOLE);
+        let _ = send(
+            &mut view,
+            &graph,
+            &[press(400.0, 300.0), move_to(420.0, 300.0)],
+        );
+        let _ = view.handle_input(&graph, InputEvent::PointerLeft);
+        assert_eq!(view.drawn_position(&graph, NodeId(1)), Some(at(20.0, 0.0)));
+
+        let response = send(
+            &mut view,
+            &graph,
+            &[move_to(900.0, 300.0), release(900.0, 300.0)],
+        );
+        assert_eq!(response.positions, [(NodeId(1), at(500.0, 0.0))]);
+
+        let _ = send(
+            &mut view,
+            &graph,
+            &[press(100.0, 100.0), move_to(150.0, 150.0)],
+        );
+        let _ = view.handle_input(&graph, InputEvent::PointerLeft);
+        assert!(view.drawn_box().is_some());
     }
 
     #[test]

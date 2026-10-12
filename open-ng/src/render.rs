@@ -34,12 +34,15 @@ pub struct Renderer {
 #[derive(Debug)]
 pub struct ViewBuffers {
     viewport: Viewport,
+    // Per view rather than in the renderer: uploads take effect at the next submit, so one shared
+    // transform would draw every view in the pass with the last one prepared.
     transform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     wires: InstanceBuffer,
     shapes: InstanceBuffer,
 }
 
+/// Per-instance data in a vertex buffer. Not a storage buffer, because WebGL2 has none.
 #[derive(Debug)]
 struct InstanceBuffer {
     label: &'static str,
@@ -76,6 +79,10 @@ struct Shape {
 }
 
 impl Renderer {
+    /// Creates the pipelines. The device must provide at least
+    /// [`wgpu::Limits::downlevel_webgl2_defaults`] and WebGL2's downlevel flags, `format` must be
+    /// renderable and blendable, and `sample_count` must be supported for it; otherwise this
+    /// panics, as wgpu does on invalid use.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Renderer {
         let module = device.create_shader_module(wgpu::include_wgsl!("render.wgsl"));
         let transform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -410,6 +417,21 @@ mod tests {
         )
         .validate(&module)
         .unwrap();
+    }
+
+    #[test]
+    fn the_view_transform_matches_its_shader_uniform() {
+        let module = wgpu::naga::front::wgsl::parse_str(include_str!("render.wgsl")).unwrap();
+        let mut layouter = wgpu::naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let (_, view) = module
+            .global_variables
+            .iter()
+            .find(|(_, global)| global.name.as_deref() == Some("view"))
+            .unwrap();
+        let size = layouter[view.ty].size as usize;
+        assert_eq!(size, size_of::<ViewTransform>());
+        assert_eq!(size % 16, 0, "WebGL2 needs a multiple of 16 bytes");
     }
 
     #[test]
