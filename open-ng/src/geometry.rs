@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use ab_glyph::FontRef;
 
 use crate::graph::{Direction, Graph, GroupId, NodeId, NodeRecord, PinId, Point, Row};
-use crate::text::text_width;
+use crate::text::{cap_height, text_width};
 
 // Sizes in graph units, to tune once text is drawn.
 pub(crate) const MIN_WIDTH: f32 = 100.0;
@@ -13,8 +13,8 @@ pub(crate) const TITLE_HEIGHT: f32 = 24.0;
 pub(crate) const ROW_HEIGHT: f32 = 20.0;
 /// Below the last row.
 pub(crate) const BOTTOM_PADDING: f32 = 6.0;
-const TITLE_SIZE: f32 = 13.0;
-const LABEL_SIZE: f32 = 11.0;
+pub(crate) const TITLE_SIZE: f32 = 13.0;
+pub(crate) const LABEL_SIZE: f32 = 11.0;
 /// Between a node's edge and the text nearest it.
 const TEXT_INSET: f32 = 12.0;
 /// Room before the title and group labels for a fold caret.
@@ -101,15 +101,69 @@ pub(crate) struct NodeLayout {
     /// The index in `ports` each pin's wires end at.
     port_of: HashMap<PinId, usize>,
     /// Each group's header row, by the y of its top edge.
-    headers: Vec<(GroupId, f32)>,
+    headers: Vec<Header>,
+    /// The title and every visible row's label, from top to bottom.
+    labels: Vec<Label>,
+}
+
+#[derive(Debug)]
+struct Header {
+    group: GroupId,
+    top: f32,
+    folded: bool,
+    /// Where the fold caret's baseline starts.
+    caret: Point,
+}
+
+/// A line of text on a node, relative to its top-left.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Label {
+    pub(crate) text: LabelText,
+    /// The left end of the baseline.
+    pub(crate) origin: Point,
+    /// In graph units per em.
+    pub(crate) size: f32,
+}
+
+/// Which of a record's strings a label shows. The record is looked up when drawing so that the
+/// layout holds no copy of host text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LabelText {
+    Title,
+    Pin(PinId),
+    Group(GroupId),
+}
+
+impl LabelText {
+    pub(crate) fn of(self, record: &NodeRecord) -> &str {
+        match self {
+            LabelText::Title => &record.title,
+            LabelText::Pin(id) => &record.pin(id).expect("laid out from this record").label,
+            LabelText::Group(id) => &record.group(id).expect("laid out from this record").label,
+        }
+    }
 }
 
 impl NodeLayout {
     pub(crate) fn new(font: &FontRef<'_>, record: &NodeRecord) -> NodeLayout {
-        let label_width = |label: &str| 2.0 * TEXT_INSET + text_width(font, label, LABEL_SIZE);
         let title_width =
             2.0 * TEXT_INSET + CARET_WIDTH + text_width(font, &record.title, TITLE_SIZE);
         let mut width = MIN_WIDTH.max(title_width);
+        // Text is centred in its row by its capitals.
+        let baseline = |top: f32, row_height: f32, size: f32| {
+            top + (row_height + cap_height(font, size)) / 2.0
+        };
+        let mut labels = vec![Label {
+            text: LabelText::Title,
+            origin: Point {
+                x: TEXT_INSET + CARET_WIDTH,
+                y: baseline(0.0, TITLE_HEIGHT, TITLE_SIZE),
+            },
+            size: TITLE_SIZE,
+        }];
+        // Each output label's index in `labels` and text width, to align right once the width
+        // is known.
+        let mut output_labels = Vec::new();
         let mut height = TITLE_HEIGHT;
         // Each port's row middle and direction: its x waits for the width.
         let mut ports = Vec::new();
@@ -119,8 +173,24 @@ impl NodeLayout {
             let (pins, folded) = match row {
                 Row::Pin(pin) => (std::slice::from_ref(pin), false),
                 Row::Group(group) => {
-                    width = width.max(CARET_WIDTH + label_width(&group.label));
-                    headers.push((group.id, height));
+                    width = width.max(
+                        2.0 * TEXT_INSET + CARET_WIDTH + text_width(font, &group.label, LABEL_SIZE),
+                    );
+                    let y = baseline(height, ROW_HEIGHT, LABEL_SIZE);
+                    headers.push(Header {
+                        group: group.id,
+                        top: height,
+                        folded: group.folded,
+                        caret: Point { x: TEXT_INSET, y },
+                    });
+                    labels.push(Label {
+                        text: LabelText::Group(group.id),
+                        origin: Point {
+                            x: TEXT_INSET + CARET_WIDTH,
+                            y,
+                        },
+                        size: LABEL_SIZE,
+                    });
                     height += ROW_HEIGHT;
                     (&group.pins[..], group.folded)
                 }
@@ -139,7 +209,19 @@ impl NodeLayout {
                 }
             } else {
                 for pin in pins {
-                    width = width.max(label_width(&pin.label));
+                    let measured = text_width(font, &pin.label, LABEL_SIZE);
+                    width = width.max(2.0 * TEXT_INSET + measured);
+                    if pin.direction == Direction::Output {
+                        output_labels.push((labels.len(), measured));
+                    }
+                    labels.push(Label {
+                        text: LabelText::Pin(pin.id),
+                        origin: Point {
+                            x: TEXT_INSET,
+                            y: baseline(height, ROW_HEIGHT, LABEL_SIZE),
+                        },
+                        size: LABEL_SIZE,
+                    });
                     port_of.insert(pin.id, ports.len());
                     ports.push((height + ROW_HEIGHT / 2.0, pin.direction));
                     height += ROW_HEIGHT;
@@ -156,12 +238,16 @@ impl NodeLayout {
                 y,
             })
             .collect();
+        for (index, text_width) in output_labels {
+            labels[index].origin.x = width - TEXT_INSET - text_width;
+        }
         NodeLayout {
             width,
             height: height + BOTTOM_PADDING,
             ports,
             port_of,
             headers,
+            labels,
         }
     }
 
@@ -188,16 +274,36 @@ impl NodeLayout {
 
     /// Each group's header row when the node's top-left is at `top_left`.
     pub(crate) fn headers(&self, top_left: Point) -> impl Iterator<Item = Rect> {
-        self.headers.iter().map(move |&(_, top)| Rect {
-            min: offset(top_left, Point { x: 0.0, y: top }),
+        self.headers.iter().map(move |header| Rect {
+            min: offset(
+                top_left,
+                Point {
+                    x: 0.0,
+                    y: header.top,
+                },
+            ),
             max: offset(
                 top_left,
                 Point {
                     x: self.width,
-                    y: top + ROW_HEIGHT,
+                    y: header.top + ROW_HEIGHT,
                 },
             ),
         })
+    }
+
+    /// Where each group header's fold caret starts its baseline when the node's top-left is at
+    /// `top_left`, and whether the group is folded.
+    pub(crate) fn carets(&self, top_left: Point) -> impl Iterator<Item = (Point, bool)> {
+        self.headers
+            .iter()
+            .map(move |header| (offset(top_left, header.caret), header.folded))
+    }
+
+    /// The title and every visible row's label, from top to bottom, relative to the node's
+    /// top-left.
+    pub(crate) fn labels(&self) -> &[Label] {
+        &self.labels
     }
 
     /// Every port drawn when the node's top-left is at `top_left`.
@@ -214,12 +320,12 @@ impl NodeLayout {
         }
         self.headers
             .iter()
-            .find(|&&(_, top)| (top..top + ROW_HEIGHT).contains(&y))
-            .map(|&(id, _)| id)
+            .find(|header| (header.top..header.top + ROW_HEIGHT).contains(&y))
+            .map(|header| header.group)
     }
 }
 
-fn offset(top_left: Point, relative: Point) -> Point {
+pub(crate) fn offset(top_left: Point, relative: Point) -> Point {
     Point {
         x: top_left.x + relative.x,
         y: top_left.y + relative.y,
@@ -439,6 +545,61 @@ mod tests {
         let layout = lay_out(&folded);
         let below = at(top_left.x + 10.0, top_left.y + row_middle(2));
         assert_eq!(layout.header_at(top_left, below), None, "the output's row");
+    }
+
+    #[test]
+    fn labels_sit_inside_their_rows_with_outputs_aligned_right() {
+        let font = bundled_font();
+        let record = record(
+            "Blur",
+            vec![
+                Row::Pin(pin(1, "Image", Direction::Input)),
+                Row::Group(Group {
+                    id: GroupId(1),
+                    label: "Options".to_owned(),
+                    folded: false,
+                    pins: vec![pin(2, "Size", Direction::Output)],
+                }),
+                group(true, vec![pin(3, "Hidden", Direction::Input)]),
+            ],
+        );
+        let layout = lay_out(&record);
+        let labels = layout.labels();
+        let texts: Vec<_> = labels.iter().map(|label| label.text.of(&record)).collect();
+        assert_eq!(texts, ["Blur", "Image", "Options", "Size", "Options"]);
+
+        // Each baseline is below its row's middle by half a capital.
+        let middles = [
+            TITLE_HEIGHT / 2.0,
+            row_middle(0),
+            row_middle(1),
+            row_middle(2),
+            row_middle(3),
+        ];
+        for (label, middle) in labels.iter().zip(middles) {
+            let below = label.origin.y - middle;
+            assert!((below - cap_height(&font, label.size) / 2.0).abs() < 1e-4);
+        }
+        let x: Vec<_> = labels.iter().map(|label| label.origin.x).collect();
+        let size_width = text_width(&font, "Size", LABEL_SIZE);
+        assert_eq!(
+            x,
+            [
+                TEXT_INSET + CARET_WIDTH,
+                TEXT_INSET,
+                TEXT_INSET + CARET_WIDTH,
+                layout.width - TEXT_INSET - size_width,
+                TEXT_INSET + CARET_WIDTH,
+            ]
+        );
+        let carets: Vec<_> = layout.carets(at(0.0, 0.0)).collect();
+        assert_eq!(
+            carets,
+            [
+                (at(TEXT_INSET, labels[2].origin.y), false),
+                (at(TEXT_INSET, labels[4].origin.y), true),
+            ]
+        );
     }
 
     #[test]

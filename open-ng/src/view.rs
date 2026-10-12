@@ -608,12 +608,25 @@ impl View {
         self.viewport.scale_factor * self.zoom
     }
 
-    fn to_graph(&self, point: PhysicalPoint) -> Point {
+    pub(crate) fn logical_per_unit(&self) -> f32 {
+        self.zoom
+    }
+
+    pub(crate) fn to_graph(&self, point: PhysicalPoint) -> Point {
         let centre = self.viewport.centre();
         let per_unit = self.physical_per_unit();
         Point {
             x: self.centre.x + (point.x - centre.x) / per_unit,
             y: self.centre.y + (point.y - centre.y) / per_unit,
+        }
+    }
+
+    pub(crate) fn to_physical(&self, point: Point) -> PhysicalPoint {
+        let centre = self.viewport.centre();
+        let per_unit = self.physical_per_unit();
+        PhysicalPoint {
+            x: centre.x + (point.x - self.centre.x) * per_unit,
+            y: centre.y + (point.y - self.centre.y) * per_unit,
         }
     }
 }

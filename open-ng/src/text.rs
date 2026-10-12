@@ -3,7 +3,7 @@
 //! Text is set from advances alone: no kerning, shaping or fallback fonts. A character the
 //! font lacks takes the `.notdef` advance, so a measured width is the width drawn.
 
-use ab_glyph::{Font, FontRef};
+use ab_glyph::{Font, FontRef, GlyphId};
 
 /// Geist Regular from the Geist font release (vercel/geist-font), under the SIL Open Font
 /// License in `fonts/OFL.txt`. The upstream static TTF is subset with
@@ -23,16 +23,30 @@ pub(crate) fn bundled_font() -> FontRef<'static> {
     FontRef::try_from_slice(GEIST_REGULAR).expect("the bundled font parses")
 }
 
-/// The width of `text` in one line at a font size of `size` units per em.
+/// The width of `text` in one line at a font size of `size` units per em. Drawing places each
+/// glyph at the sum of the advances before it, so the last one ends at this width.
 pub(crate) fn text_width(font: &FontRef<'_>, text: &str, size: f32) -> f32 {
-    let advance: f32 = text
-        .chars()
-        .map(|c| font.h_advance_unscaled(font.glyph_id(c)))
-        .sum();
-    advance * size / units_per_em(font)
+    text.chars()
+        .map(|c| advance(font, font.glyph_id(c), size))
+        .sum()
 }
 
-fn units_per_em(font: &FontRef<'_>) -> f32 {
+/// How far the glyph moves the next one along at a font size of `size` units per em.
+pub(crate) fn advance(font: &FontRef<'_>, glyph: GlyphId, size: f32) -> f32 {
+    font.h_advance_unscaled(glyph) * size / units_per_em(font)
+}
+
+/// The height of capital letters above the baseline at a font size of `size` units per em, by
+/// which text is centred in its row.
+pub(crate) fn cap_height(font: &FontRef<'_>, size: f32) -> f32 {
+    let capital = font
+        .outline(font.glyph_id('H'))
+        .expect("the bundled font has an H");
+    // ab_glyph's outline bounds put the top in `min`, in font units with y up.
+    capital.bounds.min.y * size / units_per_em(font)
+}
+
+pub(crate) fn units_per_em(font: &FontRef<'_>) -> f32 {
     font.units_per_em()
         .expect("the bundled font has a head table")
 }
@@ -40,8 +54,6 @@ fn units_per_em(font: &FontRef<'_>) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use ab_glyph::GlyphId;
 
     #[test]
     fn the_bundled_font_covers_printable_ascii_and_latin_1() {

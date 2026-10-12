@@ -7,6 +7,8 @@ struct ViewTransform {
 }
 
 @group(0) @binding(0) var<uniform> view: ViewTransform;
+// Glyph coverage, read texel for texel: bitmaps are placed on whole physical pixels.
+@group(0) @binding(1) var atlas: texture_2d<f32>;
 
 // An sRGB target encodes on write, so it needs linear colors.
 override srgb_target: bool;
@@ -103,9 +105,12 @@ struct ShapeVertex {
     @location(3) border_width: f32,
     @location(4) fill: vec4<f32>,
     @location(5) border: vec4<f32>,
+    // A bitmap's x, y, width and height in the atlas, in texels; no width for a rounded rectangle.
+    @location(6) @interpolate(flat) atlas: vec4<u32>,
 }
 
-// A rounded rectangle, one pixel larger than the shape for the edge antialiasing.
+// A rounded rectangle, one pixel larger than the shape for the edge antialiasing, or a bitmap
+// exactly covering its pixels.
 @vertex
 fn shape_vertex(
     @builtin(vertex_index) index: u32,
@@ -115,9 +120,11 @@ fn shape_vertex(
     @location(3) border_width: f32,
     @location(4) fill: vec4<f32>,
     @location(5) border: vec4<f32>,
+    @location(6) atlas: vec4<u32>,
 ) -> ShapeVertex {
     let corner = vec2<f32>(f32(index & 1u), f32(index >> 1u)) * 2.0 - 1.0;
-    let local = corner * (half_size + 1.0 / view.pixels_per_unit);
+    let antialiasing = select(1.0 / view.pixels_per_unit, 0.0, atlas.z > 0u);
+    let local = corner * (half_size + antialiasing);
 
     var out: ShapeVertex;
     out.position = to_clip(centre + local);
@@ -127,11 +134,19 @@ fn shape_vertex(
     out.border_width = border_width;
     out.fill = fill;
     out.border = border;
+    out.atlas = atlas;
     return out;
 }
 
 @fragment
 fn shape_fragment(in: ShapeVertex) -> @location(0) vec4<f32> {
+    if in.atlas.z > 0u {
+        // Pixel centres are half a texel in, so truncating finds the pixel's own texel.
+        let offset = vec2<u32>(max((in.local + in.half_size) * view.pixels_per_unit, vec2<f32>(0.0)));
+        let texel = in.atlas.xy + min(offset, in.atlas.zw - 1u);
+        let coverage = textureLoad(atlas, texel, 0).r;
+        return target_color(in.fill.rgb, in.fill.a * coverage);
+    }
     let q = abs(in.local) - in.half_size + in.radius;
     let distance = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - in.radius;
     let edge = distance * view.pixels_per_unit;
