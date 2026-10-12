@@ -1,19 +1,74 @@
 # OpenNG
 
-A node-editor library for Rust applications.
+A node-editor library for Rust applications that own their graph documents.
 
 ## Status
 
-Not yet implemented. The crate is an empty placeholder and is not published.
+Early and experimental. Current features include:
 
-## Goals
+- A shared presentation `Graph` of nodes, ports, connections and a selection, kept in step with your document.
+- Any number of `View`s of one graph, each with its own pan, zoom and gesture in progress.
+- Selection by click and box, moving nodes, panning and zooming, and framing all or selected nodes.
+- A wgpu renderer that draws views into a render pass you own.
+- An example with two views of one graph, a small undo history, snapping and a locked node.
 
-- Responsive editing of graphs with thousands of nodes.
-- Complete standard interactions — navigation, selection, moving nodes, editing connections.
-- The application keeps ownership of its graph, validation, and undo history; the editor requests edits and displays the results.
-- Native desktop and browser support.
+There is no connection editing, labels or any text, hover, remappable shortcuts or browser rendering. The library compiles for `wasm32-unknown-unknown` with wgpu's WebGPU backend, but nothing has been shown running in a browser. The API will have breaking changes.
 
-These are goals, not current features.
+## How a host uses it
+
+You own one `Graph` per document network, a `View` per pane, one `Renderer` per device and target format, and a `ViewBuffers` beside each view. OpenNG keeps no global state.
+
+Input: translate your window events into `InputEvent`s and send each to every view. A view returns a `Response` with the positions and selection it requests. Apply what you accept to your document and then to the graph; ignore the rest to reject it. Ignoring a response leaves the graph unchanged, and every view draws the committed result.
+
+```rust
+for view in &mut views {
+    let response = view.handle_input(&graph, event);
+    redraw |= response.handled;
+
+    // Accept moves except of a locked node, and every selection change.
+    let moves: Vec<_> = response
+        .positions
+        .into_iter()
+        .filter(|&(id, _)| id != LOCKED)
+        .collect();
+    graph.set_node_positions(&moves)?;
+    if let Some(selection) = response.selection {
+        graph.set_selection(&selection)?;
+    }
+}
+```
+
+Drawing: prepare every view before encoding the pass, then draw each into it.
+
+```rust
+for (view, buffers) in views.iter().zip(&mut buffers) {
+    renderer.prepare(&device, &queue, &graph, view, buffers);
+}
+// ... begin your render pass ...
+for buffers in &buffers {
+    renderer.draw(&mut pass, buffers);
+}
+```
+
+OpenNG enables no wgpu backends itself; enable the ones your application needs on your own `wgpu` dependency.
+
+## Example
+
+```sh
+cargo run -p open-ng --example two_views
+```
+
+| Input | Action |
+| --- | --- |
+| Click | Select a node; on empty space, deselect all |
+| Shift-click, Ctrl-click | Add to or remove from the selection |
+| Drag a node | Move it, or the whole selection if it is selected |
+| Drag on empty space | Box-select; Shift adds, Ctrl removes |
+| Middle drag, or Space and drag | Pan |
+| Scroll | Zoom about the pointer |
+| H, G | Frame all nodes or the selection |
+| Escape | Cancel the gesture in progress |
+| Ctrl+Z, Ctrl+Shift+Z | Undo and redo (the example's own history) |
 
 ## License
 

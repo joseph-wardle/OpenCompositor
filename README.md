@@ -7,7 +7,7 @@ This repository contains two WIP Rust projects developed together:
 
 ## Status
 
-Both projects are empty scaffolding: the workspace builds, and nothing else is implemented yet.
+OpenNG has a first working step: views of a shared graph with selection, moving, panning and zooming, drawn with wgpu. See [open-ng/README.md](open-ng/README.md). OpenCompositor is still empty scaffolding.
 
 ## Goals
 
