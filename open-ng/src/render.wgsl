@@ -9,11 +9,12 @@ struct ViewTransform {
 
 // An sRGB target encodes on write, so it needs linear colors.
 override srgb_target: bool;
+// Set by the renderer, which also sizes each wire draw from it.
+override wire_segments: u32;
 
 const BACKGROUND = vec3<f32>(0.16, 0.16, 0.17);
 const WIRE_COLOR = vec3<f32>(0.72, 0.72, 0.72);
 const WIRE_WIDTH = 2.0;
-const WIRE_SEGMENTS = 32u;
 
 fn to_clip(point: vec2<f32>) -> vec4<f32> {
     let clip = (point - view.centre) * view.clip_per_unit;
@@ -60,7 +61,7 @@ fn wire_vertex(
     @location(2) p2: vec2<f32>,
     @location(3) p3: vec2<f32>,
 ) -> WireVertex {
-    let t = f32(index / 2u) / f32(WIRE_SEGMENTS);
+    let t = f32(index / 2u) / f32(wire_segments);
     let s = 1.0 - t;
     let point = s * s * s * p0 + 3.0 * s * s * t * p1 + 3.0 * s * t * t * p2 + t * t * t * p3;
     var tangent = s * s * (p1 - p0) + 2.0 * s * t * (p2 - p1) + t * t * (p3 - p2);

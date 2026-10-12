@@ -47,14 +47,17 @@ impl Graph {
     /// The node's outline at its committed position.
     pub fn node_rect(&self, id: NodeId) -> Option<Rect> {
         let record = self.node(id)?;
-        Some(node_rect(record, record.position))
+        Some(NodeLayout::new(record, record.position).rect)
     }
 
     /// The topmost node whose outline contains the point.
     pub fn node_at(&self, point: Point) -> Option<NodeId> {
         let mut topmost = None;
         for (id, record) in self.nodes() {
-            if node_rect(record, record.position).contains(point) {
+            if NodeLayout::new(record, record.position)
+                .rect
+                .contains(point)
+            {
                 topmost = Some(id);
             }
         }
@@ -64,41 +67,103 @@ impl Graph {
     /// The nodes whose outlines intersect the rectangle, in draw order.
     pub fn nodes_touching(&self, rect: Rect) -> impl Iterator<Item = NodeId> {
         self.nodes()
-            .filter(move |(_, record)| node_rect(record, record.position).intersects(&rect))
+            .filter(move |(_, record)| {
+                NodeLayout::new(record, record.position)
+                    .rect
+                    .intersects(&rect)
+            })
             .map(|(id, _)| id)
     }
 }
 
-/// The node's outline when drawn centred on `centre`, which differs from its committed position
-/// during a drag.
-pub(crate) fn node_rect(record: &NodeRecord, centre: Point) -> Rect {
-    let across = ports_on(record, Side::Top).max(ports_on(record, Side::Bottom));
-    let down = ports_on(record, Side::Left).max(ports_on(record, Side::Right));
-    let half_width = MIN_WIDTH.max((across + 1) as f32 * PORT_SPACING) / 2.0;
-    let half_height = MIN_HEIGHT.max((down + 1) as f32 * PORT_SPACING) / 2.0;
-    Rect {
-        min: Point {
-            x: centre.x - half_width,
-            y: centre.y - half_height,
-        },
-        max: Point {
-            x: centre.x + half_width,
-            y: centre.y + half_height,
-        },
+/// Where a node and its ports are when drawn centred on a point, which differs from the node's
+/// committed position during a drag.
+///
+/// Ports on a side are spaced evenly about the middle of that side, inputs first, then outputs.
+pub(crate) struct NodeLayout<'a> {
+    record: &'a NodeRecord,
+    centre: Point,
+    pub(crate) rect: Rect,
+    /// How many ports each side has, indexed by `Side as usize`.
+    ports_on: [usize; 4],
+}
+
+impl<'a> NodeLayout<'a> {
+    pub(crate) fn new(record: &'a NodeRecord, centre: Point) -> NodeLayout<'a> {
+        let mut ports_on = [0; 4];
+        for port in record.inputs.iter().chain(&record.outputs) {
+            ports_on[port.side as usize] += 1;
+        }
+        let on = |side: Side| ports_on[side as usize];
+        let across = on(Side::Top).max(on(Side::Bottom));
+        let down = on(Side::Left).max(on(Side::Right));
+        let half_width = MIN_WIDTH.max((across + 1) as f32 * PORT_SPACING) / 2.0;
+        let half_height = MIN_HEIGHT.max((down + 1) as f32 * PORT_SPACING) / 2.0;
+        let rect = Rect {
+            min: Point {
+                x: centre.x - half_width,
+                y: centre.y - half_height,
+            },
+            max: Point {
+                x: centre.x + half_width,
+                y: centre.y + half_height,
+            },
+        };
+        NodeLayout {
+            record,
+            centre,
+            rect,
+            ports_on,
+        }
     }
-}
 
-pub(crate) fn input_position(record: &NodeRecord, centre: Point, index: usize) -> Point {
-    let side = record.inputs[index].side;
-    let rank = count_on(&record.inputs[..index], side);
-    port_position(record, centre, side, rank)
-}
+    pub(crate) fn input(&self, index: usize) -> Point {
+        let side = self.record.inputs[index].side;
+        let rank = count_on(&self.record.inputs[..index], side);
+        self.port(side, rank)
+    }
 
-/// Outputs follow inputs on a side they share.
-pub(crate) fn output_position(record: &NodeRecord, centre: Point, index: usize) -> Point {
-    let side = record.outputs[index].side;
-    let rank = count_on(&record.inputs, side) + count_on(&record.outputs[..index], side);
-    port_position(record, centre, side, rank)
+    pub(crate) fn output(&self, index: usize) -> Point {
+        let side = self.record.outputs[index].side;
+        let rank =
+            count_on(&self.record.inputs, side) + count_on(&self.record.outputs[..index], side);
+        self.port(side, rank)
+    }
+
+    /// Every port's position: the inputs in order, then the outputs.
+    pub(crate) fn ports(&self) -> impl Iterator<Item = Point> {
+        let mut ranks = [0; 4];
+        let ports = self.record.inputs.iter().chain(&self.record.outputs);
+        ports.map(move |port| {
+            let rank = &mut ranks[port.side as usize];
+            *rank += 1;
+            self.port(port.side, *rank - 1)
+        })
+    }
+
+    /// The position of the port `rank` places along `side`, counting inputs before outputs.
+    fn port(&self, side: Side, rank: usize) -> Point {
+        let along = (rank as f32 - (self.ports_on[side as usize] - 1) as f32 / 2.0) * PORT_SPACING;
+        let (centre, rect) = (self.centre, self.rect);
+        match side {
+            Side::Top => Point {
+                x: centre.x + along,
+                y: rect.min.y,
+            },
+            Side::Bottom => Point {
+                x: centre.x + along,
+                y: rect.max.y,
+            },
+            Side::Left => Point {
+                x: rect.min.x,
+                y: centre.y + along,
+            },
+            Side::Right => Point {
+                x: rect.max.x,
+                y: centre.y + along,
+            },
+        }
+    }
 }
 
 /// The control points of the cubic Bézier for a wire, which leaves each port along its side's
@@ -115,30 +180,6 @@ pub(crate) fn wire(start: Point, start_side: Side, end: Point, end_side: Side) -
     [start, pull(start, start_side), pull(end, end_side), end]
 }
 
-/// Ports on a side are spaced evenly about the middle of that side.
-fn port_position(record: &NodeRecord, centre: Point, side: Side, rank: usize) -> Point {
-    let rect = node_rect(record, centre);
-    let along = (rank as f32 - (ports_on(record, side) - 1) as f32 / 2.0) * PORT_SPACING;
-    match side {
-        Side::Top => Point {
-            x: centre.x + along,
-            y: rect.min.y,
-        },
-        Side::Bottom => Point {
-            x: centre.x + along,
-            y: rect.max.y,
-        },
-        Side::Left => Point {
-            x: rect.min.x,
-            y: centre.y + along,
-        },
-        Side::Right => Point {
-            x: rect.max.x,
-            y: centre.y + along,
-        },
-    }
-}
-
 fn outward_normal(side: Side) -> Point {
     match side {
         Side::Top => Point { x: 0.0, y: -1.0 },
@@ -146,10 +187,6 @@ fn outward_normal(side: Side) -> Point {
         Side::Left => Point { x: -1.0, y: 0.0 },
         Side::Right => Point { x: 1.0, y: 0.0 },
     }
-}
-
-fn ports_on(record: &NodeRecord, side: Side) -> usize {
-    count_on(&record.inputs, side) + count_on(&record.outputs, side)
 }
 
 fn count_on(ports: &[Port], side: Side) -> usize {
@@ -171,35 +208,82 @@ mod tests {
         Point { x, y }
     }
 
-    #[test]
-    fn ports_spread_along_their_sides_and_widen_the_node() {
-        let mut record = NodeRecord::vertical(at(100.0, 50.0), GREY, 2, 1);
-        let centre = record.position;
-
-        assert_eq!(
-            node_rect(&record, centre),
-            Rect::from_corners(at(60.0, 35.0), at(140.0, 65.0))
-        );
-        assert_eq!(input_position(&record, centre, 0), at(90.0, 35.0));
-        assert_eq!(input_position(&record, centre, 1), at(110.0, 35.0));
-        assert_eq!(output_position(&record, centre, 0), at(100.0, 65.0));
-
-        record.inputs.push(Port { side: Side::Left });
-        assert_eq!(input_position(&record, centre, 1), at(110.0, 30.0));
-        assert_eq!(input_position(&record, centre, 2), at(60.0, 50.0));
-
-        let wide = NodeRecord::vertical(at(0.0, 0.0), GREY, 5, 1);
-        assert_eq!(node_rect(&wide, wide.position).max.x, 60.0);
-        assert_eq!(input_position(&wide, wide.position, 0), at(-40.0, -15.0));
+    fn layout_of(inputs: &[Side], outputs: &[Side]) -> NodeRecord {
+        let ports = |sides: &[Side]| sides.iter().map(|&side| Port { side }).collect();
+        NodeRecord {
+            position: at(100.0, 50.0),
+            color: GREY,
+            inputs: ports(inputs),
+            outputs: ports(outputs),
+        }
     }
 
     #[test]
-    fn ports_follow_the_centre_they_are_drawn_at() {
-        let record = NodeRecord::vertical(at(0.0, 0.0), GREY, 1, 1);
-        let dragged = at(30.0, -20.0);
+    fn ports_sit_evenly_along_their_sides_inputs_first() {
+        use Side::{Bottom, Left, Right, Top};
+        let records = [
+            layout_of(&[Top], &[Bottom]),
+            layout_of(&[Top, Top, Left], &[Bottom]),
+            layout_of(&[Top; 5], &[Top, Right, Top]),
+            layout_of(&[Left, Right, Left], &[Right, Left, Bottom]),
+            layout_of(&[], &[]),
+        ];
+        for record in &records {
+            let layout = NodeLayout::new(record, record.position);
+            let rect = layout.rect;
+            assert!(rect.max.x - rect.min.x >= MIN_WIDTH && rect.max.y - rect.min.y >= MIN_HEIGHT);
+            assert_eq!(
+                at(
+                    (rect.min.x + rect.max.x) / 2.0,
+                    (rect.min.y + rect.max.y) / 2.0
+                ),
+                record.position
+            );
 
-        assert_eq!(input_position(&record, dragged, 0), at(30.0, -35.0));
-        assert_eq!(output_position(&record, dragged, 0), at(30.0, -5.0));
+            let ports: Vec<_> = layout.ports().collect();
+            let inputs = (0..record.inputs.len()).map(|i| layout.input(i));
+            let outputs = (0..record.outputs.len()).map(|i| layout.output(i));
+            assert_eq!(ports, inputs.chain(outputs).collect::<Vec<_>>());
+
+            let sides = record.inputs.iter().chain(&record.outputs).map(|p| p.side);
+            for side in [Top, Bottom, Left, Right] {
+                // Each side's ports in order, as their distance along that side.
+                let along: Vec<f32> = sides
+                    .clone()
+                    .zip(&ports)
+                    .filter(|&(s, _)| s == side)
+                    .map(|(_, port)| match side {
+                        Top => {
+                            assert_eq!(port.y, rect.min.y);
+                            port.x - rect.min.x
+                        }
+                        Bottom => {
+                            assert_eq!(port.y, rect.max.y);
+                            port.x - rect.min.x
+                        }
+                        Left => {
+                            assert_eq!(port.x, rect.min.x);
+                            port.y - rect.min.y
+                        }
+                        Right => {
+                            assert_eq!(port.x, rect.max.x);
+                            port.y - rect.min.y
+                        }
+                    })
+                    .collect();
+                let length = match side {
+                    Top | Bottom => rect.max.x - rect.min.x,
+                    Left | Right => rect.max.y - rect.min.y,
+                };
+                if let (Some(&first), Some(&last)) = (along.first(), along.last()) {
+                    assert_eq!(first, length - last, "centred on the side");
+                    assert!(first >= PORT_SPACING, "clear of the corners");
+                }
+                for pair in along.windows(2) {
+                    assert_eq!(pair[1] - pair[0], PORT_SPACING);
+                }
+            }
+        }
     }
 
     #[test]

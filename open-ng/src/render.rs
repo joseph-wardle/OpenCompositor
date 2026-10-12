@@ -5,7 +5,7 @@ use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::geometry::{self, Rect};
+use crate::geometry::{self, NodeLayout, Rect};
 use crate::graph::{Color, Graph, Point};
 use crate::view::{View, Viewport};
 
@@ -96,7 +96,10 @@ impl Renderer {
             bind_group_layouts: &[Some(&transform_layout)],
             immediate_size: 0,
         });
-        let constants = [("srgb_target", f64::from(u8::from(format.is_srgb())))];
+        let constants = [
+            ("srgb_target", f64::from(u8::from(format.is_srgb()))),
+            ("wire_segments", f64::from(WIRE_SEGMENTS)),
+        ];
         let pipeline = |name: &str,
                         buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
                         topology: wgpu::PrimitiveTopology,
@@ -310,9 +313,9 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
                 .node(to.node)
                 .expect("connections join nodes in the graph");
             let points = geometry::wire(
-                geometry::output_position(output, drawn(from.node), from.index),
+                NodeLayout::new(output, drawn(from.node)).output(from.index),
                 output.outputs[from.index].side,
-                geometry::input_position(input, drawn(to.node), to.index),
+                NodeLayout::new(input, drawn(to.node)).input(to.index),
                 input.inputs[to.index].side,
             );
             Wire {
@@ -335,17 +338,15 @@ fn shapes(graph: &Graph, view: &View) -> Vec<Shape> {
         } else {
             (NODE_BORDER, NODE_BORDER_WIDTH)
         };
+        let layout = NodeLayout::new(record, centre);
         shapes.push(Shape {
             radius: NODE_CORNER_RADIUS,
             border_width,
             fill: opaque(record.color),
             border,
-            ..rectangle(geometry::node_rect(record, centre))
+            ..rectangle(layout.rect)
         });
-        let inputs = (0..record.inputs.len()).map(|i| geometry::input_position(record, centre, i));
-        let outputs =
-            (0..record.outputs.len()).map(|i| geometry::output_position(record, centre, i));
-        shapes.extend(inputs.chain(outputs).map(|port| Shape {
+        shapes.extend(layout.ports().map(|port| Shape {
             centre: [port.x, port.y],
             half_size: [PORT_RADIUS; 2],
             radius: PORT_RADIUS,
@@ -459,10 +460,11 @@ mod tests {
         assert_eq!(wire.points[0], [0.0, 15.0]);
         assert_eq!(wire.points[3], [30.0, 65.0]);
         let shapes = shapes(&graph, &view);
-        let [_, _, _, node, input_port, _] = &shapes[..] else {
+        let [_, _, _, node, input_port, output_port] = &shapes[..] else {
             panic!("each node draws with its two ports");
         };
         assert_eq!(node.centre, [30.0, 80.0]);
         assert_eq!(input_port.centre, wire.points[3]);
+        assert_eq!(output_port.centre, [30.0, 95.0]);
     }
 }
