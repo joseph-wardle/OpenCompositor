@@ -13,7 +13,7 @@ use open_ng::{
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key as WinitKey, NamedKey};
+use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 /// The physical pixels between the two views.
@@ -71,7 +71,7 @@ struct Editor {
     buffers: [ViewBuffers; 2],
     history: History,
     pointer: PhysicalPoint,
-    modifiers: Modifiers,
+    modifiers: ModifiersState,
 }
 
 impl Editor {
@@ -112,7 +112,7 @@ impl Editor {
             buffers,
             history: History::default(),
             pointer: PhysicalPoint::default(),
-            modifiers: Modifiers::default(),
+            modifiers: ModifiersState::empty(),
         }
     }
 
@@ -130,10 +130,7 @@ impl Editor {
                 return;
             }
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.modifiers = Modifiers {
-                    shift: modifiers.state().shift_key(),
-                    ctrl: modifiers.state().control_key(),
-                };
+                self.modifiers = modifiers.state();
                 return;
             }
             WindowEvent::KeyboardInput { event, .. } => match self.key(event) {
@@ -149,6 +146,7 @@ impl Editor {
                     position: self.pointer,
                 }
             }
+            WindowEvent::CursorLeft { .. } => InputEvent::PointerLeft,
             WindowEvent::MouseInput { state, button, .. } => {
                 let button = match button {
                     MouseButton::Left => Button::Left,
@@ -159,7 +157,10 @@ impl Editor {
                     ElementState::Pressed => InputEvent::PointerPressed {
                         position: self.pointer,
                         button,
-                        modifiers: self.modifiers,
+                        modifiers: Modifiers {
+                            shift: self.modifiers.shift_key(),
+                            ctrl: self.modifiers.control_key(),
+                        },
                     },
                     ElementState::Released => InputEvent::PointerReleased {
                         position: self.pointer,
@@ -206,8 +207,8 @@ impl Editor {
             WinitKey::Character(c) if c.eq_ignore_ascii_case("g") => Key::G,
             WinitKey::Character(c) if c.eq_ignore_ascii_case("z") => {
                 let gesture_active = self.views.iter().any(View::has_active_gesture);
-                if pressed && self.modifiers.ctrl && !gesture_active {
-                    let changed = if self.modifiers.shift {
+                if pressed && self.modifiers.control_key() && !gesture_active {
+                    let changed = if self.modifiers.shift_key() {
                         self.history.redo(&mut self.graph)
                     } else {
                         self.history.undo(&mut self.graph)
@@ -220,6 +221,13 @@ impl Editor {
             }
             _ => return None,
         };
+        // Chorded with Ctrl, Alt or Meta these are the host's shortcuts, as they are a browser's.
+        // Releases always pass, so that a held Space cannot stick.
+        let chorded =
+            self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
+        if pressed && chorded && key != Key::Escape {
+            return None;
+        }
         Some(if pressed {
             InputEvent::KeyPressed(key)
         } else {

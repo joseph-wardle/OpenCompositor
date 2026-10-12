@@ -53,4 +53,7 @@ pub enum InputEvent {
     },
     KeyPressed(Key),
     KeyReleased(Key),
+    /// The pointer left the render target. H and G stop acting on the view it was over until the
+    /// pointer returns; a gesture continues.
+    PointerLeft,
 }
