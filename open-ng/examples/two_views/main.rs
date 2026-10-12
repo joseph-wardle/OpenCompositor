@@ -2,7 +2,8 @@
 //!
 //! The example is the host: it owns the graph and a small history, and decides what each
 //! response from a view does. Moves snap to a 10-unit grid, the Write node is locked in place,
-//! and Ctrl+Z and Ctrl+Shift+Z undo and redo moves and selection changes.
+//! and Ctrl+Z and Ctrl+Shift+Z undo and redo moves and selection changes. Folding a group stays
+//! out of the history, as Blender keeps panel toggles out of undo.
 //!
 //! This file is what every platform shares; each platform's module starts the GPU, translates its
 //! events and schedules redraws.
@@ -17,8 +18,8 @@ mod native;
 mod web;
 
 use open_ng::{
-    Color, Connection, Direction, Graph, InputEvent, NodeId, NodeRecord, Pin, PinId, PinRef, Point,
-    Renderer, Response, Row, View, ViewBuffers, Viewport,
+    Color, Connection, Direction, Fold, Graph, Group, GroupId, InputEvent, NodeId, NodeRecord, Pin,
+    PinId, PinRef, Point, Renderer, Response, Row, View, ViewBuffers, Viewport,
 };
 
 /// The physical pixels between the two views.
@@ -69,6 +70,9 @@ impl Editor {
         for view in &mut self.views {
             let response = view.handle_input(&self.graph, input);
             handled |= response.handled;
+            if let Some(fold) = response.fold {
+                apply_fold(&mut self.graph, fold);
+            }
             self.history.apply(&mut self.graph, response);
         }
         handled
@@ -247,7 +251,7 @@ fn viewports(width: u32, height: u32, scale_factor: f32) -> [Viewport; 2] {
 
 /// Two sources merged, blurred and written, from left to right around the graph origin where
 /// new views are centred. Every node's input is pin 1 and its output pin 2, except the merge's
-/// second input, pin 3.
+/// second input, pin 3. The blur has two more inputs in a group.
 fn network() -> Graph {
     let pin = |id, label: &str, direction| {
         Row::Pin(Pin {
@@ -281,7 +285,27 @@ fn network() -> Graph {
             -20.0,
             -40.0,
             (90, 140, 90),
-            vec![input("Image"), output],
+            vec![
+                input("Image"),
+                output,
+                Row::Group(Group {
+                    id: GroupId(1),
+                    label: "Options".to_owned(),
+                    folded: false,
+                    pins: vec![
+                        Pin {
+                            id: PinId(3),
+                            label: "Size".to_owned(),
+                            direction: Direction::Input,
+                        },
+                        Pin {
+                            id: PinId(4),
+                            label: "Mask".to_owned(),
+                            direction: Direction::Input,
+                        },
+                    ],
+                }),
+            ],
         ),
         node("Write", 140.0, -40.0, (150, 70, 70), vec![input("Image")]),
     ];
@@ -305,6 +329,23 @@ fn network() -> Graph {
             .expect("an output and an input that exist");
     }
     graph
+}
+
+fn apply_fold(graph: &mut Graph, fold: Fold) {
+    let mut record = graph
+        .node(fold.node)
+        .expect("views request only nodes that exist")
+        .clone();
+    for row in &mut record.rows {
+        if let Row::Group(group) = row
+            && group.id == fold.group
+        {
+            group.folded = fold.folded;
+        }
+    }
+    graph
+        .update_node(fold.node, record)
+        .expect("the same pins and groups");
 }
 
 /// The host's undo history: each entry is one response as applied.

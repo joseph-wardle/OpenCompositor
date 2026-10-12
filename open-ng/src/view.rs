@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::geometry::Rect;
-use crate::graph::{AddStamp, Graph, NodeId, Point};
+use crate::graph::{AddStamp, Graph, GroupId, NodeId, Point};
 use crate::input::{Button, InputEvent, Key, Modifiers, PhysicalPoint};
 
 const MIN_ZOOM: f32 = 0.1;
@@ -55,9 +55,21 @@ pub struct Response {
     pub positions: Vec<(NodeId, Point)>,
     /// The new selection, if it selects different nodes. Empty deselects all.
     pub selection: Option<Vec<NodeId>>,
+    /// A group to fold or unfold, from a click on its header.
+    pub fold: Option<Fold>,
     /// The view used the event: the host should redraw and should not also treat it as its own
     /// shortcut.
     pub handled: bool,
+}
+
+/// A request to fold or unfold one group. The host applies it by updating the node's record
+/// with the group's `folded` set as requested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fold {
+    pub node: NodeId,
+    pub group: GroupId,
+    /// The state requested, which differs from the record's when the click was released.
+    pub folded: bool,
 }
 
 /// One view of a [`Graph`], with its own navigation and gesture.
@@ -87,6 +99,9 @@ enum Gesture {
         at: PhysicalPoint,
         from: Point,
         node: Option<NodeId>,
+        /// The group whose header the press hit, if it was unmodified. Released there, it folds
+        /// or unfolds the group and leaves the selection alone.
+        header: Option<GroupId>,
         combine: Combine,
         since: AddStamp,
     },
@@ -275,6 +290,9 @@ impl View {
         match &self.gesture {
             None | Some(Gesture::Pan { .. }) => graph.selection().to_vec(),
             Some(Gesture::Press {
+                header: Some(_), ..
+            }) => graph.selection().to_vec(),
+            Some(Gesture::Press {
                 node,
                 combine,
                 since,
@@ -317,6 +335,7 @@ impl View {
                 node,
                 combine,
                 since,
+                ..
             }) if self.beyond_drag_threshold(at, position)
                 && (node.is_none() || combine == Combine::Replace) =>
             {
@@ -364,11 +383,18 @@ impl View {
             }
         } else {
             let from = self.to_graph(position);
+            let node = graph.node_at(from);
+            let combine = Combine::from_modifiers(modifiers);
+            // Modified clicks on a header select, as they do on the rest of the node.
+            let header = node
+                .filter(|_| combine == Combine::Replace)
+                .and_then(|id| graph.header_at(id, from));
             Gesture::Press {
                 at: position,
                 from,
-                node: graph.node_at(from),
-                combine: Combine::from_modifiers(modifiers),
+                node,
+                header,
+                combine,
                 since: graph.add_stamp(),
             }
         });
@@ -391,8 +417,28 @@ impl View {
                 ..Response::default()
             };
         };
+        let mut fold = None;
         let (positions, after) = match gesture {
             Gesture::Pan { .. } => (Vec::new(), None),
+            Gesture::Press {
+                node,
+                header: Some(group),
+                since,
+                ..
+            } => {
+                // The host may have removed the node or the group since the press.
+                fold = node
+                    .filter(|&id| graph.has_node_since(id, since))
+                    .and_then(|id| {
+                        let group = graph.node(id)?.group(group)?;
+                        Some(Fold {
+                            node: id,
+                            group: group.id,
+                            folded: !group.folded,
+                        })
+                    });
+                (Vec::new(), None)
+            }
             Gesture::Press {
                 node,
                 combine,
@@ -435,6 +481,7 @@ impl View {
         Response {
             positions,
             selection: after.filter(|after| selects_other_nodes(graph, after)),
+            fold,
             handled: true,
         }
     }
@@ -574,7 +621,7 @@ impl Gesture {
 mod tests {
     use super::*;
     use crate::geometry::{BOTTOM_PADDING, MIN_WIDTH, TITLE_HEIGHT};
-    use crate::graph::{Color, NodeRecord};
+    use crate::graph::{Color, Direction, Group, NodeRecord, Pin, PinId, Row};
 
     const GREY: Color = Color {
         r: 128,
@@ -1238,6 +1285,133 @@ mod tests {
         let response = view.handle_input(&graph, release(600.0, 350.0));
         assert_eq!(response.positions, []);
         assert_eq!(response.selection, None);
+    }
+
+    /// Node 1 centred at the origin as in [`three_nodes`], with group 7's header as its first row
+    /// and one input inside the group, and node 2 as before.
+    fn grouped(folded: bool) -> Graph {
+        let mut graph = three_nodes();
+        let mut record = graph.node(NodeId(1)).unwrap().clone();
+        record.rows = vec![Row::Group(Group {
+            id: GroupId(7),
+            label: "Options".to_owned(),
+            folded,
+            pins: vec![Pin {
+                id: PinId(1),
+                label: "Size".to_owned(),
+                direction: Direction::Input,
+            }],
+        })];
+        graph.update_node(NodeId(1), record).unwrap();
+        graph
+    }
+
+    /// Over node 1's group header, whose row spans graph y 9 to 29 below its 24-unit title.
+    const HEADER: (f32, f32) = (400.0, 320.0);
+
+    fn set_folded(graph: &mut Graph, fold: Fold) {
+        let mut record = graph.node(fold.node).unwrap().clone();
+        for row in &mut record.rows {
+            if let Row::Group(group) = row
+                && group.id == fold.group
+            {
+                group.folded = fold.folded;
+            }
+        }
+        graph.update_node(fold.node, record).unwrap();
+    }
+
+    #[test]
+    fn a_click_on_a_header_requests_one_fold_and_keeps_the_selection() {
+        let mut graph = grouped(false);
+        graph.set_selection(&ids(&[2])).unwrap();
+        let mut view = View::new(WHOLE);
+        let (x, y) = HEADER;
+
+        let _ = view.handle_input(&graph, press(x, y));
+        assert_eq!(view.drawn_selection(&graph), ids(&[2]));
+        let response = view.handle_input(&graph, release(x, y));
+        let fold = Fold {
+            node: NodeId(1),
+            group: GroupId(7),
+            folded: true,
+        };
+        assert_eq!(
+            response,
+            Response {
+                fold: Some(fold),
+                handled: true,
+                ..Response::default()
+            }
+        );
+
+        set_folded(&mut graph, fold);
+        let response = send(&mut view, &graph, &[press(x, y), release(x, y)]);
+        assert_eq!(
+            response.fold,
+            Some(Fold {
+                folded: false,
+                ..fold
+            })
+        );
+
+        let response = send(
+            &mut view,
+            &graph,
+            &[press(x, y - 15.0), release(x, y - 15.0)],
+        );
+        assert_eq!(response.fold, None, "the title is not a header");
+        assert_eq!(response.selection, Some(ids(&[1])));
+    }
+
+    #[test]
+    fn modified_clicks_and_drags_on_a_header_act_as_on_the_node() {
+        let mut graph = grouped(false);
+        graph.set_selection(&ids(&[2])).unwrap();
+        let mut view = View::new(WHOLE);
+        let (x, y) = HEADER;
+
+        let shift_click = [press_with(x, y, SHIFT), release(x, y)];
+        let response = send(&mut view, &graph, &shift_click);
+        assert_eq!(response.fold, None);
+        assert_eq!(response.selection, Some(ids(&[2, 1])));
+
+        let drag = [press(x, y), move_to(x + 20.0, y), release(x + 20.0, y)];
+        let response = send(&mut view, &graph, &drag);
+        assert_eq!(response.fold, None);
+        assert_eq!(response.positions, [(NodeId(1), centred(20.0, 0.0))]);
+        assert_eq!(response.selection, Some(ids(&[1])));
+    }
+
+    #[test]
+    fn a_header_click_requests_nothing_if_its_group_or_node_went_or_it_was_cancelled() {
+        let mut graph = grouped(false);
+        let mut view = View::new(WHOLE);
+        let (x, y) = HEADER;
+        let nothing = Response {
+            handled: true,
+            ..Response::default()
+        };
+
+        let _ = view.handle_input(&graph, press(x, y));
+        let mut ungrouped = graph.node(NodeId(1)).unwrap().clone();
+        ungrouped.rows.clear();
+        graph.update_node(NodeId(1), ungrouped).unwrap();
+        assert_eq!(view.handle_input(&graph, release(x, y)), nothing);
+
+        let mut graph = grouped(false);
+        let _ = view.handle_input(&graph, press(x, y));
+        let record = graph.node(NodeId(1)).unwrap().clone();
+        graph.remove_node(NodeId(1)).unwrap();
+        graph.add_node(NodeId(1), record).unwrap();
+        assert_eq!(view.handle_input(&graph, release(x, y)), nothing);
+
+        let _ = view.handle_input(&graph, press(x, y));
+        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::Escape));
+        assert_eq!(
+            view.handle_input(&graph, release(x, y)),
+            Response::default()
+        );
     }
 
     /// Sends the event to every view and accepts each response, as a host would.

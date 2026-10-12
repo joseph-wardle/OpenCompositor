@@ -91,6 +91,13 @@ impl NodeRecord {
     pub(crate) fn pin(&self, id: PinId) -> Option<&Pin> {
         self.pins().find(|pin| pin.id == id)
     }
+
+    pub(crate) fn group(&self, id: GroupId) -> Option<&Group> {
+        self.rows.iter().find_map(|row| match row {
+            Row::Group(group) if group.id == id => Some(group),
+            _ => None,
+        })
+    }
 }
 
 /// A pin of a node in the graph.

@@ -6,7 +6,7 @@ use std::mem::size_of;
 use bytemuck::{Pod, Zeroable};
 
 use crate::geometry::{self, Rect};
-use crate::graph::{Color, Graph, PinRef, Point};
+use crate::graph::{Color, Graph, NodeId, PinRef, Point};
 use crate::view::{View, Viewport};
 
 const WIRE_SEGMENTS: u32 = 32;
@@ -17,6 +17,8 @@ const SELECTED_BORDER: [u8; 4] = [255, 200, 40, 255];
 const SELECTED_BORDER_WIDTH: f32 = 2.5;
 const PORT_RADIUS: f32 = 4.0;
 const PORT_FILL: [u8; 4] = [210, 210, 210, 255];
+const PORT_RING: [u8; 4] = [150, 150, 150, 255];
+const PORT_RING_WIDTH: f32 = 1.5;
 const BOX_FILL: [u8; 4] = [255, 255, 255, 12];
 const BOX_BORDER: [u8; 4] = [220, 220, 220, 255];
 
@@ -324,9 +326,22 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
         .collect()
 }
 
-/// Each node followed by its ports, in draw order, then any selection box.
+/// Each node followed by its ports, in draw order, then any selection box. A port is filled if
+/// any pin whose wires end there is connected and hollow otherwise.
 fn shapes(graph: &Graph, view: &View) -> Vec<Shape> {
     let selected: HashSet<_> = view.drawn_selection(graph).into_iter().collect();
+    let connected: HashSet<(NodeId, usize)> = graph
+        .connections()
+        .iter()
+        .flat_map(|connection| [connection.from, connection.to])
+        .map(|pin| {
+            let index = graph
+                .node_layout(pin.node)
+                .and_then(|layout| layout.port_index(pin.pin))
+                .expect("connections join pins in the graph");
+            (pin.node, index)
+        })
+        .collect();
     let mut shapes = Vec::new();
     for (id, record, layout) in graph.laid_out_nodes() {
         let top_left = view
@@ -344,13 +359,20 @@ fn shapes(graph: &Graph, view: &View) -> Vec<Shape> {
             border,
             ..rectangle(layout.rect(top_left))
         });
-        shapes.extend(layout.ports(top_left).map(|port| Shape {
-            centre: [port.x, port.y],
-            half_size: [PORT_RADIUS; 2],
-            radius: PORT_RADIUS,
-            border_width: NODE_BORDER_WIDTH,
-            fill: PORT_FILL,
-            border: NODE_BORDER,
+        shapes.extend(layout.ports(top_left).enumerate().map(|(index, port)| {
+            let (fill, border, border_width) = if connected.contains(&(id, index)) {
+                (PORT_FILL, NODE_BORDER, NODE_BORDER_WIDTH)
+            } else {
+                ([0; 4], PORT_RING, PORT_RING_WIDTH)
+            };
+            Shape {
+                centre: [port.x, port.y],
+                half_size: [PORT_RADIUS; 2],
+                radius: PORT_RADIUS,
+                border_width,
+                fill,
+                border,
+            }
         }));
     }
     if let Some(rect) = view.drawn_box() {
@@ -387,7 +409,7 @@ fn opaque(color: Color) -> [u8; 4] {
 mod tests {
     use super::*;
     use crate::geometry::{MIN_WIDTH, ROW_HEIGHT, TITLE_HEIGHT};
-    use crate::graph::{Connection, Direction, NodeId, NodeRecord, Pin, PinId, Row};
+    use crate::graph::{Connection, Direction, Group, GroupId, NodeRecord, Pin, PinId, Row};
     use crate::input::{Button, InputEvent, Modifiers, PhysicalPoint};
 
     const GREY: Color = Color {
@@ -485,15 +507,81 @@ mod tests {
         assert_eq!(wire.points[0], [MIN_WIDTH, row_middle(1.0)]);
         assert_eq!(wire.points[3], [30.0, 80.0 + row_middle(0.0)]);
         let shapes = shapes(&graph, &view);
-        let [_, _, _, node, input_port, output_port] = &shapes[..] else {
+        let [_, unconnected, _, node, input_port, output_port] = &shapes[..] else {
             panic!("each node draws with its two ports");
         };
+        assert_eq!(unconnected.fill, [0; 4]);
+        assert_eq!(input_port.fill, PORT_FILL);
         assert_eq!(node.centre[0] - node.half_size[0], 30.0);
         assert_eq!(node.centre[1] - node.half_size[1], 80.0);
         assert_eq!(input_port.centre, wire.points[3]);
         assert_eq!(
             output_port.centre,
             [30.0 + MIN_WIDTH, 80.0 + row_middle(1.0)]
+        );
+    }
+
+    #[test]
+    fn a_folded_header_port_is_filled_if_any_hidden_member_on_its_side_is_connected() {
+        let pin = |id, direction| Pin {
+            id: PinId(id),
+            label: String::new(),
+            direction,
+        };
+        let group = |id, pins| {
+            Row::Group(Group {
+                id: GroupId(id),
+                label: String::new(),
+                folded: true,
+                pins,
+            })
+        };
+        let record = NodeRecord {
+            position: at(0.0, 0.0),
+            title: String::new(),
+            color: GREY,
+            rows: vec![
+                group(
+                    1,
+                    vec![
+                        pin(1, Direction::Input),
+                        pin(2, Direction::Input),
+                        pin(3, Direction::Output),
+                    ],
+                ),
+                group(2, vec![pin(4, Direction::Input)]),
+            ],
+        };
+        let mut graph = Graph::default();
+        graph.add_node(NodeId(1), record.clone()).unwrap();
+        graph.add_node(NodeId(2), record).unwrap();
+        let connection = Connection {
+            from: PinRef {
+                node: NodeId(2),
+                pin: PinId(3),
+            },
+            to: PinRef {
+                node: NodeId(1),
+                pin: PinId(2),
+            },
+        };
+        graph.add_connection(connection).unwrap();
+        let view = View::new(Viewport {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            scale_factor: 1.0,
+        });
+
+        let fills: Vec<_> = shapes(&graph, &view)
+            .iter()
+            .map(|shape| shape.fill == PORT_FILL)
+            .collect();
+        // Each node, then its first header's input and output ports, then its second's input.
+        assert_eq!(
+            fills,
+            [false, true, false, false, false, false, true, false]
         );
     }
 }

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use ab_glyph::FontRef;
 
-use crate::graph::{Direction, Graph, NodeId, NodeRecord, PinId, Point, Row};
+use crate::graph::{Direction, Graph, GroupId, NodeId, NodeRecord, PinId, Point, Row};
 use crate::text::text_width;
 
 // Sizes in graph units, to tune once text is drawn.
@@ -78,6 +78,13 @@ impl Graph {
             .filter(move |(_, record, layout)| layout.rect(record.position).intersects(&rect))
             .map(|(id, _, _)| id)
     }
+
+    /// The group whose header row on the node contains the point, with the node at its committed
+    /// position.
+    pub(crate) fn header_at(&self, id: NodeId, point: Point) -> Option<GroupId> {
+        let record = self.node(id)?;
+        self.node_layout(id)?.header_at(record.position, point)
+    }
 }
 
 /// Where a node's parts are relative to its top-left corner. The graph lays out each record as
@@ -95,6 +102,8 @@ pub(crate) struct NodeLayout {
     ports: Vec<Point>,
     /// The index in `ports` each pin's wires end at.
     port_of: HashMap<PinId, usize>,
+    /// Each group's header row, by the y of its top edge.
+    headers: Vec<(GroupId, f32)>,
 }
 
 impl NodeLayout {
@@ -107,11 +116,13 @@ impl NodeLayout {
         // Each port's row middle and direction: its x waits for the width.
         let mut ports = Vec::new();
         let mut port_of = HashMap::new();
+        let mut headers = Vec::new();
         for row in &record.rows {
             let (pins, folded) = match row {
                 Row::Pin(pin) => (std::slice::from_ref(pin), false),
                 Row::Group(group) => {
                     width = width.max(CARET_WIDTH + label_width(&group.label));
+                    headers.push((group.id, height));
                     height += ROW_HEIGHT;
                     (&group.pins[..], group.folded)
                 }
@@ -152,6 +163,7 @@ impl NodeLayout {
             height: height + BOTTOM_PADDING,
             ports,
             port_of,
+            headers,
         }
     }
 
@@ -167,13 +179,31 @@ impl NodeLayout {
 
     /// Where the pin's wires end when the node's top-left is at `top_left`.
     pub(crate) fn port(&self, top_left: Point, pin: PinId) -> Option<Point> {
-        let &index = self.port_of.get(&pin)?;
-        Some(offset(top_left, self.ports[index]))
+        Some(offset(top_left, self.ports[self.port_index(pin)?]))
+    }
+
+    /// The index among [`NodeLayout::ports`] of the port the pin's wires end at. A folded group's
+    /// members on one side share one.
+    pub(crate) fn port_index(&self, pin: PinId) -> Option<usize> {
+        self.port_of.get(&pin).copied()
     }
 
     /// Every port drawn when the node's top-left is at `top_left`.
     pub(crate) fn ports(&self, top_left: Point) -> impl Iterator<Item = Point> {
         self.ports.iter().map(move |&port| offset(top_left, port))
+    }
+
+    /// The group whose header row contains the point when the node's top-left is at `top_left`.
+    pub(crate) fn header_at(&self, top_left: Point, point: Point) -> Option<GroupId> {
+        let x = point.x - top_left.x;
+        let y = point.y - top_left.y;
+        if !(0.0..=self.width).contains(&x) {
+            return None;
+        }
+        self.headers
+            .iter()
+            .find(|&&(_, top)| (top..top + ROW_HEIGHT).contains(&y))
+            .map(|&(id, _)| id)
     }
 }
 
@@ -365,6 +395,38 @@ mod tests {
 
         let empty = record("Merge", vec![group(true, vec![])]);
         assert_eq!(lay_out(&empty).ports(at(0.0, 0.0)).count(), 0);
+    }
+
+    #[test]
+    fn a_header_row_is_hit_across_the_node_and_its_members_are_not() {
+        let open = record(
+            "Blur",
+            vec![
+                Row::Pin(pin(1, "Image", Direction::Input)),
+                group(false, vec![pin(2, "Size", Direction::Input)]),
+                Row::Pin(pin(3, "Image", Direction::Output)),
+            ],
+        );
+        let top_left = open.position;
+        let layout = lay_out(&open);
+        let width = layout.width;
+        let hit = |x, row: usize| {
+            layout.header_at(top_left, at(top_left.x + x, top_left.y + row_middle(row)))
+        };
+
+        assert_eq!(hit(0.0, 1), Some(GroupId(1)));
+        assert_eq!(hit(width, 1), Some(GroupId(1)));
+        assert_eq!(hit(width + 1.0, 1), None);
+        assert_eq!(hit(width / 2.0, 0), None);
+        assert_eq!(hit(width / 2.0, 2), None, "a member row");
+        let title = at(top_left.x + 10.0, top_left.y + TITLE_HEIGHT / 2.0);
+        assert_eq!(layout.header_at(top_left, title), None);
+
+        let mut folded = open;
+        folded.rows[1] = group(true, vec![pin(2, "Size", Direction::Input)]);
+        let layout = lay_out(&folded);
+        let below = at(top_left.x + 10.0, top_left.y + row_middle(2));
+        assert_eq!(layout.header_at(top_left, below), None, "the output's row");
     }
 
     #[test]
