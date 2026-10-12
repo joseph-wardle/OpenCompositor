@@ -10,9 +10,9 @@ Early and experimental. Current features include:
 - Any number of `View`s of one graph, each with its own pan, zoom and gesture in progress.
 - Selection by click and box, moving nodes, panning and zooming, and framing all or selected nodes.
 - A wgpu renderer that draws views into a render pass you own.
-- An example with two views of one graph, a small undo history, snapping and a locked node.
+- An example with two views of one graph, a small undo history, snapping and a locked node, running natively and in a web page with WebGPU or WebGL2.
 
-There is no connection editing, labels or any text, hover, remappable shortcuts or browser rendering. The library compiles for `wasm32-unknown-unknown` with wgpu's WebGPU backend, but nothing has been shown running in a browser. The API will have breaking changes.
+There is no connection editing, labels or any text, hover, touch input or remappable shortcuts. The API will have breaking changes.
 
 ## How a host uses it
 
@@ -57,6 +57,14 @@ OpenNG enables no wgpu backends itself; enable the ones your application needs o
 ```sh
 cargo run -p open-ng --example two_views
 ```
+
+To run it in a browser, install [Trunk](https://trunkrs.dev), then from the `open-ng` directory:
+
+```sh
+trunk serve --example two_views examples/two_views/index.html
+```
+
+and open the address it prints. The page uses WebGPU where the browser offers it and WebGL2 otherwise, and shows which.
 
 | Input | Action |
 | --- | --- |
