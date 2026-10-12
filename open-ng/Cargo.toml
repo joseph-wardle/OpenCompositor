@@ -15,7 +15,7 @@ workspace = true
 bytemuck = { version = "1.25.2", features = ["derive"] }
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 pollster = "1.0.1"
 wgpu = "30"
 winit = "0.30.13"
