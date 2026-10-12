@@ -5,12 +5,14 @@ use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::geometry::{self, Rect};
+use crate::geometry::{self, Rect, TITLE_HEIGHT};
 use crate::graph::{Color, Graph, NodeId, PinRef, Point};
 use crate::view::{View, Viewport};
 
 const WIRE_SEGMENTS: u32 = 32;
 const NODE_CORNER_RADIUS: f32 = 4.0;
+const NODE_BODY: [u8; 4] = [52, 52, 56, 255];
+const HEADER_FILL: [u8; 4] = [64, 64, 69, 255];
 const NODE_BORDER: [u8; 4] = [20, 20, 20, 255];
 const NODE_BORDER_WIDTH: f32 = 1.0;
 const SELECTED_BORDER: [u8; 4] = [255, 200, 40, 255];
@@ -304,7 +306,8 @@ impl InstanceBuffer {
     }
 }
 
-/// The wires as drawn, following any nodes being dragged.
+/// The wires as drawn, following any nodes being dragged. Unlike nodes, they are not culled; a
+/// wire's control points enclose its curve, if culling them ever pays.
 fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
     let end = |pin: PinRef| {
         let top_left = view.drawn_position(graph, pin.node);
@@ -326,8 +329,8 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
         .collect()
 }
 
-/// Each node followed by its ports, in draw order, then any selection box. A port is filled if
-/// any pin whose wires end there is connected and hollow otherwise.
+/// Each node in view followed by its ports, from bottom to top, then any selection box. A port
+/// is filled if any pin whose wires end there is connected and hollow otherwise.
 fn shapes(graph: &Graph, view: &View) -> Vec<Shape> {
     let selected: HashSet<_> = view.drawn_selection(graph).into_iter().collect();
     let connected: HashSet<(NodeId, usize)> = graph
@@ -342,22 +345,74 @@ fn shapes(graph: &Graph, view: &View) -> Vec<Shape> {
             (pin.node, index)
         })
         .collect();
+    // Ports and the antialiased edge reach past a node's outline.
+    let margin = PORT_RADIUS + 1.0 / view.physical_per_unit();
+    let visible = view.visible_rect();
+    let visible = Rect {
+        min: Point {
+            x: visible.min.x - margin,
+            y: visible.min.y - margin,
+        },
+        max: Point {
+            x: visible.max.x + margin,
+            y: visible.max.y + margin,
+        },
+    };
     let mut shapes = Vec::new();
-    for (id, record, layout) in graph.laid_out_nodes() {
+    for (id, record, layout) in graph.nodes_in_draw_order(&selected) {
         let top_left = view
             .drawn_position(graph, id)
             .expect("the node is in the graph");
+        let rect = layout.rect(top_left);
+        if !rect.intersects(&visible) {
+            continue;
+        }
         let (border, border_width) = if selected.contains(&id) {
             (SELECTED_BORDER, SELECTED_BORDER_WIDTH)
         } else {
             (NODE_BORDER, NODE_BORDER_WIDTH)
         };
+        let title = Rect {
+            min: rect.min,
+            max: Point {
+                x: rect.max.x,
+                y: rect.min.y + TITLE_HEIGHT,
+            },
+        };
+        let title_corners = Rect {
+            min: Point {
+                x: title.min.x,
+                y: title.max.y - NODE_CORNER_RADIUS,
+            },
+            max: title.max,
+        };
+        shapes.extend([
+            Shape {
+                radius: NODE_CORNER_RADIUS,
+                fill: NODE_BODY,
+                ..rectangle(rect)
+            },
+            Shape {
+                radius: NODE_CORNER_RADIUS,
+                fill: opaque(record.color),
+                ..rectangle(title)
+            },
+            // Squares the title bar's lower corners.
+            Shape {
+                fill: opaque(record.color),
+                ..rectangle(title_corners)
+            },
+        ]);
+        shapes.extend(layout.headers(top_left).map(|header| Shape {
+            fill: HEADER_FILL,
+            ..rectangle(header)
+        }));
+        // The outline goes over the fills so that the title bar does not cover it.
         shapes.push(Shape {
             radius: NODE_CORNER_RADIUS,
             border_width,
-            fill: opaque(record.color),
             border,
-            ..rectangle(layout.rect(top_left))
+            ..rectangle(rect)
         });
         shapes.extend(layout.ports(top_left).enumerate().map(|(index, port)| {
             let (fill, border, border_width) = if connected.contains(&(id, index)) {
@@ -507,8 +562,20 @@ mod tests {
         assert_eq!(wire.points[0], [MIN_WIDTH, row_middle(1.0)]);
         assert_eq!(wire.points[3], [30.0, 80.0 + row_middle(0.0)]);
         let shapes = shapes(&graph, &view);
-        let [_, unconnected, _, node, input_port, output_port] = &shapes[..] else {
-            panic!("each node draws with its two ports");
+        let [
+            _,
+            _,
+            _,
+            _,
+            unconnected,
+            _,
+            node,
+            ..,
+            input_port,
+            output_port,
+        ] = &shapes[..]
+        else {
+            panic!("each node draws as four shapes and its two ports");
         };
         assert_eq!(unconnected.fill, [0; 4]);
         assert_eq!(input_port.fill, PORT_FILL);
@@ -574,14 +641,105 @@ mod tests {
             scale_factor: 1.0,
         });
 
-        let fills: Vec<_> = shapes(&graph, &view)
+        let filled: Vec<_> = shapes(&graph, &view)
             .iter()
+            .filter(|shape| shape.half_size == [PORT_RADIUS; 2])
             .map(|shape| shape.fill == PORT_FILL)
             .collect();
-        // Each node, then its first header's input and output ports, then its second's input.
-        assert_eq!(
-            fills,
-            [false, true, false, false, false, false, true, false]
-        );
+        // For each node, its first header's input and output ports, then its second's input.
+        assert_eq!(filled, [true, false, false, false, true, false]);
+    }
+
+    /// Nodes 1, 2 and 3, untitled with no rows, side by side from x = -200, -50 and 100.
+    fn three_nodes() -> Graph {
+        let mut graph = Graph::default();
+        for id in 1..=3 {
+            let record = NodeRecord {
+                position: at(-350.0 + 150.0 * id as f32, 0.0),
+                title: String::new(),
+                color: GREY,
+                rows: Vec::new(),
+            };
+            graph.add_node(NodeId(id), record).unwrap();
+        }
+        graph
+    }
+
+    /// The left edge of each node body drawn, from bottom to top.
+    fn bodies(graph: &Graph, view: &View) -> Vec<f32> {
+        shapes(graph, view)
+            .iter()
+            .filter(|shape| shape.fill == NODE_BODY)
+            .map(|shape| shape.centre[0] - shape.half_size[0])
+            .collect()
+    }
+
+    #[test]
+    fn selected_nodes_draw_above_the_rest_with_the_selection_shown() {
+        let mut graph = three_nodes();
+        graph.set_selection(&[NodeId(1), NodeId(3)]).unwrap();
+        let mut view = View::new(Viewport {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            scale_factor: 1.0,
+        });
+        assert_eq!(bodies(&graph, &view), [-50.0, -200.0, 100.0]);
+
+        // Pressing node 2 shows it as the only selection before release.
+        let press = InputEvent::PointerPressed {
+            position: PhysicalPoint { x: 400.0, y: 310.0 },
+            button: Button::Left,
+            modifiers: Modifiers::default(),
+        };
+        let _ = view.handle_input(&graph, press);
+        assert_eq!(bodies(&graph, &view), [-200.0, 100.0, -50.0]);
+    }
+
+    #[test]
+    fn nodes_out_of_view_are_not_drawn_but_their_wires_are() {
+        let mut graph = three_nodes();
+        let pin = |direction| {
+            Row::Pin(Pin {
+                id: PinId(1),
+                label: String::new(),
+                direction,
+            })
+        };
+        let mut record = graph.node(NodeId(1)).unwrap().clone();
+        record.rows = vec![pin(Direction::Output)];
+        graph.update_node(NodeId(1), record).unwrap();
+        let mut record = graph.node(NodeId(3)).unwrap().clone();
+        record.rows = vec![pin(Direction::Input)];
+        graph.update_node(NodeId(3), record).unwrap();
+        let connection = Connection {
+            from: PinRef {
+                node: NodeId(1),
+                pin: PinId(1),
+            },
+            to: PinRef {
+                node: NodeId(3),
+                pin: PinId(1),
+            },
+        };
+        graph.add_connection(connection).unwrap();
+        // 140 units wide from x = -70, so only node 2 is in view.
+        let view = View::new(Viewport {
+            x: 0,
+            y: 0,
+            width: 140,
+            height: 600,
+            scale_factor: 1.0,
+        });
+
+        assert_eq!(bodies(&graph, &view), [-50.0]);
+        assert_eq!(wires(&graph, &view).len(), 1);
+
+        // Node 1's output port reaches 4 units past its right edge, now at x = -73.
+        let mut record = graph.node(NodeId(1)).unwrap().clone();
+        record.position.x += 27.0;
+        graph.update_node(NodeId(1), record).unwrap();
+        assert_eq!(bodies(&graph, &view), [-173.0, -50.0]);
     }
 }

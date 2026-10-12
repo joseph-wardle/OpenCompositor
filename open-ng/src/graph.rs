@@ -171,7 +171,8 @@ impl std::error::Error for GraphError {}
 /// first and leaves the graph unchanged on error.
 #[derive(Debug)]
 pub struct Graph {
-    /// In draw order: later nodes are drawn above earlier ones.
+    /// In the order nodes were added. Later nodes draw above earlier ones, and selected nodes
+    /// above unselected ones.
     nodes: Vec<Entry>,
     index_of: HashMap<NodeId, usize>,
     connections: Vec<Connection>,
@@ -319,7 +320,8 @@ impl Graph {
         Some(&self.nodes[index].record)
     }
 
-    /// All nodes in draw order, bottom first.
+    /// All nodes in the order they were added. Later nodes draw above earlier ones, and selected
+    /// nodes above unselected ones.
     pub fn nodes(&self) -> impl Iterator<Item = (NodeId, &NodeRecord)> {
         self.nodes.iter().map(|entry| (entry.id, &entry.record))
     }
@@ -337,13 +339,29 @@ impl Graph {
         Some(&self.nodes[index].layout)
     }
 
-    /// All nodes in draw order with their layouts.
+    /// All nodes with their layouts, in the order they were added.
     pub(crate) fn laid_out_nodes(
         &self,
     ) -> impl Iterator<Item = (NodeId, &NodeRecord, &NodeLayout)> {
         self.nodes
             .iter()
             .map(|entry| (entry.id, &entry.record, &entry.layout))
+    }
+
+    /// All nodes with their layouts from bottom to top: the unselected nodes in the order they
+    /// were added, then the selected ones in that order. Deriving the order from the selection
+    /// keeps the nodes being worked on on top without a stored stacking order.
+    pub(crate) fn nodes_in_draw_order<'a>(
+        &'a self,
+        selected: &'a HashSet<NodeId>,
+    ) -> impl Iterator<Item = (NodeId, &'a NodeRecord, &'a NodeLayout)> {
+        let unselected = self
+            .laid_out_nodes()
+            .filter(|(id, _, _)| !selected.contains(id));
+        let selected = self
+            .laid_out_nodes()
+            .filter(|(id, _, _)| selected.contains(id));
+        unselected.chain(selected)
     }
 
     pub(crate) fn add_stamp(&self) -> AddStamp {

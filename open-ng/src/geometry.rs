@@ -1,6 +1,6 @@
 //! Where nodes, ports and wires are, computed in one place for drawing, wire ends and hit testing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ab_glyph::FontRef;
 
@@ -61,18 +61,16 @@ impl Graph {
         Some(self.node_layout(id)?.rect(record.position))
     }
 
-    /// The topmost node whose outline contains the point.
+    /// The topmost node whose outline contains the point. Selected nodes are above the rest.
     pub fn node_at(&self, point: Point) -> Option<NodeId> {
-        let mut topmost = None;
-        for (id, record, layout) in self.laid_out_nodes() {
-            if layout.rect(record.position).contains(point) {
-                topmost = Some(id);
-            }
-        }
-        topmost
+        let selected: HashSet<_> = self.selection().iter().copied().collect();
+        self.nodes_in_draw_order(&selected)
+            .filter(|(_, record, layout)| layout.rect(record.position).contains(point))
+            .last()
+            .map(|(id, _, _)| id)
     }
 
-    /// The nodes whose outlines intersect the rectangle, in draw order.
+    /// The nodes whose outlines intersect the rectangle, in the order they were added.
     pub fn nodes_touching(&self, rect: Rect) -> impl Iterator<Item = NodeId> {
         self.laid_out_nodes()
             .filter(move |(_, record, layout)| layout.rect(record.position).intersects(&rect))
@@ -186,6 +184,20 @@ impl NodeLayout {
     /// members on one side share one.
     pub(crate) fn port_index(&self, pin: PinId) -> Option<usize> {
         self.port_of.get(&pin).copied()
+    }
+
+    /// Each group's header row when the node's top-left is at `top_left`.
+    pub(crate) fn headers(&self, top_left: Point) -> impl Iterator<Item = Rect> {
+        self.headers.iter().map(move |&(_, top)| Rect {
+            min: offset(top_left, Point { x: 0.0, y: top }),
+            max: offset(
+                top_left,
+                Point {
+                    x: self.width,
+                    y: top + ROW_HEIGHT,
+                },
+            ),
+        })
     }
 
     /// Every port drawn when the node's top-left is at `top_left`.
@@ -455,6 +467,14 @@ mod tests {
         assert_eq!(graph.node_at(at(10.0, 10.0)), Some(NodeId(1)));
         assert_eq!(graph.node_at(at(60.0, 10.0)), Some(NodeId(2)));
         assert_eq!(graph.node_at(at(10.0, -10.0)), None);
+
+        graph.set_selection(&[NodeId(1)]).unwrap();
+        assert_eq!(
+            graph.node_at(at(60.0, 10.0)),
+            Some(NodeId(1)),
+            "selected nodes are above the rest"
+        );
+        graph.set_selection(&[]).unwrap();
 
         graph.remove_node(NodeId(2)).unwrap();
         assert_eq!(graph.node_at(at(60.0, 10.0)), Some(NodeId(1)));

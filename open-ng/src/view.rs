@@ -305,6 +305,24 @@ impl View {
         }
     }
 
+    /// The part of the graph the viewport shows.
+    pub(crate) fn visible_rect(&self) -> Rect {
+        let Viewport {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } = self.viewport;
+        let corner = |x: u32, y: u32| {
+            self.to_graph(PhysicalPoint {
+                x: x as f32,
+                y: y as f32,
+            })
+        };
+        Rect::from_corners(corner(x, y), corner(x + width, y + height))
+    }
+
     /// The box being dragged out to select nodes.
     pub(crate) fn drawn_box(&self) -> Option<Rect> {
         let Some(Gesture::BoxSelect { from, .. }) = self.gesture else {
