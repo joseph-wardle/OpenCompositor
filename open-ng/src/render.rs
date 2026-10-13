@@ -423,7 +423,9 @@ struct DrawnConnections<'a> {
 impl DrawnConnections<'_> {
     fn of(view: &View) -> DrawnConnections<'_> {
         match view.wire_preview() {
-            Some(WirePreview::Accepted { edit, displaced }) => DrawnConnections {
+            Some(WirePreview::Accepted {
+                edit, displaced, ..
+            }) => DrawnConnections {
                 hidden: edit.remove.iter().chain(displaced).copied().collect(),
                 added: &edit.add,
             },
@@ -502,13 +504,17 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
             in_view([from, third(1.0), third(2.0), to], CUT_STROKE_COLOR)
         }));
     }
-    if let Some(WirePreview::Loose {
-        from,
-        side,
-        pointer,
-        ..
-    }) = view.wire_preview()
-    {
+    let loose = match view.wire_preview() {
+        Some(WirePreview::Loose {
+            from,
+            side,
+            pointer,
+            ..
+        }) => Some((from, side, pointer)),
+        Some(WirePreview::Accepted { loose, pointer, .. }) => Some((loose, Side::Output, pointer)),
+        None => None,
+    };
+    if let Some((from, side, pointer)) = loose {
         let pointer = view.to_graph(pointer);
         wires.extend(from.iter().filter_map(|&pin| {
             let port = end(pin, side)?;
@@ -1240,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn lifted_wires_hang_loose_from_their_outputs_until_dropped_where_the_host_accepts() {
+    fn lifted_wires_hang_loose_from_their_outputs_and_leave_their_input_over_space() {
         let (mut graph, _) = dragged_to_an_occupied_input(1.0, Verdict::Refuse { reason: None });
         let wire_1 = Connection {
             from: PinRef {
@@ -1290,7 +1296,19 @@ mod tests {
             position: PhysicalPoint { x: 700.0, y: 500.0 },
         };
         let _ = view.handle_input(&graph, over_space, accept_all);
-        assert_eq!(wires(&graph, &view), []);
+        let drawn: Vec<_> = wires(&graph, &view)
+            .iter()
+            .map(|wire| (wire.points[0], wire.points[3], wire.color))
+            .collect();
+        let pointer = [300.0, 200.0];
+        assert_eq!(
+            drawn,
+            [
+                ([MIN_WIDTH, 100.0 + middle], pointer, LOOSE_WIRE_COLOR),
+                ([MIN_WIDTH, middle], pointer, LOOSE_WIRE_COLOR),
+            ],
+            "off their input, where release would remove them, but still held"
+        );
         let filled: Vec<_> = shapes_without_text(&graph, &view)
             .iter()
             .filter(|shape| shape.half_size == [PORT_RADIUS; 2])

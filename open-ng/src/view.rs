@@ -176,9 +176,13 @@ type Judge<'a> = dyn FnMut(&ConnectionEdit) -> Verdict + 'a;
 /// loose wire to the pointer.
 #[derive(Debug)]
 pub(crate) enum WirePreview<'a> {
+    /// Lifted wires that release would remove still hang from each output in `loose` to the
+    /// pointer, so that they follow the drag rather than vanish; `loose` is otherwise empty.
     Accepted {
         edit: &'a ConnectionEdit,
         displaced: &'a [Connection],
+        loose: &'a [PinRef],
+        pointer: PhysicalPoint,
     },
     /// There is no proposal, or the host refused it, for `reason` if it gave one. A loose wire
     /// runs from each pin in `from`, on `side`, to the pointer.
@@ -684,15 +688,26 @@ impl View {
             return None;
         };
         let (attached, side) = drag.attached();
+        let pointer = self.pointer.expect("a wire drag follows a press");
         Some(match &drag.proposal {
             Some(Proposal {
                 edit,
                 verdict: Verdict::Accept { displaced },
-            }) => WirePreview::Accepted { edit, displaced },
+            }) => WirePreview::Accepted {
+                edit,
+                displaced,
+                // Over empty space only a lift has a proposal, and it removes the lifted wires.
+                loose: if drag.target == Some(Target::Space) {
+                    attached
+                } else {
+                    &[]
+                },
+                pointer,
+            },
             proposal => WirePreview::Loose {
                 from: attached,
                 side,
-                pointer: self.pointer.expect("a wire drag follows a press"),
+                pointer,
                 refusal: match proposal {
                     Some(Proposal {
                         verdict: Verdict::Refuse { reason },
