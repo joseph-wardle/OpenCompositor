@@ -65,6 +65,15 @@ pub(crate) enum Side {
     Output,
 }
 
+impl Side {
+    pub(crate) fn opposite(self) -> Side {
+        match self {
+            Side::Input => Side::Output,
+            Side::Output => Side::Input,
+        }
+    }
+}
+
 /// One row with a label and a port on each side its direction has. Labels may repeat.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pin {
@@ -404,6 +413,13 @@ impl Graph {
         self.index_of
             .get(&id)
             .is_some_and(|&index| self.nodes[index].added <= stamp)
+    }
+
+    /// Whether `pin` is on a node that has been in the graph since `stamp` was taken and still
+    /// has that side.
+    pub(crate) fn has_port_since(&self, pin: PinRef, side: Side, stamp: AddStamp) -> bool {
+        self.has_node_since(pin.node, stamp)
+            && self.pin(pin).is_ok_and(|pin| pin.direction.has(side))
     }
 
     fn retain_connections(&mut self, mut keep: impl FnMut(&Connection) -> bool) {

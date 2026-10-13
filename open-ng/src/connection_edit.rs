@@ -34,7 +34,6 @@ impl ConnectionEdit {
     /// The edit without what would change nothing, or `None` if nothing is left. Removing and
     /// adding the same connection cancel out, which is what dropping a lifted wire back where it
     /// was proposes.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wire drags will propose edits"))]
     pub(crate) fn normalised(mut self, graph: &Graph) -> Option<ConnectionEdit> {
         let removed: FxHashSet<_> = self.remove.iter().copied().collect();
         let added: FxHashSet<_> = self.add.iter().copied().collect();

@@ -11,14 +11,16 @@ use crate::atlas::{ATLAS_SIZE, GlyphAtlas, Ink};
 use crate::geometry::{
     self, LABEL_SIZE, LabelText, PORT_RADIUS, Rect, TITLE_HEIGHT, WIRE_SEGMENTS,
 };
-use crate::graph::{Color, Graph, NodeId, PinRef, Point, Side};
+use crate::graph::{Color, Connection, Graph, NodeId, PinRef, Point, Side};
 use crate::input::PhysicalPoint;
-use crate::text::{advance, bundled_font, cap_height};
-use crate::view::{View, Viewport};
+use crate::text::{advance, bundled_font, cap_height, text_width};
+use crate::view::{View, Viewport, WirePreview};
 
 /// In graph units; never drawn thinner than a pixel.
 const WIRE_WIDTH: f32 = 2.0;
 const WIRE_COLOR: [u8; 4] = [184, 184, 184, 255];
+/// A dragged wire the host has not accepted, which release would not connect.
+const LOOSE_WIRE_COLOR: [u8; 4] = [184, 184, 184, 110];
 const NODE_CORNER_RADIUS: f32 = 4.0;
 const NODE_BODY: [u8; 4] = [52, 52, 56, 255];
 const HEADER_FILL: [u8; 4] = [64, 64, 69, 255];
@@ -35,6 +37,14 @@ const BOX_FILL: [u8; 4] = [255, 255, 255, 12];
 const BOX_BORDER: [u8; 4] = [220, 220, 220, 255];
 const TITLE_TEXT: [u8; 4] = [240, 240, 240, 255];
 const LABEL_TEXT: [u8; 4] = [200, 200, 204, 255];
+/// The note beside the pointer giving the reason the host refused a dragged wire. Sizes are in
+/// logical pixels, whatever the zoom.
+const REFUSAL_SIZE: f32 = 12.0;
+const REFUSAL_OFFSET: Point = Point { x: 14.0, y: 18.0 };
+const REFUSAL_PADDING: f32 = 6.0;
+const REFUSAL_FILL: [u8; 4] = [28, 28, 30, 240];
+const REFUSAL_BORDER: [u8; 4] = [214, 96, 84, 255];
+const REFUSAL_TEXT: [u8; 4] = [240, 240, 240, 255];
 /// Text fades out as its size falls from the first to the second of these, in logical pixels
 /// per em, so that the cutoff looks the same on every display.
 const TEXT_FADE: [f32; 2] = [7.0, 5.0];
@@ -400,6 +410,35 @@ impl InstanceBuffer {
     }
 }
 
+/// The connections a view draws: the committed ones, less those its accepted wire drag removes,
+/// plus those it adds.
+struct DrawnConnections<'a> {
+    hidden: FxHashSet<Connection>,
+    added: &'a [Connection],
+}
+
+impl DrawnConnections<'_> {
+    fn of(view: &View) -> DrawnConnections<'_> {
+        match view.wire_preview() {
+            Some(WirePreview::Accepted { edit, displaced }) => DrawnConnections {
+                hidden: edit.remove.iter().chain(displaced).copied().collect(),
+                added: &edit.add,
+            },
+            _ => DrawnConnections {
+                hidden: FxHashSet::default(),
+                added: &[],
+            },
+        }
+    }
+
+    fn iter<'a>(&'a self, graph: &'a Graph) -> impl Iterator<Item = &'a Connection> {
+        let committed = graph.connections().iter();
+        committed
+            .filter(|connection| !self.hidden.contains(connection))
+            .chain(self.added)
+    }
+}
+
 /// The wires in view as drawn, following any nodes being dragged.
 fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
     // The drawn width reaches a pixel at least, with another pixel each side for the edge
@@ -407,41 +446,55 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
     let pixel = 1.0 / view.physical_per_unit();
     let margin = WIRE_WIDTH.max(pixel) / 2.0 + pixel;
     let visible = view.visible_rect();
+    // A preview's pins may have gone since the view last handled an event.
     let end = |pin: PinRef, side| {
-        let top_left = view.drawn_position(graph, pin.node);
-        let layout = graph.node_layout(pin.node);
-        top_left
-            .zip(layout)
-            .and_then(|(top_left, layout)| layout.port(top_left, pin.pin, side))
-            .expect("connections join pins with those sides in the graph")
+        let top_left = view.drawn_position(graph, pin.node)?;
+        graph.node_layout(pin.node)?.port(top_left, pin.pin, side)
     };
-    graph
-        .connections()
-        .iter()
-        .filter_map(|connection| {
-            let points = geometry::wire(
-                end(connection.from, Side::Output),
-                end(connection.to, Side::Input),
-            );
-            // A Bézier curve lies within its control points' bounds.
-            let x = points.map(|point| point.x);
-            let y = points.map(|point| point.y);
-            let bounds = Rect {
-                min: Point {
-                    x: x.into_iter().fold(f32::INFINITY, f32::min) - margin,
-                    y: y.into_iter().fold(f32::INFINITY, f32::min) - margin,
-                },
-                max: Point {
-                    x: x.into_iter().fold(f32::NEG_INFINITY, f32::max) + margin,
-                    y: y.into_iter().fold(f32::NEG_INFINITY, f32::max) + margin,
-                },
-            };
-            bounds.intersects(&visible).then(|| Wire {
-                points: points.map(|point| [point.x, point.y]),
-                color: WIRE_COLOR,
-            })
+    let in_view = |points: [Point; 4], color| {
+        // A Bézier curve lies within its control points' bounds.
+        let x = points.map(|point| point.x);
+        let y = points.map(|point| point.y);
+        let bounds = Rect {
+            min: Point {
+                x: x.into_iter().fold(f32::INFINITY, f32::min) - margin,
+                y: y.into_iter().fold(f32::INFINITY, f32::min) - margin,
+            },
+            max: Point {
+                x: x.into_iter().fold(f32::NEG_INFINITY, f32::max) + margin,
+                y: y.into_iter().fold(f32::NEG_INFINITY, f32::max) + margin,
+            },
+        };
+        bounds.intersects(&visible).then(|| Wire {
+            points: points.map(|point| [point.x, point.y]),
+            color,
         })
-        .collect()
+    };
+    let drawn = DrawnConnections::of(view);
+    let mut wires: Vec<Wire> = drawn
+        .iter(graph)
+        .filter_map(|connection| {
+            let output = end(connection.from, Side::Output)?;
+            let input = end(connection.to, Side::Input)?;
+            in_view(geometry::wire(output, input), WIRE_COLOR)
+        })
+        .collect();
+    if let Some(WirePreview::Loose {
+        from,
+        side,
+        pointer,
+        ..
+    }) = view.wire_preview()
+        && let Some(port) = end(from, side)
+    {
+        let pointer = view.to_graph(pointer);
+        let points = match side {
+            Side::Output => geometry::wire(port, pointer),
+            Side::Input => geometry::wire(pointer, port),
+        };
+        wires.extend(in_view(points, LOOSE_WIRE_COLOR));
+    }
+    wires
 }
 
 /// Each node in view followed by its ports and text, from bottom to top, then any selection box.
@@ -449,21 +502,18 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
 /// missing from the atlas are rasterised into it.
 fn shapes(graph: &Graph, view: &View, font: &FontRef<'_>, atlas: &mut GlyphAtlas) -> Vec<Shape> {
     let selected: HashSet<_> = view.drawn_selection(graph).into_iter().collect();
-    let connected: FxHashSet<(NodeId, usize)> = graph
-        .connections()
-        .iter()
+    let drawn = DrawnConnections::of(view);
+    let connected: FxHashSet<(NodeId, usize)> = drawn
+        .iter(graph)
         .flat_map(|connection| {
             [
                 (connection.from, Side::Output),
                 (connection.to, Side::Input),
             ]
         })
-        .map(|(pin, side)| {
-            let index = graph
-                .node_layout(pin.node)
-                .and_then(|layout| layout.port_index(pin.pin, side))
-                .expect("connections join pins with those sides in the graph");
-            (pin.node, index)
+        .filter_map(|(pin, side)| {
+            let index = graph.node_layout(pin.node)?.port_index(pin.pin, side)?;
+            Some((pin.node, index))
         })
         .collect();
     // Ports and the antialiased edge reach past a node's outline.
@@ -595,6 +645,14 @@ fn shapes(graph: &Graph, view: &View, font: &FontRef<'_>, atlas: &mut GlyphAtlas
             ..rectangle(rect)
         });
     }
+    if let Some(WirePreview::Loose {
+        pointer,
+        refusal: Some(reason),
+        ..
+    }) = view.wire_preview()
+    {
+        text.refusal(&mut shapes, reason, pointer);
+    }
     shapes
 }
 
@@ -664,6 +722,55 @@ impl TextPainter<'_> {
         });
     }
 
+    /// `reason` on a box beside the pointer, on the side with room for it, at a fixed logical
+    /// size and on whole physical pixels.
+    fn refusal(&mut self, shapes: &mut Vec<Shape>, reason: &str, pointer: PhysicalPoint) {
+        let viewport = self.view.viewport();
+        let scale = viewport.scale_factor;
+        let size = REFUSAL_SIZE * scale;
+        let padding = REFUSAL_PADDING * scale;
+        let width = (text_width(self.font, reason, size) + 2.0 * padding).ceil();
+        let height = (cap_height(size) + 2.0 * padding).ceil();
+        // Beside the pointer, or flipped to its other side where that runs past the viewport.
+        let beside = |pointer: f32, offset: f32, length: f32, start: u32, extent: u32| {
+            let after = pointer + offset * scale;
+            let before = pointer - offset * scale - length;
+            let place = if after + length > (start + extent) as f32 {
+                before.max(start as f32)
+            } else {
+                after
+            };
+            place.round()
+        };
+        let x = beside(
+            pointer.x,
+            REFUSAL_OFFSET.x,
+            width,
+            viewport.x,
+            viewport.width,
+        );
+        let y = beside(
+            pointer.y,
+            REFUSAL_OFFSET.y,
+            height,
+            viewport.y,
+            viewport.height,
+        );
+        let corner = |x: f32, y: f32| self.view.to_graph(PhysicalPoint { x, y });
+        let per_unit = self.view.physical_per_unit();
+        shapes.push(Shape {
+            border_width: 1.0 / per_unit,
+            fill: REFUSAL_FILL,
+            border: REFUSAL_BORDER,
+            ..rectangle(Rect::from_corners(
+                corner(x, y),
+                corner(x + width, y + height),
+            ))
+        });
+        let baseline = corner(x + padding.round(), y + height - padding.round());
+        self.line(shapes, reason, baseline, size / per_unit, REFUSAL_TEXT);
+    }
+
     /// A box for a character the font lacks, within the `.notdef` advance that measurement gives
     /// it. Geist's own `.notdef` glyph is blank.
     fn missing(&self, pen: Point, size: f32, color: [u8; 4]) -> Shape {
@@ -709,7 +816,7 @@ fn opaque(color: Color) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection_edit::accept_all;
+    use crate::connection_edit::{ConnectionEdit, Verdict, accept_all};
     use crate::geometry::{MIN_WIDTH, ROW_HEIGHT, TITLE_HEIGHT};
     use crate::graph::{Connection, Direction, Group, GroupId, NodeRecord, Pin, PinId, Row};
     use crate::input::{Button, InputEvent, Modifiers, PhysicalPoint};
@@ -984,6 +1091,119 @@ mod tests {
             .collect();
         // Each node's input port, then its output port.
         assert_eq!(filled, [false, true, true, false]);
+    }
+
+    /// Node 1 at the origin and node 3 below it, each with output 1, and node 2 at x = 200 with
+    /// input 1, which node 3 feeds. The view, at `scale_factor`, has node 1's output dragged to
+    /// node 2's input and judged by `verdict`.
+    fn dragged_to_an_occupied_input(scale_factor: f32, verdict: Verdict) -> (Graph, View) {
+        let mut graph = Graph::default();
+        for (id, position, direction) in [
+            (1, at(0.0, 0.0), Direction::Output),
+            (2, at(200.0, 0.0), Direction::Input),
+            (3, at(0.0, 100.0), Direction::Output),
+        ] {
+            let record = NodeRecord {
+                position,
+                title: String::new(),
+                color: GREY,
+                rows: vec![Row::Pin(Pin {
+                    id: PinId(1),
+                    label: String::new(),
+                    direction,
+                })],
+            };
+            graph.add_node(NodeId(id), record).unwrap();
+        }
+        graph.add_connection(occupant()).unwrap();
+        let mut view = view(scale_factor);
+        let port = |x: f32| PhysicalPoint {
+            x: 400.0 + x * scale_factor,
+            y: 300.0 + (TITLE_HEIGHT + ROW_HEIGHT / 2.0) * scale_factor,
+        };
+        let drag = [
+            InputEvent::PointerPressed {
+                position: port(MIN_WIDTH),
+                button: Button::Left,
+                modifiers: Modifiers::default(),
+            },
+            InputEvent::PointerMoved {
+                position: port(200.0),
+            },
+        ];
+        for event in drag {
+            let _ = view.handle_input(&graph, event, |_: &ConnectionEdit| verdict.clone());
+        }
+        (graph, view)
+    }
+
+    fn occupant() -> Connection {
+        Connection {
+            from: PinRef {
+                node: NodeId(3),
+                pin: PinId(1),
+            },
+            to: PinRef {
+                node: NodeId(2),
+                pin: PinId(1),
+            },
+        }
+    }
+
+    #[test]
+    fn an_accepted_wire_drag_draws_the_graph_as_the_host_would_leave_it() {
+        let verdict = Verdict::Accept {
+            displaced: vec![occupant()],
+        };
+        let (graph, view) = dragged_to_an_occupied_input(1.0, verdict);
+
+        let [wire] = wires(&graph, &view)[..] else {
+            panic!("the new wire alone");
+        };
+        let middle = TITLE_HEIGHT + ROW_HEIGHT / 2.0;
+        assert_eq!(wire.points[0], [MIN_WIDTH, middle]);
+        assert_eq!(wire.points[3], [200.0, middle]);
+        assert_eq!(wire.color, WIRE_COLOR);
+        let filled: Vec<_> = shapes_without_text(&graph, &view)
+            .iter()
+            .filter(|shape| shape.half_size == [PORT_RADIUS; 2])
+            .map(|shape| shape.fill == PORT_FILL)
+            .collect();
+        assert_eq!(filled, [true, true, false], "nodes 1, 2 and 3");
+    }
+
+    #[test]
+    fn a_refused_wire_drag_draws_a_loose_wire_and_the_reason_on_whole_pixels_with_room() {
+        let scale_factor = 1.5;
+        let verdict = Verdict::Refuse {
+            reason: Some("Inputs on this node are locked".to_owned()),
+        };
+        let (graph, view) = dragged_to_an_occupied_input(scale_factor, verdict);
+
+        let colors: Vec<_> = wires(&graph, &view).iter().map(|w| w.color).collect();
+        assert_eq!(colors, [WIRE_COLOR, LOOSE_WIRE_COLOR]);
+        let shapes = drawn_shapes(&graph, &view);
+        let [note] = shapes
+            .iter()
+            .filter(|shape| shape.border == REFUSAL_BORDER)
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("one note");
+        };
+        let corner = |sign: f32| {
+            view.to_physical(Point {
+                x: note.centre[0] + sign * note.half_size[0],
+                y: note.centre[1] + sign * note.half_size[1],
+            })
+        };
+        let (min, max) = (corner(-1.0), corner(1.0));
+        for edge in [min.x, min.y, max.x, max.y] {
+            assert!((edge - edge.round()).abs() < 1e-3, "{edge} is not whole");
+        }
+        // The pointer is at physical x 700 of 800, too near the right edge for the note.
+        assert!(min.x >= 0.0 && max.x < 700.0);
+        assert!(min.y > 300.0);
+        assert!(shapes.iter().any(|shape| is_glyph(shape, REFUSAL_TEXT)));
     }
 
     #[test]

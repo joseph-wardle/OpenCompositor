@@ -3,7 +3,8 @@
 //! The example is the host: it owns the graph and a small history, and decides what each
 //! response from a view does. Moves snap to a 10-unit grid, the Write node is locked in place,
 //! and Ctrl+Z and Ctrl+Shift+Z undo and redo moves and selection changes. Folding a group stays
-//! out of the history, as Blender keeps panel toggles out of undo.
+//! out of the history, as Blender keeps panel toggles out of undo. Wires can be dragged between
+//! ports, but the host refuses every connection edit for now.
 //!
 //! This file is what every platform shares; each platform's module starts the GPU, translates its
 //! events and schedules redraws.
@@ -68,15 +69,28 @@ impl Editor {
     /// whether a view used it: the host should redraw, and not also treat the event as its own.
     fn handle(&mut self, input: InputEvent) -> bool {
         let mut handled = false;
-        for view in &mut self.views {
-            let response = view.handle_input(&self.graph, input, judge);
+        for index in 0..self.views.len() {
+            let response = self.views[index].handle_input(&self.graph, input, judge);
             handled |= response.handled;
+            let mut changed = false;
             if let Some(fold) = response.fold {
                 apply_fold(&mut self.graph, fold);
+                changed = true;
             }
-            self.history.apply(&mut self.graph, response);
+            changed |= self.history.apply(&mut self.graph, response);
+            if changed {
+                self.refresh();
+            }
         }
         handled
+    }
+
+    /// Call it after every change to the graph, so that no view keeps showing what it found
+    /// under a pointer that has not moved since.
+    fn refresh(&mut self) {
+        for view in &mut self.views {
+            view.refresh(&self.graph, judge);
+        }
     }
 
     /// Call it when the window loses focus.
@@ -89,11 +103,19 @@ impl Editor {
     /// Undo and redo wait for a gesture to finish, as the views' own keys do. Each returns
     /// whether the graph changed.
     fn undo(&mut self) -> bool {
-        !self.gesture_active() && self.history.undo(&mut self.graph)
+        let changed = !self.gesture_active() && self.history.undo(&mut self.graph);
+        if changed {
+            self.refresh();
+        }
+        changed
     }
 
     fn redo(&mut self) -> bool {
-        !self.gesture_active() && self.history.redo(&mut self.graph)
+        let changed = !self.gesture_active() && self.history.redo(&mut self.graph);
+        if changed {
+            self.refresh();
+        }
+        changed
     }
 
     fn gesture_active(&self) -> bool {
@@ -104,7 +126,9 @@ impl Editor {
 /// Whether the host would apply a connection edit. The history cannot record connection edits
 /// yet, so it refuses them all.
 fn judge(_: &ConnectionEdit) -> Verdict {
-    Verdict::Refuse { reason: None }
+    Verdict::Refuse {
+        reason: Some("Connection edits cannot be undone yet".to_owned()),
+    }
 }
 
 /// The surface the views draw into, and everything on the GPU that draws them.
@@ -411,8 +435,9 @@ impl State {
 }
 
 impl History {
-    /// Applies what the host accepts of a response as one undo step.
-    fn apply(&mut self, graph: &mut Graph, response: Response) {
+    /// Applies what the host accepts of a response as one undo step. Returns whether the graph
+    /// changed.
+    fn apply(&mut self, graph: &mut Graph, response: Response) -> bool {
         let mut edit = Edit {
             before: State::default(),
             after: State::default(),
@@ -436,11 +461,12 @@ impl History {
             }
         }
         if edit.after.positions.is_empty() && edit.after.selection.is_none() {
-            return;
+            return false;
         }
         edit.after.restore(graph);
         self.undo.push(edit);
         self.redo.clear();
+        true
     }
 
     fn undo(&mut self, graph: &mut Graph) -> bool {
