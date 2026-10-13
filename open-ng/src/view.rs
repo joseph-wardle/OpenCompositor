@@ -1288,21 +1288,16 @@ impl Gesture {
     }
 }
 
+/// Graphs and pointer positions that view and render tests share, for a view over [`WHOLE`]:
+/// 800 × 600 physical pixels at scale 1, so graph (0, 0) is at physical (400, 300).
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::connection_edit::accept_all;
-    use crate::geometry::{BOTTOM_PADDING, MIN_WIDTH, TITLE_HEIGHT};
-    use crate::graph::{Color, Direction, Group, NodeRecord, Pin, PinId, Row};
-
-    const GREY: Color = Color {
-        r: 128,
-        g: 128,
-        b: 128,
+pub(crate) mod fixtures {
+    use super::Viewport;
+    use crate::graph::{
+        Color, Connection, Direction, Graph, NodeId, NodeRecord, Pin, PinId, PinRef, Point, Row,
     };
 
-    /// 800 × 600 physical pixels at scale 1, so graph (0, 0) starts at physical (400, 300).
-    const WHOLE: Viewport = Viewport {
+    pub(crate) const WHOLE: Viewport = Viewport {
         x: 0,
         y: 0,
         width: 800,
@@ -1310,9 +1305,97 @@ mod tests {
         scale_factor: 1.0,
     };
 
-    fn at(x: f32, y: f32) -> Point {
+    pub(crate) const GREY: Color = Color {
+        r: 128,
+        g: 128,
+        b: 128,
+    };
+
+    pub(crate) fn at(x: f32, y: f32) -> Point {
         Point { x, y }
     }
+
+    pub(crate) fn untitled(position: Point) -> NodeRecord {
+        NodeRecord {
+            position,
+            title: String::new(),
+            color: GREY,
+            rows: Vec::new(),
+        }
+    }
+
+    pub(crate) fn pin_ref(node: u64, pin: u64) -> PinRef {
+        PinRef {
+            node: NodeId(node),
+            pin: PinId(pin),
+        }
+    }
+
+    pub(crate) fn pin_row(id: u64, direction: Direction) -> Row {
+        Row::Pin(Pin {
+            id: PinId(id),
+            label: String::new(),
+            direction,
+        })
+    }
+
+    /// Node 1 at the origin with output 1, its port at physical (500, 334), and node 2 at
+    /// (200, 0) with inputs 1 and 2, their ports at physical (600, 334) and (600, 354).
+    pub(crate) fn unwired() -> Graph {
+        let mut graph = Graph::default();
+        let mut source = untitled(at(0.0, 0.0));
+        source.rows = vec![pin_row(1, Direction::Output)];
+        graph.add_node(NodeId(1), source).unwrap();
+        let mut target = untitled(at(200.0, 0.0));
+        target.rows = vec![pin_row(1, Direction::Input), pin_row(2, Direction::Input)];
+        graph.add_node(NodeId(2), target).unwrap();
+        graph
+    }
+
+    pub(crate) const OUTPUT: (f32, f32) = (500.0, 334.0);
+    pub(crate) const INPUT_1: (f32, f32) = (600.0, 334.0);
+    pub(crate) const INPUT_2: (f32, f32) = (600.0, 354.0);
+
+    /// [`unwired`] plus node 3 below node 1 with output 1, its port at physical (500, 394), and
+    /// wires from both outputs into node 2's input 1.
+    pub(crate) fn lifting() -> Graph {
+        let mut graph = unwired();
+        let mut source = untitled(at(0.0, 60.0));
+        source.rows = vec![pin_row(1, Direction::Output)];
+        graph.add_node(NodeId(3), source).unwrap();
+        for wire in lifted(1) {
+            graph.add_connection(wire).unwrap();
+        }
+        graph
+    }
+
+    pub(crate) const OUTPUT_3: (f32, f32) = (500.0, 394.0);
+    /// Over no node, well inside the view.
+    pub(crate) const SPACE: (f32, f32) = (700.0, 500.0);
+
+    /// The wires [`lifting`] lifts, as they would be into node 2's `input`.
+    pub(crate) fn lifted(input: u64) -> [Connection; 2] {
+        [1, 3].map(|node| Connection {
+            from: pin_ref(node, 1),
+            to: pin_ref(2, input),
+        })
+    }
+
+    /// A stroke between the outputs and node 2 in [`lifting`], down across both wires: the upper
+    /// at physical y = 334 and the lower at 364, where it is half way.
+    pub(crate) const STROKE: [(f32, f32); 2] = [(550.0, 300.0), (550.0, 420.0)];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{
+        INPUT_1, INPUT_2, OUTPUT, OUTPUT_3, SPACE, STROKE, WHOLE, at, lifted, lifting, pin_ref,
+        pin_row, untitled, unwired,
+    };
+    use super::*;
+    use crate::connection_edit::accept_all;
+    use crate::geometry::{BOTTOM_PADDING, MIN_WIDTH, TITLE_HEIGHT};
+    use crate::graph::{Direction, Group, Pin, PinId, Row};
 
     fn px(x: f32, y: f32) -> PhysicalPoint {
         PhysicalPoint { x, y }
@@ -1327,15 +1410,6 @@ mod tests {
     /// The top-left of an untitled node with no rows centred on (x, y).
     fn centred(x: f32, y: f32) -> Point {
         at(x - SIZE.x / 2.0, y - SIZE.y / 2.0)
-    }
-
-    fn untitled(position: Point) -> NodeRecord {
-        NodeRecord {
-            position,
-            title: String::new(),
-            color: GREY,
-            rows: Vec::new(),
-        }
     }
 
     /// Nodes 1, 2 and 3 centred at graph x = 0, 200 and 400, each 100 × 30.
@@ -2252,38 +2326,6 @@ mod tests {
         assert_eq!(right.centre, at(310.0, 0.0));
     }
 
-    fn pin_ref(node: u64, pin: u64) -> PinRef {
-        PinRef {
-            node: NodeId(node),
-            pin: PinId(pin),
-        }
-    }
-
-    fn pin_row(id: u64, direction: Direction) -> Row {
-        Row::Pin(Pin {
-            id: PinId(id),
-            label: String::new(),
-            direction,
-        })
-    }
-
-    /// Node 1 at the origin with output 1, its port at physical (500, 334), and node 2 at
-    /// (200, 0) with inputs 1 and 2, their ports at physical (600, 334) and (600, 354).
-    fn unwired() -> Graph {
-        let mut graph = Graph::default();
-        let mut source = untitled(at(0.0, 0.0));
-        source.rows = vec![pin_row(1, Direction::Output)];
-        graph.add_node(NodeId(1), source).unwrap();
-        let mut target = untitled(at(200.0, 0.0));
-        target.rows = vec![pin_row(1, Direction::Input), pin_row(2, Direction::Input)];
-        graph.add_node(NodeId(2), target).unwrap();
-        graph
-    }
-
-    const OUTPUT: (f32, f32) = (500.0, 334.0);
-    const INPUT_1: (f32, f32) = (600.0, 334.0);
-    const INPUT_2: (f32, f32) = (600.0, 354.0);
-
     fn into(input: u64) -> ConnectionEdit {
         ConnectionEdit {
             remove: Vec::new(),
@@ -2683,31 +2725,6 @@ mod tests {
         assert_eq!(view.hovered_side(), None);
     }
 
-    /// [`unwired`] plus node 3 below node 1 with output 1, its port at physical (500, 394), and
-    /// wires from both outputs into node 2's input 1.
-    fn lifting() -> Graph {
-        let mut graph = unwired();
-        let mut source = untitled(at(0.0, 60.0));
-        source.rows = vec![pin_row(1, Direction::Output)];
-        graph.add_node(NodeId(3), source).unwrap();
-        for wire in lifted(1) {
-            graph.add_connection(wire).unwrap();
-        }
-        graph
-    }
-
-    const OUTPUT_3: (f32, f32) = (500.0, 394.0);
-    /// Over no node, well inside the view.
-    const SPACE: (f32, f32) = (700.0, 500.0);
-
-    /// The wires [`lifting`] lifts, as they would be into node 2's `input`.
-    fn lifted(input: u64) -> [Connection; 2] {
-        [1, 3].map(|node| Connection {
-            from: pin_ref(node, 1),
-            to: pin_ref(2, input),
-        })
-    }
-
     fn moved(input: u64) -> ConnectionEdit {
         ConnectionEdit {
             remove: lifted(1).to_vec(),
@@ -2927,10 +2944,6 @@ mod tests {
             add: Vec::new(),
         }
     }
-
-    /// A stroke between the outputs and node 2 in [`lifting`], down across both wires: the upper
-    /// at physical y = 334 and the lower at 364, where it is half way.
-    const STROKE: [(f32, f32); 2] = [(550.0, 300.0), (550.0, 420.0)];
 
     #[test]
     fn a_y_drag_cuts_each_wire_it_crosses_once_whatever_the_zoom() {
