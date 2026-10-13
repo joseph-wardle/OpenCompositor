@@ -251,7 +251,8 @@ fn viewports(width: u32, height: u32, scale_factor: f32) -> [Viewport; 2] {
 
 /// Two sources merged, blurred and written, from left to right around the graph origin where
 /// new views are centred. Every node's input is pin 1 and its output pin 2, except the merge's
-/// second input, pin 3. The blur has four more inputs in two groups, one folded.
+/// second input, pin 3. The blur has four more pins in two groups, one folded; its size both
+/// receives and supplies a value.
 fn network() -> Graph {
     let pin = |id, label: &str, direction| {
         Row::Pin(Pin {
@@ -300,7 +301,7 @@ fn network() -> Graph {
                         Pin {
                             id: PinId(3),
                             label: "Size".to_owned(),
-                            direction: Direction::Input,
+                            direction: Direction::Both,
                         },
                         Pin {
                             id: PinId(4),

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use ab_glyph::FontRef;
 use rustc_hash::FxHashMap;
 
-use crate::graph::{Direction, Graph, GroupId, NodeId, NodeRecord, PinId, Point, Row};
+use crate::graph::{Direction, Graph, GroupId, NodeId, NodeRecord, PinId, Point, Row, Side};
 use crate::text::{cap_height, text_width};
 
 // Sizes in graph units, to tune once text is drawn.
@@ -89,18 +89,18 @@ impl Graph {
 /// Where a node's parts are relative to its top-left corner. The graph lays out each record as
 /// it is added or replaced, so moving and drawing nodes never measures text.
 ///
-/// The title bar is at the top, then one row per pin or group header in record order. Each row's
-/// port is at its middle, on the left edge for an input and the right for an output. The node is
-/// as wide as its title and widest visible row need: text is never shortened.
+/// The title bar is at the top, then one row per pin or group header in record order. A row's
+/// ports are at its middle, on the left edge for an input side and the right for an output side.
+/// The node is as wide as its title and widest visible row need: text is never shortened.
 #[derive(Debug)]
 pub(crate) struct NodeLayout {
     width: f32,
     height: f32,
-    /// The ports drawn: one per visible pin, and one on each side of a folded group's header
-    /// that has members on that side.
+    /// The ports drawn: one per side of each visible pin, and one on each side of a folded
+    /// group's header that has members with that side.
     ports: Vec<Point>,
-    /// The index in `ports` each pin's wires end at.
-    port_of: FxHashMap<PinId, usize>,
+    /// The index in `ports` where the wires on each side of each pin end.
+    port_of: FxHashMap<(PinId, Side), usize>,
     /// Each group's header row, by the y of its top edge.
     headers: Vec<Header>,
     /// The title and every visible row's label, from top to bottom.
@@ -164,7 +164,7 @@ impl NodeLayout {
         // is known.
         let mut output_labels = Vec::new();
         let mut height = TITLE_HEIGHT;
-        // Each port's row middle and direction: its x waits for the width.
+        // Each port's row middle and side: its x waits for the width.
         let mut ports = Vec::new();
         let mut port_of = FxHashMap::default();
         let mut headers = Vec::new();
@@ -196,20 +196,21 @@ impl NodeLayout {
             };
             if folded {
                 let header = height - ROW_HEIGHT / 2.0;
-                for direction in [Direction::Input, Direction::Output] {
+                for side in [Side::Input, Side::Output] {
                     let mut header_port = None;
-                    for pin in pins.iter().filter(|pin| pin.direction == direction) {
+                    for pin in pins.iter().filter(|pin| pin.direction.has(side)) {
                         let index = *header_port.get_or_insert_with(|| {
-                            ports.push((header, direction));
+                            ports.push((header, side));
                             ports.len() - 1
                         });
-                        port_of.insert(pin.id, index);
+                        port_of.insert((pin.id, side), index);
                     }
                 }
             } else {
                 for pin in pins {
                     let measured = text_width(font, &pin.label, LABEL_SIZE);
                     width = width.max(2.0 * TEXT_INSET + measured);
+                    // A pin with both sides labels its input side.
                     if pin.direction == Direction::Output {
                         output_labels.push((labels.len(), measured));
                     }
@@ -221,18 +222,22 @@ impl NodeLayout {
                         },
                         size: LABEL_SIZE,
                     });
-                    port_of.insert(pin.id, ports.len());
-                    ports.push((height + ROW_HEIGHT / 2.0, pin.direction));
+                    for side in [Side::Input, Side::Output] {
+                        if pin.direction.has(side) {
+                            port_of.insert((pin.id, side), ports.len());
+                            ports.push((height + ROW_HEIGHT / 2.0, side));
+                        }
+                    }
                     height += ROW_HEIGHT;
                 }
             }
         }
         let ports = ports
             .into_iter()
-            .map(|(y, direction)| Point {
-                x: match direction {
-                    Direction::Input => 0.0,
-                    Direction::Output => width,
+            .map(|(y, side)| Point {
+                x: match side {
+                    Side::Input => 0.0,
+                    Side::Output => width,
                 },
                 y,
             })
@@ -260,15 +265,15 @@ impl NodeLayout {
         }
     }
 
-    /// Where the pin's wires end when the node's top-left is at `top_left`.
-    pub(crate) fn port(&self, top_left: Point, pin: PinId) -> Option<Point> {
-        Some(offset(top_left, self.ports[self.port_index(pin)?]))
+    /// Where the wires on one side of the pin end when the node's top-left is at `top_left`.
+    pub(crate) fn port(&self, top_left: Point, pin: PinId, side: Side) -> Option<Point> {
+        Some(offset(top_left, self.ports[self.port_index(pin, side)?]))
     }
 
-    /// The index among [`NodeLayout::ports`] of the port the pin's wires end at. A folded group's
-    /// members on one side share one.
-    pub(crate) fn port_index(&self, pin: PinId) -> Option<usize> {
-        self.port_of.get(&pin).copied()
+    /// The index among [`NodeLayout::ports`] of the port where the wires on one side of the pin
+    /// end. A folded group's members with that side share one.
+    pub(crate) fn port_index(&self, pin: PinId, side: Side) -> Option<usize> {
+        self.port_of.get(&(pin, side)).copied()
     }
 
     /// Each group's header row when the node's top-left is at `top_left`.
@@ -420,15 +425,35 @@ mod tests {
             rect.max.y - rect.min.y,
             row_middle(3) - ROW_HEIGHT / 2.0 + BOTTOM_PADDING
         );
-        let port = |id| layout.port(top_left, PinId(id)).unwrap();
-        assert_eq!(port(1), at(rect.min.x, top_left.y + row_middle(0)));
-        assert_eq!(port(2), at(rect.max.x, top_left.y + row_middle(1)));
-        assert_eq!(port(3), at(rect.min.x, top_left.y + row_middle(2)));
+        let port = |id, side| layout.port(top_left, PinId(id), side);
+        let input = |id| port(id, Side::Input).unwrap();
+        assert_eq!(input(1), at(rect.min.x, top_left.y + row_middle(0)));
+        let output = port(2, Side::Output).unwrap();
+        assert_eq!(output, at(rect.max.x, top_left.y + row_middle(1)));
+        assert_eq!(input(3), at(rect.min.x, top_left.y + row_middle(2)));
         assert_eq!(
             layout.ports(top_left).collect::<Vec<_>>(),
-            [port(1), port(2), port(3)]
+            [input(1), output, input(3)]
         );
-        assert_eq!(layout.port(top_left, PinId(4)), None);
+        assert_eq!(port(1, Side::Output), None);
+        assert_eq!(port(2, Side::Input), None);
+        assert_eq!(port(4, Side::Input), None);
+    }
+
+    #[test]
+    fn a_pin_with_both_sides_has_a_port_on_each_edge_and_its_label_on_the_left() {
+        let record = record("Transform", vec![Row::Pin(pin(1, "Size", Direction::Both))]);
+        let layout = lay_out(&record);
+        let top_left = record.position;
+        let rect = layout.rect(top_left);
+        let middle = top_left.y + row_middle(0);
+
+        let input = layout.port(top_left, PinId(1), Side::Input);
+        let output = layout.port(top_left, PinId(1), Side::Output);
+        assert_eq!(input, Some(at(rect.min.x, middle)));
+        assert_eq!(output, Some(at(rect.max.x, middle)));
+        assert_eq!(layout.ports(top_left).count(), 2);
+        assert_eq!(layout.labels()[1].origin.x, TEXT_INSET);
     }
 
     #[test]
@@ -462,11 +487,11 @@ mod tests {
     }
 
     #[test]
-    fn folded_members_end_their_wires_at_the_header_on_their_side() {
+    fn folded_members_end_their_wires_at_the_header_on_each_side_they_have() {
         let members = vec![
             pin(1, "Size", Direction::Input),
             pin(2, "Mask", Direction::Output),
-            pin(3, "Mix", Direction::Input),
+            pin(3, "Mix", Direction::Both),
         ];
         let open = record(
             "Blur",
@@ -479,17 +504,20 @@ mod tests {
         folded.rows[1] = group(true, members);
         let top_left = open.position;
         let (open, folded) = (lay_out(&open), lay_out(&folded));
-        let port = |layout: &NodeLayout, id| layout.port(top_left, PinId(id)).unwrap();
+        let port = |layout: &NodeLayout, id, side| layout.port(top_left, PinId(id), side).unwrap();
 
         let header = top_left.y + row_middle(1);
         let right = top_left.x + folded.width;
-        assert_eq!(port(&folded, 1), at(top_left.x, header));
-        assert_eq!(port(&folded, 3), at(top_left.x, header));
-        assert_eq!(port(&folded, 2), at(right, header));
-        assert_eq!(port(&folded, 4), port(&open, 4));
+        assert_eq!(port(&folded, 1, Side::Input), at(top_left.x, header));
+        assert_eq!(port(&folded, 3, Side::Input), at(top_left.x, header));
+        assert_eq!(port(&folded, 2, Side::Output), at(right, header));
+        assert_eq!(port(&folded, 3, Side::Output), at(right, header));
+        assert_eq!(port(&folded, 4, Side::Output), port(&open, 4, Side::Output));
         assert_eq!(folded.ports(top_left).count(), 3);
-        assert_eq!(port(&open, 3), at(top_left.x, top_left.y + row_middle(4)));
-        assert_eq!(open.ports(top_left).count(), 4);
+        let mix = top_left.y + row_middle(4);
+        assert_eq!(port(&open, 3, Side::Input), at(top_left.x, mix));
+        assert_eq!(port(&open, 3, Side::Output), at(right, mix));
+        assert_eq!(open.ports(top_left).count(), 5);
 
         assert_eq!(folded.rect(top_left).min, open.rect(top_left).min);
         assert_eq!(open.height - folded.height, 3.0 * ROW_HEIGHT);

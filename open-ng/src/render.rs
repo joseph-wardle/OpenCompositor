@@ -9,7 +9,7 @@ use rustc_hash::FxHashSet;
 
 use crate::atlas::{ATLAS_SIZE, GlyphAtlas, Ink};
 use crate::geometry::{self, LABEL_SIZE, LabelText, Rect, TITLE_HEIGHT};
-use crate::graph::{Color, Graph, NodeId, PinRef, Point};
+use crate::graph::{Color, Graph, NodeId, PinRef, Point, Side};
 use crate::input::PhysicalPoint;
 use crate::text::{advance, bundled_font, cap_height};
 use crate::view::{View, Viewport};
@@ -403,19 +403,22 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
     let pixel = 1.0 / view.physical_per_unit();
     let margin = WIRE_WIDTH.max(pixel) / 2.0 + pixel;
     let visible = view.visible_rect();
-    let end = |pin: PinRef| {
+    let end = |pin: PinRef, side| {
         let top_left = view.drawn_position(graph, pin.node);
         let layout = graph.node_layout(pin.node);
         top_left
             .zip(layout)
-            .and_then(|(top_left, layout)| layout.port(top_left, pin.pin))
-            .expect("connections join pins in the graph")
+            .and_then(|(top_left, layout)| layout.port(top_left, pin.pin, side))
+            .expect("connections join pins with those sides in the graph")
     };
     graph
         .connections()
         .iter()
         .filter_map(|connection| {
-            let points = geometry::wire(end(connection.from), end(connection.to));
+            let points = geometry::wire(
+                end(connection.from, Side::Output),
+                end(connection.to, Side::Input),
+            );
             // A Bézier curve lies within its control points' bounds.
             let x = points.map(|point| point.x);
             let y = points.map(|point| point.y);
@@ -444,12 +447,17 @@ fn shapes(graph: &Graph, view: &View, font: &FontRef<'_>, atlas: &mut GlyphAtlas
     let connected: FxHashSet<(NodeId, usize)> = graph
         .connections()
         .iter()
-        .flat_map(|connection| [connection.from, connection.to])
-        .map(|pin| {
+        .flat_map(|connection| {
+            [
+                (connection.from, Side::Output),
+                (connection.to, Side::Input),
+            ]
+        })
+        .map(|(pin, side)| {
             let index = graph
                 .node_layout(pin.node)
-                .and_then(|layout| layout.port_index(pin.pin))
-                .expect("connections join pins in the graph");
+                .and_then(|layout| layout.port_index(pin.pin, side))
+                .expect("connections join pins with those sides in the graph");
             (pin.node, index)
         })
         .collect();
@@ -921,6 +929,49 @@ mod tests {
         assert_eq!(filled, [true, false, false, false, true, false]);
     }
 
+    #[test]
+    fn a_wire_between_pins_with_both_sides_uses_and_fills_only_its_own_ports() {
+        let mut graph = Graph::default();
+        for (id, x) in [(1, 0.0), (2, 200.0)] {
+            let record = NodeRecord {
+                position: at(x, 0.0),
+                title: String::new(),
+                color: GREY,
+                rows: vec![Row::Pin(Pin {
+                    id: PinId(1),
+                    label: String::new(),
+                    direction: Direction::Both,
+                })],
+            };
+            graph.add_node(NodeId(id), record).unwrap();
+        }
+        let pin = |id| PinRef {
+            node: NodeId(id),
+            pin: PinId(1),
+        };
+        graph
+            .add_connection(Connection {
+                from: pin(1),
+                to: pin(2),
+            })
+            .unwrap();
+        let view = view(1.0);
+
+        let [wire] = wires(&graph, &view)[..] else {
+            panic!("one connection draws one wire");
+        };
+        let middle = TITLE_HEIGHT + ROW_HEIGHT / 2.0;
+        assert_eq!(wire.points[0], [MIN_WIDTH, middle]);
+        assert_eq!(wire.points[3], [200.0, middle]);
+        let filled: Vec<_> = shapes_without_text(&graph, &view)
+            .iter()
+            .filter(|shape| shape.half_size == [PORT_RADIUS; 2])
+            .map(|shape| shape.fill == PORT_FILL)
+            .collect();
+        // Each node's input port, then its output port.
+        assert_eq!(filled, [false, true, true, false]);
+    }
+
     /// Nodes 1, 2 and 3, untitled with no rows, side by side from x = -200, -50 and 100.
     fn three_nodes() -> Graph {
         let mut graph = Graph::default();
@@ -1050,10 +1101,13 @@ mod tests {
             .unwrap();
         // Moves the nodes so that the wire runs between these points.
         let place = |graph: &mut Graph, output: Point, input: Point| {
-            for (id, end) in [(NodeId(1), output), (NodeId(2), input)] {
+            for (id, end, side) in [
+                (NodeId(1), output, Side::Output),
+                (NodeId(2), input, Side::Input),
+            ] {
                 let mut record = graph.node(id).unwrap().clone();
                 let layout = graph.node_layout(id).unwrap();
-                let port = layout.port(record.position, PinId(1)).unwrap();
+                let port = layout.port(record.position, PinId(1), side).unwrap();
                 record.position.x += end.x - port.x;
                 record.position.y += end.y - port.y;
                 graph.update_node(id, record).unwrap();
