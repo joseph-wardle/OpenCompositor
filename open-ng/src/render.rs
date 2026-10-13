@@ -485,14 +485,16 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
         pointer,
         ..
     }) = view.wire_preview()
-        && let Some(port) = end(from, side)
     {
         let pointer = view.to_graph(pointer);
-        let points = match side {
-            Side::Output => geometry::wire(port, pointer),
-            Side::Input => geometry::wire(pointer, port),
-        };
-        wires.extend(in_view(points, LOOSE_WIRE_COLOR));
+        wires.extend(from.iter().filter_map(|&pin| {
+            let port = end(pin, side)?;
+            let points = match side {
+                Side::Output => geometry::wire(port, pointer),
+                Side::Input => geometry::wire(pointer, port),
+            };
+            in_view(points, LOOSE_WIRE_COLOR)
+        }));
     }
     wires
 }
@@ -1204,6 +1206,66 @@ mod tests {
         assert!(min.x >= 0.0 && max.x < 700.0);
         assert!(min.y > 300.0);
         assert!(shapes.iter().any(|shape| is_glyph(shape, REFUSAL_TEXT)));
+    }
+
+    #[test]
+    fn lifted_wires_hang_loose_from_their_outputs_until_dropped_where_the_host_accepts() {
+        let (mut graph, _) = dragged_to_an_occupied_input(1.0, Verdict::Refuse { reason: None });
+        let wire_1 = Connection {
+            from: PinRef {
+                node: NodeId(1),
+                pin: PinId(1),
+            },
+            ..occupant()
+        };
+        graph.add_connection(wire_1).unwrap();
+        let mut view = view(1.0);
+        let middle = TITLE_HEIGHT + ROW_HEIGHT / 2.0;
+        let lift = [
+            InputEvent::PointerPressed {
+                position: PhysicalPoint {
+                    x: 600.0,
+                    y: 300.0 + middle,
+                },
+                button: Button::Left,
+                modifiers: Modifiers::default(),
+            },
+            // Over node 1's body.
+            InputEvent::PointerMoved {
+                position: PhysicalPoint { x: 450.0, y: 310.0 },
+            },
+        ];
+        for event in lift {
+            let _ = view.handle_input(&graph, event, accept_all);
+        }
+
+        let drawn: Vec<_> = wires(&graph, &view)
+            .iter()
+            .map(|wire| (wire.points[0], wire.points[3], wire.color))
+            .collect();
+        let pointer = [50.0, 10.0];
+        assert_eq!(
+            drawn,
+            [
+                ([MIN_WIDTH, 100.0 + middle], [200.0, middle], WIRE_COLOR),
+                ([MIN_WIDTH, middle], [200.0, middle], WIRE_COLOR),
+                ([MIN_WIDTH, 100.0 + middle], pointer, LOOSE_WIRE_COLOR),
+                ([MIN_WIDTH, middle], pointer, LOOSE_WIRE_COLOR),
+            ],
+            "the committed graph, then each lifted wire loose"
+        );
+
+        let over_space = InputEvent::PointerMoved {
+            position: PhysicalPoint { x: 700.0, y: 500.0 },
+        };
+        let _ = view.handle_input(&graph, over_space, accept_all);
+        assert_eq!(wires(&graph, &view), []);
+        let filled: Vec<_> = shapes_without_text(&graph, &view)
+            .iter()
+            .filter(|shape| shape.half_size == [PORT_RADIUS; 2])
+            .map(|shape| shape.fill == PORT_FILL)
+            .collect();
+        assert_eq!(filled, [false, false, false], "nodes 1, 2 and 3");
     }
 
     #[test]

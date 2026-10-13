@@ -108,8 +108,8 @@ enum Gesture {
         /// The group whose header the press hit, if it was unmodified. Released there, it folds
         /// or unfolds the group and leaves the selection alone.
         header: Option<GroupId>,
-        /// The side of a pin the press hit. Dragged, it starts a wire; released, it is a click on
-        /// the node.
+        /// The side of a pin the press hit. Dragged, it starts a wire or lifts the wires into an
+        /// input; released, it is a click on the node.
         port: Option<(PinRef, Side)>,
         combine: Combine,
         since: AddStamp,
@@ -126,17 +126,37 @@ enum Gesture {
     Wire(WireDrag),
 }
 
-/// A new wire dragged from one side of a pin toward the other side of another.
+/// Wires dragged by their free end: a new wire from one side of a pin toward the other side of
+/// another, or every wire into an input, lifted off it.
 #[derive(Debug)]
 struct WireDrag {
-    origin: PinRef,
+    pressed: PinRef,
     side: Side,
-    /// When the press found `origin`, so that a node added since under its ID is not mistaken
-    /// for it.
+    /// When the press found `pressed`, so that a node added since under its ID is not mistaken
+    /// for it, nor a wire from one for a lifted wire.
     since: AddStamp,
-    /// The pin under the pointer with the side opposite `side`.
-    target: Option<PinRef>,
+    dragged: Dragged,
+    /// Where releasing would drop the free end.
+    target: Option<Target>,
     proposal: Option<Proposal>,
+}
+
+#[derive(Debug)]
+enum Dragged {
+    /// A wire from the pressed side.
+    New,
+    /// The wires into the pressed input, by the outputs they come from, which stay attached. Never
+    /// empty: the drag ends when the last of them goes.
+    Lifted(Vec<PinRef>),
+}
+
+/// Where a wire drag's free end would land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// The side of a pin the free end would join.
+    Pin(PinRef),
+    /// Empty space in the view, where lifted wires are removed and a new wire goes nowhere.
+    Space,
 }
 
 /// A normalised edit and the host's verdict on it.
@@ -157,9 +177,10 @@ pub(crate) enum WirePreview<'a> {
         edit: &'a ConnectionEdit,
         displaced: &'a [Connection],
     },
-    /// There is no proposal, or the host refused it, for `reason` if it gave one.
+    /// There is no proposal, or the host refused it, for `reason` if it gave one. A loose wire
+    /// runs from each pin in `from`, on `side`, to the pointer.
     Loose {
-        from: PinRef,
+        from: &'a [PinRef],
         side: Side,
         pointer: PhysicalPoint,
         refusal: Option<&'a str>,
@@ -249,21 +270,94 @@ impl SelectionEdit {
 }
 
 impl WireDrag {
-    /// The edit connecting the origin to `target`, if it would change the graph.
-    fn edit(&self, graph: &Graph, target: PinRef) -> Option<ConnectionEdit> {
-        let connection = match self.side {
-            Side::Output => Connection {
-                from: self.origin,
-                to: target,
-            },
-            Side::Input => Connection {
-                from: target,
-                to: self.origin,
-            },
+    fn new(graph: &Graph, pressed: PinRef, side: Side, since: AddStamp) -> WireDrag {
+        let lifted: Vec<_> = match side {
+            Side::Output => Vec::new(),
+            Side::Input => graph
+                .connections()
+                .iter()
+                .filter(|connection| connection.to == pressed)
+                .map(|connection| connection.from)
+                .collect(),
         };
-        let edit = ConnectionEdit {
-            remove: Vec::new(),
-            add: vec![connection],
+        WireDrag {
+            pressed,
+            side,
+            since,
+            dragged: if lifted.is_empty() {
+                Dragged::New
+            } else {
+                Dragged::Lifted(lifted)
+            },
+            target: None,
+            proposal: None,
+        }
+    }
+
+    /// The side of a pin the free end joins.
+    fn free_side(&self) -> Side {
+        match self.dragged {
+            Dragged::New => self.side.opposite(),
+            Dragged::Lifted(_) => Side::Input,
+        }
+    }
+
+    /// The pins the dragged wires stay attached to, all on the returned side.
+    fn attached(&self) -> (&[PinRef], Side) {
+        match &self.dragged {
+            Dragged::New => (std::slice::from_ref(&self.pressed), self.side),
+            Dragged::Lifted(outputs) => (outputs, Side::Output),
+        }
+    }
+
+    /// Forgets lifted wires the graph no longer has, and returns whether the drag still holds
+    /// any wire: the pressed side and, for a lift, at least one of its wires must remain.
+    fn still_holds(&mut self, graph: &Graph) -> bool {
+        if !graph.has_port_since(self.pressed, self.side, self.since) {
+            return false;
+        }
+        let Dragged::Lifted(outputs) = &mut self.dragged else {
+            return true;
+        };
+        let input = self.pressed;
+        outputs.retain(|&from| {
+            graph.has_node_since(from.node, self.since)
+                && graph.contains_connection(Connection { from, to: input })
+        });
+        !outputs.is_empty()
+    }
+
+    /// The edit dropping the free end at `target`, if it would change the graph. Lifted wires all
+    /// move or are all removed.
+    fn edit(&self, graph: &Graph, target: Target) -> Option<ConnectionEdit> {
+        let edit = match (&self.dragged, target) {
+            (Dragged::New, Target::Space) => return None,
+            (Dragged::New, Target::Pin(target)) => {
+                let connection = match self.side {
+                    Side::Output => Connection {
+                        from: self.pressed,
+                        to: target,
+                    },
+                    Side::Input => Connection {
+                        from: target,
+                        to: self.pressed,
+                    },
+                };
+                ConnectionEdit {
+                    remove: Vec::new(),
+                    add: vec![connection],
+                }
+            }
+            (Dragged::Lifted(outputs), target) => {
+                let into = |to| outputs.iter().map(move |&from| Connection { from, to });
+                ConnectionEdit {
+                    remove: into(self.pressed).collect(),
+                    add: match target {
+                        Target::Pin(target) => into(target).collect(),
+                        Target::Space => Vec::new(),
+                    },
+                }
+            }
         };
         edit.normalised(graph)
     }
@@ -433,7 +527,10 @@ impl View {
     /// highlighted.
     pub(crate) fn hovered_side(&self) -> Option<(PinRef, Side)> {
         match &self.gesture {
-            Some(Gesture::Wire(drag)) => drag.target.map(|pin| (pin, drag.side.opposite())),
+            Some(Gesture::Wire(drag)) => match drag.target {
+                Some(Target::Pin(pin)) => Some((pin, drag.free_side())),
+                Some(Target::Space) | None => None,
+            },
             _ => self.hover,
         }
     }
@@ -442,14 +539,15 @@ impl View {
         let Some(Gesture::Wire(drag)) = &self.gesture else {
             return None;
         };
+        let (attached, side) = drag.attached();
         Some(match &drag.proposal {
             Some(Proposal {
                 edit,
                 verdict: Verdict::Accept { displaced },
             }) => WirePreview::Accepted { edit, displaced },
             proposal => WirePreview::Loose {
-                from: drag.origin,
-                side: drag.side,
+                from: attached,
+                side,
                 pointer: self.pointer.expect("a wire drag follows a press"),
                 refusal: match proposal {
                     Some(Proposal {
@@ -505,17 +603,11 @@ impl View {
             // Modifiers do not change a port drag. The view follows the wire after the event.
             Some(Gesture::Press {
                 at,
-                port: Some((origin, side)),
+                port: Some((pressed, side)),
                 since,
                 ..
-            }) if self.beyond_drag_threshold(at, position) && starts_wire(graph, origin, side) => {
-                Some(Gesture::Wire(WireDrag {
-                    origin,
-                    side,
-                    since,
-                    target: None,
-                    proposal: None,
-                }))
+            }) if self.beyond_drag_threshold(at, position) => {
+                Some(Gesture::Wire(WireDrag::new(graph, pressed, side, since)))
             }
             // Modified drags on a node will move it with its upstream or downstream nodes, so for
             // now they stay clicks.
@@ -620,9 +712,9 @@ impl View {
             Gesture::Pan { .. } => (Vec::new(), None),
             Gesture::Wire(mut drag) => {
                 // The graph may have changed since the last event without a refresh.
-                if graph.has_port_since(drag.origin, drag.side, drag.since) {
+                if drag.still_holds(graph) {
                     let edit = self
-                        .wire_target(graph, drag.side)
+                        .drop_under_pointer(graph, drag.free_side())
                         .and_then(|target| drag.edit(graph, target));
                     drag.propose(edit, judge);
                     connections = drag
@@ -725,8 +817,7 @@ impl View {
     }
 
     fn key_pressed(&mut self, graph: &Graph, key: Key) -> Response {
-        let pointer_inside =
-            self.pointer_in_target && self.pointer.is_some_and(|p| self.viewport.contains(p));
+        let pointer_inside = self.pointer_in_view().is_some();
         let handled = match key {
             Key::Space => {
                 self.space_held = true;
@@ -807,28 +898,35 @@ impl View {
         self.port_under_pointer(graph)
     }
 
-    /// The pin whose side opposite `side` is under the pointer, which a wire from `side` would
-    /// join.
-    fn wire_target(&self, graph: &Graph, side: Side) -> Option<PinRef> {
-        self.port_under_pointer(graph)
-            .filter(|&(_, target)| target == side.opposite())
-            .map(|(pin, _)| pin)
+    /// Where a wire end joining `side` would land at the pointer: on that side of the pin under
+    /// it, or in empty space. Elsewhere on a node, or outside this view, it lands nowhere.
+    fn drop_under_pointer(&self, graph: &Graph, side: Side) -> Option<Target> {
+        let pointer = self.pointer_in_view()?;
+        match graph.hit(self.to_graph(pointer), self.port_reach()) {
+            None => Some(Target::Space),
+            Some((node, Part::Port(pin, hit))) if hit == side => {
+                Some(Target::Pin(PinRef { node, pin }))
+            }
+            Some(_) => None,
+        }
     }
 
     /// The side of a pin under the pointer, if the pointer is in this view.
     fn port_under_pointer(&self, graph: &Graph) -> Option<(PinRef, Side)> {
-        if !self.pointer_in_target {
-            return None;
-        }
-        let pointer = self.pointer.filter(|&p| self.viewport.contains(p))?;
+        let pointer = self.pointer_in_view()?;
         match graph.hit(self.to_graph(pointer), self.port_reach())? {
             (node, Part::Port(pin, side)) => Some((PinRef { node, pin }, side)),
             (_, Part::Body | Part::Header(_)) => None,
         }
     }
 
-    /// Moves a wire drag's target to the port under the pointer, proposing the new connection,
-    /// or cancels the drag if its origin is gone. Returns whether it cancelled the drag.
+    fn pointer_in_view(&self) -> Option<PhysicalPoint> {
+        self.pointer
+            .filter(|&pointer| self.pointer_in_target && self.viewport.contains(pointer))
+    }
+
+    /// Moves a wire drag's target to where the pointer is, proposing the edit dropping it there,
+    /// or cancels the drag if it no longer holds a wire. Returns whether it cancelled the drag.
     fn follow_wire(&mut self, graph: &Graph, judge: &mut Judge<'_>) -> bool {
         let Some(Gesture::Wire(mut drag)) = self
             .gesture
@@ -836,10 +934,10 @@ impl View {
         else {
             return false;
         };
-        if !graph.has_port_since(drag.origin, drag.side, drag.since) {
+        if !drag.still_holds(graph) {
             return true;
         }
-        let target = self.wire_target(graph, drag.side);
+        let target = self.drop_under_pointer(graph, drag.free_side());
         if target != drag.target {
             drag.target = target;
             let edit = target.and_then(|target| drag.edit(graph, target));
@@ -879,12 +977,6 @@ impl View {
             y: centre.y + (point.y - self.centre.y) * per_unit,
         }
     }
-}
-
-/// Whether a drag from this side of a pin starts a new wire. An occupied input's wires are
-/// lifted rather than joined by another; lifting is not built, so a drag there moves the node.
-fn starts_wire(graph: &Graph, pin: PinRef, side: Side) -> bool {
-    side == Side::Output || !graph.connections().iter().any(|c| c.to == pin)
 }
 
 /// Whether `after` selects different nodes from the graph's selection. Order alone is no change.
@@ -1887,10 +1979,12 @@ mod tests {
         }
     }
 
-    /// A host's connection policy that refuses wires into one pin and records what it is asked.
+    /// A host's connection policy that refuses wires into one pin and removing one wire, and
+    /// records what it is asked.
     #[derive(Default)]
     struct Policy {
         refused: Option<PinRef>,
+        kept: Option<Connection>,
         asked: Vec<ConnectionEdit>,
     }
 
@@ -1901,6 +1995,10 @@ mod tests {
                 if edit.add.iter().any(|c| Some(c.to) == self.refused) {
                     Verdict::Refuse {
                         reason: Some("Locked".to_owned()),
+                    }
+                } else if edit.remove.iter().any(|&c| Some(c) == self.kept) {
+                    Verdict::Refuse {
+                        reason: Some("Kept".to_owned()),
                     }
                 } else {
                     Verdict::Accept {
@@ -2190,5 +2288,235 @@ mod tests {
             .unwrap();
         view.refresh(&graph, accept_all);
         assert_eq!(view.hovered_side(), None);
+    }
+
+    /// [`unwired`] plus node 3 below node 1 with output 1, its port at physical (500, 394), and
+    /// wires from both outputs into node 2's input 1.
+    fn lifting() -> Graph {
+        let mut graph = unwired();
+        let mut source = untitled(at(0.0, 60.0));
+        source.rows = vec![pin_row(1, Direction::Output)];
+        graph.add_node(NodeId(3), source).unwrap();
+        for wire in lifted(1) {
+            graph.add_connection(wire).unwrap();
+        }
+        graph
+    }
+
+    const OUTPUT_3: (f32, f32) = (500.0, 394.0);
+    /// Over no node, well inside the view.
+    const SPACE: (f32, f32) = (700.0, 500.0);
+
+    /// The wires [`lifting`] lifts, as they would be into node 2's `input`.
+    fn lifted(input: u64) -> [Connection; 2] {
+        [1, 3].map(|node| Connection {
+            from: pin_ref(node, 1),
+            to: pin_ref(2, input),
+        })
+    }
+
+    fn moved(input: u64) -> ConnectionEdit {
+        ConnectionEdit {
+            remove: lifted(1).to_vec(),
+            add: lifted(input).to_vec(),
+        }
+    }
+
+    fn removed() -> ConnectionEdit {
+        ConnectionEdit {
+            remove: lifted(1).to_vec(),
+            add: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_drag_from_an_occupied_input_lifts_all_its_wires_onto_another_input() {
+        let graph = lifting();
+        let mut view = View::new(WHOLE);
+        let mut policy = Policy::default();
+        let (x, y) = INPUT_1;
+
+        let click = [press(x, y), release(x, y)];
+        let response = send_judged(&mut view, &graph, &mut policy, &click);
+        assert_eq!(
+            response.selection,
+            Some(ids(&[2])),
+            "a click never disconnects"
+        );
+        assert_eq!(response.connections, None);
+
+        let _ = send_judged(
+            &mut view,
+            &graph,
+            &mut policy,
+            &[press(x, y), move_to(x + 4.0, y)],
+        );
+        let Some(WirePreview::Loose { from, side, .. }) = view.wire_preview() else {
+            panic!("dropping back where they were changes nothing");
+        };
+        assert_eq!(
+            (from, side),
+            (&[pin_ref(1, 1), pin_ref(3, 1)][..], Side::Output)
+        );
+
+        let (x, y) = INPUT_2;
+        let _ = send_judged(&mut view, &graph, &mut policy, &[move_to(x, y)]);
+        assert_eq!(preview(&view), Some(Ok(moved(2))));
+        assert_eq!(view.hovered_side(), Some((pin_ref(2, 2), Side::Input)));
+        let (x, y) = OUTPUT_3;
+        let _ = send_judged(&mut view, &graph, &mut policy, &[move_to(x, y)]);
+        assert_eq!(
+            preview(&view),
+            Some(Err(None)),
+            "a lifted end joins no output"
+        );
+        let (x, y) = INPUT_2;
+        let response = send_judged(
+            &mut view,
+            &graph,
+            &mut policy,
+            &[move_to(x, y), release(x, y)],
+        );
+        assert_eq!(response.connections, Some(moved(2)));
+        assert_eq!(policy.asked, [moved(2), moved(2)]);
+
+        let (to_x, to_y) = INPUT_1;
+        let drop_back = [
+            press(to_x, to_y),
+            move_to(x, y),
+            move_to(to_x, to_y),
+            release(to_x, to_y),
+        ];
+        let response = send_judged(&mut view, &graph, &mut policy, &drop_back);
+        assert_eq!(response.connections, None);
+    }
+
+    #[test]
+    fn lifted_wires_are_removed_only_over_empty_space_in_the_view() {
+        let graph = lifting();
+        let mut view = View::new(WHOLE);
+        let mut policy = Policy::default();
+        let (x, y) = INPUT_1;
+        let (space_x, space_y) = SPACE;
+        let lift = [press(x, y), move_to(space_x, space_y)];
+        let nothing = Response {
+            handled: true,
+            ..Response::default()
+        };
+
+        let _ = send_judged(&mut view, &graph, &mut policy, &lift);
+        assert_eq!(preview(&view), Some(Ok(removed())));
+        assert_eq!(view.hovered_side(), None);
+        let response = send_judged(&mut view, &graph, &mut policy, &[release(space_x, space_y)]);
+        assert_eq!(response.connections, Some(removed()));
+
+        for (x, y) in [(650.0, 320.0), (850.0, 500.0)] {
+            let mut released = lift.to_vec();
+            released.extend([move_to(x, y), release(x, y)]);
+            let response = send_judged(&mut view, &graph, &mut policy, &released);
+            assert_eq!(response, nothing, "over a node body or outside the view");
+        }
+
+        let mut left = lift.to_vec();
+        left.push(InputEvent::PointerLeft);
+        let _ = send_judged(&mut view, &graph, &mut policy, &left);
+        assert_eq!(preview(&view), Some(Err(None)), "outside the window");
+
+        let middle = InputEvent::PointerPressed {
+            position: px(space_x, space_y),
+            button: Button::Middle,
+            modifiers: Modifiers::default(),
+        };
+        for cancel in [InputEvent::KeyPressed(Key::Escape), middle] {
+            let _ = send_judged(&mut view, &graph, &mut policy, &lift);
+            let _ = send_judged(&mut view, &graph, &mut policy, &[cancel]);
+            let response =
+                send_judged(&mut view, &graph, &mut policy, &[release(space_x, space_y)]);
+            assert_eq!(response.connections, None);
+        }
+        let _ = send_judged(&mut view, &graph, &mut policy, &lift);
+        view.cancel_gesture();
+        let response = send_judged(&mut view, &graph, &mut policy, &[release(space_x, space_y)]);
+        assert_eq!(response.connections, None);
+    }
+
+    #[test]
+    fn a_lift_is_judged_all_or_nothing() {
+        let graph = lifting();
+        let mut view = View::new(WHOLE);
+        let mut policy = Policy {
+            kept: Some(lifted(1)[1]),
+            ..Policy::default()
+        };
+        let (x, y) = INPUT_1;
+        let (space_x, space_y) = SPACE;
+        let lift = [press(x, y), move_to(space_x, space_y)];
+
+        let _ = send_judged(&mut view, &graph, &mut policy, &lift);
+        assert_eq!(preview(&view), Some(Err(Some("Kept".to_owned()))));
+        let response = send_judged(&mut view, &graph, &mut policy, &[release(space_x, space_y)]);
+        assert_eq!(response.connections, None);
+        assert_eq!(policy.asked, [removed()]);
+    }
+
+    #[test]
+    fn a_lift_lets_go_of_wires_the_host_removes_and_ends_with_the_last() {
+        let mut graph = lifting();
+        let mut view = View::new(WHOLE);
+        let mut policy = Policy::default();
+        let (x, y) = INPUT_1;
+        let (space_x, space_y) = SPACE;
+        let _ = send_judged(
+            &mut view,
+            &graph,
+            &mut policy,
+            &[press(x, y), move_to(space_x, space_y)],
+        );
+
+        // Node 3 goes and returns under its ID with the same wire, which is not the lifted one.
+        let record = graph.node(NodeId(3)).unwrap().clone();
+        graph.remove_node(NodeId(3)).unwrap();
+        graph.add_node(NodeId(3), record).unwrap();
+        graph.add_connection(lifted(1)[1]).unwrap();
+        view.refresh(&graph, policy.judge());
+        let only_1 = ConnectionEdit {
+            remove: vec![lifted(1)[0]],
+            add: Vec::new(),
+        };
+        assert_eq!(preview(&view), Some(Ok(only_1.clone())));
+
+        let (to_x, to_y) = INPUT_2;
+        let _ = send_judged(&mut view, &graph, &mut policy, &[move_to(to_x, to_y)]);
+        graph.remove_connection(lifted(1)[0]).unwrap();
+        let response = send_judged(&mut view, &graph, &mut policy, &[release(to_x, to_y)]);
+        assert_eq!(
+            response,
+            Response {
+                handled: true,
+                ..Response::default()
+            },
+            "unrefreshed, the release finds none left"
+        );
+
+        let mut graph = lifting();
+        let _ = send_judged(
+            &mut view,
+            &graph,
+            &mut policy,
+            &[press(x, y), move_to(space_x, space_y)],
+        );
+        graph.remove_connection(lifted(1)[0]).unwrap();
+        let response = send_judged(&mut view, &graph, &mut policy, &[move_to(to_x, to_y)]);
+        assert_eq!(
+            preview(&view),
+            Some(Ok(ConnectionEdit {
+                remove: vec![lifted(1)[1]],
+                add: vec![lifted(2)[1]],
+            }))
+        );
+        assert!(response.handled);
+        graph.remove_connection(lifted(1)[1]).unwrap();
+        let response = send_judged(&mut view, &graph, &mut policy, &[move_to(to_x, to_y)]);
+        assert!(response.handled && !view.has_active_gesture());
     }
 }

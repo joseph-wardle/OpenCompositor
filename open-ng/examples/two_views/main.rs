@@ -4,7 +4,7 @@
 //! response from a view does. Moves snap to a 10-unit grid, the Write node is locked in place,
 //! and Ctrl+Z and Ctrl+Shift+Z undo and redo moves and selection changes. Folding a group stays
 //! out of the history, as Blender keeps panel toggles out of undo. Wires can be dragged between
-//! ports, but the host refuses every connection edit for now.
+//! ports and lifted off inputs, but the host refuses every connection edit for now.
 //!
 //! This file is what every platform shares; each platform's module starts the GPU, translates its
 //! events and schedules redraws.
