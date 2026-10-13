@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 
-use crate::geometry::Rect;
-use crate::graph::{AddStamp, Graph, GroupId, NodeId, Point};
+use crate::geometry::{self, Part, Rect};
+use crate::graph::{AddStamp, Graph, GroupId, NodeId, PinRef, Point, Side};
 use crate::input::{Button, InputEvent, Key, Modifiers, PhysicalPoint};
 
 const MIN_ZOOM: f32 = 0.01;
@@ -86,6 +86,8 @@ pub struct View {
     pointer_in_target: bool,
     space_held: bool,
     gesture: Option<Gesture>,
+    /// The side of a pin a press at the pointer would grab, while no gesture is in progress.
+    hover: Option<(PinRef, Side)>,
 }
 
 #[derive(Debug)]
@@ -209,6 +211,7 @@ impl View {
             pointer_in_target: false,
             space_held: false,
             gesture: None,
+            hover: None,
         }
     }
 
@@ -235,7 +238,13 @@ impl View {
     }
 
     pub fn handle_input(&mut self, graph: &Graph, event: InputEvent) -> Response {
-        match event {
+        // Keys the view does not use leave the hover alone, so that a change to the graph since
+        // the last event never reports a host shortcut as handled.
+        let pointer_event = !matches!(
+            event,
+            InputEvent::KeyPressed(_) | InputEvent::KeyReleased(_)
+        );
+        let mut response = match event {
             InputEvent::PointerMoved { position } => self.pointer_moved(graph, position),
             InputEvent::PointerPressed {
                 position,
@@ -257,7 +266,15 @@ impl View {
                 self.pointer_in_target = false;
                 Response::default()
             }
+        };
+        if pointer_event || response.handled {
+            let hover = self.side_under_pointer(graph);
+            if hover != self.hover {
+                self.hover = hover;
+                response.handled = true;
+            }
         }
+        response
     }
 
     /// The graph point at the viewport's centre.
@@ -303,6 +320,11 @@ impl View {
                 self.box_selection(graph, *from, *combine).apply(graph)
             }
         }
+    }
+
+    /// The side of a pin a press at the pointer would grab, drawn highlighted.
+    pub(crate) fn hovered_side(&self) -> Option<(PinRef, Side)> {
+        self.hover
     }
 
     /// The part of the graph the viewport shows.
@@ -401,16 +423,17 @@ impl View {
             }
         } else {
             let from = self.to_graph(position);
-            let node = graph.node_at(from);
+            let hit = graph.hit(from, self.port_reach());
             let combine = Combine::from_modifiers(modifiers);
             // Modified clicks on a header select, as they do on the rest of the node.
-            let header = node
-                .filter(|_| combine == Combine::Replace)
-                .and_then(|id| graph.header_at(id, from));
+            let header = match hit {
+                Some((_, Part::Header(group))) if combine == Combine::Replace => Some(group),
+                _ => None,
+            };
             Gesture::Press {
                 at: position,
                 from,
-                node,
+                node: hit.map(|(id, _)| id),
                 header,
                 combine,
                 since: graph.add_stamp(),
@@ -602,6 +625,24 @@ impl View {
     fn beyond_drag_threshold(&self, from: PhysicalPoint, to: PhysicalPoint) -> bool {
         let threshold = DRAG_THRESHOLD * self.viewport.scale_factor;
         (to.x - from.x).abs() > threshold || (to.y - from.y).abs() > threshold
+    }
+
+    /// The side of a pin a press at the pointer would grab, if the pointer is in this view and
+    /// no gesture is in progress.
+    fn side_under_pointer(&self, graph: &Graph) -> Option<(PinRef, Side)> {
+        if self.gesture.is_some() || !self.pointer_in_target {
+            return None;
+        }
+        let pointer = self.pointer.filter(|&p| self.viewport.contains(p))?;
+        match graph.hit(self.to_graph(pointer), self.port_reach())? {
+            (node, Part::Port(pin, side)) => Some((PinRef { node, pin }, side)),
+            (_, Part::Body | Part::Header(_)) => None,
+        }
+    }
+
+    /// How far past a node's outline its ports are hit, in graph units.
+    fn port_reach(&self) -> f32 {
+        geometry::port_reach(self.logical_per_unit())
     }
 
     pub(crate) fn physical_per_unit(&self) -> f32 {
@@ -1323,6 +1364,60 @@ mod tests {
         let response = view.handle_input(&graph, release(600.0, 350.0));
         assert_eq!(response.positions, []);
         assert_eq!(response.selection, None);
+    }
+
+    #[test]
+    fn hovering_shows_the_side_a_press_would_grab_and_a_press_there_grabs_the_node() {
+        let mut graph = Graph::default();
+        let mut record = untitled(at(0.0, 0.0));
+        record.rows = vec![Row::Pin(Pin {
+            id: PinId(1),
+            label: "Size".to_owned(),
+            direction: Direction::Both,
+        })];
+        graph.add_node(NodeId(1), record).unwrap();
+        let mut view = View::new(WHOLE);
+        let size = |side| {
+            let pin = PinRef {
+                node: NodeId(1),
+                pin: PinId(1),
+            };
+            Some((pin, side))
+        };
+        // The row's middle, below the 24-unit title.
+        let y = 334.0;
+
+        assert!(view.handle_input(&graph, move_to(490.0, y)).handled);
+        assert_eq!(view.hovered_side(), size(Side::Output), "past the label");
+        assert!(!view.handle_input(&graph, move_to(491.0, y)).handled);
+        let _ = view.handle_input(&graph, move_to(402.0, y));
+        assert_eq!(view.hovered_side(), size(Side::Input));
+        let _ = view.handle_input(&graph, move_to(395.0, y));
+        assert_eq!(
+            view.hovered_side(),
+            size(Side::Input),
+            "a reach past the edge"
+        );
+        assert!(view.handle_input(&graph, move_to(450.0, 312.0)).handled);
+        assert_eq!(view.hovered_side(), None, "the title");
+
+        let _ = send(&mut view, &graph, &[move_to(490.0, y), press(490.0, y)]);
+        assert_eq!(view.hovered_side(), None, "hidden during a gesture");
+        let response = view.handle_input(&graph, release(490.0, y));
+        assert_eq!(response.selection, Some(ids(&[1])));
+        assert_eq!(view.hovered_side(), size(Side::Output));
+        assert!(view.handle_input(&graph, InputEvent::PointerLeft).handled);
+        assert_eq!(view.hovered_side(), None);
+
+        // Zooming in about a point just past the edge brings the reach within it.
+        let _ = view.handle_input(&graph, move_to(395.0, y));
+        assert_eq!(view.hovered_side(), size(Side::Input));
+        let zoom_in = InputEvent::Scrolled {
+            position: px(395.0, y),
+            lines: 8.0,
+        };
+        let _ = view.handle_input(&graph, zoom_in);
+        assert_eq!(view.hovered_side(), None);
     }
 
     /// Node 1 centred at the origin as in [`three_nodes`], with group 7's header as its first row

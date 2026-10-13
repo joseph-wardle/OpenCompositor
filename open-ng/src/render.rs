@@ -8,7 +8,9 @@ use bytemuck::{Pod, Zeroable};
 use rustc_hash::FxHashSet;
 
 use crate::atlas::{ATLAS_SIZE, GlyphAtlas, Ink};
-use crate::geometry::{self, LABEL_SIZE, LabelText, Rect, TITLE_HEIGHT, WIRE_SEGMENTS};
+use crate::geometry::{
+    self, LABEL_SIZE, LabelText, PORT_RADIUS, Rect, TITLE_HEIGHT, WIRE_SEGMENTS,
+};
 use crate::graph::{Color, Graph, NodeId, PinRef, Point, Side};
 use crate::input::PhysicalPoint;
 use crate::text::{advance, bundled_font, cap_height};
@@ -24,10 +26,11 @@ const NODE_BORDER: [u8; 4] = [20, 20, 20, 255];
 const NODE_BORDER_WIDTH: f32 = 1.0;
 const SELECTED_BORDER: [u8; 4] = [255, 200, 40, 255];
 const SELECTED_BORDER_WIDTH: f32 = 2.5;
-const PORT_RADIUS: f32 = 4.0;
 const PORT_FILL: [u8; 4] = [210, 210, 210, 255];
 const PORT_RING: [u8; 4] = [150, 150, 150, 255];
 const PORT_RING_WIDTH: f32 = 1.5;
+/// The ring of the port a press would grab.
+const HOVERED_RING: [u8; 4] = [255, 255, 255, 255];
 const BOX_FILL: [u8; 4] = [255, 255, 255, 12];
 const BOX_BORDER: [u8; 4] = [220, 220, 220, 255];
 const TITLE_TEXT: [u8; 4] = [240, 240, 240, 255];
@@ -534,11 +537,19 @@ fn shapes(graph: &Graph, view: &View, font: &FontRef<'_>, atlas: &mut GlyphAtlas
             border,
             ..rectangle(rect)
         });
+        let hovered = view
+            .hovered_side()
+            .filter(|(pin, _)| pin.node == id)
+            .and_then(|(pin, side)| layout.port_index(pin.pin, side));
         shapes.extend(layout.ports(top_left).enumerate().map(|(index, port)| {
-            let (fill, border, border_width) = if connected.contains(&(id, index)) {
-                (PORT_FILL, NODE_BORDER, NODE_BORDER_WIDTH)
+            let connected = connected.contains(&(id, index));
+            let fill = if connected { PORT_FILL } else { [0; 4] };
+            let (border, border_width) = if hovered == Some(index) {
+                (HOVERED_RING, PORT_RING_WIDTH)
+            } else if connected {
+                (NODE_BORDER, NODE_BORDER_WIDTH)
             } else {
-                ([0; 4], PORT_RING, PORT_RING_WIDTH)
+                (PORT_RING, PORT_RING_WIDTH)
             };
             Shape {
                 centre: [port.x, port.y],
@@ -972,6 +983,43 @@ mod tests {
             .collect();
         // Each node's input port, then its output port.
         assert_eq!(filled, [false, true, true, false]);
+    }
+
+    #[test]
+    fn the_port_a_press_would_grab_is_ringed() {
+        let mut graph = Graph::default();
+        let record = NodeRecord {
+            position: at(0.0, 0.0),
+            title: String::new(),
+            color: GREY,
+            rows: vec![Row::Pin(Pin {
+                id: PinId(1),
+                label: String::new(),
+                direction: Direction::Both,
+            })],
+        };
+        graph.add_node(NodeId(1), record).unwrap();
+        let mut view = view(1.0);
+        let ringed = |view: &View| -> Vec<bool> {
+            shapes_without_text(&graph, view)
+                .iter()
+                .filter(|shape| shape.half_size == [PORT_RADIUS; 2])
+                .map(|shape| shape.border == HOVERED_RING)
+                .collect()
+        };
+        let hover = |view: &mut View, x| {
+            let position = PhysicalPoint {
+                x: 400.0 + x,
+                y: 300.0 + TITLE_HEIGHT + ROW_HEIGHT / 2.0,
+            };
+            let _ = view.handle_input(&graph, InputEvent::PointerMoved { position });
+        };
+
+        assert_eq!(ringed(&view), [false, false]);
+        hover(&mut view, MIN_WIDTH / 2.0);
+        assert_eq!(ringed(&view), [false, true]);
+        hover(&mut view, 1.0);
+        assert_eq!(ringed(&view), [true, false]);
     }
 
     /// Nodes 1, 2 and 3, untitled with no rows, side by side from x = -200, -50 and 100.

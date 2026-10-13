@@ -110,7 +110,10 @@ fn listen(host: &Rc<RefCell<Host>>, canvas: &HtmlCanvasElement, document: &Docum
     {
         let host = host.clone();
         on(canvas, "pointerleave", move |_: PointerEvent| {
-            host.borrow_mut().editor.handle(InputEvent::PointerLeft);
+            let handled = host.borrow_mut().editor.handle(InputEvent::PointerLeft);
+            if handled {
+                request_frame(&host);
+            }
         });
     }
     // Capture also ends after the last button is released, when no gesture remains to cancel.

@@ -373,7 +373,7 @@ impl Graph {
     /// All nodes with their layouts, in the order they were added.
     pub(crate) fn laid_out_nodes(
         &self,
-    ) -> impl Iterator<Item = (NodeId, &NodeRecord, &NodeLayout)> {
+    ) -> impl DoubleEndedIterator<Item = (NodeId, &NodeRecord, &NodeLayout)> {
         self.nodes
             .iter()
             .map(|entry| (entry.id, &entry.record, &entry.layout))
