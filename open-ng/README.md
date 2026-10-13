@@ -4,36 +4,68 @@ A node-editor library for Rust applications that own their graph documents.
 
 ## Status
 
-Early and experimental. Current features include:
+Very early and very experimental. Current features include:
 
 - A shared presentation `Graph` of nodes, connections and a selection, kept in step with your document. Each node has a title and rows of labelled input and output pins, which may sit in foldable groups.
 - Any number of `View`s of one graph, each with its own pan, zoom and gesture in progress.
 - Selection by click and box, moving nodes, folding groups, panning and zooming, and framing all or selected nodes.
+- Connection editing: drawing wires between ports, lifting wires off an input to move or remove them, and cutting wires with a stroke. The host judges each edit while it is previewed and decides again when applying it.
 - A wgpu renderer that draws views into a render pass you own, with text in one bundled font.
-- An example with two views of one graph, a small undo history, snapping and a locked node, running natively and in a web page with WebGPU or WebGL2.
+- An example with two views of one graph, a small undo history, snapping, a locked node and inputs that take one wire, several, or a growing list, running natively and in a web page with WebGPU or WebGL2.
 
-There is no connection editing, hover, touch input or remappable shortcuts. Text is set without kerning, shaping or right-to-left support, and host fonts are not supported. The API will have breaking changes.
+There is no touch input or remappable shortcuts. Text is set without kerning, shaping or right-to-left support, and host fonts are not supported. The API will have breaking changes.
 
 ## How a host uses it
 
 You own one `Graph` per document network, a `View` per pane, one `Renderer` per device and target format, and a `ViewBuffers` beside each view. OpenNG keeps no global state.
 
-Input: translate your window events into `InputEvent`s and send each to every view. A view returns a `Response` with the positions, selection and group fold it requests. Apply what you accept to your document and then to the graph; ignore the rest to reject it. Ignoring a response leaves the graph unchanged, and every view draws the committed result.
+Input: translate your window events into `InputEvent`s and send each to every view. A view returns a `Response` with the positions, selection, group fold and connection edit it requests. Apply what you accept to your document and then to the graph; ignore the rest to reject it. Ignoring a response leaves the graph unchanged, and every view draws the committed result.
+
+While a wire drag or cut is in progress, the view asks a judge you pass in whether you would accept the `ConnectionEdit` it proposes, and previews your `Verdict`: an acceptance, with any other connections you would remove such as the wire a new one replaces, or a refusal with an optional reason shown beside the pointer. The verdict is advisory. When the gesture ends, the response carries the edit only if you last accepted it, and you decide again when applying it. After changing the graph or your rules, refresh every view, including the one whose response you applied.
 
 ```rust
+// Refuse wires into or out of a locked node, and accept the rest.
+let judge = |edit: &ConnectionEdit| {
+    let mut changes = edit.remove.iter().chain(&edit.add);
+    if changes.any(|c| c.from.node == LOCKED || c.to.node == LOCKED) {
+        Verdict::Refuse { reason: Some("Locked".to_owned()) }
+    } else {
+        Verdict::Accept { displaced: Vec::new() }
+    }
+};
+let mut changed = false;
 for view in &mut views {
-    let response = view.handle_input(&graph, event);
+    let response = view.handle_input(&graph, event, judge);
     redraw |= response.handled;
 
-    // Accept moves except of a locked node, and every selection change.
+    // Accept moves except of the locked node, and every selection change.
     let moves: Vec<_> = response
         .positions
         .into_iter()
         .filter(|&(id, _)| id != LOCKED)
         .collect();
+    changed |= !moves.is_empty();
     graph.set_node_positions(&moves)?;
     if let Some(selection) = response.selection {
         graph.set_selection(&selection)?;
+    }
+    if let Some(edit) = response.connections
+        && matches!(judge(&edit), Verdict::Accept { .. })
+    {
+        for &connection in &edit.remove {
+            graph.remove_connection(connection)?;
+        }
+        for &connection in &edit.add {
+            if !graph.contains_connection(connection) {
+                graph.add_connection(connection)?;
+            }
+        }
+        changed = true;
+    }
+}
+if changed {
+    for view in &mut views {
+        view.refresh(&graph, judge);
     }
 }
 ```
@@ -64,7 +96,7 @@ To run it in a browser, install [Trunk](https://trunkrs.dev), then from the `ope
 trunk serve --example two_views examples/two_views/index.html
 ```
 
-and open the address it prints. The page uses WebGPU where the browser offers it and WebGL2 otherwise, and shows which.
+and open the address it prints. The page uses WebGPU where the browser offers it and WebGL2 otherwise.
 
 | Input | Action |
 | --- | --- |
@@ -73,11 +105,15 @@ and open the address it prints. The page uses WebGPU where the browser offers it
 | Drag a node | Move it, or the whole selection if it is selected |
 | Drag on empty space | Box-select; Shift adds, Ctrl removes |
 | Click a group's header | Fold or unfold the group |
+| Drag from a port | Draw a wire to a port on the other side |
+| Drag from a wired input | Lift its wires; drop them on another input to move them, or on empty space to remove them |
+| Y and drag | Cut the wires the stroke crosses |
 | Middle drag, or Space and drag | Pan |
 | Scroll | Zoom about the pointer |
 | H, G | Frame all nodes or the selection |
 | Escape | Cancel the gesture in progress |
 | Ctrl+Z, Ctrl+Shift+Z | Undo and redo (the example's own history) |
+| L | Lock or unlock the Write node (the example's own rule) |
 
 ## License
 

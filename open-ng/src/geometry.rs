@@ -1,11 +1,9 @@
 //! Where nodes, ports and wires are, computed in one place for drawing, wire ends and hit testing.
 
-use std::collections::HashSet;
-
 use ab_glyph::FontRef;
 use rustc_hash::FxHashMap;
 
-use crate::graph::{Direction, Graph, GroupId, NodeId, NodeRecord, PinId, Point, Row};
+use crate::graph::{Direction, Graph, GroupId, NodeId, NodeRecord, PinId, Point, Row, Side};
 use crate::text::{cap_height, text_width};
 
 // Sizes in graph units, to tune once text is drawn.
@@ -20,6 +18,14 @@ pub(crate) const LABEL_SIZE: f32 = 11.0;
 const TEXT_INSET: f32 = 12.0;
 /// Room before the title and group labels for a fold caret.
 const CARET_WIDTH: f32 = 14.0;
+/// The radius of a drawn port.
+pub(crate) const PORT_RADIUS: f32 = 4.0;
+/// The least distance, in logical pixels, from which a port is hit, so that small ports stay easy
+/// to grab when zoomed out.
+const PORT_REACH_PIXELS: f32 = 6.0;
+/// The straight segments a wire is drawn with. Anything that tests where a wire is uses the same
+/// ones, so that it finds the wire where it is seen.
+pub(crate) const WIRE_SEGMENTS: u32 = 32;
 
 /// An axis-aligned rectangle in graph units, edges included.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,11 +70,35 @@ impl Graph {
 
     /// The topmost node whose outline contains the point. Selected nodes are above the rest.
     pub fn node_at(&self, point: Point) -> Option<NodeId> {
-        let selected: HashSet<_> = self.selection().iter().copied().collect();
-        self.nodes_in_draw_order(&selected)
-            .filter(|(_, record, layout)| layout.rect(record.position).contains(point))
-            .last()
-            .map(|(id, _, _)| id)
+        self.topmost(|record, layout| layout.rect(record.position).contains(point).then_some(()))
+            .map(|(id, ())| id)
+    }
+
+    /// The topmost node at the point, with the part of it there. A node's ports reach past its
+    /// outline by `port_reach` graph units, and what they reach over is the node's: a node above
+    /// another blocks the ports beneath it.
+    pub(crate) fn hit(&self, point: Point, port_reach: f32) -> Option<(NodeId, Part)> {
+        self.topmost(|record, layout| layout.part_at(record.position, point, port_reach))
+    }
+
+    /// The topmost node for which `find` finds something, with what it found. Selected nodes are
+    /// above the rest. The selection is searched only for nodes found, so that this allocates
+    /// nothing and can run on every pointer move.
+    fn topmost<T>(
+        &self,
+        mut find: impl FnMut(&NodeRecord, &NodeLayout) -> Option<T>,
+    ) -> Option<(NodeId, T)> {
+        let mut unselected = None;
+        for (id, record, layout) in self.laid_out_nodes().rev() {
+            let Some(found) = find(record, layout) else {
+                continue;
+            };
+            if self.selection().contains(&id) {
+                return Some((id, found));
+            }
+            unselected.get_or_insert((id, found));
+        }
+        unselected
     }
 
     /// The nodes whose outlines intersect the rectangle, in the order they were added.
@@ -77,43 +107,61 @@ impl Graph {
             .filter(move |(_, record, layout)| layout.rect(record.position).intersects(&rect))
             .map(|(id, _, _)| id)
     }
-
-    /// The group whose header row on the node contains the point, with the node at its committed
-    /// position.
-    pub(crate) fn header_at(&self, id: NodeId, point: Point) -> Option<GroupId> {
-        let record = self.node(id)?;
-        self.node_layout(id)?.header_at(record.position, point)
-    }
 }
 
 /// Where a node's parts are relative to its top-left corner. The graph lays out each record as
 /// it is added or replaced, so moving and drawing nodes never measures text.
 ///
-/// The title bar is at the top, then one row per pin or group header in record order. Each row's
-/// port is at its middle, on the left edge for an input and the right for an output. The node is
-/// as wide as its title and widest visible row need: text is never shortened.
+/// The title bar is at the top, then one row per pin or group header in record order. A row's
+/// ports are at its middle, on the left edge for an input side and the right for an output side.
+/// The node is as wide as its title and widest visible row need: text is never shortened.
 #[derive(Debug)]
 pub(crate) struct NodeLayout {
     width: f32,
     height: f32,
-    /// The ports drawn: one per visible pin, and one on each side of a folded group's header
-    /// that has members on that side.
+    /// The ports drawn: one per side of each visible pin, and one on each side of a folded
+    /// group's header that has members with that side.
     ports: Vec<Point>,
-    /// The index in `ports` each pin's wires end at.
-    port_of: FxHashMap<PinId, usize>,
+    /// The index in `ports` where the wires on each side of each pin end.
+    port_of: FxHashMap<(PinId, Side), usize>,
     /// Each group's header row, by the y of its top edge.
     headers: Vec<Header>,
+    /// Each visible row below the title, from top to bottom.
+    rows: Vec<VisibleRow>,
     /// The title and every visible row's label, from top to bottom.
     labels: Vec<Label>,
 }
 
 #[derive(Debug)]
 struct Header {
-    group: GroupId,
     top: f32,
     folded: bool,
     /// Where the fold caret's baseline starts.
     caret: Point,
+}
+
+#[derive(Debug)]
+enum VisibleRow {
+    Header(GroupId),
+    Pin {
+        pin: PinId,
+        direction: Direction,
+        /// The x where the row's input side gives way to its output side: the end of the label
+        /// for a pin with an input side, as that is where the label is, and its start otherwise.
+        split: f32,
+    },
+}
+
+/// What part of a node is at a point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Part {
+    Body,
+    /// A group's header row, outside its folded ports.
+    Header(GroupId),
+    /// A folded group's port. It stands for several pins, so it is no wire end.
+    FoldedPort(GroupId),
+    /// One side of an unfolded pin: its port, or the part of its row that grabs that side.
+    Port(PinId, Side),
 }
 
 /// A line of text on a node, relative to its top-left.
@@ -160,14 +208,15 @@ impl NodeLayout {
             },
             size: TITLE_SIZE,
         }];
-        // Each output label's index in `labels` and text width, to align right once the width
-        // is known.
+        // Each output label's index in `labels`, its row's index in `rows` and its text width, to
+        // align right once the width is known.
         let mut output_labels = Vec::new();
         let mut height = TITLE_HEIGHT;
-        // Each port's row middle and direction: its x waits for the width.
+        // Each port's row middle and side: its x waits for the width.
         let mut ports = Vec::new();
         let mut port_of = FxHashMap::default();
         let mut headers = Vec::new();
+        let mut rows = Vec::new();
         for row in &record.rows {
             let (pins, folded) = match row {
                 Row::Pin(pin) => (std::slice::from_ref(pin), false),
@@ -176,8 +225,8 @@ impl NodeLayout {
                         2.0 * TEXT_INSET + CARET_WIDTH + text_width(font, &group.label, LABEL_SIZE),
                     );
                     let y = height + row_baseline;
+                    rows.push(VisibleRow::Header(group.id));
                     headers.push(Header {
-                        group: group.id,
                         top: height,
                         folded: group.folded,
                         caret: Point { x: TEXT_INSET, y },
@@ -196,23 +245,29 @@ impl NodeLayout {
             };
             if folded {
                 let header = height - ROW_HEIGHT / 2.0;
-                for direction in [Direction::Input, Direction::Output] {
+                for side in [Side::Input, Side::Output] {
                     let mut header_port = None;
-                    for pin in pins.iter().filter(|pin| pin.direction == direction) {
+                    for pin in pins.iter().filter(|pin| pin.direction.has(side)) {
                         let index = *header_port.get_or_insert_with(|| {
-                            ports.push((header, direction));
+                            ports.push((header, side));
                             ports.len() - 1
                         });
-                        port_of.insert(pin.id, index);
+                        port_of.insert((pin.id, side), index);
                     }
                 }
             } else {
                 for pin in pins {
                     let measured = text_width(font, &pin.label, LABEL_SIZE);
                     width = width.max(2.0 * TEXT_INSET + measured);
+                    // A pin with both sides labels its input side.
                     if pin.direction == Direction::Output {
-                        output_labels.push((labels.len(), measured));
+                        output_labels.push((labels.len(), rows.len(), measured));
                     }
+                    rows.push(VisibleRow::Pin {
+                        pin: pin.id,
+                        direction: pin.direction,
+                        split: TEXT_INSET + measured,
+                    });
                     labels.push(Label {
                         text: LabelText::Pin(pin.id),
                         origin: Point {
@@ -221,24 +276,32 @@ impl NodeLayout {
                         },
                         size: LABEL_SIZE,
                     });
-                    port_of.insert(pin.id, ports.len());
-                    ports.push((height + ROW_HEIGHT / 2.0, pin.direction));
+                    for side in [Side::Input, Side::Output] {
+                        if pin.direction.has(side) {
+                            port_of.insert((pin.id, side), ports.len());
+                            ports.push((height + ROW_HEIGHT / 2.0, side));
+                        }
+                    }
                     height += ROW_HEIGHT;
                 }
             }
         }
         let ports = ports
             .into_iter()
-            .map(|(y, direction)| Point {
-                x: match direction {
-                    Direction::Input => 0.0,
-                    Direction::Output => width,
+            .map(|(y, side)| Point {
+                x: match side {
+                    Side::Input => 0.0,
+                    Side::Output => width,
                 },
                 y,
             })
             .collect();
-        for (index, text_width) in output_labels {
-            labels[index].origin.x = width - TEXT_INSET - text_width;
+        for (label, row, text_width) in output_labels {
+            let start = width - TEXT_INSET - text_width;
+            labels[label].origin.x = start;
+            if let VisibleRow::Pin { split, .. } = &mut rows[row] {
+                *split = start;
+            }
         }
         NodeLayout {
             width,
@@ -246,6 +309,7 @@ impl NodeLayout {
             ports,
             port_of,
             headers,
+            rows,
             labels,
         }
     }
@@ -260,15 +324,15 @@ impl NodeLayout {
         }
     }
 
-    /// Where the pin's wires end when the node's top-left is at `top_left`.
-    pub(crate) fn port(&self, top_left: Point, pin: PinId) -> Option<Point> {
-        Some(offset(top_left, self.ports[self.port_index(pin)?]))
+    /// Where the wires on one side of the pin end when the node's top-left is at `top_left`.
+    pub(crate) fn port(&self, top_left: Point, pin: PinId, side: Side) -> Option<Point> {
+        Some(offset(top_left, self.ports[self.port_index(pin, side)?]))
     }
 
-    /// The index among [`NodeLayout::ports`] of the port the pin's wires end at. A folded group's
-    /// members on one side share one.
-    pub(crate) fn port_index(&self, pin: PinId) -> Option<usize> {
-        self.port_of.get(&pin).copied()
+    /// The index among [`NodeLayout::ports`] of the port where the wires on one side of the pin
+    /// end. A folded group's members with that side share one.
+    pub(crate) fn port_index(&self, pin: PinId, side: Side) -> Option<usize> {
+        self.port_of.get(&(pin, side)).copied()
     }
 
     /// Each group's header row when the node's top-left is at `top_left`.
@@ -310,18 +374,52 @@ impl NodeLayout {
         self.ports.iter().map(move |&port| offset(top_left, port))
     }
 
-    /// The group whose header row contains the point when the node's top-left is at `top_left`.
-    pub(crate) fn header_at(&self, top_left: Point, point: Point) -> Option<GroupId> {
+    /// The part of the node at the point when its top-left is at `top_left`, if any. Ports reach
+    /// `port_reach` graph units, at most half a row, past the outline.
+    pub(crate) fn part_at(&self, top_left: Point, point: Point, port_reach: f32) -> Option<Part> {
         let x = point.x - top_left.x;
         let y = point.y - top_left.y;
-        if !(0.0..=self.width).contains(&x) {
+        if !(0.0..=self.height).contains(&y) {
             return None;
         }
-        self.headers
-            .iter()
-            .find(|header| (header.top..header.top + ROW_HEIGHT).contains(&y))
-            .map(|header| header.group)
+        let reaches_port = || {
+            self.ports
+                .iter()
+                .any(|port| (x - port.x).hypot(y - port.y) <= port_reach)
+        };
+        if !(0.0..=self.width).contains(&x) && !reaches_port() {
+            return None;
+        }
+        let row = ((y - TITLE_HEIGHT) / ROW_HEIGHT).floor();
+        if row < 0.0 {
+            return Some(Part::Body);
+        }
+        Some(match self.rows.get(row as usize) {
+            None => Part::Body,
+            // Only a folded header has ports, and only its own are within reach of its row.
+            Some(&VisibleRow::Header(group)) if reaches_port() => Part::FoldedPort(group),
+            Some(&VisibleRow::Header(group)) => Part::Header(group),
+            Some(&VisibleRow::Pin {
+                pin,
+                direction,
+                split,
+            }) => {
+                let side = if x < split { Side::Input } else { Side::Output };
+                if direction.has(side) {
+                    Part::Port(pin, side)
+                } else {
+                    Part::Body
+                }
+            }
+        })
     }
+}
+
+/// How far from a port's centre it is hit, in graph units, at a zoom in logical pixels per graph
+/// unit: as far as it is drawn or [`PORT_REACH_PIXELS`], whichever is further, but never into
+/// the next row.
+pub(crate) fn port_reach(logical_per_unit: f32) -> f32 {
+    (PORT_REACH_PIXELS / logical_per_unit).clamp(PORT_RADIUS, ROW_HEIGHT / 2.0)
 }
 
 pub(crate) fn offset(top_left: Point, relative: Point) -> Point {
@@ -347,6 +445,81 @@ pub(crate) fn wire(output: Point, input: Point) -> [Point; 4] {
         },
         input,
     ]
+}
+
+/// The smallest rectangle holding a wire's control points, which holds the wire too.
+pub(crate) fn wire_bounds(control: [Point; 4]) -> Rect {
+    let [first, rest @ ..] = control;
+    rest.into_iter()
+        .fold(Rect::from_corners(first, first), |bounds, point| Rect {
+            min: Point {
+                x: bounds.min.x.min(point.x),
+                y: bounds.min.y.min(point.y),
+            },
+            max: Point {
+                x: bounds.max.x.max(point.x),
+                y: bounds.max.y.max(point.y),
+            },
+        })
+}
+
+/// Where the straight stroke from `from` to `to` crosses the wire with these control points, once
+/// for each of the segments the wire is drawn with that it crosses. Touching counts.
+pub(crate) fn wire_crossings(
+    control: [Point; 4],
+    from: Point,
+    to: Point,
+) -> impl Iterator<Item = Point> {
+    let near = wire_bounds(control).intersects(&Rect::from_corners(from, to));
+    let joints = near.then(|| {
+        std::array::from_fn::<_, { WIRE_SEGMENTS as usize + 1 }, _>(|index| {
+            point_on_wire(control, index as f32 / WIRE_SEGMENTS as f32)
+        })
+    });
+    joints.into_iter().flat_map(move |joints| {
+        (1..joints.len()).filter_map(move |end| crossing(joints[end - 1], joints[end], from, to))
+    })
+}
+
+/// The point at `t` along the wire, computed as the shader does.
+fn point_on_wire(control: [Point; 4], t: f32) -> Point {
+    let s = 1.0 - t;
+    let weights = [s * s * s, 3.0 * s * s * t, 3.0 * s * t * t, t * t * t];
+    let mut point = Point::default();
+    for (weight, control) in weights.into_iter().zip(control) {
+        point.x += weight * control.x;
+        point.y += weight * control.y;
+    }
+    point
+}
+
+/// Where the segments from `a` to `b` and from `c` to `d` cross, if they do. Touching counts;
+/// parallel segments never cross.
+fn crossing(a: Point, b: Point, c: Point, d: Point) -> Option<Point> {
+    let cross = |u: Point, v: Point| u.x * v.y - u.y * v.x;
+    let ab = Point {
+        x: b.x - a.x,
+        y: b.y - a.y,
+    };
+    let cd = Point {
+        x: d.x - c.x,
+        y: d.y - c.y,
+    };
+    let ac = Point {
+        x: c.x - a.x,
+        y: c.y - a.y,
+    };
+    let denominator = cross(ab, cd);
+    if denominator == 0.0 {
+        return None;
+    }
+    let along_ab = cross(ac, cd) / denominator;
+    let along_cd = cross(ac, ab) / denominator;
+    let point = Point {
+        x: a.x + along_ab * ab.x,
+        y: a.y + along_ab * ab.y,
+    };
+    ((0.0..=1.0).contains(&along_ab) && (0.0..=1.0).contains(&along_cd)).then_some(point)
 }
 
 #[cfg(test)]
@@ -420,15 +593,35 @@ mod tests {
             rect.max.y - rect.min.y,
             row_middle(3) - ROW_HEIGHT / 2.0 + BOTTOM_PADDING
         );
-        let port = |id| layout.port(top_left, PinId(id)).unwrap();
-        assert_eq!(port(1), at(rect.min.x, top_left.y + row_middle(0)));
-        assert_eq!(port(2), at(rect.max.x, top_left.y + row_middle(1)));
-        assert_eq!(port(3), at(rect.min.x, top_left.y + row_middle(2)));
+        let port = |id, side| layout.port(top_left, PinId(id), side);
+        let input = |id| port(id, Side::Input).unwrap();
+        assert_eq!(input(1), at(rect.min.x, top_left.y + row_middle(0)));
+        let output = port(2, Side::Output).unwrap();
+        assert_eq!(output, at(rect.max.x, top_left.y + row_middle(1)));
+        assert_eq!(input(3), at(rect.min.x, top_left.y + row_middle(2)));
         assert_eq!(
             layout.ports(top_left).collect::<Vec<_>>(),
-            [port(1), port(2), port(3)]
+            [input(1), output, input(3)]
         );
-        assert_eq!(layout.port(top_left, PinId(4)), None);
+        assert_eq!(port(1, Side::Output), None);
+        assert_eq!(port(2, Side::Input), None);
+        assert_eq!(port(4, Side::Input), None);
+    }
+
+    #[test]
+    fn a_pin_with_both_sides_has_a_port_on_each_edge_and_its_label_on_the_left() {
+        let record = record("Transform", vec![Row::Pin(pin(1, "Size", Direction::Both))]);
+        let layout = lay_out(&record);
+        let top_left = record.position;
+        let rect = layout.rect(top_left);
+        let middle = top_left.y + row_middle(0);
+
+        let input = layout.port(top_left, PinId(1), Side::Input);
+        let output = layout.port(top_left, PinId(1), Side::Output);
+        assert_eq!(input, Some(at(rect.min.x, middle)));
+        assert_eq!(output, Some(at(rect.max.x, middle)));
+        assert_eq!(layout.ports(top_left).count(), 2);
+        assert_eq!(layout.labels()[1].origin.x, TEXT_INSET);
     }
 
     #[test]
@@ -462,11 +655,11 @@ mod tests {
     }
 
     #[test]
-    fn folded_members_end_their_wires_at_the_header_on_their_side() {
+    fn folded_members_end_their_wires_at_the_header_on_each_side_they_have() {
         let members = vec![
             pin(1, "Size", Direction::Input),
             pin(2, "Mask", Direction::Output),
-            pin(3, "Mix", Direction::Input),
+            pin(3, "Mix", Direction::Both),
         ];
         let open = record(
             "Blur",
@@ -479,17 +672,20 @@ mod tests {
         folded.rows[1] = group(true, members);
         let top_left = open.position;
         let (open, folded) = (lay_out(&open), lay_out(&folded));
-        let port = |layout: &NodeLayout, id| layout.port(top_left, PinId(id)).unwrap();
+        let port = |layout: &NodeLayout, id, side| layout.port(top_left, PinId(id), side).unwrap();
 
         let header = top_left.y + row_middle(1);
         let right = top_left.x + folded.width;
-        assert_eq!(port(&folded, 1), at(top_left.x, header));
-        assert_eq!(port(&folded, 3), at(top_left.x, header));
-        assert_eq!(port(&folded, 2), at(right, header));
-        assert_eq!(port(&folded, 4), port(&open, 4));
+        assert_eq!(port(&folded, 1, Side::Input), at(top_left.x, header));
+        assert_eq!(port(&folded, 3, Side::Input), at(top_left.x, header));
+        assert_eq!(port(&folded, 2, Side::Output), at(right, header));
+        assert_eq!(port(&folded, 3, Side::Output), at(right, header));
+        assert_eq!(port(&folded, 4, Side::Output), port(&open, 4, Side::Output));
         assert_eq!(folded.ports(top_left).count(), 3);
-        assert_eq!(port(&open, 3), at(top_left.x, top_left.y + row_middle(4)));
-        assert_eq!(open.ports(top_left).count(), 4);
+        let mix = top_left.y + row_middle(4);
+        assert_eq!(port(&open, 3, Side::Input), at(top_left.x, mix));
+        assert_eq!(port(&open, 3, Side::Output), at(right, mix));
+        assert_eq!(open.ports(top_left).count(), 5);
 
         assert_eq!(folded.rect(top_left).min, open.rect(top_left).min);
         assert_eq!(open.height - folded.height, 3.0 * ROW_HEIGHT);
@@ -527,23 +723,98 @@ mod tests {
         let top_left = open.position;
         let layout = lay_out(&open);
         let width = layout.width;
-        let hit = |x, row: usize| {
-            layout.header_at(top_left, at(top_left.x + x, top_left.y + row_middle(row)))
+        let hit = |layout: &NodeLayout, x, y| {
+            layout.part_at(top_left, at(top_left.x + x, top_left.y + y), PORT_RADIUS)
         };
+        let header = Some(Part::Header(GroupId(1)));
 
-        assert_eq!(hit(0.0, 1), Some(GroupId(1)));
-        assert_eq!(hit(width, 1), Some(GroupId(1)));
-        assert_eq!(hit(width + 1.0, 1), None);
-        assert_eq!(hit(width / 2.0, 0), None);
-        assert_eq!(hit(width / 2.0, 2), None, "a member row");
-        let title = at(top_left.x + 10.0, top_left.y + TITLE_HEIGHT / 2.0);
-        assert_eq!(layout.header_at(top_left, title), None);
+        assert_eq!(hit(&layout, 0.0, row_middle(1)), header);
+        assert_eq!(hit(&layout, width, row_middle(1)), header);
+        assert_eq!(hit(&layout, width + 1.0, row_middle(1)), None);
+        assert_eq!(hit(&layout, width / 2.0, row_middle(0)), Some(Part::Body));
+        let member = hit(&layout, width / 2.0, row_middle(2));
+        assert_eq!(member, Some(Part::Body), "a member row");
+        assert_eq!(hit(&layout, 10.0, TITLE_HEIGHT / 2.0), Some(Part::Body));
 
         let mut folded = open;
         folded.rows[1] = group(true, vec![pin(2, "Size", Direction::Input)]);
         let layout = lay_out(&folded);
-        let below = at(top_left.x + 10.0, top_left.y + row_middle(2));
-        assert_eq!(layout.header_at(top_left, below), None, "the output's row");
+        let port = Some(Part::FoldedPort(GroupId(1)));
+        assert_eq!(hit(&layout, -2.0, row_middle(1)), port, "outside the node");
+        assert_eq!(hit(&layout, 2.0, row_middle(1)), port, "inside the node");
+        assert_eq!(hit(&layout, 10.0, row_middle(1)), header);
+        let below = hit(&layout, 10.0, row_middle(2));
+        assert_eq!(below, Some(Part::Body), "the output's row");
+    }
+
+    #[test]
+    fn a_row_grabs_a_side_by_its_port_and_label_and_splits_at_the_label_end_with_both() {
+        let font = bundled_font();
+        let rows = vec![
+            Row::Pin(pin(1, "Image", Direction::Input)),
+            Row::Pin(pin(2, "Result", Direction::Output)),
+            Row::Pin(pin(3, "Size", Direction::Both)),
+        ];
+        // At the narrowest width, and widened by the title so that outputs' labels move right.
+        for title in ["", LONG] {
+            let record = record(title, rows.clone());
+            let layout = lay_out(&record);
+            let top_left = record.position;
+            let width = layout.width;
+            let reach = PORT_RADIUS;
+            let hit = |x, row| {
+                let point = at(top_left.x + x, top_left.y + row_middle(row));
+                layout.part_at(top_left, point, reach)
+            };
+            let port = |pin, side| Some(Part::Port(PinId(pin), side));
+            let body = Some(Part::Body);
+
+            let image_end = TEXT_INSET + text_width(&font, "Image", LABEL_SIZE);
+            assert_eq!(hit(-reach + 0.1, 0), port(1, Side::Input));
+            assert_eq!(hit(image_end - 0.1, 0), port(1, Side::Input));
+            assert_eq!(hit(image_end + 0.1, 0), body);
+            assert_eq!(hit(width + 1.0, 0), None);
+
+            let result_start = width - TEXT_INSET - text_width(&font, "Result", LABEL_SIZE);
+            assert_eq!(hit(-1.0, 1), None);
+            assert_eq!(hit(result_start - 0.1, 1), body);
+            assert_eq!(hit(result_start + 0.1, 1), port(2, Side::Output));
+            assert_eq!(hit(width + reach - 0.1, 1), port(2, Side::Output));
+
+            let size_end = TEXT_INSET + text_width(&font, "Size", LABEL_SIZE);
+            assert_eq!(hit(-1.0, 2), port(3, Side::Input));
+            assert_eq!(hit(size_end - 0.1, 2), port(3, Side::Input));
+            assert_eq!(hit(size_end + 0.1, 2), port(3, Side::Output));
+            assert_eq!(hit(width + 1.0, 2), port(3, Side::Output));
+        }
+    }
+
+    #[test]
+    fn ports_reach_a_few_pixels_past_the_outline_but_never_into_the_next_row() {
+        assert_eq!(port_reach(1.0), PORT_REACH_PIXELS);
+        assert_eq!(port_reach(4.0), PORT_RADIUS, "as far as it is drawn");
+        assert_eq!(port_reach(0.1), ROW_HEIGHT / 2.0);
+
+        let record = record("", vec![Row::Pin(pin(1, "Image", Direction::Input))]);
+        let layout = lay_out(&record);
+        let top_left = record.position;
+        let port = layout.port(top_left, PinId(1), Side::Input).unwrap();
+        for zoom in [0.1, 1.0, 4.0] {
+            let reach = port_reach(zoom);
+            // Diagonally out from the port, just within and just beyond its reach.
+            let away = |distance: f32| {
+                let along = distance / 2.0f32.sqrt();
+                at(port.x - along, port.y - along)
+            };
+            let input = Some(Part::Port(PinId(1), Side::Input));
+            assert_eq!(layout.part_at(top_left, away(reach - 0.01), reach), input);
+            assert_eq!(layout.part_at(top_left, away(reach + 0.01), reach), None);
+        }
+        let beside_title = at(top_left.x - 1.0, top_left.y + TITLE_HEIGHT / 2.0);
+        assert_eq!(
+            layout.part_at(top_left, beside_title, ROW_HEIGHT / 2.0),
+            None
+        );
     }
 
     #[test]
@@ -610,6 +881,34 @@ mod tests {
         assert_eq!(end, at(30.0, 40.0));
     }
 
+    #[test]
+    fn a_stroke_crosses_a_wire_where_its_segments_are_drawn() {
+        // Symmetric about its middle, which is a joint between segments.
+        let control = wire(at(0.0, 0.0), at(100.0, 100.0));
+        let crossings = |from, to| wire_crossings(control, from, to).collect::<Vec<_>>();
+
+        assert_eq!(crossings(at(40.0, -10.0), at(40.0, 110.0)).len(), 1);
+        // Both segments meeting at the middle touch the stroke there.
+        assert_eq!(
+            crossings(at(50.0, -10.0), at(50.0, 50.0)),
+            [at(50.0, 50.0); 2],
+            "touching counts"
+        );
+        assert_eq!(crossings(at(50.0, -10.0), at(50.0, 40.0)), []);
+        assert_eq!(crossings(at(-50.0, 0.0), at(-50.0, 100.0)), []);
+        // Along the first segment the curve bulges past its chord, which is what is drawn.
+        let first = point_on_wire(control, 1.0 / WIRE_SEGMENTS as f32);
+        let chord_middle = at(first.x / 2.0, first.y / 2.0);
+        let curve_middle = point_on_wire(control, 0.5 / WIRE_SEGMENTS as f32);
+        assert!(curve_middle.y < chord_middle.y);
+        let between = at(chord_middle.x, (chord_middle.y + curve_middle.y) / 2.0);
+        assert_eq!(
+            crossings(between, at(chord_middle.x, -10.0)),
+            [],
+            "between the curve and the drawn segment"
+        );
+    }
+
     /// An untitled node with no rows, which is the minimum size, with its top-left at `x`.
     fn untitled(x: f32) -> NodeRecord {
         NodeRecord {
@@ -638,6 +937,38 @@ mod tests {
 
         graph.remove_node(NodeId(2)).unwrap();
         assert_eq!(graph.node_at(at(60.0, 10.0)), Some(NodeId(1)));
+    }
+
+    #[test]
+    fn a_node_owns_its_ports_past_its_outline_and_blocks_those_beneath_it() {
+        let mut graph = Graph::default();
+        let mut left = untitled(0.0);
+        left.rows = vec![Row::Pin(pin(1, "Out", Direction::Output))];
+        graph.add_node(NodeId(1), left).unwrap();
+        let mut right = untitled(MIN_WIDTH + 2.0);
+        right.rows = vec![Row::Pin(pin(1, "In", Direction::Input))];
+        graph.add_node(NodeId(2), right).unwrap();
+        let middle = row_middle(0);
+        let hit = |graph: &Graph, x| graph.hit(at(x, middle), PORT_RADIUS);
+        let output = Some((NodeId(1), Part::Port(PinId(1), Side::Output)));
+        let input = Some((NodeId(2), Part::Port(PinId(1), Side::Input)));
+
+        assert_eq!(hit(&graph, MIN_WIDTH + 1.0), input, "the node above");
+        graph.set_selection(&[NodeId(1)]).unwrap();
+        assert_eq!(hit(&graph, MIN_WIDTH + 1.0), output, "now above");
+        assert_eq!(
+            hit(&graph, MIN_WIDTH + 3.0),
+            output,
+            "over the other's port"
+        );
+        assert_eq!(
+            hit(&graph, MIN_WIDTH + 5.0),
+            Some((NodeId(2), Part::Port(PinId(1), Side::Input))),
+            "beyond its reach"
+        );
+        graph.set_selection(&[NodeId(2)]).unwrap();
+        assert_eq!(hit(&graph, MIN_WIDTH - 1.0), input, "over the other's body");
+        assert_eq!(graph.node_at(at(MIN_WIDTH - 1.0, middle)), Some(NodeId(1)));
     }
 
     #[test]

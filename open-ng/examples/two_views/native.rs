@@ -151,7 +151,7 @@ impl Host {
         }
     }
 
-    /// Handles undo and redo, and translates the keys the views use.
+    /// Handles the host's own keys, and translates the keys the views use.
     fn key(&mut self, event: KeyEvent) -> Option<InputEvent> {
         let pressed = event.state == ElementState::Pressed;
         let key = match event.logical_key {
@@ -159,6 +159,7 @@ impl Host {
             WinitKey::Named(NamedKey::Escape) => Key::Escape,
             WinitKey::Character(c) if c.eq_ignore_ascii_case("h") => Key::H,
             WinitKey::Character(c) if c.eq_ignore_ascii_case("g") => Key::G,
+            WinitKey::Character(c) if c.eq_ignore_ascii_case("y") => Key::Y,
             WinitKey::Character(c) if c.eq_ignore_ascii_case("z") => {
                 if pressed && self.modifiers.control_key() {
                     let changed = if self.modifiers.shift_key() {
@@ -172,10 +173,17 @@ impl Host {
                 }
                 return None;
             }
+            WinitKey::Character(c) if c.eq_ignore_ascii_case("l") => {
+                if pressed && !event.repeat && self.modifiers.is_empty() {
+                    self.editor.toggle_write_lock();
+                    self.window.request_redraw();
+                }
+                return None;
+            }
             _ => return None,
         };
         // Chorded with Ctrl, Alt or Meta these are the host's shortcuts, as they are a browser's.
-        // Releases always pass, so that a held Space cannot stick.
+        // Releases always pass, so that a held Space or Y cannot stick.
         let chorded =
             self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
         if pressed && chorded && key != Key::Escape {
@@ -201,4 +209,9 @@ impl Host {
             self.gpu.queue.present(frame);
         }
     }
+}
+
+/// Tells the developer about an edit the host refused that a view had shown as accepted.
+pub fn report(message: &str) {
+    eprintln!("{message}");
 }

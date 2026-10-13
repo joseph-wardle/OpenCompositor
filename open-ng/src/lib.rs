@@ -1,6 +1,7 @@
 //! A node editor library for host applications that own their graph documents.
 
 mod atlas;
+mod connection_edit;
 mod geometry;
 mod graph;
 mod input;
@@ -8,6 +9,7 @@ mod render;
 mod text;
 mod view;
 
+pub use connection_edit::{ConnectionEdit, Verdict};
 pub use geometry::Rect;
 pub use graph::{
     Color, Connection, Direction, Graph, GraphError, Group, GroupId, NodeId, NodeRecord, Pin,

@@ -37,14 +37,44 @@ pub struct PinId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GroupId(pub u64);
 
-/// Which way data flows through a pin. Inputs sit on a node's left edge, outputs on its right.
+/// Which way data flows through a pin. An input's port is on the node's left edge, an output's
+/// on its right, and a pin that both receives and supplies a value has one on each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Input,
     Output,
+    Both,
 }
 
-/// One input or output, drawn as a row with a port and a label. Labels may repeat.
+impl Direction {
+    pub(crate) fn has(self, side: Side) -> bool {
+        matches!(
+            (self, side),
+            (Direction::Both, _)
+                | (Direction::Input, Side::Input)
+                | (Direction::Output, Side::Output)
+        )
+    }
+}
+
+/// One of a pin's ports. A connection leaves its `from` pin's output side and enters its `to`
+/// pin's input side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Side {
+    Input,
+    Output,
+}
+
+impl Side {
+    pub(crate) fn opposite(self) -> Side {
+        match self {
+            Side::Input => Side::Output,
+            Side::Output => Side::Input,
+        }
+    }
+}
+
+/// One row with a label and a port on each side its direction has. Labels may repeat.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pin {
     pub id: PinId,
@@ -52,8 +82,8 @@ pub struct Pin {
     pub direction: Direction,
 }
 
-/// A header row followed by its pins, which may be inputs and outputs in any order. Groups do
-/// not nest. A folded group hides its pins; their wires end at the header instead.
+/// A header row followed by its pins, of any directions in any order. Groups do not nest. A
+/// folded group hides its pins; their wires end at the header instead.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Group {
     pub id: GroupId,
@@ -82,14 +112,15 @@ pub struct NodeRecord {
 
 impl NodeRecord {
     /// Every pin, grouped or not, from top to bottom.
-    pub(crate) fn pins(&self) -> impl Iterator<Item = &Pin> {
+    pub fn pins(&self) -> impl Iterator<Item = &Pin> {
         self.rows.iter().flat_map(|row| match row {
             Row::Pin(pin) => std::slice::from_ref(pin),
             Row::Group(group) => &group.pins[..],
         })
     }
 
-    pub(crate) fn pin(&self, id: PinId) -> Option<&Pin> {
+    /// The pin with this ID, grouped or not.
+    pub fn pin(&self, id: PinId) -> Option<&Pin> {
         self.pins().find(|pin| pin.id == id)
     }
 
@@ -101,14 +132,16 @@ impl NodeRecord {
     }
 }
 
-/// A pin of a node in the graph.
+/// A pin of a node in the graph. It names no side: a connection's `from` always uses the output
+/// side and its `to` the input side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PinRef {
     pub node: NodeId,
     pub pin: PinId,
 }
 
-/// A wire from an output pin to an input pin. A connection is identified by its endpoints.
+/// A wire from a pin's output side to a pin's input side. A connection is identified by its
+/// endpoints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Connection {
     pub from: PinRef,
@@ -127,7 +160,7 @@ pub enum GraphError {
         group: GroupId,
     },
     MissingPin(PinRef),
-    /// A connection must run from an output to an input.
+    /// A connection must run from a pin with an output side to a pin with an input side.
     NotOutputToInput(Connection),
     MissingConnection(Connection),
     RepeatedInSelection(NodeId),
@@ -234,20 +267,15 @@ impl Graph {
     }
 
     /// Replaces a node's record. Wires follow their pins wherever the record now places them;
-    /// connections to pins it no longer has, or that now face the other way, are removed. To undo
-    /// an update, restore the old record and then the removed connections.
+    /// connections to pins it no longer has, or that lost the side the connection uses, are
+    /// removed. To undo an update, restore the old record and then the removed connections.
     pub fn update_node(&mut self, id: NodeId, record: NodeRecord) -> Result<(), GraphError> {
         let index = self.index(id)?;
         check_ids(id, &record)?;
-        let faces = |pin: PinRef, direction: Direction| {
-            pin.node != id
-                || record
-                    .pin(pin.pin)
-                    .is_some_and(|p| p.direction == direction)
+        let has = |pin: PinRef, side: Side| {
+            pin.node != id || record.pin(pin.pin).is_some_and(|p| p.direction.has(side))
         };
-        self.retain_connections(|c| {
-            faces(c.from, Direction::Output) && faces(c.to, Direction::Input)
-        });
+        self.retain_connections(|c| has(c.from, Side::Output) && has(c.to, Side::Input));
         let entry = &mut self.nodes[index];
         entry.layout = NodeLayout::new(&self.font, &record);
         entry.record = record;
@@ -283,12 +311,12 @@ impl Graph {
         Ok(())
     }
 
-    /// Adds a connection from an existing output to an existing input. Adding an existing
-    /// connection does nothing.
+    /// Adds a connection from an existing pin with an output side to an existing pin with an
+    /// input side. Adding an existing connection does nothing.
     pub fn add_connection(&mut self, connection: Connection) -> Result<(), GraphError> {
         let from = self.pin(connection.from)?;
         let to = self.pin(connection.to)?;
-        if from.direction != Direction::Output || to.direction != Direction::Input {
+        if !from.direction.has(Side::Output) || !to.direction.has(Side::Input) {
             return Err(GraphError::NotOutputToInput(connection));
         }
         if self.connection_set.insert(connection) {
@@ -339,6 +367,12 @@ impl Graph {
         &self.connections
     }
 
+    /// Whether the graph has this connection, without searching
+    /// [`connections`](Graph::connections).
+    pub fn contains_connection(&self, connection: Connection) -> bool {
+        self.connection_set.contains(&connection)
+    }
+
     pub fn selection(&self) -> &[NodeId] {
         &self.selection
     }
@@ -351,7 +385,7 @@ impl Graph {
     /// All nodes with their layouts, in the order they were added.
     pub(crate) fn laid_out_nodes(
         &self,
-    ) -> impl Iterator<Item = (NodeId, &NodeRecord, &NodeLayout)> {
+    ) -> impl DoubleEndedIterator<Item = (NodeId, &NodeRecord, &NodeLayout)> {
         self.nodes
             .iter()
             .map(|entry| (entry.id, &entry.record, &entry.layout))
@@ -382,6 +416,13 @@ impl Graph {
         self.index_of
             .get(&id)
             .is_some_and(|&index| self.nodes[index].added <= stamp)
+    }
+
+    /// Whether `pin` is on a node that has been in the graph since `stamp` was taken and still
+    /// has that side.
+    pub(crate) fn has_port_since(&self, pin: PinRef, side: Side, stamp: AddStamp) -> bool {
+        self.has_node_since(pin.node, stamp)
+            && self.pin(pin).is_ok_and(|pin| pin.direction.has(side))
     }
 
     fn retain_connections(&mut self, mut keep: impl FnMut(&Connection) -> bool) {
@@ -554,8 +595,10 @@ mod tests {
         }
         graph.add_connection(wire(1, 2)).unwrap();
         assert_eq!(graph.connections(), [wire(1, 2), wire(2, 3)]);
+        assert!(graph.contains_connection(wire(1, 2)));
 
         graph.remove_connection(wire(1, 2)).unwrap();
+        assert!(!graph.contains_connection(wire(1, 2)));
         assert_eq!(
             graph.remove_connection(wire(1, 2)),
             Err(GraphError::MissingConnection(wire(1, 2)))
@@ -601,6 +644,44 @@ mod tests {
         graph.add_connection(wire(1, 2)).unwrap();
         graph.add_connection(wire(2, 3)).unwrap();
         assert_eq!(graph.connections(), [wire(1, 2), wire(2, 3)]);
+    }
+
+    #[test]
+    fn a_pin_with_both_sides_keeps_the_wires_of_the_side_it_still_has() {
+        let mut graph = chain();
+        let with_image = |direction| {
+            let mut record = node(2.0);
+            record.rows[0] = Row::Pin(pin(1, "Image", direction));
+            record
+        };
+        // Node 2's pin 1 supplies its value as well as receiving one.
+        let supplied = Connection {
+            from: pin_ref(2, 1),
+            to: pin_ref(3, 1),
+        };
+        graph
+            .update_node(NodeId(2), with_image(Direction::Both))
+            .unwrap();
+        graph.add_connection(supplied).unwrap();
+        assert_eq!(graph.connections(), [wire(1, 2), wire(2, 3), supplied]);
+
+        graph
+            .update_node(NodeId(2), with_image(Direction::Input))
+            .unwrap();
+        assert_eq!(graph.connections(), [wire(1, 2), wire(2, 3)]);
+        assert_eq!(
+            graph.add_connection(supplied),
+            Err(GraphError::NotOutputToInput(supplied))
+        );
+
+        graph
+            .update_node(NodeId(2), with_image(Direction::Both))
+            .unwrap();
+        graph.add_connection(supplied).unwrap();
+        graph
+            .update_node(NodeId(2), with_image(Direction::Output))
+            .unwrap();
+        assert_eq!(graph.connections(), [wire(2, 3), supplied]);
     }
 
     #[test]

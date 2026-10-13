@@ -1,9 +1,10 @@
 //! Two views of one graph, side by side in one window.
 //!
-//! The example is the host: it owns the graph and a small history, and decides what each
-//! response from a view does. Moves snap to a 10-unit grid, the Write node is locked in place,
-//! and Ctrl+Z and Ctrl+Shift+Z undo and redo moves and selection changes. Folding a group stays
-//! out of the history, as Blender keeps panel toggles out of undo.
+//! The example is the host: it owns the document, decides what each response from a view does
+//! and keeps the undo history. Wires can be dragged between ports, lifted off inputs and cut by
+//! dragging across them with Y held; Ctrl+Z and Ctrl+Shift+Z undo and redo. The rules the host
+//! applies are in the document module; L toggles its lock on the Write node, which shows the
+//! views judging an edit again when the host's rules change in the middle of it.
 //!
 //! This file is what every platform shares; each platform's module starts the GPU, translates its
 //! events and schedules redraws.
@@ -17,15 +18,18 @@ mod native;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-use open_ng::{
-    Color, Connection, Direction, Fold, Graph, Group, GroupId, InputEvent, NodeId, NodeRecord, Pin,
-    PinId, PinRef, Point, Renderer, Response, Row, View, ViewBuffers, Viewport,
-};
+mod document;
+
+#[cfg(not(target_arch = "wasm32"))]
+use native::report;
+use open_ng::{InputEvent, Renderer, View, ViewBuffers, Viewport};
+#[cfg(target_arch = "wasm32")]
+use web::report;
+
+use crate::document::Document;
 
 /// The physical pixels between the two views.
 const GAP: u32 = 8;
-const GRID: f32 = 10.0;
-const LOCKED: NodeId = NodeId(5);
 
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
@@ -37,18 +41,16 @@ fn main() {
 /// The document and the views onto it.
 #[derive(Debug)]
 struct Editor {
-    graph: Graph,
+    document: Document,
     views: [View; 2],
-    history: History,
 }
 
 impl Editor {
     fn new(width: u32, height: u32, scale_factor: f32) -> Editor {
         let [left, right] = viewports(width, height, scale_factor);
         Editor {
-            graph: network(),
+            document: Document::new(),
             views: [View::new(left), View::new(right)],
-            history: History::default(),
         }
     }
 
@@ -67,15 +69,34 @@ impl Editor {
     /// whether a view used it: the host should redraw, and not also treat the event as its own.
     fn handle(&mut self, input: InputEvent) -> bool {
         let mut handled = false;
-        for view in &mut self.views {
-            let response = view.handle_input(&self.graph, input);
+        for index in 0..self.views.len() {
+            let document = &self.document;
+            let judge = |edit: &_| document.judge(edit);
+            let response = self.views[index].handle_input(document.graph(), input, judge);
             handled |= response.handled;
-            if let Some(fold) = response.fold {
-                apply_fold(&mut self.graph, fold);
+            match self.document.apply(response) {
+                Ok(true) => self.refresh(),
+                Ok(false) => {}
+                // The views were refreshed after every change, so this means a bug in the host.
+                Err(reason) => report(&format!("Refused a connection edit: {reason}")),
             }
-            self.history.apply(&mut self.graph, response);
         }
         handled
+    }
+
+    /// Call it after every change to the graph or to the host's rules, so that no view keeps
+    /// showing what it found under a pointer that has not moved since, or a verdict the host
+    /// would no longer give.
+    fn refresh(&mut self) {
+        for view in &mut self.views {
+            let document = &self.document;
+            view.refresh(document.graph(), |edit| document.judge(edit));
+        }
+    }
+
+    fn toggle_write_lock(&mut self) {
+        self.document.toggle_write_lock();
+        self.refresh();
     }
 
     /// Call it when the window loses focus.
@@ -88,11 +109,19 @@ impl Editor {
     /// Undo and redo wait for a gesture to finish, as the views' own keys do. Each returns
     /// whether the graph changed.
     fn undo(&mut self) -> bool {
-        !self.gesture_active() && self.history.undo(&mut self.graph)
+        let changed = !self.gesture_active() && self.document.undo();
+        if changed {
+            self.refresh();
+        }
+        changed
     }
 
     fn redo(&mut self) -> bool {
-        !self.gesture_active() && self.history.redo(&mut self.graph)
+        let changed = !self.gesture_active() && self.document.redo();
+        if changed {
+            self.refresh();
+        }
+        changed
     }
 
     fn gesture_active(&self) -> bool {
@@ -178,8 +207,13 @@ impl Gpu {
     fn draw(&mut self, editor: &Editor) -> Option<wgpu::SurfaceTexture> {
         let frame = self.next_texture()?;
         for (view, buffers) in editor.views.iter().zip(&mut self.buffers) {
-            self.renderer
-                .prepare(&self.device, &self.queue, &editor.graph, view, buffers);
+            self.renderer.prepare(
+                &self.device,
+                &self.queue,
+                editor.document.graph(),
+                view,
+                buffers,
+            );
         }
 
         let target = frame
@@ -247,209 +281,4 @@ fn viewports(width: u32, height: u32, scale_factor: f32) -> [Viewport; 2] {
             scale_factor,
         },
     ]
-}
-
-/// Two sources merged, blurred and written, from left to right around the graph origin where
-/// new views are centred. Every node's input is pin 1 and its output pin 2, except the merge's
-/// second input, pin 3. The blur has four more inputs in two groups, one folded.
-fn network() -> Graph {
-    let pin = |id, label: &str, direction| {
-        Row::Pin(Pin {
-            id: PinId(id),
-            label: label.to_owned(),
-            direction,
-        })
-    };
-    let input = |label| pin(1, label, Direction::Input);
-    let output = pin(2, "Image", Direction::Output);
-    let node = |title: &str, x, y, (r, g, b), rows| NodeRecord {
-        position: Point { x, y },
-        title: title.to_owned(),
-        color: Color { r, g, b },
-        rows,
-    };
-    let source = (70, 120, 170);
-    let mut graph = Graph::default();
-    let nodes = [
-        node("Read", -340.0, -90.0, source, vec![output.clone()]),
-        node("Read", -340.0, 20.0, source, vec![output.clone()]),
-        node(
-            "Merge",
-            -180.0,
-            -40.0,
-            (150, 110, 60),
-            vec![
-                output.clone(),
-                input("Foreground"),
-                pin(3, "Background", Direction::Input),
-            ],
-        ),
-        node(
-            "Directional Blur",
-            -20.0,
-            -40.0,
-            (90, 140, 90),
-            vec![
-                input("Image"),
-                output,
-                Row::Group(Group {
-                    id: GroupId(1),
-                    label: "Options".to_owned(),
-                    folded: false,
-                    pins: vec![
-                        Pin {
-                            id: PinId(3),
-                            label: "Size".to_owned(),
-                            direction: Direction::Input,
-                        },
-                        Pin {
-                            id: PinId(4),
-                            label: "Mask".to_owned(),
-                            direction: Direction::Input,
-                        },
-                    ],
-                }),
-                Row::Group(Group {
-                    id: GroupId(2),
-                    label: "Advanced".to_owned(),
-                    folded: true,
-                    pins: vec![
-                        Pin {
-                            id: PinId(5),
-                            label: "Edge handling".to_owned(),
-                            direction: Direction::Input,
-                        },
-                        Pin {
-                            id: PinId(6),
-                            label: "Premultiplied alpha".to_owned(),
-                            direction: Direction::Input,
-                        },
-                    ],
-                }),
-            ],
-        ),
-        node("Write", 140.0, -40.0, (150, 70, 70), vec![input("Image")]),
-    ];
-    for (id, record) in (1..).map(NodeId).zip(nodes) {
-        graph.add_node(id, record).expect("a new node ID");
-    }
-    let wires = [(1, 3, 1), (2, 3, 3), (3, 4, 1), (4, 5, 1)];
-    for (from, to, input) in wires {
-        let connection = Connection {
-            from: PinRef {
-                node: NodeId(from),
-                pin: PinId(2),
-            },
-            to: PinRef {
-                node: NodeId(to),
-                pin: PinId(input),
-            },
-        };
-        graph
-            .add_connection(connection)
-            .expect("an output and an input that exist");
-    }
-    graph
-}
-
-fn apply_fold(graph: &mut Graph, fold: Fold) {
-    let mut record = graph
-        .node(fold.node)
-        .expect("views request only nodes that exist")
-        .clone();
-    for row in &mut record.rows {
-        if let Row::Group(group) = row
-            && group.id == fold.group
-        {
-            group.folded = fold.folded;
-        }
-    }
-    graph
-        .update_node(fold.node, record)
-        .expect("the same pins and groups");
-}
-
-/// The host's undo history: each entry is one response as applied.
-#[derive(Debug, Default)]
-struct History {
-    undo: Vec<Edit>,
-    redo: Vec<Edit>,
-}
-
-#[derive(Debug)]
-struct Edit {
-    before: State,
-    after: State,
-}
-
-/// The positions and selection an edit changes.
-#[derive(Debug, Default)]
-struct State {
-    positions: Vec<(NodeId, Point)>,
-    selection: Option<Vec<NodeId>>,
-}
-
-impl State {
-    fn restore(&self, graph: &mut Graph) {
-        graph
-            .set_node_positions(&self.positions)
-            .expect("nodes are never removed");
-        if let Some(selection) = &self.selection {
-            graph
-                .set_selection(selection)
-                .expect("nodes are never removed");
-        }
-    }
-}
-
-impl History {
-    /// Applies what the host accepts of a response as one undo step.
-    fn apply(&mut self, graph: &mut Graph, response: Response) {
-        let mut edit = Edit {
-            before: State::default(),
-            after: State::default(),
-        };
-        if let Some(selection) = response.selection {
-            edit.before.selection = Some(graph.selection().to_vec());
-            edit.after.selection = Some(selection);
-        }
-        for (id, position) in response.positions {
-            let current = graph
-                .node(id)
-                .expect("views request only nodes that exist")
-                .position;
-            let snapped = Point {
-                x: (position.x / GRID).round() * GRID,
-                y: (position.y / GRID).round() * GRID,
-            };
-            if id != LOCKED && snapped != current {
-                edit.before.positions.push((id, current));
-                edit.after.positions.push((id, snapped));
-            }
-        }
-        if edit.after.positions.is_empty() && edit.after.selection.is_none() {
-            return;
-        }
-        edit.after.restore(graph);
-        self.undo.push(edit);
-        self.redo.clear();
-    }
-
-    fn undo(&mut self, graph: &mut Graph) -> bool {
-        let Some(edit) = self.undo.pop() else {
-            return false;
-        };
-        edit.before.restore(graph);
-        self.redo.push(edit);
-        true
-    }
-
-    fn redo(&mut self, graph: &mut Graph) -> bool {
-        let Some(edit) = self.redo.pop() else {
-            return false;
-        };
-        edit.after.restore(graph);
-        self.undo.push(edit);
-        true
-    }
 }

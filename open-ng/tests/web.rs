@@ -11,8 +11,9 @@ use std::rc::Rc;
 
 use ab_glyph::{Font, FontRef};
 use open_ng::{
-    Color, Direction, Graph, InputEvent, NodeId, NodeRecord, PhysicalPoint, Pin, PinId, Point,
-    Renderer, Row, View, ViewBuffers, Viewport,
+    Button, Color, Connection, ConnectionEdit, Direction, Graph, InputEvent, Key, Modifiers,
+    NodeId, NodeRecord, PhysicalPoint, Pin, PinId, PinRef, Point, Renderer, Row, Verdict, View,
+    ViewBuffers, Viewport,
 };
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -30,6 +31,7 @@ const FILL: Color = Color {
 };
 const SELECTED_BORDER: [u8; 3] = [255, 200, 40];
 const BODY: [u8; 3] = [52, 52, 56];
+const WIRE: [u8; 3] = [184, 184, 184];
 
 #[wasm_bindgen_test]
 async fn webgl2_draws_each_view_inside_its_viewport() {
@@ -121,7 +123,7 @@ async fn webgl2_draws_text_at_each_views_zoom_under_the_nodes_above() {
                 position: PhysicalPoint { x: 300.0, y: 50.0 },
                 lines: 1.0,
             };
-            let _ = view.handle_input(&graph, scroll);
+            let _ = view.handle_input(&graph, scroll, accept_all);
         }
         view
     });
@@ -170,6 +172,179 @@ async fn webgl2_draws_text_at_each_views_zoom_under_the_nodes_above() {
         assert_eq!(covered, 0, "zoom {zoom}: the label shows through node 2");
         let beyond = inked(x(22.0, 60.0), y(4.0, 20.0), BODY).len();
         assert!(beyond > 0, "zoom {zoom}: the label is drawn beside node 2");
+    }
+}
+
+#[wasm_bindgen_test]
+async fn webgl2_draws_a_wire_in_its_color_and_fades_it_below_a_pixel_wide() {
+    let (device, queue) = webgl2_device().await;
+
+    // An untitled node's one row has its middle 34 units below the top, so the wire runs straight
+    // along y = 0 from x = -100 to 100, past both views' centres.
+    let mut graph = Graph::default();
+    for (id, x, direction) in [(1, -200.0, Direction::Output), (2, 100.0, Direction::Input)] {
+        let record = NodeRecord {
+            position: Point { x, y: -34.0 },
+            title: String::new(),
+            color: FILL,
+            rows: vec![Row::Pin(Pin {
+                id: PinId(1),
+                label: String::new(),
+                direction,
+            })],
+        };
+        graph.add_node(NodeId(id), record).unwrap();
+    }
+    let pin = |id| PinRef {
+        node: NodeId(id),
+        pin: PinId(1),
+    };
+    graph
+        .add_connection(Connection {
+            from: pin(1),
+            to: pin(2),
+        })
+        .unwrap();
+    // Eight notches out zoom the right view to 1.2⁻⁸, where the wire is under half a pixel wide.
+    let zoom_out = 1.2_f32.powi(-8);
+    let views = [0, 1].map(|index| {
+        let mut view = View::new(Viewport {
+            x: index * WIDTH / 2,
+            y: 0,
+            width: WIDTH / 2,
+            height: HEIGHT,
+            scale_factor: 1.0,
+        });
+        if index == 1 {
+            let scroll = InputEvent::Scrolled {
+                position: PhysicalPoint { x: 300.0, y: 50.0 },
+                lines: -8.0,
+            };
+            let _ = view.handle_input(&graph, scroll, accept_all);
+        }
+        view
+    });
+    let pixels = draw(&device, &queue, &graph, &views).await;
+
+    // The wire's centre line is the boundary between rows 49 and 50, both fully covered at zoom
+    // 1, where the wire is two pixels wide.
+    assert_eq!(pixel(&pixels, WIDTH / 4, 49), WIRE);
+    assert_eq!(pixel(&pixels, WIDTH / 4, 50), WIRE);
+    // Below a pixel the wire keeps its ink per length: each column holds as much ink as a wire
+    // its width at full strength.
+    for (column, width) in [(WIDTH / 4, 2.0), (3 * WIDTH / 4, 2.0 * zoom_out)] {
+        let ink: f32 = (0..HEIGHT)
+            .map(|row| {
+                let pixel = pixel(&pixels, column, row);
+                f32::from(pixel[0] - BACKGROUND[0]) / f32::from(WIRE[0] - BACKGROUND[0])
+            })
+            .sum();
+        assert!(
+            (ink - width).abs() < 0.05,
+            "column {column}: {ink} pixels of ink, expected {width}"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+async fn webgl2_draws_a_cut_and_a_loose_wire_in_their_colors_and_alphas() {
+    const CUT_WIRE: [u8; 3] = [214, 96, 84];
+    let (device, queue) = webgl2_device().await;
+
+    // As above, wire 1 runs straight along y = 0 across both views. Node 3's free output is at
+    // (-50, 38), clear of everything else.
+    let mut graph = Graph::default();
+    for (id, position, direction) in [
+        (
+            1,
+            Point {
+                x: -200.0,
+                y: -34.0,
+            },
+            Direction::Output,
+        ),
+        (2, Point { x: 100.0, y: -34.0 }, Direction::Input),
+        (3, Point { x: -150.0, y: 4.0 }, Direction::Output),
+    ] {
+        let record = NodeRecord {
+            position,
+            title: String::new(),
+            color: FILL,
+            rows: vec![Row::Pin(Pin {
+                id: PinId(1),
+                label: String::new(),
+                direction,
+            })],
+        };
+        graph.add_node(NodeId(id), record).unwrap();
+    }
+    let pin = |id| PinRef {
+        node: NodeId(id),
+        pin: PinId(1),
+    };
+    graph
+        .add_connection(Connection {
+            from: pin(1),
+            to: pin(2),
+        })
+        .unwrap();
+    // The left view cuts down x = 0 across wire 1. The right view drags a wire from node 3's
+    // output 120 units right along y = 38, to empty space.
+    let gestures = [
+        vec![
+            InputEvent::KeyPressed(Key::Y),
+            press(PhysicalPoint { x: 100.0, y: 20.0 }),
+            InputEvent::PointerMoved {
+                position: PhysicalPoint { x: 100.0, y: 80.0 },
+            },
+        ],
+        vec![
+            press(PhysicalPoint { x: 250.0, y: 88.0 }),
+            InputEvent::PointerMoved {
+                position: PhysicalPoint { x: 370.0, y: 88.0 },
+            },
+        ],
+    ];
+    let views = [0, 1].map(|index| {
+        let mut view = View::new(Viewport {
+            x: index * WIDTH / 2,
+            y: 0,
+            width: WIDTH / 2,
+            height: HEIGHT,
+            scale_factor: 1.0,
+        });
+        for &event in &gestures[index as usize] {
+            let _ = view.handle_input(&graph, event, accept_all);
+        }
+        view
+    });
+    let pixels = draw(&device, &queue, &graph, &views).await;
+
+    // Both are two pixels wide, and the stroke and the loose wire are translucent.
+    let over_background = |color: [u8; 3], alpha: f32| {
+        std::array::from_fn(|i| {
+            let (color, background) = (f32::from(color[i]), f32::from(BACKGROUND[i]));
+            (background + (color - background) * alpha).round() as u8
+        })
+    };
+    let stroke = over_background([240; 3], 200.0 / 255.0);
+    let loose = over_background(WIRE, 110.0 / 255.0);
+    let near = |found: [u8; 3], expected: [u8; 3], what: &str| {
+        assert!(
+            (0..3).all(|i| found[i].abs_diff(expected[i]) <= 2),
+            "{what}: {found:?}, expected {expected:?}"
+        );
+    };
+    for row in [49, 50] {
+        assert_eq!(pixel(&pixels, WIDTH / 8, row), CUT_WIRE, "the cut wire");
+        near(
+            pixel(&pixels, 3 * WIDTH / 4, row + 38),
+            loose,
+            "the loose wire",
+        );
+    }
+    for column in [99, 100] {
+        near(pixel(&pixels, column, 30), stroke, "the cut stroke");
     }
 }
 
@@ -325,4 +500,18 @@ async fn draw(
 fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 3] {
     let i = ((y * WIDTH + x) * 4) as usize;
     [pixels[i], pixels[i + 1], pixels[i + 2]]
+}
+
+fn press(position: PhysicalPoint) -> InputEvent {
+    InputEvent::PointerPressed {
+        position,
+        button: Button::Left,
+        modifiers: Modifiers::default(),
+    }
+}
+
+fn accept_all(_: &ConnectionEdit) -> Verdict {
+    Verdict::Accept {
+        displaced: Vec::new(),
+    }
 }
