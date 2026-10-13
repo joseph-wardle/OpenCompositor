@@ -575,19 +575,21 @@ fn shapes(
     atlas: &mut GlyphAtlas,
 ) -> Layered<Shape> {
     let selected: HashSet<_> = view.drawn_selection(graph).into_iter().collect();
-    let connected: FxHashSet<(NodeId, usize)> = previews
-        .connections(graph)
-        .flat_map(|connection| {
-            [
-                (connection.from, Side::Output),
-                (connection.to, Side::Input),
-            ]
-        })
-        .filter_map(|(pin, side)| {
-            let index = graph.node_layout(pin.node)?.port_index(pin.pin, side)?;
-            Some((pin.node, index))
-        })
-        .collect();
+    let mut connected: FxHashSet<(NodeId, usize)> = FxHashSet::default();
+    connected.reserve(2 * graph.connections().len());
+    for connection in previews.connections(graph) {
+        for (pin, side) in [
+            (connection.from, Side::Output),
+            (connection.to, Side::Input),
+        ] {
+            if let Some(index) = graph
+                .node_layout(pin.node)
+                .and_then(|layout| layout.port_index(pin.pin, side))
+            {
+                connected.insert((pin.node, index));
+            }
+        }
+    }
     // Ports and the antialiased edge reach past a node's outline.
     let margin = PORT_RADIUS + 1.0 / view.physical_per_unit();
     let visible = view.visible_rect();
