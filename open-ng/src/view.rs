@@ -136,20 +136,20 @@ enum Gesture {
 #[derive(Debug)]
 struct WireDrag {
     pressed: PinRef,
-    side: Side,
     /// When the press found `pressed`, so that a node added since under its ID is not mistaken
     /// for it, nor a wire from one for a lifted wire.
     since: AddStamp,
     dragged: Dragged,
     /// Where releasing would drop the free end.
     target: Option<Target>,
+    /// The edit dropping the free end at `target`, if it would change the graph.
     proposal: Option<Proposal>,
 }
 
 #[derive(Debug)]
 enum Dragged {
-    /// A wire from the pressed side.
-    New,
+    /// A wire from this side of the pressed pin.
+    New(Side),
     /// The wires into the pressed input, by the outputs they come from, which stay attached. Never
     /// empty: the drag ends when the last of them goes.
     Lifted(Vec<PinRef>),
@@ -321,10 +321,9 @@ impl WireDrag {
         };
         WireDrag {
             pressed,
-            side,
             since,
             dragged: if lifted.is_empty() {
-                Dragged::New
+                Dragged::New(side)
             } else {
                 Dragged::Lifted(lifted)
             },
@@ -333,10 +332,18 @@ impl WireDrag {
         }
     }
 
+    /// The side of the pressed pin the drag started from.
+    fn pressed_side(&self) -> Side {
+        match self.dragged {
+            Dragged::New(side) => side,
+            Dragged::Lifted(_) => Side::Input,
+        }
+    }
+
     /// The side of a pin the free end joins.
     fn free_side(&self) -> Side {
         match self.dragged {
-            Dragged::New => self.side.opposite(),
+            Dragged::New(side) => side.opposite(),
             Dragged::Lifted(_) => Side::Input,
         }
     }
@@ -344,7 +351,7 @@ impl WireDrag {
     /// The pins the dragged wires stay attached to, all on the returned side.
     fn attached(&self) -> (&[PinRef], Side) {
         match &self.dragged {
-            Dragged::New => (std::slice::from_ref(&self.pressed), self.side),
+            Dragged::New(side) => (std::slice::from_ref(&self.pressed), *side),
             Dragged::Lifted(outputs) => (outputs, Side::Output),
         }
     }
@@ -352,27 +359,32 @@ impl WireDrag {
     /// Forgets lifted wires the graph no longer has, and returns whether the drag still holds
     /// any wire: the pressed side and, for a lift, at least one of its wires must remain.
     fn still_holds(&mut self, graph: &Graph) -> bool {
-        if !graph.has_port_since(self.pressed, self.side, self.since) {
+        if !graph.has_port_since(self.pressed, self.pressed_side(), self.since) {
             return false;
         }
         let Dragged::Lifted(outputs) = &mut self.dragged else {
             return true;
         };
         let input = self.pressed;
+        let before = outputs.len();
         outputs.retain(|&from| {
             graph.has_node_since(from.node, self.since)
                 && graph.contains_connection(Connection { from, to: input })
         });
-        !outputs.is_empty()
+        let (lost, holds) = (outputs.len() != before, !outputs.is_empty());
+        if lost {
+            self.reconsider();
+        }
+        holds
     }
 
     /// The edit dropping the free end at `target`, if it would change the graph. Lifted wires all
     /// move or are all removed.
     fn edit(&self, graph: &Graph, target: Target) -> Option<ConnectionEdit> {
         let edit = match (&self.dragged, target) {
-            (Dragged::New, Target::Space) => return None,
-            (Dragged::New, Target::Pin(target)) => {
-                let connection = match self.side {
+            (Dragged::New(_), Target::Space) => return None,
+            (&Dragged::New(side), Target::Pin(target)) => {
+                let connection = match side {
                     Side::Output => Connection {
                         from: self.pressed,
                         to: target,
@@ -401,14 +413,38 @@ impl WireDrag {
         edit.normalised(graph)
     }
 
-    /// Makes `edit` the proposal, asking the host about it only if it differs from the last.
-    fn propose(&mut self, edit: Option<ConnectionEdit>, judge: &mut Judge<'_>) {
+    /// Moves the free end to `target` and, if it moved, proposes dropping it there. Comparing
+    /// targets first keeps pointer moves within one target from building an edit.
+    fn aim(&mut self, graph: &Graph, target: Option<Target>, judge: &mut Judge<'_>) {
+        if target != self.target {
+            self.propose_at(graph, target, judge);
+        }
+    }
+
+    /// Proposes dropping the free end at `target`, asking the host only if the edit differs from
+    /// the last.
+    fn propose_at(&mut self, graph: &Graph, target: Option<Target>, judge: &mut Judge<'_>) {
+        self.target = target;
+        let edit = target.and_then(|target| self.edit(graph, target));
         if self.proposal.as_ref().map(|proposal| &proposal.edit) != edit.as_ref() {
             self.proposal = edit.map(|edit| Proposal {
                 verdict: judge(&edit),
                 edit,
             });
         }
+    }
+
+    /// Makes the next aim propose again and ask the host, even at the same target and edit.
+    fn reconsider(&mut self) {
+        self.target = None;
+        self.proposal = None;
+    }
+
+    /// The proposal, if the host accepted it.
+    fn accepted(self) -> Option<ConnectionEdit> {
+        self.proposal
+            .filter(|proposal| matches!(proposal.verdict, Verdict::Accept { .. }))
+            .map(|proposal| proposal.edit)
     }
 }
 
@@ -638,11 +674,7 @@ impl View {
     /// view cannot notice the change itself.
     pub fn refresh(&mut self, graph: &Graph, mut judge: impl FnMut(&ConnectionEdit) -> Verdict) {
         match &mut self.gesture {
-            Some(Gesture::Wire(drag)) => {
-                // Forgetting the target makes the host judge the proposal again.
-                drag.target = None;
-                drag.proposal = None;
-            }
+            Some(Gesture::Wire(drag)) => drag.reconsider(),
             Some(Gesture::Cut(cut)) => cut.judge_again(graph, &mut judge),
             _ => {}
         }
@@ -929,16 +961,12 @@ impl View {
                 (Vec::new(), None)
             }
             Gesture::Wire(mut drag) => {
-                // The graph may have changed since the last event without a refresh.
+                // The graph may have changed since the last event without a refresh, so the edit
+                // is built again even at the same target.
                 if drag.still_holds(graph) {
-                    let edit = self
-                        .drop_under_pointer(graph, drag.free_side())
-                        .and_then(|target| drag.edit(graph, target));
-                    drag.propose(edit, judge);
-                    connections = drag
-                        .proposal
-                        .filter(|proposal| matches!(proposal.verdict, Verdict::Accept { .. }))
-                        .map(|proposal| proposal.edit);
+                    let target = self.drop_under_pointer(graph, drag.free_side());
+                    drag.propose_at(graph, target, judge);
+                    connections = drag.accepted();
                 }
                 (Vec::new(), None)
             }
@@ -1172,11 +1200,7 @@ impl View {
             return true;
         }
         let target = self.drop_under_pointer(graph, drag.free_side());
-        if target != drag.target {
-            drag.target = target;
-            let edit = target.and_then(|target| drag.edit(graph, target));
-            drag.propose(edit, judge);
-        }
+        drag.aim(graph, target, judge);
         self.gesture = Some(Gesture::Wire(drag));
         false
     }
