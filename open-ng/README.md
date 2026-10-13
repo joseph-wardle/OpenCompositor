@@ -4,7 +4,7 @@ A node-editor library for Rust applications that own their graph documents.
 
 ## Status
 
-Early and experimental. Current features include:
+Very early and very experimental. Current features include:
 
 - A shared presentation `Graph` of nodes, connections and a selection, kept in step with your document. Each node has a title and rows of labelled input and output pins, which may sit in foldable groups.
 - Any number of `View`s of one graph, each with its own pan, zoom and gesture in progress.
@@ -64,7 +64,7 @@ To run it in a browser, install [Trunk](https://trunkrs.dev), then from the `ope
 trunk serve --example two_views examples/two_views/index.html
 ```
 
-and open the address it prints. The page uses WebGPU where the browser offers it and WebGL2 otherwise, and shows which.
+and open the address it prints. The page uses WebGPU where the browser offers it and WebGL2 otherwise.
 
 | Input | Action |
 | --- | --- |

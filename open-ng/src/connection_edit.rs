@@ -4,14 +4,17 @@ use rustc_hash::FxHashSet;
 
 use crate::graph::{Connection, Graph};
 
-/// Connections to remove and to add as one edit.
+/// Connections to remove and connections to have after, as one edit.
 ///
 /// A view shows its host the same edit twice: while a gesture is in progress, as a proposal for
 /// the host to judge (see [`View::handle_input`](crate::View::handle_input)), and once released,
 /// if the host's last verdict accepted it, as
-/// [`Response::connections`](crate::Response::connections). Either way it is normalised: no
-/// connection appears twice or in both lists, every removal is in the graph, no addition is, and
-/// at least one list is not empty.
+/// [`Response::connections`](crate::Response::connections). Either way it is
+/// [normalised](ConnectionEdit::normalised).
+///
+/// An addition the graph already has is a wire the edit keeps: dropping a bundle of lifted wires
+/// onto an input already wired from one of their outputs keeps that wire, and the host must not
+/// displace it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnectionEdit {
     pub remove: Vec<Connection>,
@@ -31,11 +34,13 @@ pub enum Verdict {
 }
 
 impl ConnectionEdit {
-    /// The edit without what would change nothing, or `None` if nothing is left. Removing and
-    /// adding the same connection cancel out, which is what dropping a lifted wire back where it
-    /// was proposes.
-    pub(crate) fn normalised(mut self, graph: &Graph) -> Option<ConnectionEdit> {
-        let removed: FxHashSet<_> = self.remove.iter().copied().collect();
+    /// The edit without what would change nothing, or `None` if it would change nothing. No
+    /// connection appears twice or in both lists, and every removal is in the graph. A connection
+    /// in both lists stays, which is what dropping a lifted wire back where it was proposes.
+    ///
+    /// Views propose only normalised edits. A host applying edits from elsewhere, such as a
+    /// script, can normalise them first.
+    pub fn normalised(mut self, graph: &Graph) -> Option<ConnectionEdit> {
         let added: FxHashSet<_> = self.add.iter().copied().collect();
         let mut seen = FxHashSet::default();
         self.remove.retain(|&connection| {
@@ -44,12 +49,10 @@ impl ConnectionEdit {
                 && seen.insert(connection)
         });
         seen.clear();
-        self.add.retain(|&connection| {
-            !removed.contains(&connection)
-                && !graph.contains_connection(connection)
-                && seen.insert(connection)
-        });
-        (!self.remove.is_empty() || !self.add.is_empty()).then_some(self)
+        self.add.retain(|&connection| seen.insert(connection));
+        let changes = !self.remove.is_empty()
+            || (self.add.iter()).any(|&connection| !graph.contains_connection(connection));
+        changes.then_some(self)
     }
 }
 
@@ -115,32 +118,24 @@ mod tests {
         let graph = chain();
         let dropped_back = edit(&[wire(1, 2)], &[wire(1, 2)]);
         assert_eq!(dropped_back.normalised(&graph), None);
-        let reconnected = edit(&[], &[wire(2, 3)]);
+        let reconnected = edit(&[], &[wire(2, 3), wire(2, 3)]);
         assert_eq!(reconnected.normalised(&graph), None);
         let already_gone = edit(&[wire(3, 4)], &[]);
         assert_eq!(already_gone.normalised(&graph), None);
-        // A lifted wire the host removed during the drag, dropped back where it was.
-        let gone_and_back = edit(&[wire(3, 4)], &[wire(3, 4)]);
-        assert_eq!(gone_and_back.normalised(&graph), None);
     }
 
     #[test]
-    fn normalising_keeps_only_the_changes_once_each_in_order() {
+    fn normalising_keeps_each_change_and_kept_wire_once_in_order() {
         let graph = chain();
+        // Wires 1 → 2 and 2 → 3 lifted and dropped onto node 3's input, which 2 → 3 already
+        // feeds.
         let bundle = edit(
-            &[wire(1, 2), wire(2, 3), wire(1, 2)],
-            &[wire(1, 3), wire(2, 3), wire(1, 3), wire(1, 4)],
+            &[wire(1, 2), wire(2, 3), wire(1, 2), wire(3, 4)],
+            &[wire(1, 3), wire(2, 3), wire(1, 3)],
         );
         assert_eq!(
             bundle.normalised(&graph),
-            Some(edit(&[wire(1, 2)], &[wire(1, 3), wire(1, 4)]))
+            Some(edit(&[wire(1, 2)], &[wire(1, 3), wire(2, 3)]))
         );
-    }
-
-    #[test]
-    fn a_connection_in_both_lists_leaves_both_even_when_repeated() {
-        let graph = chain();
-        let repeated = edit(&[wire(1, 2), wire(1, 2)], &[wire(1, 2), wire(3, 4)]);
-        assert_eq!(repeated.normalised(&graph), Some(edit(&[], &[wire(3, 4)])));
     }
 }

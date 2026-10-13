@@ -414,7 +414,8 @@ impl InstanceBuffer {
 }
 
 /// The connections a view draws: the committed ones, less those its accepted wire drag removes,
-/// plus those it adds.
+/// plus those it has after. The committed copies of wires it keeps are hidden, so that each is
+/// drawn once.
 struct DrawnConnections<'a> {
     hidden: FxHashSet<Connection>,
     added: &'a [Connection],
@@ -426,7 +427,9 @@ impl DrawnConnections<'_> {
             Some(WirePreview::Accepted {
                 edit, displaced, ..
             }) => DrawnConnections {
-                hidden: edit.remove.iter().chain(displaced).copied().collect(),
+                hidden: (edit.remove.iter().chain(displaced).chain(&edit.add))
+                    .copied()
+                    .collect(),
                 added: &edit.add,
             },
             _ => DrawnConnections {

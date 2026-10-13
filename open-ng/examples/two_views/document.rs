@@ -57,8 +57,10 @@ struct State {
 /// planned no change to the graph can fail and none is left half done.
 #[derive(Debug)]
 struct Effect {
-    /// The edit's removals, then the wires its additions displace.
     removed: Vec<Connection>,
+    /// The wires the additions replace, which the edit does not list.
+    displaced: Vec<Connection>,
+    /// The edit's additions the graph does not have yet.
     added: Vec<Connection>,
     records: Vec<(NodeId, Change<NodeRecord>)>,
     sources: Vec<(PinRef, Change<Vec<PinRef>>)>,
@@ -96,7 +98,7 @@ impl Document {
     pub fn judge(&self, edit: &ConnectionEdit) -> Verdict {
         match self.plan(edit) {
             Ok(effect) => Verdict::Accept {
-                displaced: effect.removed[edit.remove.len()..].to_vec(),
+                displaced: effect.map_or_else(Vec::new, |effect| effect.displaced),
             },
             Err(reason) => Verdict::Refuse {
                 reason: Some(reason),
@@ -109,7 +111,7 @@ impl Document {
     /// of undo. A connection edit the host refuses changes nothing, and the reason is returned.
     pub fn apply(&mut self, response: Response) -> Result<bool, String> {
         let connections = match &response.connections {
-            Some(edit) => Some(self.plan(edit)?),
+            Some(edit) => self.plan(edit)?,
             None => None,
         };
         let mut changed = false;
@@ -180,44 +182,51 @@ impl Document {
     }
 
     /// The judge's verdict and the applied edit both come from here, so the preview shows what
-    /// applying would do.
-    fn plan(&self, edit: &ConnectionEdit) -> Result<Effect, String> {
+    /// applying would do. An edit that would change nothing has no effect.
+    fn plan(&self, edit: &ConnectionEdit) -> Result<Option<Effect>, String> {
         let graph = &self.graph;
-        // Views propose edits only against the graph they last saw, so this fails only for a
-        // host that changed the graph without refreshing them.
-        let fits = edit.remove.iter().all(|&c| graph.contains_connection(c))
-            && edit
-                .add
-                .iter()
-                .all(|&c| !graph.contains_connection(c) && can_wire(graph, c));
-        if !fits {
-            return Err("The graph changed during the edit".to_owned());
+        // Views propose only normalised edits, but scripts may not.
+        let Some(edit) = edit.clone().normalised(graph) else {
+            return Ok(None);
+        };
+        let added: Vec<_> = (edit.add.iter().copied())
+            .filter(|&c| !graph.contains_connection(c))
+            .collect();
+        if !added.iter().all(|&c| can_wire(graph, c)) {
+            return Err("No such output and input".to_owned());
         }
 
-        let mut removed = edit.remove.clone();
-        for (index, added) in edit.add.iter().enumerate() {
-            if self.sources.contains_key(&added.to) {
+        let mut displaced = Vec::new();
+        for (index, kept) in edit.add.iter().enumerate() {
+            if self.sources.contains_key(&kept.to) {
                 continue;
             }
-            if edit.add[..index].iter().any(|other| other.to == added.to) {
-                return Err(format!("{} takes one wire", label(graph, added.to)));
+            if edit.add[..index].iter().any(|other| other.to == kept.to) {
+                return Err(format!("{} takes one wire", label(graph, kept.to)));
             }
             let occupants = graph.connections().iter();
-            removed.extend(occupants.filter(|c| c.to == added.to && !edit.remove.contains(c)));
+            displaced.extend(
+                occupants.filter(|c| {
+                    c.to == kept.to && !edit.remove.contains(c) && !edit.add.contains(c)
+                }),
+            );
         }
         let touches_write = |c: &Connection| c.from.node == WRITE || c.to.node == WRITE;
-        if self.write_locked && removed.iter().chain(&edit.add).any(touches_write) {
+        let changed = || edit.remove.iter().chain(&displaced).chain(&added);
+        if self.write_locked && changed().any(touches_write) {
             return Err("Write is locked".to_owned());
         }
-        if makes_cycle(graph, &removed, &edit.add) {
+        let removed: Vec<_> = edit.remove.iter().chain(&displaced).copied().collect();
+        if makes_cycle(graph, &removed, &added) {
             return Err("That would make a cycle".to_owned());
         }
-        Ok(Effect {
-            records: self.spare_connected(&edit.add),
-            sources: self.source_changes(&removed, &edit.add),
-            removed,
-            added: edit.add.clone(),
-        })
+        Ok(Some(Effect {
+            records: self.spare_connected(&added),
+            sources: self.source_changes(&removed, &added),
+            removed: edit.remove,
+            displaced,
+            added,
+        }))
     }
 
     /// If an addition connects the merge's spare input, the spare becomes the next foreground
@@ -329,7 +338,7 @@ impl State {
 
 impl Effect {
     fn redo(&self, graph: &mut Graph, sources: &mut HashMap<PinRef, Vec<PinRef>>) {
-        for &connection in &self.removed {
+        for &connection in self.removed.iter().chain(&self.displaced) {
             graph.remove_connection(connection).expect(PLANNED);
         }
         for (id, record) in &self.records {
@@ -354,7 +363,7 @@ impl Effect {
                 .update_node(*id, record.before.clone())
                 .expect(PLANNED);
         }
-        for &connection in &self.removed {
+        for &connection in self.removed.iter().chain(&self.displaced) {
             graph.add_connection(connection).expect(PLANNED);
         }
         for (input, order) in &self.sources {
@@ -363,7 +372,8 @@ impl Effect {
     }
 }
 
-/// Whether both pins exist, `from` with an output side and `to` with an input side.
+/// Whether both pins exist, `from` with an output side and `to` with an input side. Views propose
+/// only such wires, but scripts may not.
 fn can_wire(graph: &Graph, connection: Connection) -> bool {
     let direction = |pin: PinRef| Some(graph.node(pin.node)?.pin(pin.pin)?.direction);
     matches!(
@@ -706,13 +716,44 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_that_no_longer_fits_the_graph_changes_nothing() {
+    fn a_bundle_keeps_a_wire_its_target_already_has() {
+        let mut document = Document::new();
+        let sheet = [wire(1, 6, 1), wire(2, 6, 1)];
+        let onto_foreground = edit(&sheet, &[wire(1, 3, 1), wire(2, 3, 1)]);
+        let refusal = refused("Foreground takes one wire");
+        assert_eq!(
+            document.judge(&onto_foreground),
+            refusal,
+            "not Read 1 displaced"
+        );
+
+        let foreground = wire(1, 3, 1);
+        let onto_sheet = edit(&[foreground], &[sheet[0]]);
+        assert_eq!(document.judge(&onto_sheet), accepted(&[]));
+        assert_eq!(document.apply(connect(onto_sheet)), Ok(true));
+        assert!(document.graph.contains_connection(sheet[0]));
+        assert_eq!(document.sources[&SHEET_IMAGES], [pin(1, 2), pin(2, 2)]);
+        assert!(document.undo());
+        assert!(document.graph.contains_connection(foreground));
+        assert!(document.graph.contains_connection(sheet[0]));
+    }
+
+    #[test]
+    fn a_script_edit_is_normalised_and_its_wires_checked() {
         let mut document = Document::new();
         let gone = wire(1, 4, 4);
-        let stale = edit(&[gone, wire(1, 6, 1)], &[]);
-        let before = document.graph.connections().to_vec();
-        assert!(document.apply(connect(stale)).is_err());
-        assert_eq!(document.graph.connections(), before);
-        assert!(!document.undo(), "no step");
+        let new = wire(3, 6, 1);
+        let repeated = edit(&[gone, wire(1, 6, 1), wire(1, 6, 1)], &[new, new]);
+        assert_eq!(document.apply(connect(repeated)), Ok(true));
+        assert_eq!(document.sources[&SHEET_IMAGES], [pin(2, 2), pin(3, 2)]);
+        assert!(document.undo());
+        assert_eq!(document.sources[&SHEET_IMAGES], [pin(1, 2), pin(2, 2)]);
+
+        let unchanged = edit(&[gone], &[wire(2, 6, 1)]);
+        assert_eq!(document.apply(connect(unchanged)), Ok(false));
+        let no_such_pin = edit(&[], &[wire(1, 4, 9)]);
+        assert!(document.apply(connect(no_such_pin)).is_err());
+        let steps = (document.undo.len(), document.redo.len());
+        assert_eq!(steps, (0, 1), "neither added a step");
     }
 }

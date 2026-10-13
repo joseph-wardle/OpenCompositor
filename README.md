@@ -1,8 +1,8 @@
 # OpenCompositor
 
-This repository contains two WIP Rust projects developed together:
+This repository contains two very early WIP Rust projects developed together:
 
-- **OpenCompositor** (`compositor/`) — a node-based desktop compositor.
+- **OpenCompositor** (`compositor/`) — a USD-based compositor.
 - **OpenNG** (`open-ng/`) — a node-editor library. It is usable on its own and does not depend on the compositor.
 
 ## Status
@@ -11,7 +11,7 @@ OpenNG has a first working step: views of a shared graph with selection, moving,
 
 ## Goals
 
-OpenCompositor aims for a Nuke-style node workflow with fast interactive feedback, GPU and CPU execution, OpenColorIO color management, Python automation, headless rendering, USD scenes, and OpenFX plugins.
+OpenCompositor aims for a Nuke-style node workflow with fast interactive feedback, GPU and CPU execution, OpenColorIO color management, Python automation, headless rendering, USD scenes, and OpenFX plugins. It is also exploring the application of USD for composable and reusable compositing workflows.
 
 OpenNG aims to be a fast, programmable node editor for applications that own their graph data, running natively and in the browser.
 
