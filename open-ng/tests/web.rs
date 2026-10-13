@@ -9,7 +9,11 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use open_ng::{Color, Graph, NodeId, NodeRecord, Point, Renderer, View, ViewBuffers, Viewport};
+use ab_glyph::{Font, FontRef};
+use open_ng::{
+    Color, Direction, Graph, InputEvent, NodeId, NodeRecord, PhysicalPoint, Pin, PinId, Point,
+    Renderer, Row, View, ViewBuffers, Viewport,
+};
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -25,17 +29,23 @@ const FILL: Color = Color {
     b: 170,
 };
 const SELECTED_BORDER: [u8; 3] = [255, 200, 40];
+const BODY: [u8; 3] = [52, 52, 56];
 
 #[wasm_bindgen_test]
 async fn webgl2_draws_each_view_inside_its_viewport() {
     let (device, queue) = webgl2_device().await;
 
-    // Each view is 200 pixels wide with the graph origin at its centre. Node 1 sits there, and
-    // node 2 straddles the right view's left edge: the right view is drawn last, so anything it
-    // draws outside itself stays on top.
+    // Each view is 200 pixels wide with the graph origin at its centre. Node 1 is centred there,
+    // and node 2 straddles the right view's left edge: the right view is drawn last, so anything
+    // it draws outside itself stays on top. An untitled node with no rows is 100 × 30.
     let mut graph = Graph::default();
-    for (id, x) in [(1, 0.0), (2, -100.0)] {
-        let record = NodeRecord::vertical(Point { x, y: 0.0 }, FILL, 1, 1);
+    for (id, x) in [(1, -50.0), (2, -150.0)] {
+        let record = NodeRecord {
+            position: Point { x, y: -15.0 },
+            title: String::new(),
+            color: FILL,
+            rows: Vec::new(),
+        };
         graph.add_node(NodeId(id), record).unwrap();
     }
     graph.set_selection(&[NodeId(1)]).unwrap();
@@ -54,7 +64,7 @@ async fn webgl2_draws_each_view_inside_its_viewport() {
     for left in [0, WIDTH / 2] {
         assert_eq!(pixel(&pixels, left + 5, 5), BACKGROUND, "background");
         assert_eq!(pixel(&pixels, left + 80, 50), fill, "fill");
-        assert_eq!(pixel(&pixels, left + 61, 50), SELECTED_BORDER, "border");
+        assert_eq!(pixel(&pixels, left + 51, 50), SELECTED_BORDER, "border");
     }
     // The viewport alone clips here: SwiftShader rasterizes nothing outside it, so this cannot
     // show that the scissor is set, which GPUs with guard-band clipping need.
@@ -63,6 +73,118 @@ async fn webgl2_draws_each_view_inside_its_viewport() {
         BACKGROUND,
         "the right view drew outside itself"
     );
+}
+
+#[wasm_bindgen_test]
+async fn webgl2_draws_text_at_each_views_zoom_under_the_nodes_above() {
+    const TITLE: &str = "Blur radius";
+    const COVER: Color = Color {
+        r: 150,
+        g: 60,
+        b: 60,
+    };
+    let (device, queue) = webgl2_device().await;
+
+    // Node 1's title bar spans y = -22 to 2 and its one row 2 to 22. Node 2, added later, covers
+    // the middle of that row's label, which is long enough to show on either side.
+    let mut graph = Graph::default();
+    let titled = NodeRecord {
+        position: Point { x: -90.0, y: -22.0 },
+        title: TITLE.to_owned(),
+        color: FILL,
+        rows: vec![Row::Pin(Pin {
+            id: PinId(1),
+            label: "M".repeat(16),
+            direction: Direction::Input,
+        })],
+    };
+    graph.add_node(NodeId(1), titled).unwrap();
+    let cover = NodeRecord {
+        position: Point { x: -80.0, y: 4.0 },
+        title: String::new(),
+        color: COVER,
+        rows: Vec::new(),
+    };
+    graph.add_node(NodeId(2), cover).unwrap();
+    let zooms = [1.0, 1.2];
+    let views = [0, 1].map(|index| {
+        let mut view = View::new(Viewport {
+            x: index * WIDTH / 2,
+            y: 0,
+            width: WIDTH / 2,
+            height: HEIGHT,
+            scale_factor: 1.0,
+        });
+        if index == 1 {
+            // One notch in at the view's centre keeps the graph origin there.
+            let scroll = InputEvent::Scrolled {
+                position: PhysicalPoint { x: 300.0, y: 50.0 },
+                lines: 1.0,
+            };
+            let _ = view.handle_input(&graph, scroll);
+        }
+        view
+    });
+    let pixels = draw(&device, &queue, &graph, &views).await;
+
+    let font = FontRef::try_from_slice(include_bytes!("../fonts/Geist-Regular.ttf")).unwrap();
+    let title_ink = title_ink_width(&font, TITLE, 13.0);
+    let fill = [FILL.r, FILL.g, FILL.b];
+    for (index, zoom) in zooms.into_iter().enumerate() {
+        let left = index as u32 * WIDTH / 2;
+        // Physical pixel columns or rows between two graph coordinates, a few pixels inside them
+        // and the view.
+        let x = |from: f32, to: f32| {
+            let centre = left as f32 + WIDTH as f32 / 4.0;
+            let from = ((centre + from * zoom).ceil() as u32).max(left) + 2;
+            let to = ((centre + to * zoom).floor() as u32).min(left + WIDTH / 2) - 2;
+            from..to
+        };
+        let y = |from: f32, to: f32| {
+            let centre = HEIGHT as f32 / 2.0;
+            (centre + from * zoom).ceil() as u32 + 2..(centre + to * zoom).floor() as u32 - 2
+        };
+        // The columns with a pixel clearly unlike `under`.
+        let inked = |columns: std::ops::Range<u32>, rows: std::ops::Range<u32>, under: [u8; 3]| {
+            columns
+                .filter(|&column| {
+                    rows.clone().any(|row| {
+                        let pixel = pixel(&pixels, column, row);
+                        (0..3).any(|i| pixel[i].abs_diff(under[i]) > 24)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let title = inked(x(-90.0, 50.0), y(-22.0, 2.0), fill);
+        let (first, last) = (title[0], title[title.len() - 1]);
+        let width = (last + 1 - first) as f32;
+        assert!(
+            (width - title_ink * zoom).abs() <= 1.0,
+            "zoom {zoom}: title ink is {width} pixels wide, measured {}",
+            title_ink * zoom
+        );
+
+        let cover = [COVER.r, COVER.g, COVER.b];
+        let covered = inked(x(-80.0, 20.0), y(4.0, 28.0), cover).len();
+        assert_eq!(covered, 0, "zoom {zoom}: the label shows through node 2");
+        let beyond = inked(x(22.0, 60.0), y(4.0, 20.0), BODY).len();
+        assert!(beyond > 0, "zoom {zoom}: the label is drawn beside node 2");
+    }
+}
+
+/// The width from the first glyph's ink to the last's, with each glyph at the sum of the
+/// advances before it, in graph units at `size` units per em.
+fn title_ink_width(font: &FontRef<'_>, text: &str, size: f32) -> f32 {
+    let per_unit = size / font.units_per_em().unwrap();
+    let glyphs: Vec<_> = text.chars().map(|c| font.glyph_id(c)).collect();
+    let pens: f32 = glyphs[..glyphs.len() - 1]
+        .iter()
+        .map(|&glyph| font.h_advance_unscaled(glyph))
+        .sum();
+    let first = font.outline(glyphs[0]).unwrap().bounds.min.x;
+    let last = font.outline(glyphs[glyphs.len() - 1]).unwrap().bounds.max.x;
+    (pens + last - first) * per_unit
 }
 
 /// A device on the WebGL2 backend. Fails rather than skips without one, so that a browser that

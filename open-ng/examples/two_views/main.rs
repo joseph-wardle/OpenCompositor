@@ -1,8 +1,9 @@
 //! Two views of one graph, side by side in one window.
 //!
 //! The example is the host: it owns the graph and a small history, and decides what each
-//! response from a view does. Moves snap to a 10-unit grid, the bottom node is locked in place,
-//! and Ctrl+Z and Ctrl+Shift+Z undo and redo moves and selection changes.
+//! response from a view does. Moves snap to a 10-unit grid, the Write node is locked in place,
+//! and Ctrl+Z and Ctrl+Shift+Z undo and redo moves and selection changes. Folding a group stays
+//! out of the history, as Blender keeps panel toggles out of undo.
 //!
 //! This file is what every platform shares; each platform's module starts the GPU, translates its
 //! events and schedules redraws.
@@ -17,8 +18,8 @@ mod native;
 mod web;
 
 use open_ng::{
-    Color, Connection, Graph, InputEvent, InputRef, NodeId, NodeRecord, OutputRef, Point, Renderer,
-    Response, View, ViewBuffers, Viewport,
+    Color, Connection, Direction, Fold, Graph, Group, GroupId, InputEvent, NodeId, NodeRecord, Pin,
+    PinId, PinRef, Point, Renderer, Response, Row, View, ViewBuffers, Viewport,
 };
 
 /// The physical pixels between the two views.
@@ -69,6 +70,9 @@ impl Editor {
         for view in &mut self.views {
             let response = view.handle_input(&self.graph, input);
             handled |= response.handled;
+            if let Some(fold) = response.fold {
+                apply_fold(&mut self.graph, fold);
+            }
             self.history.apply(&mut self.graph, response);
         }
         handled
@@ -245,39 +249,124 @@ fn viewports(width: u32, height: u32, scale_factor: f32) -> [Viewport; 2] {
     ]
 }
 
-/// Two sources merged, blurred and written, laid out around the graph origin where new views
-/// are centred.
+/// Two sources merged, blurred and written, from left to right around the graph origin where
+/// new views are centred. Every node's input is pin 1 and its output pin 2, except the merge's
+/// second input, pin 3. The blur has four more inputs in two groups, one folded.
 fn network() -> Graph {
-    let node = |x, y, (r, g, b), inputs, outputs| {
-        NodeRecord::vertical(Point { x, y }, Color { r, g, b }, inputs, outputs)
+    let pin = |id, label: &str, direction| {
+        Row::Pin(Pin {
+            id: PinId(id),
+            label: label.to_owned(),
+            direction,
+        })
+    };
+    let input = |label| pin(1, label, Direction::Input);
+    let output = pin(2, "Image", Direction::Output);
+    let node = |title: &str, x, y, (r, g, b), rows| NodeRecord {
+        position: Point { x, y },
+        title: title.to_owned(),
+        color: Color { r, g, b },
+        rows,
     };
     let source = (70, 120, 170);
     let mut graph = Graph::default();
     let nodes = [
-        node(-80.0, -160.0, source, 0, 1),
-        node(80.0, -160.0, source, 0, 1),
-        node(0.0, -60.0, (150, 110, 60), 2, 1),
-        node(0.0, 40.0, (90, 140, 90), 1, 1),
-        node(0.0, 140.0, (150, 70, 70), 1, 0),
+        node("Read", -340.0, -90.0, source, vec![output.clone()]),
+        node("Read", -340.0, 20.0, source, vec![output.clone()]),
+        node(
+            "Merge",
+            -180.0,
+            -40.0,
+            (150, 110, 60),
+            vec![
+                output.clone(),
+                input("Foreground"),
+                pin(3, "Background", Direction::Input),
+            ],
+        ),
+        node(
+            "Directional Blur",
+            -20.0,
+            -40.0,
+            (90, 140, 90),
+            vec![
+                input("Image"),
+                output,
+                Row::Group(Group {
+                    id: GroupId(1),
+                    label: "Options".to_owned(),
+                    folded: false,
+                    pins: vec![
+                        Pin {
+                            id: PinId(3),
+                            label: "Size".to_owned(),
+                            direction: Direction::Input,
+                        },
+                        Pin {
+                            id: PinId(4),
+                            label: "Mask".to_owned(),
+                            direction: Direction::Input,
+                        },
+                    ],
+                }),
+                Row::Group(Group {
+                    id: GroupId(2),
+                    label: "Advanced".to_owned(),
+                    folded: true,
+                    pins: vec![
+                        Pin {
+                            id: PinId(5),
+                            label: "Edge handling".to_owned(),
+                            direction: Direction::Input,
+                        },
+                        Pin {
+                            id: PinId(6),
+                            label: "Premultiplied alpha".to_owned(),
+                            direction: Direction::Input,
+                        },
+                    ],
+                }),
+            ],
+        ),
+        node("Write", 140.0, -40.0, (150, 70, 70), vec![input("Image")]),
     ];
     for (id, record) in (1..).map(NodeId).zip(nodes) {
         graph.add_node(id, record).expect("a new node ID");
     }
-    let wires = [(1, 3, 0), (2, 3, 1), (3, 4, 0), (4, 5, 0)];
+    let wires = [(1, 3, 1), (2, 3, 3), (3, 4, 1), (4, 5, 1)];
     for (from, to, input) in wires {
         let connection = Connection {
-            from: OutputRef {
+            from: PinRef {
                 node: NodeId(from),
-                index: 0,
+                pin: PinId(2),
             },
-            to: InputRef {
+            to: PinRef {
                 node: NodeId(to),
-                index: input,
+                pin: PinId(input),
             },
         };
-        graph.add_connection(connection).expect("ports that exist");
+        graph
+            .add_connection(connection)
+            .expect("an output and an input that exist");
     }
     graph
+}
+
+fn apply_fold(graph: &mut Graph, fold: Fold) {
+    let mut record = graph
+        .node(fold.node)
+        .expect("views request only nodes that exist")
+        .clone();
+    for row in &mut record.rows {
+        if let Row::Group(group) = row
+            && group.id == fold.group
+        {
+            group.folded = fold.folded;
+        }
+    }
+    graph
+        .update_node(fold.node, record)
+        .expect("the same pins and groups");
 }
 
 /// The host's undo history: each entry is one response as applied.

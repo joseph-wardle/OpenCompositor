@@ -1,9 +1,10 @@
 [package]
 name = "open-ng"
-version = "0.2.0"
+version = "0.3.0"
 description = "A programmable node editor library for native and browser applications."
 edition.workspace = true
-license.workspace = true
+# The bundled font in fonts/ is under the SIL Open Font License.
+license = "(MIT OR Apache-2.0) AND OFL-1.1"
 repository = "https://github.com/joseph-wardle/OpenCompositor"
 readme = "README.md"
 publish = false
@@ -12,7 +13,9 @@ publish = false
 workspace = true
 
 [dependencies]
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
+rustc-hash = "1.1.0"
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
