@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 
+use rustc_hash::FxHashSet;
+
 use crate::connection_edit::{ConnectionEdit, Verdict};
 use crate::geometry::{self, Part, Rect};
 use crate::graph::{AddStamp, Connection, Graph, GroupId, NodeId, PinRef, Point, Side};
@@ -203,9 +205,13 @@ struct Cut {
     /// Every wire the stroke has crossed, once each, in order, with when it was crossed, so that
     /// a wire from a node added since under the same ID is not mistaken for it.
     crossed: Vec<(Connection, AddStamp)>,
-    /// The edit removing the crossed wires the host accepted cutting, if it accepted any.
-    accepted: Option<Proposal>,
-    /// The host's reason for refusing the last wire it judged, if it refused it and gave one.
+    /// The wires in `crossed`, to find them without searching it.
+    crossed_set: FxHashSet<Connection>,
+    /// The crossed wires the host accepted cutting, in the order crossed, and the others it would
+    /// remove with them.
+    cut: Vec<Connection>,
+    displaced: Vec<Connection>,
+    /// The host's reason for refusing the last wires it judged, if it refused them and gave one.
     refusal: Option<String>,
 }
 
@@ -411,83 +417,106 @@ impl Cut {
         Cut {
             stroke: vec![from],
             crossed: Vec::new(),
-            accepted: None,
+            crossed_set: FxHashSet::default(),
+            cut: Vec::new(),
+            displaced: Vec::new(),
             refusal: None,
         }
     }
 
-    /// Extends the stroke to `to`, and asks the host about each wire it newly crosses inside
+    /// Extends the stroke to `to`, and asks the host about the wires it newly crosses inside
     /// `visible` and outside every node, where the wire is seen.
     fn extend(&mut self, graph: &Graph, to: Point, visible: Rect, judge: &mut Judge<'_>) {
+        // The host may have changed the graph since the last event without a refresh.
+        let first_new = if self.forget_lost(graph) {
+            self.forget_verdicts();
+            0
+        } else {
+            self.crossed.len()
+        };
         let from = *self.stroke.last().expect("a stroke starts at the press");
-        if to == from {
+        if to != from {
+            self.stroke.push(to);
+            let now = graph.add_stamp();
+            for &connection in graph.connections() {
+                if self.crossed_set.contains(&connection) {
+                    continue;
+                }
+                let Some(control) = committed_wire(graph, connection) else {
+                    continue;
+                };
+                let seen = geometry::wire_crossings(control, from, to)
+                    .any(|point| visible.contains(point) && graph.node_at(point).is_none());
+                if seen {
+                    self.crossed_set.insert(connection);
+                    self.crossed.push((connection, now));
+                }
+            }
+        }
+        self.judge(first_new, judge);
+    }
+
+    /// Asks the host about cutting the wires crossed from `first_new` on together with those it
+    /// already accepted cutting: all at once and, if it refuses, one at a time in the order
+    /// crossed, so that one wire the host keeps leaves the rest of the cut alone.
+    fn judge(&mut self, first_new: usize, judge: &mut Judge<'_>) {
+        let new = first_new..self.crossed.len();
+        if new.len() > 1 && self.try_cut(new.clone(), judge) {
             return;
         }
-        self.stroke.push(to);
-        let now = graph.add_stamp();
-        for &connection in graph.connections() {
-            let Some(control) = committed_wire(graph, connection) else {
-                continue;
-            };
-            let seen = geometry::wire_crossings(control, from, to)
-                .any(|point| visible.contains(point) && graph.node_at(point).is_none());
-            if seen
-                && !self
-                    .crossed
-                    .iter()
-                    .any(|&(crossed, _)| crossed == connection)
-            {
-                self.crossed.push((connection, now));
-                self.judge(graph, connection, judge);
-            }
+        for index in new {
+            self.try_cut(index..index + 1, judge);
         }
     }
 
-    /// Asks the host about cutting `connection` together with the wires it already accepted.
-    /// Refused, it stays uncut and the others stay cut.
-    fn judge(&mut self, graph: &Graph, connection: Connection, judge: &mut Judge<'_>) {
-        let mut edit = self
-            .accepted
-            .as_ref()
-            .map_or_else(ConnectionEdit::default, |accepted| accepted.edit.clone());
-        edit.remove.push(connection);
-        let Some(edit) = edit.normalised(graph) else {
-            return;
+    /// Asks the host about cutting the crossed wires in `range` together with those it already
+    /// accepted cutting, and returns whether it accepted.
+    fn try_cut(&mut self, range: std::ops::Range<usize>, judge: &mut Judge<'_>) -> bool {
+        let wires = self.crossed[range]
+            .iter()
+            .map(|&(connection, _)| connection);
+        let edit = ConnectionEdit {
+            remove: self.cut.iter().copied().chain(wires).collect(),
+            add: Vec::new(),
         };
         match judge(&edit) {
-            verdict @ Verdict::Accept { .. } => {
-                self.accepted = Some(Proposal { edit, verdict });
+            Verdict::Accept { displaced } => {
+                self.cut = edit.remove;
+                self.displaced = displaced;
                 self.refusal = None;
+                true
             }
-            Verdict::Refuse { reason } => self.refusal = reason,
+            Verdict::Refuse { reason } => {
+                self.refusal = reason;
+                false
+            }
         }
     }
 
-    /// Asks the host about every crossed wire again, in the order crossed.
+    /// Forgets crossed wires the graph no longer has, and asks about the rest again.
     fn judge_again(&mut self, graph: &Graph, judge: &mut Judge<'_>) {
-        self.accepted = None;
-        self.refusal = None;
-        for index in 0..self.crossed.len() {
-            let (connection, _) = self.crossed[index];
-            self.judge(graph, connection, judge);
-        }
+        self.forget_lost(graph);
+        self.forget_verdicts();
+        self.judge(0, judge);
     }
 
-    /// Forgets crossed wires the graph no longer has and, if there were any, asks about the rest
-    /// again.
-    fn keep_up(&mut self, graph: &Graph, judge: &mut Judge<'_>) {
-        if self.forget_lost(graph) {
-            self.judge_again(graph, judge);
-        }
+    fn forget_verdicts(&mut self) {
+        self.cut.clear();
+        self.displaced.clear();
+        self.refusal = None;
     }
 
     /// Forgets crossed wires the graph no longer has, and returns whether there were any.
     fn forget_lost(&mut self, graph: &Graph) -> bool {
         let before = self.crossed.len();
         self.crossed.retain(|&(connection, since)| {
-            graph.has_node_since(connection.from.node, since)
+            let kept = graph.has_node_since(connection.from.node, since)
                 && graph.has_node_since(connection.to.node, since)
-                && graph.contains_connection(connection)
+                && graph.contains_connection(connection);
+            if !kept {
+                self.crossed_set.remove(&connection);
+            }
+            kept
         });
         self.crossed.len() != before
     }
@@ -548,9 +577,9 @@ impl View {
     /// While a gesture proposes a [`ConnectionEdit`], the view asks `judge` whether the host would
     /// accept it, once each time the proposal changes, and previews the verdict. The verdict is
     /// advisory: on release the view requests the edit only if the last verdict accepted it, and
-    /// the host decides again when applying it. A cut asks about each wire it crosses together
-    /// with those the host already accepted cutting, so that one wire the host keeps leaves the
-    /// rest of the cut alone.
+    /// the host decides again when applying it. A cut asks about the wires each move crosses
+    /// together with those the host already accepted cutting and, if the host refuses, about each
+    /// of them in turn, so that one wire the host keeps leaves the rest of the cut alone.
     pub fn handle_input(
         &mut self,
         graph: &Graph,
@@ -614,13 +643,10 @@ impl View {
                 drag.target = None;
                 drag.proposal = None;
             }
-            Some(Gesture::Cut(cut)) => {
-                cut.forget_lost(graph);
-                cut.judge_again(graph, &mut judge);
-            }
+            Some(Gesture::Cut(cut)) => cut.judge_again(graph, &mut judge),
             _ => {}
         }
-        self.follow_graph(graph, &mut judge);
+        self.follow_wire(graph, &mut judge);
         self.hover = self.side_under_pointer(graph);
     }
 
@@ -723,17 +749,10 @@ impl View {
         let Some(Gesture::Cut(cut)) = &self.gesture else {
             return None;
         };
-        let (cut_wires, displaced): (&[Connection], &[Connection]) = match &cut.accepted {
-            Some(Proposal {
-                edit,
-                verdict: Verdict::Accept { displaced },
-            }) => (&edit.remove, displaced),
-            _ => (&[], &[]),
-        };
         Some(CutPreview {
             stroke: &cut.stroke,
-            cut: cut_wires,
-            displaced,
+            cut: &cut.cut,
+            displaced: &cut.displaced,
             pointer: self.pointer.expect("a cut follows a press"),
             refusal: cut.refusal.as_deref(),
         })
@@ -903,8 +922,10 @@ impl View {
             // Released anywhere, a cut removes what the host accepted cutting.
             Gesture::Cut(mut cut) => {
                 cut.extend(graph, self.to_graph(position), self.visible_rect(), judge);
-                cut.keep_up(graph, judge);
-                connections = cut.accepted.map(|accepted| accepted.edit);
+                connections = (!cut.cut.is_empty()).then_some(ConnectionEdit {
+                    remove: cut.cut,
+                    add: Vec::new(),
+                });
                 (Vec::new(), None)
             }
             Gesture::Wire(mut drag) => {
@@ -1130,7 +1151,9 @@ impl View {
     /// a wire drag.
     fn follow_graph(&mut self, graph: &Graph, judge: &mut Judge<'_>) -> bool {
         if let Some(Gesture::Cut(cut)) = &mut self.gesture {
-            cut.keep_up(graph, judge);
+            if cut.forget_lost(graph) {
+                cut.judge_again(graph, judge);
+            }
             return false;
         }
         self.follow_wire(graph, judge)
@@ -2875,7 +2898,10 @@ mod tests {
         let stroke = [press(x, top), move_to(x, bottom), release(x, bottom)];
         let response = send_judged(&mut view, &graph, &mut policy, &stroke);
         assert_eq!(response.connections, Some(cutting(&[upper])));
-        assert_eq!(policy.asked, [cutting(&[upper]), cutting(&[upper, lower])]);
+        let both = cutting(&[upper, lower]);
+        let one_at_a_time = [cutting(&[upper]), both.clone()];
+        assert_eq!(policy.asked[..1], [both], "crossed in one move");
+        assert_eq!(policy.asked[1..], one_at_a_time);
     }
 
     #[test]
