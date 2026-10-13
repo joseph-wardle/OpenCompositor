@@ -11,8 +11,9 @@ use std::rc::Rc;
 
 use ab_glyph::{Font, FontRef};
 use open_ng::{
-    Color, Connection, ConnectionEdit, Direction, Graph, InputEvent, NodeId, NodeRecord,
-    PhysicalPoint, Pin, PinId, PinRef, Point, Renderer, Row, Verdict, View, ViewBuffers, Viewport,
+    Button, Color, Connection, ConnectionEdit, Direction, Graph, InputEvent, Key, Modifiers,
+    NodeId, NodeRecord, PhysicalPoint, Pin, PinId, PinRef, Point, Renderer, Row, Verdict, View,
+    ViewBuffers, Viewport,
 };
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -245,6 +246,108 @@ async fn webgl2_draws_a_wire_in_its_color_and_fades_it_below_a_pixel_wide() {
     }
 }
 
+#[wasm_bindgen_test]
+async fn webgl2_draws_a_cut_and_a_loose_wire_in_their_colors_and_alphas() {
+    const CUT_WIRE: [u8; 3] = [214, 96, 84];
+    let (device, queue) = webgl2_device().await;
+
+    // As above, wire 1 runs straight along y = 0 across both views. Node 3's free output is at
+    // (-50, 38), clear of everything else.
+    let mut graph = Graph::default();
+    for (id, position, direction) in [
+        (
+            1,
+            Point {
+                x: -200.0,
+                y: -34.0,
+            },
+            Direction::Output,
+        ),
+        (2, Point { x: 100.0, y: -34.0 }, Direction::Input),
+        (3, Point { x: -150.0, y: 4.0 }, Direction::Output),
+    ] {
+        let record = NodeRecord {
+            position,
+            title: String::new(),
+            color: FILL,
+            rows: vec![Row::Pin(Pin {
+                id: PinId(1),
+                label: String::new(),
+                direction,
+            })],
+        };
+        graph.add_node(NodeId(id), record).unwrap();
+    }
+    let pin = |id| PinRef {
+        node: NodeId(id),
+        pin: PinId(1),
+    };
+    graph
+        .add_connection(Connection {
+            from: pin(1),
+            to: pin(2),
+        })
+        .unwrap();
+    // The left view cuts down x = 0 across wire 1. The right view drags a wire from node 3's
+    // output 120 units right along y = 38, to empty space.
+    let gestures = [
+        vec![
+            InputEvent::KeyPressed(Key::Y),
+            press(PhysicalPoint { x: 100.0, y: 20.0 }),
+            InputEvent::PointerMoved {
+                position: PhysicalPoint { x: 100.0, y: 80.0 },
+            },
+        ],
+        vec![
+            press(PhysicalPoint { x: 250.0, y: 88.0 }),
+            InputEvent::PointerMoved {
+                position: PhysicalPoint { x: 370.0, y: 88.0 },
+            },
+        ],
+    ];
+    let views = [0, 1].map(|index| {
+        let mut view = View::new(Viewport {
+            x: index * WIDTH / 2,
+            y: 0,
+            width: WIDTH / 2,
+            height: HEIGHT,
+            scale_factor: 1.0,
+        });
+        for &event in &gestures[index as usize] {
+            let _ = view.handle_input(&graph, event, accept_all);
+        }
+        view
+    });
+    let pixels = draw(&device, &queue, &graph, &views).await;
+
+    // Both are two pixels wide, and the stroke and the loose wire are translucent.
+    let over_background = |color: [u8; 3], alpha: f32| {
+        std::array::from_fn(|i| {
+            let (color, background) = (f32::from(color[i]), f32::from(BACKGROUND[i]));
+            (background + (color - background) * alpha).round() as u8
+        })
+    };
+    let stroke = over_background([240; 3], 200.0 / 255.0);
+    let loose = over_background(WIRE, 110.0 / 255.0);
+    let near = |found: [u8; 3], expected: [u8; 3], what: &str| {
+        assert!(
+            (0..3).all(|i| found[i].abs_diff(expected[i]) <= 2),
+            "{what}: {found:?}, expected {expected:?}"
+        );
+    };
+    for row in [49, 50] {
+        assert_eq!(pixel(&pixels, WIDTH / 8, row), CUT_WIRE, "the cut wire");
+        near(
+            pixel(&pixels, 3 * WIDTH / 4, row + 38),
+            loose,
+            "the loose wire",
+        );
+    }
+    for column in [99, 100] {
+        near(pixel(&pixels, column, 30), stroke, "the cut stroke");
+    }
+}
+
 /// The width from the first glyph's ink to the last's, with each glyph at the sum of the
 /// advances before it, in graph units at `size` units per em.
 fn title_ink_width(font: &FontRef<'_>, text: &str, size: f32) -> f32 {
@@ -399,7 +502,14 @@ fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 3] {
     [pixels[i], pixels[i + 1], pixels[i + 2]]
 }
 
-/// The tests only zoom, which proposes no connection edits.
+fn press(position: PhysicalPoint) -> InputEvent {
+    InputEvent::PointerPressed {
+        position,
+        button: Button::Left,
+        modifiers: Modifiers::default(),
+    }
+}
+
 fn accept_all(_: &ConnectionEdit) -> Verdict {
     Verdict::Accept {
         displaced: Vec::new(),
