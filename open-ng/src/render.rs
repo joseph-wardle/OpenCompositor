@@ -1023,6 +1023,71 @@ mod tests {
     }
 
     #[test]
+    fn a_wire_is_drawn_while_any_of_its_stroke_is_in_view() {
+        let mut graph = Graph::default();
+        for (id, direction) in [(1, Direction::Output), (2, Direction::Input)] {
+            let record = NodeRecord {
+                position: at(0.0, 0.0),
+                title: String::new(),
+                color: GREY,
+                rows: vec![Row::Pin(Pin {
+                    id: PinId(1),
+                    label: String::new(),
+                    direction,
+                })],
+            };
+            graph.add_node(NodeId(id), record).unwrap();
+        }
+        let pin = |id| PinRef {
+            node: NodeId(id),
+            pin: PinId(1),
+        };
+        graph
+            .add_connection(Connection {
+                from: pin(1),
+                to: pin(2),
+            })
+            .unwrap();
+        // Moves the nodes so that the wire runs between these points.
+        let place = |graph: &mut Graph, output: Point, input: Point| {
+            for (id, end) in [(NodeId(1), output), (NodeId(2), input)] {
+                let mut record = graph.node(id).unwrap().clone();
+                let layout = graph.node_layout(id).unwrap();
+                let port = layout.port(record.position, PinId(1)).unwrap();
+                record.position.x += end.x - port.x;
+                record.position.y += end.y - port.y;
+                graph.update_node(id, record).unwrap();
+            }
+        };
+        let view = view(1.0);
+        let visible = view.visible_rect();
+
+        // At zoom 1 the stroke is a unit either side of the centre line, and its antialiased edge
+        // half a unit more, so only the edge is in view.
+        place(
+            &mut graph,
+            at(-100.0, visible.min.y - 1.25),
+            at(100.0, visible.min.y - 1.25),
+        );
+        assert_eq!(wires(&graph, &view).len(), 1);
+        place(
+            &mut graph,
+            at(-100.0, visible.min.y - 3.0),
+            at(100.0, visible.min.y - 3.0),
+        );
+        assert!(wires(&graph, &view).is_empty());
+
+        // A wire running back to the left first bulges about 8 units to the right of its output,
+        // into the view, though both ends are outside it.
+        place(
+            &mut graph,
+            at(visible.min.x - 4.0, 0.0),
+            at(visible.min.x - 104.0, 0.0),
+        );
+        assert_eq!(wires(&graph, &view).len(), 1);
+    }
+
+    #[test]
     fn each_nodes_text_draws_after_it_and_before_the_next_node() {
         let mut graph = Graph::default();
         graph.add_node(NodeId(1), labelled("Blur", 0.0)).unwrap();
