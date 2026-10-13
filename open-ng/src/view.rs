@@ -112,9 +112,9 @@ enum Gesture {
         /// The group whose header the press hit, if it was unmodified. Released there, it folds
         /// or unfolds the group and leaves the selection alone.
         header: Option<GroupId>,
-        /// The side of a pin the press hit. Dragged, it starts a wire or lifts the wires into an
-        /// input; released, it is a click on the node.
-        port: Option<(PinRef, Side)>,
+        /// The port the press hit. Released, it is a click on the node or, unmodified on a folded
+        /// group's port, on its header.
+        port: Option<PressedPort>,
         combine: Combine,
         since: AddStamp,
     },
@@ -129,6 +129,15 @@ enum Gesture {
     },
     Wire(WireDrag),
     Cut(Cut),
+}
+
+#[derive(Debug)]
+enum PressedPort {
+    /// One side of a pin. Dragged, it starts a wire or lifts the wires into an input.
+    Pin(PinRef, Side),
+    /// A folded group's port, which stands for several pins. Dragged, it stays a click, so that
+    /// a press meant to start a wire neither starts one nor moves the node.
+    Folded,
 }
 
 /// Wires dragged by their free end: a new wire from one side of a pin toward the other side of
@@ -413,12 +422,15 @@ impl WireDrag {
         edit.normalised(graph)
     }
 
-    /// Moves the free end to `target` and, if it moved, proposes dropping it there. Comparing
-    /// targets first keeps pointer moves within one target from building an edit.
-    fn aim(&mut self, graph: &Graph, target: Option<Target>, judge: &mut Judge<'_>) {
-        if target != self.target {
+    /// Moves the free end to `target` and, if it moved, proposes dropping it there. Returns
+    /// whether it moved. Comparing targets first keeps pointer moves within one target from
+    /// building an edit.
+    fn aim(&mut self, graph: &Graph, target: Option<Target>, judge: &mut Judge<'_>) -> bool {
+        let moved = target != self.target;
+        if moved {
             self.propose_at(graph, target, judge);
         }
+        moved
     }
 
     /// Proposes dropping the free end at `target`, asking the host only if the edit differs from
@@ -642,14 +654,7 @@ impl View {
             }
             InputEvent::Scrolled { position, lines } => self.scrolled(position, lines),
             InputEvent::KeyPressed(key) => self.key_pressed(graph, key),
-            InputEvent::KeyReleased(key) => {
-                match key {
-                    Key::Space => self.space_held = false,
-                    Key::Y => self.y_held = false,
-                    Key::Escape | Key::H | Key::G => {}
-                }
-                Response::default()
-            }
+            InputEvent::KeyReleased(key) => self.key_released(key),
             InputEvent::PointerLeft => {
                 self.pointer_in_target = false;
                 Response::default()
@@ -842,7 +847,7 @@ impl View {
             // Modifiers do not change a port drag. The view follows the wire after the event.
             Some(Gesture::Press {
                 at,
-                port: Some((pressed, side)),
+                port: Some(PressedPort::Pin(pressed, side)),
                 since,
                 ..
             }) if self.beyond_drag_threshold(at, position) => {
@@ -854,6 +859,7 @@ impl View {
                 at,
                 from,
                 node,
+                port: None,
                 combine,
                 since,
                 ..
@@ -910,11 +916,18 @@ impl View {
             let combine = Combine::from_modifiers(modifiers);
             // Modified clicks on a header select, as they do on the rest of the node.
             let header = match hit {
-                Some((_, Part::Header(group))) if combine == Combine::Replace => Some(group),
+                Some((_, Part::Header(group) | Part::FoldedPort(group)))
+                    if combine == Combine::Replace =>
+                {
+                    Some(group)
+                }
                 _ => None,
             };
             let port = match hit {
-                Some((node, Part::Port(pin, side))) => Some((PinRef { node, pin }, side)),
+                Some((node, Part::Port(pin, side))) => {
+                    Some(PressedPort::Pin(PinRef { node, pin }, side))
+                }
+                Some((_, Part::FoldedPort(_))) => Some(PressedPort::Folded),
                 _ => None,
             };
             Gesture::Press {
@@ -1090,6 +1103,21 @@ impl View {
         }
     }
 
+    /// Releasing Space or Y while the pointer is in the view is handled, so that the port under
+    /// the pointer is found again.
+    fn key_released(&mut self, key: Key) -> Response {
+        let held = match key {
+            Key::Space => &mut self.space_held,
+            Key::Y => &mut self.y_held,
+            Key::Escape | Key::H | Key::G => return Response::default(),
+        };
+        *held = false;
+        Response {
+            handled: self.pointer_in_view().is_some(),
+            ..Response::default()
+        }
+    }
+
     /// Centres the nodes and zooms to fit them. Does nothing if there are none.
     fn frame(&mut self, graph: &Graph, nodes: impl Iterator<Item = NodeId>) {
         let Some(bounds) = nodes
@@ -1140,9 +1168,10 @@ impl View {
         (to.x - from.x).abs() > threshold || (to.y - from.y).abs() > threshold
     }
 
-    /// The side of a pin a press at the pointer would grab, if no gesture is in progress.
+    /// The side of a pin a press at the pointer would grab, if no gesture is in progress and no
+    /// held key turns the press into a pan or a cut.
     fn side_under_pointer(&self, graph: &Graph) -> Option<(PinRef, Side)> {
-        if self.gesture.is_some() {
+        if self.gesture.is_some() || self.space_held || self.y_held {
             return None;
         }
         self.port_under_pointer(graph)
@@ -1166,7 +1195,7 @@ impl View {
         let pointer = self.pointer_in_view()?;
         match graph.hit(self.to_graph(pointer), self.port_reach())? {
             (node, Part::Port(pin, side)) => Some((PinRef { node, pin }, side)),
-            (_, Part::Body | Part::Header(_)) => None,
+            (_, Part::Body | Part::Header(_) | Part::FoldedPort(_)) => None,
         }
     }
 
@@ -1175,20 +1204,22 @@ impl View {
             .filter(|&pointer| self.pointer_in_target && self.viewport.contains(pointer))
     }
 
-    /// Brings the gesture up to date with the graph and the pointer. Returns whether it cancelled
-    /// a wire drag.
+    /// Brings the gesture up to date with the graph and the pointer. Returns whether that changed
+    /// what the view draws.
     fn follow_graph(&mut self, graph: &Graph, judge: &mut Judge<'_>) -> bool {
         if let Some(Gesture::Cut(cut)) = &mut self.gesture {
-            if cut.forget_lost(graph) {
+            let lost = cut.forget_lost(graph);
+            if lost {
                 cut.judge_again(graph, judge);
             }
-            return false;
+            return lost;
         }
         self.follow_wire(graph, judge)
     }
 
     /// Moves a wire drag's target to where the pointer is, proposing the edit dropping it there,
-    /// or cancels the drag if it no longer holds a wire. Returns whether it cancelled the drag.
+    /// or cancels the drag if it no longer holds a wire. Returns whether it cancelled the drag or
+    /// moved its target.
     fn follow_wire(&mut self, graph: &Graph, judge: &mut Judge<'_>) -> bool {
         let Some(Gesture::Wire(mut drag)) = self
             .gesture
@@ -1200,9 +1231,9 @@ impl View {
             return true;
         }
         let target = self.drop_under_pointer(graph, drag.free_side());
-        drag.aim(graph, target, judge);
+        let moved = drag.aim(graph, target, judge);
         self.gesture = Some(Gesture::Wire(drag));
-        false
+        moved
     }
 
     /// How far past a node's outline its ports are hit, in graph units.
@@ -2098,6 +2129,30 @@ mod tests {
     }
 
     #[test]
+    fn a_press_on_a_folded_port_stays_a_click_on_its_header() {
+        let graph = grouped(true);
+        let mut view = View::new(WHOLE);
+        // Just outside the folded input port on the node's left edge.
+        let (x, y) = (348.0, HEADER.1);
+
+        let drag = [press(x, y), move_to(x - 40.0, y), release(x - 40.0, y)];
+        let response = send(&mut view, &graph, &drag);
+        let unfold = Fold {
+            node: NodeId(1),
+            group: GroupId(7),
+            folded: false,
+        };
+        assert_eq!(
+            response,
+            Response {
+                fold: Some(unfold),
+                handled: true,
+                ..Response::default()
+            }
+        );
+    }
+
+    #[test]
     fn a_header_click_requests_nothing_if_its_group_or_node_went_or_it_was_cancelled() {
         let mut graph = grouped(false);
         let mut view = View::new(WHOLE);
@@ -2325,6 +2380,39 @@ mod tests {
             }
         );
         assert_eq!(policy.asked, [into(1)]);
+    }
+
+    #[test]
+    fn leaving_the_view_during_a_wire_drag_loosens_the_wire() {
+        let graph = unwired();
+        let mut view = View::new(WHOLE);
+        let mut policy = Policy::default();
+        let ((x, y), (to_x, to_y)) = (OUTPUT, INPUT_1);
+        let drag = [press(x, y), move_to(to_x, to_y)];
+        let _ = send_judged(&mut view, &graph, &mut policy, &drag);
+        assert_eq!(view.hovered_side(), Some((pin_ref(2, 1), Side::Input)));
+
+        let response = view.handle_input(&graph, InputEvent::PointerLeft, policy.judge());
+        assert!(response.handled);
+        assert_eq!(view.hovered_side(), None);
+        assert_eq!(preview(&view), Some(Err(None)));
+    }
+
+    #[test]
+    fn holding_space_or_y_hides_the_port_a_press_would_grab() {
+        let graph = unwired();
+        let mut view = View::new(WHOLE);
+        let (x, y) = OUTPUT;
+        let output = Some((pin_ref(1, 1), Side::Output));
+        let _ = view.handle_input(&graph, move_to(x, y), accept_all);
+
+        for key in [Key::Space, Key::Y] {
+            let _ = view.handle_input(&graph, InputEvent::KeyPressed(key), accept_all);
+            assert_eq!(view.hovered_side(), None, "{key:?}");
+            let response = view.handle_input(&graph, InputEvent::KeyReleased(key), accept_all);
+            assert!(response.handled, "{key:?}");
+            assert_eq!(view.hovered_side(), output, "{key:?}");
+        }
     }
 
     #[test]

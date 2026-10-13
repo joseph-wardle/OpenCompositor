@@ -156,8 +156,10 @@ enum VisibleRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Part {
     Body,
-    /// A group's header row, its folded ports included.
+    /// A group's header row, outside its folded ports.
     Header(GroupId),
+    /// A folded group's port. It stands for several pins, so it is no wire end.
+    FoldedPort(GroupId),
     /// One side of an unfolded pin: its port, or the part of its row that grabs that side.
     Port(PinId, Side),
 }
@@ -394,6 +396,8 @@ impl NodeLayout {
         }
         Some(match self.rows.get(row as usize) {
             None => Part::Body,
+            // Only a folded header has ports, and only its own are within reach of its row.
+            Some(&VisibleRow::Header(group)) if reaches_port() => Part::FoldedPort(group),
             Some(&VisibleRow::Header(group)) => Part::Header(group),
             Some(&VisibleRow::Pin {
                 pin,
@@ -735,7 +739,10 @@ mod tests {
         let mut folded = open;
         folded.rows[1] = group(true, vec![pin(2, "Size", Direction::Input)]);
         let layout = lay_out(&folded);
-        assert_eq!(hit(&layout, -2.0, row_middle(1)), header, "its folded port");
+        let port = Some(Part::FoldedPort(GroupId(1)));
+        assert_eq!(hit(&layout, -2.0, row_middle(1)), port, "outside the node");
+        assert_eq!(hit(&layout, 2.0, row_middle(1)), port, "inside the node");
+        assert_eq!(hit(&layout, 10.0, row_middle(1)), header);
         let below = hit(&layout, 10.0, row_middle(2));
         assert_eq!(below, Some(Part::Body), "the output's row");
     }
