@@ -6,19 +6,19 @@ A node-editor library for Rust applications that own their graph documents.
 
 Early and experimental. Current features include:
 
-- A shared presentation `Graph` of nodes, ports, connections and a selection, kept in step with your document.
+- A shared presentation `Graph` of nodes, connections and a selection, kept in step with your document. Each node has a title and rows of labelled input and output pins, which may sit in foldable groups.
 - Any number of `View`s of one graph, each with its own pan, zoom and gesture in progress.
-- Selection by click and box, moving nodes, panning and zooming, and framing all or selected nodes.
-- A wgpu renderer that draws views into a render pass you own.
+- Selection by click and box, moving nodes, folding groups, panning and zooming, and framing all or selected nodes.
+- A wgpu renderer that draws views into a render pass you own, with text in one bundled font.
 - An example with two views of one graph, a small undo history, snapping and a locked node, running natively and in a web page with WebGPU or WebGL2.
 
-There is no connection editing, labels or any text, hover, touch input or remappable shortcuts. The API will have breaking changes.
+There is no connection editing, hover, touch input or remappable shortcuts. Text is set without kerning, shaping or right-to-left support, and host fonts are not supported. The API will have breaking changes.
 
 ## How a host uses it
 
 You own one `Graph` per document network, a `View` per pane, one `Renderer` per device and target format, and a `ViewBuffers` beside each view. OpenNG keeps no global state.
 
-Input: translate your window events into `InputEvent`s and send each to every view. A view returns a `Response` with the positions and selection it requests. Apply what you accept to your document and then to the graph; ignore the rest to reject it. Ignoring a response leaves the graph unchanged, and every view draws the committed result.
+Input: translate your window events into `InputEvent`s and send each to every view. A view returns a `Response` with the positions, selection and group fold it requests. Apply what you accept to your document and then to the graph; ignore the rest to reject it. Ignoring a response leaves the graph unchanged, and every view draws the committed result.
 
 ```rust
 for view in &mut views {
@@ -72,6 +72,7 @@ and open the address it prints. The page uses WebGPU where the browser offers it
 | Shift-click, Ctrl-click | Add to or remove from the selection |
 | Drag a node | Move it, or the whole selection if it is selected |
 | Drag on empty space | Box-select; Shift adds, Ctrl removes |
+| Click a group's header | Fold or unfold the group |
 | Middle drag, or Space and drag | Pan |
 | Scroll | Zoom about the pointer |
 | H, G | Frame all nodes or the selection |
