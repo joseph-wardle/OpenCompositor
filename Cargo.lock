@@ -1200,6 +1200,7 @@ dependencies = [
  "bytemuck",
  "js-sys",
  "pollster",
+ "rustc-hash",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",

@@ -150,8 +150,16 @@ fn shape_fragment(in: ShapeVertex) -> @location(0) vec4<f32> {
     let q = abs(in.local) - in.half_size + in.radius;
     let distance = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - in.radius;
     let edge = distance * view.pixels_per_unit;
-    let coverage = clamp(0.5 - edge, 0.0, 1.0);
-    let in_border = clamp(0.5 + edge + in.border_width * view.pixels_per_unit, 0.0, 1.0);
-    let color = mix(in.fill, in.border, in_border);
-    return target_color(color.rgb, color.a * coverage);
+    // The fill covers what lies further inside than the border width, and the border the band
+    // between. Weighting each color by its alpha keeps a borderless edge the fill's color rather
+    // than darkening it toward a transparent border, which showed as seams between shapes.
+    let outer = clamp(0.5 - edge, 0.0, 1.0);
+    let inner = clamp(0.5 - edge - in.border_width * view.pixels_per_unit, 0.0, 1.0);
+    let fill = in.fill.a * inner;
+    let border = in.border.a * (outer - inner);
+    let alpha = fill + border;
+    if alpha <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return target_color((in.fill.rgb * fill + in.border.rgb * border) / alpha, alpha);
 }

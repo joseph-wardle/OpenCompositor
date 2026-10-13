@@ -36,14 +36,15 @@ pub(crate) fn advance(font: &FontRef<'_>, glyph: GlyphId, size: f32) -> f32 {
     font.h_advance_unscaled(glyph) * size / units_per_em(font)
 }
 
+/// The bundled font's capital height in ems. A constant, checked against the font by a test,
+/// because reading it from an outline for every node laid out was half the cost of loading a
+/// large graph.
+const CAP_HEIGHT_PER_EM: f32 = 0.71;
+
 /// The height of capital letters above the baseline at a font size of `size` units per em, by
 /// which text is centred in its row.
-pub(crate) fn cap_height(font: &FontRef<'_>, size: f32) -> f32 {
-    let capital = font
-        .outline(font.glyph_id('H'))
-        .expect("the bundled font has an H");
-    // ab_glyph's outline bounds put the top in `min`, in font units with y up.
-    capital.bounds.min.y * size / units_per_em(font)
+pub(crate) fn cap_height(size: f32) -> f32 {
+    CAP_HEIGHT_PER_EM * size
 }
 
 pub(crate) fn units_per_em(font: &FontRef<'_>) -> f32 {
@@ -83,6 +84,17 @@ mod tests {
         let small = text_width(&font, "Blur radius", 11.0);
         let large = text_width(&font, "Blur radius", 22.0);
         assert!((large - 2.0 * small).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_cap_height_is_the_height_of_an_h() {
+        let font = bundled_font();
+        let capital = font.outline(font.glyph_id('H')).unwrap();
+        // ab_glyph's outline bounds put the top in `min`, in font units with y up.
+        assert_eq!(
+            capital.bounds.min.y / units_per_em(&font),
+            CAP_HEIGHT_PER_EM
+        );
     }
 
     #[test]

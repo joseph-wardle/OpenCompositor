@@ -1,11 +1,10 @@
 //! Glyphs rasterised at the size a view shows them, packed for its atlas texture.
 
-use std::collections::HashMap;
-
 use ab_glyph::{
     Font, FontRef, Glyph, GlyphId, Outline, OutlineCurve, OutlinedGlyph, PxScale, PxScaleFactor,
     Rect, point,
 };
+use rustc_hash::FxHashMap;
 
 use crate::text::units_per_em;
 
@@ -50,7 +49,7 @@ pub(crate) struct Upload {
 #[derive(Debug, Default)]
 pub(crate) struct GlyphAtlas {
     /// `None` for ink with nothing to draw, such as a space.
-    entries: HashMap<Key, Option<Entry>>,
+    entries: FxHashMap<Key, Option<Entry>>,
     // Bitmaps fill rows from left to right; a row is as tall as its tallest bitmap.
     row_top: u32,
     row_height: u32,

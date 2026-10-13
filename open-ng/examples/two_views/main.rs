@@ -251,7 +251,7 @@ fn viewports(width: u32, height: u32, scale_factor: f32) -> [Viewport; 2] {
 
 /// Two sources merged, blurred and written, from left to right around the graph origin where
 /// new views are centred. Every node's input is pin 1 and its output pin 2, except the merge's
-/// second input, pin 3. The blur has two more inputs in a group.
+/// second input, pin 3. The blur has four more inputs in two groups, one folded.
 fn network() -> Graph {
     let pin = |id, label: &str, direction| {
         Row::Pin(Pin {
@@ -278,10 +278,14 @@ fn network() -> Graph {
             -180.0,
             -40.0,
             (150, 110, 60),
-            vec![output.clone(), input("A"), pin(3, "B", Direction::Input)],
+            vec![
+                output.clone(),
+                input("Foreground"),
+                pin(3, "Background", Direction::Input),
+            ],
         ),
         node(
-            "Blur",
+            "Directional Blur",
             -20.0,
             -40.0,
             (90, 140, 90),
@@ -301,6 +305,23 @@ fn network() -> Graph {
                         Pin {
                             id: PinId(4),
                             label: "Mask".to_owned(),
+                            direction: Direction::Input,
+                        },
+                    ],
+                }),
+                Row::Group(Group {
+                    id: GroupId(2),
+                    label: "Advanced".to_owned(),
+                    folded: true,
+                    pins: vec![
+                        Pin {
+                            id: PinId(5),
+                            label: "Edge handling".to_owned(),
+                            direction: Direction::Input,
+                        },
+                        Pin {
+                            id: PinId(6),
+                            label: "Premultiplied alpha".to_owned(),
                             direction: Direction::Input,
                         },
                     ],

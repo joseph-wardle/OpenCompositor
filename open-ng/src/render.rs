@@ -5,6 +5,7 @@ use std::mem::size_of;
 
 use ab_glyph::{Font, FontRef, GlyphId};
 use bytemuck::{Pod, Zeroable};
+use rustc_hash::FxHashSet;
 
 use crate::atlas::{ATLAS_SIZE, GlyphAtlas, Ink};
 use crate::geometry::{self, LABEL_SIZE, LabelText, Rect, TITLE_HEIGHT};
@@ -420,7 +421,7 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
 /// missing from the atlas are rasterised into it.
 fn shapes(graph: &Graph, view: &View, font: &FontRef<'_>, atlas: &mut GlyphAtlas) -> Vec<Shape> {
     let selected: HashSet<_> = view.drawn_selection(graph).into_iter().collect();
-    let connected: HashSet<(NodeId, usize)> = graph
+    let connected: FxHashSet<(NodeId, usize)> = graph
         .connections()
         .iter()
         .flat_map(|connection| [connection.from, connection.to])
@@ -629,7 +630,7 @@ impl TextPainter<'_> {
         let rect = Rect {
             min: Point {
                 x: pen.x + 0.1 * advance,
-                y: pen.y - cap_height(self.font, size),
+                y: pen.y - cap_height(size),
             },
             max: Point {
                 x: pen.x + 0.9 * advance,

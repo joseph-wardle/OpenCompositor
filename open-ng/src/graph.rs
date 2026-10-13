@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 
 use ab_glyph::FontRef;
+use rustc_hash::FxHashMap;
 
 use crate::geometry::NodeLayout;
 use crate::text::bundled_font;
@@ -174,7 +175,9 @@ pub struct Graph {
     /// In the order nodes were added. Later nodes draw above earlier ones, and selected nodes
     /// above unselected ones.
     nodes: Vec<Entry>,
-    index_of: HashMap<NodeId, usize>,
+    // Fx rather than the standard hasher, here and for pins: every prepared frame looks up both
+    // ends of every connection, and with thousands of them SipHash doubled the time to prepare.
+    index_of: FxHashMap<NodeId, usize>,
     connections: Vec<Connection>,
     selection: Vec<NodeId>,
     /// How many nodes have ever been added.
@@ -200,7 +203,7 @@ impl Default for Graph {
     fn default() -> Graph {
         Graph {
             nodes: Vec::new(),
-            index_of: HashMap::new(),
+            index_of: FxHashMap::default(),
             connections: Vec::new(),
             selection: Vec::new(),
             add_count: 0,

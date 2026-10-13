@@ -1,8 +1,9 @@
 //! Where nodes, ports and wires are, computed in one place for drawing, wire ends and hit testing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ab_glyph::FontRef;
+use rustc_hash::FxHashMap;
 
 use crate::graph::{Direction, Graph, GroupId, NodeId, NodeRecord, PinId, Point, Row};
 use crate::text::{cap_height, text_width};
@@ -99,7 +100,7 @@ pub(crate) struct NodeLayout {
     /// that has members on that side.
     ports: Vec<Point>,
     /// The index in `ports` each pin's wires end at.
-    port_of: HashMap<PinId, usize>,
+    port_of: FxHashMap<PinId, usize>,
     /// Each group's header row, by the y of its top edge.
     headers: Vec<Header>,
     /// The title and every visible row's label, from top to bottom.
@@ -150,14 +151,12 @@ impl NodeLayout {
             2.0 * TEXT_INSET + CARET_WIDTH + text_width(font, &record.title, TITLE_SIZE);
         let mut width = MIN_WIDTH.max(title_width);
         // Text is centred in its row by its capitals.
-        let baseline = |top: f32, row_height: f32, size: f32| {
-            top + (row_height + cap_height(font, size)) / 2.0
-        };
+        let row_baseline = (ROW_HEIGHT + cap_height(LABEL_SIZE)) / 2.0;
         let mut labels = vec![Label {
             text: LabelText::Title,
             origin: Point {
                 x: TEXT_INSET + CARET_WIDTH,
-                y: baseline(0.0, TITLE_HEIGHT, TITLE_SIZE),
+                y: (TITLE_HEIGHT + cap_height(TITLE_SIZE)) / 2.0,
             },
             size: TITLE_SIZE,
         }];
@@ -167,7 +166,7 @@ impl NodeLayout {
         let mut height = TITLE_HEIGHT;
         // Each port's row middle and direction: its x waits for the width.
         let mut ports = Vec::new();
-        let mut port_of = HashMap::new();
+        let mut port_of = FxHashMap::default();
         let mut headers = Vec::new();
         for row in &record.rows {
             let (pins, folded) = match row {
@@ -176,7 +175,7 @@ impl NodeLayout {
                     width = width.max(
                         2.0 * TEXT_INSET + CARET_WIDTH + text_width(font, &group.label, LABEL_SIZE),
                     );
-                    let y = baseline(height, ROW_HEIGHT, LABEL_SIZE);
+                    let y = height + row_baseline;
                     headers.push(Header {
                         group: group.id,
                         top: height,
@@ -218,7 +217,7 @@ impl NodeLayout {
                         text: LabelText::Pin(pin.id),
                         origin: Point {
                             x: TEXT_INSET,
-                            y: baseline(height, ROW_HEIGHT, LABEL_SIZE),
+                            y: height + row_baseline,
                         },
                         size: LABEL_SIZE,
                     });
@@ -578,7 +577,7 @@ mod tests {
         ];
         for (label, middle) in labels.iter().zip(middles) {
             let below = label.origin.y - middle;
-            assert!((below - cap_height(&font, label.size) / 2.0).abs() < 1e-4);
+            assert!((below - cap_height(label.size) / 2.0).abs() < 1e-4);
         }
         let x: Vec<_> = labels.iter().map(|label| label.origin.x).collect();
         let size_width = text_width(&font, "Size", LABEL_SIZE);
