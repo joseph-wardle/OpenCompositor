@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use ab_glyph::FontRef;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::geometry::NodeLayout;
 use crate::text::bundled_font;
@@ -179,6 +179,8 @@ pub struct Graph {
     // ends of every connection, and with thousands of them SipHash doubled the time to prepare.
     index_of: FxHashMap<NodeId, usize>,
     connections: Vec<Connection>,
+    /// The same connections, so that adding one need not search them all.
+    connection_set: FxHashSet<Connection>,
     selection: Vec<NodeId>,
     /// How many nodes have ever been added.
     add_count: u64,
@@ -205,6 +207,7 @@ impl Default for Graph {
             nodes: Vec::new(),
             index_of: FxHashMap::default(),
             connections: Vec::new(),
+            connection_set: FxHashSet::default(),
             selection: Vec::new(),
             add_count: 0,
             font: bundled_font(),
@@ -242,8 +245,9 @@ impl Graph {
                     .pin(pin.pin)
                     .is_some_and(|p| p.direction == direction)
         };
-        self.connections
-            .retain(|c| faces(c.from, Direction::Output) && faces(c.to, Direction::Input));
+        self.retain_connections(|c| {
+            faces(c.from, Direction::Output) && faces(c.to, Direction::Input)
+        });
         let entry = &mut self.nodes[index];
         entry.layout = NodeLayout::new(&self.font, &record);
         entry.record = record;
@@ -262,8 +266,7 @@ impl Graph {
                 .get_mut(&later.id)
                 .expect("every node is indexed") -= 1;
         }
-        self.connections
-            .retain(|c| c.from.node != id && c.to.node != id);
+        self.retain_connections(|c| c.from.node != id && c.to.node != id);
         self.selection.retain(|&selected| selected != id);
         Ok(())
     }
@@ -288,18 +291,21 @@ impl Graph {
         if from.direction != Direction::Output || to.direction != Direction::Input {
             return Err(GraphError::NotOutputToInput(connection));
         }
-        if !self.connections.contains(&connection) {
+        if self.connection_set.insert(connection) {
             self.connections.push(connection);
         }
         Ok(())
     }
 
     pub fn remove_connection(&mut self, connection: Connection) -> Result<(), GraphError> {
+        if !self.connection_set.remove(&connection) {
+            return Err(GraphError::MissingConnection(connection));
+        }
         let index = self
             .connections
             .iter()
             .position(|&c| c == connection)
-            .ok_or(GraphError::MissingConnection(connection))?;
+            .expect("the set and the list hold the same connections");
         self.connections.remove(index);
         Ok(())
     }
@@ -376,6 +382,17 @@ impl Graph {
         self.index_of
             .get(&id)
             .is_some_and(|&index| self.nodes[index].added <= stamp)
+    }
+
+    fn retain_connections(&mut self, mut keep: impl FnMut(&Connection) -> bool) {
+        let set = &mut self.connection_set;
+        self.connections.retain(|connection| {
+            let kept = keep(connection);
+            if !kept {
+                set.remove(connection);
+            }
+            kept
+        });
     }
 
     fn index(&self, id: NodeId) -> Result<usize, GraphError> {
@@ -496,6 +513,8 @@ mod tests {
 
         assert_eq!(ids(&graph), [2, 3, 1]);
         assert_eq!(graph.connections(), [wire(2, 3)]);
+        graph.add_connection(wire(1, 2)).unwrap();
+        assert_eq!(graph.connections(), [wire(2, 3), wire(1, 2)]);
         assert_eq!(graph.selection(), [NodeId(2), NodeId(3)]);
         assert_eq!(
             graph.add_node(NodeId(1), node(0.0)),
@@ -576,6 +595,12 @@ mod tests {
         reversed_output.rows[1] = Row::Pin(pin(2, "Image", Direction::Input));
         graph.update_node(NodeId(2), reversed_output).unwrap();
         assert_eq!(graph.connections(), []);
+
+        // Undone by restoring the record and then the connections.
+        graph.update_node(NodeId(2), node(2.0)).unwrap();
+        graph.add_connection(wire(1, 2)).unwrap();
+        graph.add_connection(wire(2, 3)).unwrap();
+        assert_eq!(graph.connections(), [wire(1, 2), wire(2, 3)]);
     }
 
     #[test]

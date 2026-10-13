@@ -15,6 +15,8 @@ use crate::text::{advance, bundled_font, cap_height};
 use crate::view::{View, Viewport};
 
 const WIRE_SEGMENTS: u32 = 32;
+/// In graph units; never drawn thinner than a pixel.
+const WIRE_WIDTH: f32 = 2.0;
 const NODE_CORNER_RADIUS: f32 = 4.0;
 const NODE_BODY: [u8; 4] = [52, 52, 56, 255];
 const HEADER_FILL: [u8; 4] = [64, 64, 69, 255];
@@ -143,6 +145,7 @@ impl Renderer {
         let constants = [
             ("srgb_target", f64::from(u8::from(format.is_srgb()))),
             ("wire_segments", f64::from(WIRE_SEGMENTS)),
+            ("wire_width", f64::from(WIRE_WIDTH)),
         ];
         let pipeline = |name: &str,
                         buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
@@ -393,9 +396,13 @@ impl InstanceBuffer {
     }
 }
 
-/// The wires as drawn, following any nodes being dragged. Unlike nodes, they are not culled; a
-/// wire's control points enclose its curve, if culling them ever pays.
+/// The wires in view as drawn, following any nodes being dragged.
 fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
+    // The drawn width reaches a pixel at least, with another pixel each side for the edge
+    // antialiasing.
+    let pixel = 1.0 / view.physical_per_unit();
+    let margin = WIRE_WIDTH.max(pixel) / 2.0 + pixel;
+    let visible = view.visible_rect();
     let end = |pin: PinRef| {
         let top_left = view.drawn_position(graph, pin.node);
         let layout = graph.node_layout(pin.node);
@@ -407,11 +414,24 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
     graph
         .connections()
         .iter()
-        .map(|connection| {
+        .filter_map(|connection| {
             let points = geometry::wire(end(connection.from), end(connection.to));
-            Wire {
+            // A Bézier curve lies within its control points' bounds.
+            let x = points.map(|point| point.x);
+            let y = points.map(|point| point.y);
+            let bounds = Rect {
+                min: Point {
+                    x: x.into_iter().fold(f32::INFINITY, f32::min) - margin,
+                    y: y.into_iter().fold(f32::INFINITY, f32::min) - margin,
+                },
+                max: Point {
+                    x: x.into_iter().fold(f32::NEG_INFINITY, f32::max) + margin,
+                    y: y.into_iter().fold(f32::NEG_INFINITY, f32::max) + margin,
+                },
+            };
+            bounds.intersects(&visible).then(|| Wire {
                 points: points.map(|point| [point.x, point.y]),
-            }
+            })
         })
         .collect()
 }
@@ -949,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn nodes_out_of_view_are_not_drawn_but_their_wires_are() {
+    fn nodes_out_of_view_are_not_drawn_but_wires_crossing_it_are() {
         let mut graph = three_nodes();
         let pin = |direction| {
             Row::Pin(Pin {
@@ -992,6 +1012,14 @@ mod tests {
         record.position.x += 27.0;
         graph.update_node(NodeId(1), record).unwrap();
         assert_eq!(bodies(&graph, &view), [-173.0, -50.0]);
+
+        // With both ends far below the view, so is the whole wire.
+        for id in [1, 3] {
+            let mut record = graph.node(NodeId(id)).unwrap().clone();
+            record.position.y += 1000.0;
+            graph.update_node(NodeId(id), record).unwrap();
+        }
+        assert!(wires(&graph, &view).is_empty());
     }
 
     #[test]
