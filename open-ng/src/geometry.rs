@@ -20,6 +20,9 @@ pub(crate) const LABEL_SIZE: f32 = 11.0;
 const TEXT_INSET: f32 = 12.0;
 /// Room before the title and group labels for a fold caret.
 const CARET_WIDTH: f32 = 14.0;
+/// The straight segments a wire is drawn with. Anything that tests where a wire is uses the same
+/// ones, so that it finds the wire where it is seen.
+pub(crate) const WIRE_SEGMENTS: u32 = 32;
 
 /// An axis-aligned rectangle in graph units, edges included.
 #[derive(Clone, Copy, Debug, PartialEq)]

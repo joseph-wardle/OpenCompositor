@@ -18,7 +18,6 @@ override wire_segments: u32;
 override wire_width: f32;
 
 const BACKGROUND = vec3<f32>(0.16, 0.16, 0.17);
-const WIRE_COLOR = vec3<f32>(0.72, 0.72, 0.72);
 
 fn to_clip(point: vec2<f32>) -> vec4<f32> {
     let clip = (point - view.centre) * view.clip_per_unit;
@@ -57,6 +56,7 @@ struct WireVertex {
     // Below a pixel wide a wire fades rather than thins, so a dense zoomed-out graph is not a
     // solid mass of one-pixel lines.
     @location(2) opacity: f32,
+    @location(3) color: vec4<f32>,
 }
 
 // A triangle strip along the cubic Bézier, two vertices per step.
@@ -67,6 +67,7 @@ fn wire_vertex(
     @location(1) p1: vec2<f32>,
     @location(2) p2: vec2<f32>,
     @location(3) p3: vec2<f32>,
+    @location(4) color: vec4<f32>,
 ) -> WireVertex {
     let t = f32(index / 2u) / f32(wire_segments);
     let s = 1.0 - t;
@@ -92,13 +93,14 @@ fn wire_vertex(
     out.across = across;
     out.half_width = half_width;
     out.opacity = min(width, 1.0);
+    out.color = color;
     return out;
 }
 
 @fragment
 fn wire_fragment(in: WireVertex) -> @location(0) vec4<f32> {
     let coverage = clamp(in.half_width + 0.5 - abs(in.across), 0.0, 1.0);
-    return target_color(WIRE_COLOR, coverage * in.opacity);
+    return target_color(in.color.rgb, in.color.a * coverage * in.opacity);
 }
 
 struct ShapeVertex {

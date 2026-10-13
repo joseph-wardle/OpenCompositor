@@ -11,8 +11,8 @@ use std::rc::Rc;
 
 use ab_glyph::{Font, FontRef};
 use open_ng::{
-    Color, Direction, Graph, InputEvent, NodeId, NodeRecord, PhysicalPoint, Pin, PinId, Point,
-    Renderer, Row, View, ViewBuffers, Viewport,
+    Color, Connection, Direction, Graph, InputEvent, NodeId, NodeRecord, PhysicalPoint, Pin, PinId,
+    PinRef, Point, Renderer, Row, View, ViewBuffers, Viewport,
 };
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -30,6 +30,7 @@ const FILL: Color = Color {
 };
 const SELECTED_BORDER: [u8; 3] = [255, 200, 40];
 const BODY: [u8; 3] = [52, 52, 56];
+const WIRE: [u8; 3] = [184, 184, 184];
 
 #[wasm_bindgen_test]
 async fn webgl2_draws_each_view_inside_its_viewport() {
@@ -170,6 +171,77 @@ async fn webgl2_draws_text_at_each_views_zoom_under_the_nodes_above() {
         assert_eq!(covered, 0, "zoom {zoom}: the label shows through node 2");
         let beyond = inked(x(22.0, 60.0), y(4.0, 20.0), BODY).len();
         assert!(beyond > 0, "zoom {zoom}: the label is drawn beside node 2");
+    }
+}
+
+#[wasm_bindgen_test]
+async fn webgl2_draws_a_wire_in_its_color_and_fades_it_below_a_pixel_wide() {
+    let (device, queue) = webgl2_device().await;
+
+    // An untitled node's one row has its middle 34 units below the top, so the wire runs straight
+    // along y = 0 from x = -100 to 100, past both views' centres.
+    let mut graph = Graph::default();
+    for (id, x, direction) in [(1, -200.0, Direction::Output), (2, 100.0, Direction::Input)] {
+        let record = NodeRecord {
+            position: Point { x, y: -34.0 },
+            title: String::new(),
+            color: FILL,
+            rows: vec![Row::Pin(Pin {
+                id: PinId(1),
+                label: String::new(),
+                direction,
+            })],
+        };
+        graph.add_node(NodeId(id), record).unwrap();
+    }
+    let pin = |id| PinRef {
+        node: NodeId(id),
+        pin: PinId(1),
+    };
+    graph
+        .add_connection(Connection {
+            from: pin(1),
+            to: pin(2),
+        })
+        .unwrap();
+    // Eight notches out zoom the right view to 1.2⁻⁸, where the wire is under half a pixel wide.
+    let zoom_out = 1.2_f32.powi(-8);
+    let views = [0, 1].map(|index| {
+        let mut view = View::new(Viewport {
+            x: index * WIDTH / 2,
+            y: 0,
+            width: WIDTH / 2,
+            height: HEIGHT,
+            scale_factor: 1.0,
+        });
+        if index == 1 {
+            let scroll = InputEvent::Scrolled {
+                position: PhysicalPoint { x: 300.0, y: 50.0 },
+                lines: -8.0,
+            };
+            let _ = view.handle_input(&graph, scroll);
+        }
+        view
+    });
+    let pixels = draw(&device, &queue, &graph, &views).await;
+
+    // The wire's centre line is the boundary between rows 49 and 50, both fully covered at zoom
+    // 1, where the wire is two pixels wide.
+    assert_eq!(pixel(&pixels, WIDTH / 4, 49), WIRE);
+    assert_eq!(pixel(&pixels, WIDTH / 4, 50), WIRE);
+    // Below a pixel the wire keeps its ink per length: each column holds as much ink as a wire
+    // its width at full strength.
+    for (column, width) in [(WIDTH / 4, 2.0), (3 * WIDTH / 4, 2.0 * zoom_out)] {
+        let ink: f32 = (0..HEIGHT)
+            .map(|row| {
+                let pixel = pixel(&pixels, column, row);
+                f32::from(pixel[0] - BACKGROUND[0]) / f32::from(WIRE[0] - BACKGROUND[0])
+            })
+            .sum();
+        assert!(
+            (ink - width).abs() < 0.05,
+            "column {column}: {ink} pixels of ink, expected {width}"
+        );
     }
 }
 

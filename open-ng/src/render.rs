@@ -8,15 +8,15 @@ use bytemuck::{Pod, Zeroable};
 use rustc_hash::FxHashSet;
 
 use crate::atlas::{ATLAS_SIZE, GlyphAtlas, Ink};
-use crate::geometry::{self, LABEL_SIZE, LabelText, Rect, TITLE_HEIGHT};
+use crate::geometry::{self, LABEL_SIZE, LabelText, Rect, TITLE_HEIGHT, WIRE_SEGMENTS};
 use crate::graph::{Color, Graph, NodeId, PinRef, Point, Side};
 use crate::input::PhysicalPoint;
 use crate::text::{advance, bundled_font, cap_height};
 use crate::view::{View, Viewport};
 
-const WIRE_SEGMENTS: u32 = 32;
 /// In graph units; never drawn thinner than a pixel.
 const WIRE_WIDTH: f32 = 2.0;
+const WIRE_COLOR: [u8; 4] = [184, 184, 184, 255];
 const NODE_CORNER_RADIUS: f32 = 4.0;
 const NODE_BODY: [u8; 4] = [52, 52, 56, 255];
 const HEADER_FILL: [u8; 4] = [64, 64, 69, 255];
@@ -80,11 +80,12 @@ struct ViewTransform {
     padding: [f32; 3],
 }
 
-/// A cubic Bézier wire's control points, in graph units.
+/// A cubic Bézier wire's control points, in graph units, and its sRGB-encoded color.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct Wire {
     points: [[f32; 2]; 4],
+    color: [u8; 4],
 }
 
 /// A rounded rectangle or a bitmap from the view's glyph atlas, in graph units, with
@@ -188,7 +189,7 @@ impl Renderer {
             })
         };
         let wire_attributes = wgpu::vertex_attr_array![
-            0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2,
+            0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Unorm8x4,
         ];
         let shape_attributes = wgpu::vertex_attr_array![
             0 => Float32x2, 1 => Float32x2, 2 => Float32, 3 => Float32, 4 => Unorm8x4, 5 => Unorm8x4,
@@ -434,6 +435,7 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
             };
             bounds.intersects(&visible).then(|| Wire {
                 points: points.map(|point| [point.x, point.y]),
+                color: WIRE_COLOR,
             })
         })
         .collect()
