@@ -61,8 +61,9 @@ pub struct Response {
     /// A group to fold or unfold, from a click on its header.
     pub fold: Option<Fold>,
     /// Connections to remove and add, from a released gesture the host accepted: a wire drag whose
-    /// last proposal it accepted, or the wires a cut crossed that it accepted cutting. The host
-    /// applies it as it judged it, displaced connections included.
+    /// last proposal it accepted, or the wires a cut crossed that it accepted cutting. It does not
+    /// list the connections the host said it would displace. The host decides again when applying
+    /// it, displaced connections included, because that verdict was only advisory.
     pub connections: Option<ConnectionEdit>,
     /// The view used the event: the host should redraw and should not also treat it as its own
     /// shortcut.
@@ -670,9 +671,10 @@ impl View {
     /// Brings the view up to date with the graph and with what the host would accept: asks the
     /// host again about the gesture's proposal, and finds the port under the pointer again.
     ///
-    /// Call it for every view after changing the graph, or the policy the judge applies, other
-    /// than through an event the view is handling. A stationary pointer sends no events, so the
-    /// view cannot notice the change itself.
+    /// Call it for every view after changing the graph, or the policy the judge applies. That
+    /// includes the view whose response was just applied, because it handled the event against
+    /// the graph as it was before. A stationary pointer sends no events, so the view cannot notice
+    /// the change itself.
     pub fn refresh(&mut self, graph: &Graph, mut judge: impl FnMut(&ConnectionEdit) -> Verdict) {
         match &mut self.gesture {
             Some(Gesture::Wire(drag)) => drag.reconsider(),

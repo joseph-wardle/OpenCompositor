@@ -367,6 +367,8 @@ impl Graph {
         &self.connections
     }
 
+    /// Whether the graph has this connection, without searching
+    /// [`connections`](Graph::connections).
     pub fn contains_connection(&self, connection: Connection) -> bool {
         self.connection_set.contains(&connection)
     }
