@@ -6,8 +6,6 @@ use crate::geometry::Rect;
 use crate::graph::{AddStamp, Graph, GroupId, NodeId, Point};
 use crate::input::{Button, InputEvent, Key, Modifiers, PhysicalPoint};
 
-/// The furthest the wheel zooms out. Framing goes further when a graph needs it, so that it always
-/// fits.
 const MIN_ZOOM: f32 = 0.01;
 const MAX_ZOOM: f32 = 4.0;
 /// The zoom factor for one wheel notch.
@@ -513,9 +511,7 @@ impl View {
             return Response::default();
         }
         let anchor = self.to_graph(position);
-        // Below the minimum after framing, zooming out stays put rather than jumping in.
-        let min_zoom = MIN_ZOOM.min(self.zoom);
-        self.zoom = (self.zoom * ZOOM_STEP.powf(lines)).clamp(min_zoom, MAX_ZOOM);
+        self.zoom = (self.zoom * ZOOM_STEP.powf(lines)).clamp(MIN_ZOOM, MAX_ZOOM);
         let centre = self.viewport.centre();
         let per_unit = self.physical_per_unit();
         self.centre = Point {
@@ -578,7 +574,7 @@ impl View {
         let scale = self.viewport.scale_factor;
         let fit_width = self.viewport.width as f32 / scale / (bounds.max.x - bounds.min.x);
         let fit_height = self.viewport.height as f32 / scale / (bounds.max.y - bounds.min.y);
-        self.zoom = (FRAME_FILL * fit_width.min(fit_height)).min(MAX_ZOOM);
+        self.zoom = (FRAME_FILL * fit_width.min(fit_height)).clamp(MIN_ZOOM, MAX_ZOOM);
         self.centre = Point {
             x: (bounds.min.x + bounds.max.x) / 2.0,
             y: (bounds.min.y + bounds.max.y) / 2.0,
@@ -1151,29 +1147,13 @@ mod tests {
         });
         let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::G));
         assert_eq!(view.zoom, MAX_ZOOM);
-    }
 
-    #[test]
-    fn framing_fits_beyond_the_wheel_minimum_and_the_wheel_only_zooms_back_in() {
-        let mut graph = three_nodes();
+        // A node a million units away would fit only below the minimum.
         graph
             .add_node(NodeId(4), untitled(centred(1_000_000.0, 0.0)))
             .unwrap();
-        let mut view = View::new(WHOLE);
-        let _ = view.handle_input(&graph, move_to(400.0, 300.0));
-
         let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::H));
-        let framed = view.zoom;
-        assert!(framed < MIN_ZOOM);
-
-        let scroll = |lines| InputEvent::Scrolled {
-            position: px(400.0, 300.0),
-            lines,
-        };
-        let _ = view.handle_input(&graph, scroll(-1.0));
-        assert_eq!(view.zoom, framed);
-        let _ = view.handle_input(&graph, scroll(1.0));
-        assert!((view.zoom - framed * 1.2).abs() < 1e-9);
+        assert_eq!(view.zoom, MIN_ZOOM);
     }
 
     #[test]
