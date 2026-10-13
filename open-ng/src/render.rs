@@ -85,6 +85,19 @@ struct InstanceBuffer {
     label: &'static str,
     buffer: wgpu::Buffer,
     count: u32,
+    /// Where the upper layer starts, as in [`Layered`].
+    upper: u32,
+}
+
+/// One kind of instance for a frame, in two layers. Each layer draws its wires, then its shapes.
+/// The lower layer is the committed graph: the wires, then the nodes. The upper is a gesture's
+/// wires, so that the wire being aimed or the stroke being drawn shows over the nodes, then the
+/// shapes that must stay legible over them: the selection box and refusal notes.
+#[derive(Debug)]
+struct Layered<T> {
+    instances: Vec<T>,
+    /// The index of the upper layer's first instance.
+    upper: usize,
 }
 
 #[repr(C)]
@@ -265,9 +278,8 @@ impl Renderer {
         };
         queue.write_buffer(&buffers.transform, 0, bytemuck::bytes_of(&transform));
         let previews = Previews::of(view);
-        buffers
-            .wires
-            .write(device, queue, &wires(graph, view, &previews));
+        let wires = wires(graph, view, &previews);
+        buffers.wires.write(device, queue, &wires);
         let mut instances = shapes(graph, view, &previews, &self.font, &mut buffers.atlas);
         if buffers.atlas.is_full() {
             // Make room for this frame's glyphs alone. Any that still do not fit go undrawn.
@@ -317,15 +329,21 @@ impl Renderer {
         pass.set_bind_group(0, &buffers.bind_group, &[]);
         pass.set_pipeline(&self.background);
         pass.draw(0..3, 0..1);
-        if buffers.wires.count > 0 {
-            pass.set_pipeline(&self.wires);
-            pass.set_vertex_buffer(0, buffers.wires.buffer.slice(..));
-            pass.draw(0..2 * (WIRE_SEGMENTS + 1), 0..buffers.wires.count);
-        }
-        if buffers.shapes.count > 0 {
-            pass.set_pipeline(&self.shapes);
-            pass.set_vertex_buffer(0, buffers.shapes.buffer.slice(..));
-            pass.draw(0..4, 0..buffers.shapes.count);
+        let (wires, shapes) = (&buffers.wires, &buffers.shapes);
+        for (wires, shapes) in [
+            (0..wires.upper, 0..shapes.upper),
+            (wires.upper..wires.count, shapes.upper..shapes.count),
+        ] {
+            if !wires.is_empty() {
+                pass.set_pipeline(&self.wires);
+                pass.set_vertex_buffer(0, buffers.wires.buffer.slice(..));
+                pass.draw(0..2 * (WIRE_SEGMENTS + 1), wires);
+            }
+            if !shapes.is_empty() {
+                pass.set_pipeline(&self.shapes);
+                pass.set_vertex_buffer(0, buffers.shapes.buffer.slice(..));
+                pass.draw(0..4, shapes);
+            }
         }
     }
 }
@@ -399,11 +417,13 @@ impl InstanceBuffer {
             label,
             buffer,
             count: 0,
+            upper: 0,
         }
     }
 
     /// Replaces the instances, growing the buffer to the next power of two if they do not fit.
-    fn write<T: Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, instances: &[T]) {
+    fn write<T: Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layers: &Layered<T>) {
+        let instances = &layers.instances;
         let bytes: &[u8] = bytemuck::cast_slice(instances);
         if bytes.len() as u64 > self.buffer.size() {
             let size = (bytes.len() as u64).next_power_of_two();
@@ -413,6 +433,7 @@ impl InstanceBuffer {
             queue.write_buffer(&self.buffer, 0, bytes);
         }
         self.count = instances.len() as u32;
+        self.upper = layers.upper as u32;
     }
 }
 
@@ -459,8 +480,9 @@ impl Previews<'_> {
     }
 }
 
-/// The wires in view as drawn, following any nodes being dragged.
-fn wires(graph: &Graph, view: &View, previews: &Previews<'_>) -> Vec<Wire> {
+/// The wires in view as drawn, following any nodes being dragged: the connections, then in the
+/// upper layer any cut stroke or loose wires.
+fn wires(graph: &Graph, view: &View, previews: &Previews<'_>) -> Layered<Wire> {
     // The drawn width reaches a pixel at least, with another pixel each side for the edge
     // antialiasing.
     let pixel = 1.0 / view.physical_per_unit();
@@ -507,6 +529,7 @@ fn wires(graph: &Graph, view: &View, previews: &Previews<'_>) -> Vec<Wire> {
             in_view(geometry::wire(output, input), color)
         })
         .collect();
+    let upper = wires.len();
     if let Some(CutPreview { stroke, .. }) = previews.cut {
         // Each piece of the stroke is a wire with its control points on a straight line.
         wires.extend(stroke.windows(2).filter_map(|piece| {
@@ -535,11 +558,14 @@ fn wires(graph: &Graph, view: &View, previews: &Previews<'_>) -> Vec<Wire> {
             in_view(points, LOOSE_WIRE_COLOR)
         }));
     }
-    wires
+    Layered {
+        instances: wires,
+        upper,
+    }
 }
 
-/// Each node in view followed by its ports and text, from bottom to top, then any selection box.
-/// A port is filled if any pin whose wires end there is connected and hollow otherwise. Glyphs
+/// Each node in view followed by its ports and text, from bottom to top, then in the upper layer
+/// any selection box or refusal note. A port is filled if any pin whose wires end there is connected and hollow otherwise. Glyphs
 /// missing from the atlas are rasterised into it.
 fn shapes(
     graph: &Graph,
@@ -547,7 +573,7 @@ fn shapes(
     previews: &Previews<'_>,
     font: &FontRef<'_>,
     atlas: &mut GlyphAtlas,
-) -> Vec<Shape> {
+) -> Layered<Shape> {
     let selected: HashSet<_> = view.drawn_selection(graph).into_iter().collect();
     let connected: FxHashSet<(NodeId, usize)> = previews
         .connections(graph)
@@ -683,6 +709,7 @@ fn shapes(
             }
         }
     }
+    let upper = shapes.len();
     if let Some(rect) = view.drawn_box() {
         shapes.push(Shape {
             border_width: 1.0 / view.physical_per_unit(),
@@ -707,7 +734,10 @@ fn shapes(
     {
         text.refusal(&mut shapes, reason, pointer);
     }
-    shapes
+    Layered {
+        instances: shapes,
+        upper,
+    }
 }
 
 /// How opaque text is at a size in logical pixels per em.
@@ -885,11 +915,11 @@ mod tests {
         Point { x, y }
     }
 
-    fn drawn_wires(graph: &Graph, view: &View) -> Vec<Wire> {
+    fn layered_wires(graph: &Graph, view: &View) -> Layered<Wire> {
         wires(graph, view, &Previews::of(view))
     }
 
-    fn drawn_shapes(graph: &Graph, view: &View) -> Vec<Shape> {
+    fn layered_shapes(graph: &Graph, view: &View) -> Layered<Shape> {
         let previews = Previews::of(view);
         shapes(
             graph,
@@ -898,6 +928,14 @@ mod tests {
             &bundled_font(),
             &mut GlyphAtlas::default(),
         )
+    }
+
+    fn drawn_wires(graph: &Graph, view: &View) -> Vec<Wire> {
+        layered_wires(graph, view).instances
+    }
+
+    fn drawn_shapes(graph: &Graph, view: &View) -> Vec<Shape> {
+        layered_shapes(graph, view).instances
     }
 
     fn shapes_without_text(graph: &Graph, view: &View) -> Vec<Shape> {
@@ -1245,15 +1283,18 @@ mod tests {
         };
         let (graph, view) = dragged_to_an_occupied_input(scale_factor, verdict);
 
-        let colors: Vec<_> = drawn_wires(&graph, &view).iter().map(|w| w.color).collect();
+        let wires = layered_wires(&graph, &view);
+        let colors: Vec<_> = wires.instances.iter().map(|w| w.color).collect();
         assert_eq!(colors, [WIRE_COLOR, LOOSE_WIRE_COLOR]);
-        let shapes = drawn_shapes(&graph, &view);
+        assert_eq!(wires.upper, 1, "the loose wire over the nodes");
+        let shapes = layered_shapes(&graph, &view);
+        let shapes = &shapes.instances[shapes.upper..];
         let [note] = shapes
             .iter()
             .filter(|shape| shape.border == REFUSAL_BORDER)
             .collect::<Vec<_>>()[..]
         else {
-            panic!("one note");
+            panic!("one note, over the loose wire");
         };
         let corner = |sign: f32| {
             view.to_physical(Point {
@@ -1394,6 +1435,8 @@ mod tests {
                 ([150.0, 0.0], [150.0, 60.0], CUT_STROKE_COLOR),
             ]
         );
+        let upper = layered_wires(&graph, &view).upper;
+        assert_eq!(upper, 2, "the stroke over the nodes");
         let note = |view: &View| {
             drawn_shapes(&graph, view)
                 .iter()
