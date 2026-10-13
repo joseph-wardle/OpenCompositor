@@ -443,6 +443,81 @@ pub(crate) fn wire(output: Point, input: Point) -> [Point; 4] {
     ]
 }
 
+/// The smallest rectangle holding a wire's control points, which holds the wire too.
+pub(crate) fn wire_bounds(control: [Point; 4]) -> Rect {
+    let [first, rest @ ..] = control;
+    rest.into_iter()
+        .fold(Rect::from_corners(first, first), |bounds, point| Rect {
+            min: Point {
+                x: bounds.min.x.min(point.x),
+                y: bounds.min.y.min(point.y),
+            },
+            max: Point {
+                x: bounds.max.x.max(point.x),
+                y: bounds.max.y.max(point.y),
+            },
+        })
+}
+
+/// Where the straight stroke from `from` to `to` crosses the wire with these control points, once
+/// for each of the segments the wire is drawn with that it crosses. Touching counts.
+pub(crate) fn wire_crossings(
+    control: [Point; 4],
+    from: Point,
+    to: Point,
+) -> impl Iterator<Item = Point> {
+    let near = wire_bounds(control).intersects(&Rect::from_corners(from, to));
+    let joints = near.then(|| {
+        std::array::from_fn::<_, { WIRE_SEGMENTS as usize + 1 }, _>(|index| {
+            point_on_wire(control, index as f32 / WIRE_SEGMENTS as f32)
+        })
+    });
+    joints.into_iter().flat_map(move |joints| {
+        (1..joints.len()).filter_map(move |end| crossing(joints[end - 1], joints[end], from, to))
+    })
+}
+
+/// The point at `t` along the wire, computed as the shader does.
+fn point_on_wire(control: [Point; 4], t: f32) -> Point {
+    let s = 1.0 - t;
+    let weights = [s * s * s, 3.0 * s * s * t, 3.0 * s * t * t, t * t * t];
+    let mut point = Point::default();
+    for (weight, control) in weights.into_iter().zip(control) {
+        point.x += weight * control.x;
+        point.y += weight * control.y;
+    }
+    point
+}
+
+/// Where the segments from `a` to `b` and from `c` to `d` cross, if they do. Touching counts;
+/// parallel segments never cross.
+fn crossing(a: Point, b: Point, c: Point, d: Point) -> Option<Point> {
+    let cross = |u: Point, v: Point| u.x * v.y - u.y * v.x;
+    let ab = Point {
+        x: b.x - a.x,
+        y: b.y - a.y,
+    };
+    let cd = Point {
+        x: d.x - c.x,
+        y: d.y - c.y,
+    };
+    let ac = Point {
+        x: c.x - a.x,
+        y: c.y - a.y,
+    };
+    let denominator = cross(ab, cd);
+    if denominator == 0.0 {
+        return None;
+    }
+    let along_ab = cross(ac, cd) / denominator;
+    let along_cd = cross(ac, ab) / denominator;
+    let point = Point {
+        x: a.x + along_ab * ab.x,
+        y: a.y + along_ab * ab.y,
+    };
+    ((0.0..=1.0).contains(&along_ab) && (0.0..=1.0).contains(&along_cd)).then_some(point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,6 +872,34 @@ mod tests {
         assert_eq!(toward_start, at(25.0, 0.0));
         assert_eq!(toward_end, at(5.0, 40.0));
         assert_eq!(end, at(30.0, 40.0));
+    }
+
+    #[test]
+    fn a_stroke_crosses_a_wire_where_its_segments_are_drawn() {
+        // Symmetric about its middle, which is a joint between segments.
+        let control = wire(at(0.0, 0.0), at(100.0, 100.0));
+        let crossings = |from, to| wire_crossings(control, from, to).collect::<Vec<_>>();
+
+        assert_eq!(crossings(at(40.0, -10.0), at(40.0, 110.0)).len(), 1);
+        // Both segments meeting at the middle touch the stroke there.
+        assert_eq!(
+            crossings(at(50.0, -10.0), at(50.0, 50.0)),
+            [at(50.0, 50.0); 2],
+            "touching counts"
+        );
+        assert_eq!(crossings(at(50.0, -10.0), at(50.0, 40.0)), []);
+        assert_eq!(crossings(at(-50.0, 0.0), at(-50.0, 100.0)), []);
+        // Along the first segment the curve bulges past its chord, which is what is drawn.
+        let first = point_on_wire(control, 1.0 / WIRE_SEGMENTS as f32);
+        let chord_middle = at(first.x / 2.0, first.y / 2.0);
+        let curve_middle = point_on_wire(control, 0.5 / WIRE_SEGMENTS as f32);
+        assert!(curve_middle.y < chord_middle.y);
+        let between = at(chord_middle.x, (chord_middle.y + curve_middle.y) / 2.0);
+        assert_eq!(
+            crossings(between, at(chord_middle.x, -10.0)),
+            [],
+            "between the curve and the drawn segment"
+        );
     }
 
     /// An untitled node with no rows, which is the minimum size, with its top-left at `x`.

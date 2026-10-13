@@ -14,13 +14,16 @@ use crate::geometry::{
 use crate::graph::{Color, Connection, Graph, NodeId, PinRef, Point, Side};
 use crate::input::PhysicalPoint;
 use crate::text::{advance, bundled_font, cap_height, text_width};
-use crate::view::{View, Viewport, WirePreview};
+use crate::view::{CutPreview, View, Viewport, WirePreview};
 
 /// In graph units; never drawn thinner than a pixel.
 const WIRE_WIDTH: f32 = 2.0;
 const WIRE_COLOR: [u8; 4] = [184, 184, 184, 255];
 /// A dragged wire the host has not accepted, which release would not connect.
 const LOOSE_WIRE_COLOR: [u8; 4] = [184, 184, 184, 110];
+/// A wire the cut in progress would remove.
+const CUT_WIRE_COLOR: [u8; 4] = [214, 96, 84, 255];
+const CUT_STROKE_COLOR: [u8; 4] = [240, 240, 240, 200];
 const NODE_CORNER_RADIUS: f32 = 4.0;
 const NODE_BODY: [u8; 4] = [52, 52, 56, 255];
 const HEADER_FILL: [u8; 4] = [64, 64, 69, 255];
@@ -452,17 +455,15 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
         graph.node_layout(pin.node)?.port(top_left, pin.pin, side)
     };
     let in_view = |points: [Point; 4], color| {
-        // A Bézier curve lies within its control points' bounds.
-        let x = points.map(|point| point.x);
-        let y = points.map(|point| point.y);
+        let bounds = geometry::wire_bounds(points);
         let bounds = Rect {
             min: Point {
-                x: x.into_iter().fold(f32::INFINITY, f32::min) - margin,
-                y: y.into_iter().fold(f32::INFINITY, f32::min) - margin,
+                x: bounds.min.x - margin,
+                y: bounds.min.y - margin,
             },
             max: Point {
-                x: x.into_iter().fold(f32::NEG_INFINITY, f32::max) + margin,
-                y: y.into_iter().fold(f32::NEG_INFINITY, f32::max) + margin,
+                x: bounds.max.x + margin,
+                y: bounds.max.y + margin,
             },
         };
         bounds.intersects(&visible).then(|| Wire {
@@ -471,14 +472,36 @@ fn wires(graph: &Graph, view: &View) -> Vec<Wire> {
         })
     };
     let drawn = DrawnConnections::of(view);
+    let cut = view.cut_preview();
+    let cut_wires: FxHashSet<Connection> = cut
+        .iter()
+        .flat_map(|cut| cut.cut.iter().chain(cut.displaced))
+        .copied()
+        .collect();
     let mut wires: Vec<Wire> = drawn
         .iter(graph)
         .filter_map(|connection| {
             let output = end(connection.from, Side::Output)?;
             let input = end(connection.to, Side::Input)?;
-            in_view(geometry::wire(output, input), WIRE_COLOR)
+            let color = if cut_wires.contains(connection) {
+                CUT_WIRE_COLOR
+            } else {
+                WIRE_COLOR
+            };
+            in_view(geometry::wire(output, input), color)
         })
         .collect();
+    if let Some(CutPreview { stroke, .. }) = cut {
+        // Each piece of the stroke is a wire with its control points on a straight line.
+        wires.extend(stroke.windows(2).filter_map(|piece| {
+            let [from, to] = [piece[0], piece[1]];
+            let third = |thirds: f32| Point {
+                x: from.x + (to.x - from.x) * thirds / 3.0,
+                y: from.y + (to.y - from.y) * thirds / 3.0,
+            };
+            in_view([from, third(1.0), third(2.0), to], CUT_STROKE_COLOR)
+        }));
+    }
     if let Some(WirePreview::Loose {
         from,
         side,
@@ -655,6 +678,14 @@ fn shapes(graph: &Graph, view: &View, font: &FontRef<'_>, atlas: &mut GlyphAtlas
     {
         text.refusal(&mut shapes, reason, pointer);
     }
+    if let Some(CutPreview {
+        pointer,
+        refusal: Some(reason),
+        ..
+    }) = view.cut_preview()
+    {
+        text.refusal(&mut shapes, reason, pointer);
+    }
     shapes
 }
 
@@ -821,7 +852,7 @@ mod tests {
     use crate::connection_edit::{ConnectionEdit, Verdict, accept_all};
     use crate::geometry::{MIN_WIDTH, ROW_HEIGHT, TITLE_HEIGHT};
     use crate::graph::{Connection, Direction, Group, GroupId, NodeRecord, Pin, PinId, Row};
-    use crate::input::{Button, InputEvent, Modifiers, PhysicalPoint};
+    use crate::input::{Button, InputEvent, Key, Modifiers, PhysicalPoint};
 
     const GREY: Color = Color {
         r: 128,
@@ -1266,6 +1297,81 @@ mod tests {
             .map(|shape| shape.fill == PORT_FILL)
             .collect();
         assert_eq!(filled, [false, false, false], "nodes 1, 2 and 3");
+    }
+
+    #[test]
+    fn a_cut_marks_the_wires_it_would_remove_and_draws_its_stroke() {
+        let (mut graph, _) = dragged_to_an_occupied_input(1.0, Verdict::Refuse { reason: None });
+        let wire_1 = Connection {
+            from: PinRef {
+                node: NodeId(1),
+                pin: PinId(1),
+            },
+            ..occupant()
+        };
+        graph.add_connection(wire_1).unwrap();
+        let mut view = view(1.0);
+        let keep_occupant = |edit: &ConnectionEdit| {
+            if edit.remove.contains(&occupant()) {
+                Verdict::Refuse {
+                    reason: Some("Kept".to_owned()),
+                }
+            } else {
+                accept_all(edit)
+            }
+        };
+        let at_x_550 = |y| PhysicalPoint { x: 550.0, y };
+        // Down between the nodes, across wire 1 and short of the occupant.
+        let cut = [
+            InputEvent::KeyPressed(Key::Y),
+            InputEvent::PointerPressed {
+                position: at_x_550(300.0),
+                button: Button::Left,
+                modifiers: Modifiers::default(),
+            },
+            InputEvent::PointerMoved {
+                position: at_x_550(360.0),
+            },
+        ];
+        for event in cut {
+            let _ = view.handle_input(&graph, event, keep_occupant);
+        }
+
+        let drawn: Vec<_> = wires(&graph, &view)
+            .iter()
+            .map(|wire| (wire.points[0], wire.points[3], wire.color))
+            .collect();
+        let middle = TITLE_HEIGHT + ROW_HEIGHT / 2.0;
+        assert_eq!(
+            drawn,
+            [
+                ([MIN_WIDTH, 100.0 + middle], [200.0, middle], WIRE_COLOR),
+                ([MIN_WIDTH, middle], [200.0, middle], CUT_WIRE_COLOR),
+                ([150.0, 0.0], [150.0, 60.0], CUT_STROKE_COLOR),
+            ]
+        );
+        let note = |view: &View| {
+            drawn_shapes(&graph, view)
+                .iter()
+                .any(|shape| shape.border == REFUSAL_BORDER)
+        };
+        assert!(!note(&view));
+
+        let across_occupant = InputEvent::PointerMoved {
+            position: at_x_550(420.0),
+        };
+        let _ = view.handle_input(&graph, across_occupant, keep_occupant);
+        let colors: Vec<_> = wires(&graph, &view).iter().map(|w| w.color).collect();
+        assert_eq!(
+            colors,
+            [
+                WIRE_COLOR,
+                CUT_WIRE_COLOR,
+                CUT_STROKE_COLOR,
+                CUT_STROKE_COLOR
+            ]
+        );
+        assert!(note(&view));
     }
 
     #[test]

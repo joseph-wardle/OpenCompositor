@@ -58,8 +58,9 @@ pub struct Response {
     pub selection: Option<Vec<NodeId>>,
     /// A group to fold or unfold, from a click on its header.
     pub fold: Option<Fold>,
-    /// Connections to remove and add, from a released gesture whose last proposal the host
-    /// accepted. The host applies it as it judged it, displaced connections included.
+    /// Connections to remove and add, from a released gesture the host accepted: a wire drag whose
+    /// last proposal it accepted, or the wires a cut crossed that it accepted cutting. The host
+    /// applies it as it judged it, displaced connections included.
     pub connections: Option<ConnectionEdit>,
     /// The view used the event: the host should redraw and should not also treat it as its own
     /// shortcut.
@@ -89,6 +90,7 @@ pub struct View {
     pointer: Option<PhysicalPoint>,
     pointer_in_target: bool,
     space_held: bool,
+    y_held: bool,
     gesture: Option<Gesture>,
     /// The side of a pin a press at the pointer would grab, while no gesture is in progress.
     hover: Option<(PinRef, Side)>,
@@ -124,6 +126,7 @@ enum Gesture {
         combine: Combine,
     },
     Wire(WireDrag),
+    Cut(Cut),
 }
 
 /// Wires dragged by their free end: a new wire from one side of a pin toward the other side of
@@ -185,6 +188,32 @@ pub(crate) enum WirePreview<'a> {
         pointer: PhysicalPoint,
         refusal: Option<&'a str>,
     },
+}
+
+/// A left drag with Y held, cutting the wires its stroke crosses where this view shows them.
+#[derive(Debug)]
+struct Cut {
+    /// In graph units, from the press, so that zooming during the stroke changes nothing it has
+    /// crossed.
+    stroke: Vec<Point>,
+    /// Every wire the stroke has crossed, once each, in order, with when it was crossed, so that
+    /// a wire from a node added since under the same ID is not mistaken for it.
+    crossed: Vec<(Connection, AddStamp)>,
+    /// The edit removing the crossed wires the host accepted cutting, if it accepted any.
+    accepted: Option<Proposal>,
+    /// The host's reason for refusing the last wire it judged, if it refused it and gave one.
+    refusal: Option<String>,
+}
+
+/// How a view draws its cut: the committed graph, with the stroke and the wires it would cut.
+#[derive(Debug)]
+pub(crate) struct CutPreview<'a> {
+    pub(crate) stroke: &'a [Point],
+    /// The crossed wires the host accepted cutting, and the others it would remove with them.
+    pub(crate) cut: &'a [Connection],
+    pub(crate) displaced: &'a [Connection],
+    pub(crate) pointer: PhysicalPoint,
+    pub(crate) refusal: Option<&'a str>,
 }
 
 /// How a click or box combines its nodes with the current selection.
@@ -373,6 +402,104 @@ impl WireDrag {
     }
 }
 
+impl Cut {
+    fn new(from: Point) -> Cut {
+        Cut {
+            stroke: vec![from],
+            crossed: Vec::new(),
+            accepted: None,
+            refusal: None,
+        }
+    }
+
+    /// Extends the stroke to `to`, and asks the host about each wire it newly crosses inside
+    /// `visible` and outside every node, where the wire is seen.
+    fn extend(&mut self, graph: &Graph, to: Point, visible: Rect, judge: &mut Judge<'_>) {
+        let from = *self.stroke.last().expect("a stroke starts at the press");
+        if to == from {
+            return;
+        }
+        self.stroke.push(to);
+        let now = graph.add_stamp();
+        for &connection in graph.connections() {
+            let Some(control) = committed_wire(graph, connection) else {
+                continue;
+            };
+            let seen = geometry::wire_crossings(control, from, to)
+                .any(|point| visible.contains(point) && graph.node_at(point).is_none());
+            if seen
+                && !self
+                    .crossed
+                    .iter()
+                    .any(|&(crossed, _)| crossed == connection)
+            {
+                self.crossed.push((connection, now));
+                self.judge(graph, connection, judge);
+            }
+        }
+    }
+
+    /// Asks the host about cutting `connection` together with the wires it already accepted.
+    /// Refused, it stays uncut and the others stay cut.
+    fn judge(&mut self, graph: &Graph, connection: Connection, judge: &mut Judge<'_>) {
+        let mut edit = self
+            .accepted
+            .as_ref()
+            .map_or_else(ConnectionEdit::default, |accepted| accepted.edit.clone());
+        edit.remove.push(connection);
+        let Some(edit) = edit.normalised(graph) else {
+            return;
+        };
+        match judge(&edit) {
+            verdict @ Verdict::Accept { .. } => {
+                self.accepted = Some(Proposal { edit, verdict });
+                self.refusal = None;
+            }
+            Verdict::Refuse { reason } => self.refusal = reason,
+        }
+    }
+
+    /// Asks the host about every crossed wire again, in the order crossed.
+    fn judge_again(&mut self, graph: &Graph, judge: &mut Judge<'_>) {
+        self.accepted = None;
+        self.refusal = None;
+        for index in 0..self.crossed.len() {
+            let (connection, _) = self.crossed[index];
+            self.judge(graph, connection, judge);
+        }
+    }
+
+    /// Forgets crossed wires the graph no longer has and, if there were any, asks about the rest
+    /// again.
+    fn keep_up(&mut self, graph: &Graph, judge: &mut Judge<'_>) {
+        if self.forget_lost(graph) {
+            self.judge_again(graph, judge);
+        }
+    }
+
+    /// Forgets crossed wires the graph no longer has, and returns whether there were any.
+    fn forget_lost(&mut self, graph: &Graph) -> bool {
+        let before = self.crossed.len();
+        self.crossed.retain(|&(connection, since)| {
+            graph.has_node_since(connection.from.node, since)
+                && graph.has_node_since(connection.to.node, since)
+                && graph.contains_connection(connection)
+        });
+        self.crossed.len() != before
+    }
+}
+
+/// A connection's wire, with its nodes where they are committed.
+fn committed_wire(graph: &Graph, connection: Connection) -> Option<[Point; 4]> {
+    let end = |pin: PinRef, side| {
+        let position = graph.node(pin.node)?.position;
+        graph.node_layout(pin.node)?.port(position, pin.pin, side)
+    };
+    let output = end(connection.from, Side::Output)?;
+    let input = end(connection.to, Side::Input)?;
+    Some(geometry::wire(output, input))
+}
+
 impl View {
     /// A view at 100% zoom with the graph origin at its centre.
     pub fn new(viewport: Viewport) -> View {
@@ -383,6 +510,7 @@ impl View {
             pointer: None,
             pointer_in_target: false,
             space_held: false,
+            y_held: false,
             gesture: None,
             hover: None,
         }
@@ -408,6 +536,7 @@ impl View {
     pub fn cancel_gesture(&mut self) {
         self.gesture = None;
         self.space_held = false;
+        self.y_held = false;
     }
 
     /// Handles one event against the graph as it is now.
@@ -415,7 +544,9 @@ impl View {
     /// While a gesture proposes a [`ConnectionEdit`], the view asks `judge` whether the host would
     /// accept it, once each time the proposal changes, and previews the verdict. The verdict is
     /// advisory: on release the view requests the edit only if the last verdict accepted it, and
-    /// the host decides again when applying it.
+    /// the host decides again when applying it. A cut asks about each wire it crosses together
+    /// with those the host already accepted cutting, so that one wire the host keeps leaves the
+    /// rest of the cut alone.
     pub fn handle_input(
         &mut self,
         graph: &Graph,
@@ -429,7 +560,9 @@ impl View {
             InputEvent::KeyPressed(_) | InputEvent::KeyReleased(_)
         );
         let mut response = match event {
-            InputEvent::PointerMoved { position } => self.pointer_moved(graph, position),
+            InputEvent::PointerMoved { position } => {
+                self.pointer_moved(graph, position, &mut judge)
+            }
             InputEvent::PointerPressed {
                 position,
                 button,
@@ -441,8 +574,10 @@ impl View {
             InputEvent::Scrolled { position, lines } => self.scrolled(position, lines),
             InputEvent::KeyPressed(key) => self.key_pressed(graph, key),
             InputEvent::KeyReleased(key) => {
-                if key == Key::Space {
-                    self.space_held = false;
+                match key {
+                    Key::Space => self.space_held = false,
+                    Key::Y => self.y_held = false,
+                    Key::Escape | Key::H | Key::G => {}
                 }
                 Response::default()
             }
@@ -451,7 +586,7 @@ impl View {
                 Response::default()
             }
         };
-        response.handled |= self.follow_wire(graph, &mut judge);
+        response.handled |= self.follow_graph(graph, &mut judge);
         if pointer_event || response.handled {
             let hover = self.side_under_pointer(graph);
             if hover != self.hover {
@@ -469,12 +604,19 @@ impl View {
     /// than through an event the view is handling. A stationary pointer sends no events, so the
     /// view cannot notice the change itself.
     pub fn refresh(&mut self, graph: &Graph, mut judge: impl FnMut(&ConnectionEdit) -> Verdict) {
-        if let Some(Gesture::Wire(drag)) = &mut self.gesture {
-            // Forgetting the target makes the host judge the proposal again.
-            drag.target = None;
-            drag.proposal = None;
+        match &mut self.gesture {
+            Some(Gesture::Wire(drag)) => {
+                // Forgetting the target makes the host judge the proposal again.
+                drag.target = None;
+                drag.proposal = None;
+            }
+            Some(Gesture::Cut(cut)) => {
+                cut.forget_lost(graph);
+                cut.judge_again(graph, &mut judge);
+            }
+            _ => {}
         }
-        self.follow_wire(graph, &mut judge);
+        self.follow_graph(graph, &mut judge);
         self.hover = self.side_under_pointer(graph);
     }
 
@@ -506,7 +648,9 @@ impl View {
     /// The selection as drawn: the graph's, with the gesture's selection preview applied.
     pub(crate) fn drawn_selection(&self, graph: &Graph) -> Vec<NodeId> {
         match &self.gesture {
-            None | Some(Gesture::Pan { .. } | Gesture::Wire(_)) => graph.selection().to_vec(),
+            None | Some(Gesture::Pan { .. } | Gesture::Wire(_) | Gesture::Cut(_)) => {
+                graph.selection().to_vec()
+            }
             Some(Gesture::Press {
                 header: Some(_), ..
             }) => graph.selection().to_vec(),
@@ -560,6 +704,26 @@ impl View {
         })
     }
 
+    pub(crate) fn cut_preview(&self) -> Option<CutPreview<'_>> {
+        let Some(Gesture::Cut(cut)) = &self.gesture else {
+            return None;
+        };
+        let (cut_wires, displaced): (&[Connection], &[Connection]) = match &cut.accepted {
+            Some(Proposal {
+                edit,
+                verdict: Verdict::Accept { displaced },
+            }) => (&edit.remove, displaced),
+            _ => (&[], &[]),
+        };
+        Some(CutPreview {
+            stroke: &cut.stroke,
+            cut: cut_wires,
+            displaced,
+            pointer: self.pointer.expect("a cut follows a press"),
+            refusal: cut.refusal.as_deref(),
+        })
+    }
+
     /// The part of the graph the viewport shows.
     pub(crate) fn visible_rect(&self) -> Rect {
         let Viewport {
@@ -587,10 +751,19 @@ impl View {
         Some(Rect::from_corners(from, to))
     }
 
-    fn pointer_moved(&mut self, graph: &Graph, position: PhysicalPoint) -> Response {
+    fn pointer_moved(
+        &mut self,
+        graph: &Graph,
+        position: PhysicalPoint,
+        judge: &mut Judge<'_>,
+    ) -> Response {
         self.track_pointer(position);
         self.gesture = match self.gesture.take() {
             None => return Response::default(),
+            Some(Gesture::Cut(mut cut)) => {
+                cut.extend(graph, self.to_graph(position), self.visible_rect(), judge);
+                Some(Gesture::Cut(cut))
+            }
             Some(Gesture::Pan { button, last }) => {
                 let per_unit = self.physical_per_unit();
                 self.centre.x -= (position.x - last.x) / per_unit;
@@ -663,6 +836,8 @@ impl View {
                 button,
                 last: position,
             }
+        } else if self.y_held {
+            Gesture::Cut(Cut::new(self.to_graph(position)))
         } else {
             let from = self.to_graph(position);
             let hit = graph.hit(from, self.port_reach());
@@ -710,6 +885,13 @@ impl View {
         let mut connections = None;
         let (positions, after) = match gesture {
             Gesture::Pan { .. } => (Vec::new(), None),
+            // Released anywhere, a cut removes what the host accepted cutting.
+            Gesture::Cut(mut cut) => {
+                cut.extend(graph, self.to_graph(position), self.visible_rect(), judge);
+                cut.keep_up(graph, judge);
+                connections = cut.accepted.map(|accepted| accepted.edit);
+                (Vec::new(), None)
+            }
             Gesture::Wire(mut drag) => {
                 // The graph may have changed since the last event without a refresh.
                 if drag.still_holds(graph) {
@@ -823,6 +1005,10 @@ impl View {
                 self.space_held = true;
                 pointer_inside
             }
+            Key::Y => {
+                self.y_held = true;
+                pointer_inside
+            }
             Key::Escape => self.gesture.take().is_some(),
             Key::H if pointer_inside => {
                 self.frame(graph, graph.nodes().map(|(id, _)| id));
@@ -925,6 +1111,16 @@ impl View {
             .filter(|&pointer| self.pointer_in_target && self.viewport.contains(pointer))
     }
 
+    /// Brings the gesture up to date with the graph and the pointer. Returns whether it cancelled
+    /// a wire drag.
+    fn follow_graph(&mut self, graph: &Graph, judge: &mut Judge<'_>) -> bool {
+        if let Some(Gesture::Cut(cut)) = &mut self.gesture {
+            cut.keep_up(graph, judge);
+            return false;
+        }
+        self.follow_wire(graph, judge)
+    }
+
     /// Moves a wire drag's target to where the pointer is, proposing the edit dropping it there,
     /// or cancels the drag if it no longer holds a wire. Returns whether it cancelled the drag.
     fn follow_wire(&mut self, graph: &Graph, judge: &mut Judge<'_>) -> bool {
@@ -992,7 +1188,8 @@ impl Gesture {
             Gesture::Press { .. }
             | Gesture::Move { .. }
             | Gesture::BoxSelect { .. }
-            | Gesture::Wire(_) => Button::Left,
+            | Gesture::Wire(_)
+            | Gesture::Cut(_) => Button::Left,
         }
     }
 }
@@ -2518,5 +2715,256 @@ mod tests {
         graph.remove_connection(lifted(1)[1]).unwrap();
         let response = send_judged(&mut view, &graph, &mut policy, &[move_to(to_x, to_y)]);
         assert!(response.handled && !view.has_active_gesture());
+    }
+
+    /// What a cut would remove and the reason for its last refusal.
+    fn cut(view: &View) -> Option<(Vec<Connection>, Option<String>)> {
+        let preview = view.cut_preview()?;
+        Some((preview.cut.to_vec(), preview.refusal.map(str::to_owned)))
+    }
+
+    fn cutting(wires: &[Connection]) -> ConnectionEdit {
+        ConnectionEdit {
+            remove: wires.to_vec(),
+            add: Vec::new(),
+        }
+    }
+
+    /// A stroke between the outputs and node 2 in [`lifting`], down across both wires: the upper
+    /// at physical y = 334 and the lower at 364, where it is half way.
+    const STROKE: [(f32, f32); 2] = [(550.0, 300.0), (550.0, 420.0)];
+
+    #[test]
+    fn a_y_drag_cuts_each_wire_it_crosses_once_whatever_the_zoom() {
+        let graph = lifting();
+        let mut view = View::new(WHOLE);
+        let mut policy = Policy::default();
+        let [upper, lower] = lifted(1);
+        let [(x, top), (_, bottom)] = STROKE;
+
+        let hold_y = [move_to(x, top), InputEvent::KeyPressed(Key::Y)];
+        let response = send_judged(&mut view, &graph, &mut policy, &hold_y);
+        assert!(response.handled);
+        let _ = send_judged(
+            &mut view,
+            &graph,
+            &mut policy,
+            &[press(x, top), move_to(x, 340.0)],
+        );
+        assert_eq!(cut(&view), Some((vec![upper], None)));
+        assert_eq!(view.hovered_side(), None);
+
+        // Zoomed out about the pointer, the lower wire's middle rises to y = 360.
+        let zoom_out = InputEvent::Scrolled {
+            position: px(x, 340.0),
+            lines: -1.0,
+        };
+        let released_y = InputEvent::KeyReleased(Key::Y);
+        let _ = send_judged(&mut view, &graph, &mut policy, &[zoom_out, released_y]);
+        assert_eq!(cut(&view), Some((vec![upper], None)));
+        let _ = send_judged(&mut view, &graph, &mut policy, &[move_to(x, 362.0)]);
+        assert_eq!(cut(&view), Some((vec![upper, lower], None)));
+
+        let back = [move_to(x, top), move_to(x, bottom), release(x, bottom)];
+        let response = send_judged(&mut view, &graph, &mut policy, &back);
+        assert_eq!(response.connections, Some(cutting(&[upper, lower])));
+        assert_eq!(policy.asked, [cutting(&[upper]), cutting(&[upper, lower])]);
+
+        let without_y = [press(x, top), move_to(x, bottom), release(x, bottom)];
+        let response = send_judged(&mut view, &graph, &mut policy, &without_y);
+        assert_eq!(response.connections, None);
+        assert_eq!(policy.asked.len(), 2);
+    }
+
+    #[test]
+    fn a_cut_leaves_out_the_wires_the_host_keeps() {
+        let graph = lifting();
+        let mut view = View::new(WHOLE);
+        let [upper, lower] = lifted(1);
+        let mut policy = Policy {
+            kept: Some(upper),
+            ..Policy::default()
+        };
+        let [(x, top), (_, bottom)] = STROKE;
+
+        let _ = send_judged(
+            &mut view,
+            &graph,
+            &mut policy,
+            &[
+                InputEvent::KeyPressed(Key::Y),
+                press(x, top),
+                move_to(x, 340.0),
+            ],
+        );
+        assert_eq!(cut(&view), Some((vec![], Some("Kept".to_owned()))));
+        let _ = send_judged(&mut view, &graph, &mut policy, &[move_to(x, bottom)]);
+        assert_eq!(cut(&view), Some((vec![lower], None)));
+        let response = send_judged(
+            &mut view,
+            &graph,
+            &mut policy,
+            &[move_to(x, top), release(x, top)],
+        );
+        assert_eq!(response.connections, Some(cutting(&[lower])));
+        assert_eq!(policy.asked, [cutting(&[upper]), cutting(&[lower])]);
+
+        policy = Policy {
+            kept: Some(lower),
+            ..Policy::default()
+        };
+        let stroke = [press(x, top), move_to(x, bottom), release(x, bottom)];
+        let response = send_judged(&mut view, &graph, &mut policy, &stroke);
+        assert_eq!(response.connections, Some(cutting(&[upper])));
+        assert_eq!(policy.asked, [cutting(&[upper]), cutting(&[upper, lower])]);
+    }
+
+    #[test]
+    fn a_cut_crosses_only_wires_seen_in_the_view_and_outside_nodes() {
+        let mut graph = lifting();
+        // Over the upper wire's middle, from physical x = 530 to 630.
+        graph
+            .add_node(NodeId(4), untitled(at(130.0, 20.0)))
+            .unwrap();
+        // Down to physical y = 350 with the graph where it was, above the lower wire's middle.
+        let mut view = View::new(Viewport {
+            height: 350,
+            ..WHOLE
+        });
+        view.centre = at(0.0, -125.0);
+        let mut policy = Policy::default();
+        let [(x, top), (_, bottom)] = STROKE;
+
+        let _ = send_judged(
+            &mut view,
+            &graph,
+            &mut policy,
+            &[
+                InputEvent::KeyPressed(Key::Y),
+                press(x, top),
+                move_to(x, bottom),
+            ],
+        );
+        assert_eq!(cut(&view), Some((vec![], None)));
+        // Back up left of node 4.
+        let response = send_judged(
+            &mut view,
+            &graph,
+            &mut policy,
+            &[
+                move_to(520.0, bottom),
+                move_to(520.0, top),
+                release(520.0, top),
+            ],
+        );
+        let [upper, _] = lifted(1);
+        assert_eq!(response.connections, Some(cutting(&[upper])));
+        assert_eq!(policy.asked, [cutting(&[upper])]);
+    }
+
+    #[test]
+    fn one_stroke_cuts_every_wire_into_a_folded_group() {
+        let mut graph = unwired();
+        let mut target = graph.node(NodeId(2)).unwrap().clone();
+        let pin = |id| Pin {
+            id: PinId(id),
+            label: String::new(),
+            direction: Direction::Input,
+        };
+        target.rows = vec![Row::Group(Group {
+            id: GroupId(1),
+            label: String::new(),
+            folded: true,
+            pins: vec![pin(1), pin(2)],
+        })];
+        graph.update_node(NodeId(2), target).unwrap();
+        let members = [1, 2].map(|input| Connection {
+            from: pin_ref(1, 1),
+            to: pin_ref(2, input),
+        });
+        for wire in members {
+            graph.add_connection(wire).unwrap();
+        }
+        let mut view = View::new(WHOLE);
+        let [(x, top), (_, bottom)] = STROKE;
+
+        let response = send(
+            &mut view,
+            &graph,
+            &[
+                InputEvent::KeyPressed(Key::Y),
+                press(x, top),
+                move_to(x, 320.0),
+                release(x, bottom),
+            ],
+        );
+        assert_eq!(
+            response.connections,
+            Some(cutting(&members)),
+            "crossed between the last move and the release"
+        );
+    }
+
+    #[test]
+    fn a_cut_ends_without_a_request_when_cancelled_or_left_with_nothing() {
+        let mut graph = lifting();
+        let mut view = View::new(WHOLE);
+        let mut policy = Policy::default();
+        let [upper, lower] = lifted(1);
+        let [(x, top), (_, bottom)] = STROKE;
+        let stroke = [press(x, top), move_to(x, bottom)];
+        let hold_y = InputEvent::KeyPressed(Key::Y);
+        let _ = send_judged(&mut view, &graph, &mut policy, &[hold_y]);
+
+        let middle = InputEvent::PointerPressed {
+            position: px(x, bottom),
+            button: Button::Middle,
+            modifiers: Modifiers::default(),
+        };
+        for cancel in [InputEvent::KeyPressed(Key::Escape), middle] {
+            let _ = send_judged(&mut view, &graph, &mut policy, &stroke);
+            let _ = send_judged(&mut view, &graph, &mut policy, &[cancel]);
+            let response = send_judged(&mut view, &graph, &mut policy, &[release(x, bottom)]);
+            assert_eq!(response.connections, None);
+        }
+        let _ = send_judged(&mut view, &graph, &mut policy, &stroke);
+        view.cancel_gesture();
+        let mut forgot_y = stroke.to_vec();
+        forgot_y.push(release(x, bottom));
+        let response = send_judged(&mut view, &graph, &mut policy, &forgot_y);
+        assert_eq!(response.connections, None, "focus loss forgets Y");
+
+        let _ = send_judged(&mut view, &graph, &mut policy, &[hold_y]);
+        let _ = send_judged(&mut view, &graph, &mut policy, &stroke);
+        // Node 3 goes and returns under its ID with the same wire, which was not crossed.
+        let record = graph.node(NodeId(3)).unwrap().clone();
+        graph.remove_node(NodeId(3)).unwrap();
+        graph.add_node(NodeId(3), record).unwrap();
+        graph.add_connection(lower).unwrap();
+        policy.asked.clear();
+        view.refresh(&graph, policy.judge());
+        assert_eq!(cut(&view), Some((vec![upper], None)));
+        assert_eq!(policy.asked, [cutting(&[upper])]);
+
+        graph.remove_connection(upper).unwrap();
+        let response = send_judged(&mut view, &graph, &mut policy, &[release(x, bottom)]);
+        assert_eq!(
+            response,
+            Response {
+                handled: true,
+                ..Response::default()
+            },
+            "unrefreshed, the release finds nothing left to cut"
+        );
+
+        let _ = send_judged(&mut view, &graph, &mut policy, &stroke);
+        assert_eq!(cut(&view), Some((vec![lower], None)));
+        graph.remove_connection(lower).unwrap();
+        let _ = send_judged(&mut view, &graph, &mut policy, &[move_to(x, bottom)]);
+        assert_eq!(
+            cut(&view),
+            Some((vec![], None)),
+            "unrefreshed, the next event"
+        );
     }
 }

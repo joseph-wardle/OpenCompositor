@@ -27,6 +27,8 @@ pub enum Key {
     Escape,
     H,
     G,
+    /// Held, a left drag cuts the wires it crosses.
+    Y,
 }
 
 /// The host sends every event to every view in the window; each view decides whether the event

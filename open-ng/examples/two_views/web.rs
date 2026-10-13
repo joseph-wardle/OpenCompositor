@@ -243,7 +243,7 @@ impl Host {
     fn key(&mut self, event: &KeyboardEvent) -> bool {
         let pressed = event.type_() == "keydown";
         // The keys belong to the page while a field or a button has focus. Releases always pass,
-        // so that a held Space cannot stick.
+        // so that a held Space or Y cannot stick.
         if pressed && !self.has_keyboard() {
             return false;
         }
@@ -252,6 +252,7 @@ impl Host {
             "Escape" => Key::Escape,
             "h" | "H" => Key::H,
             "g" | "G" => Key::G,
+            "y" | "Y" => Key::Y,
             "z" | "Z" => {
                 if !pressed || !event.ctrl_key() {
                     return false;

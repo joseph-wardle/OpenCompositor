@@ -159,6 +159,7 @@ impl Host {
             WinitKey::Named(NamedKey::Escape) => Key::Escape,
             WinitKey::Character(c) if c.eq_ignore_ascii_case("h") => Key::H,
             WinitKey::Character(c) if c.eq_ignore_ascii_case("g") => Key::G,
+            WinitKey::Character(c) if c.eq_ignore_ascii_case("y") => Key::Y,
             WinitKey::Character(c) if c.eq_ignore_ascii_case("z") => {
                 if pressed && self.modifiers.control_key() {
                     let changed = if self.modifiers.shift_key() {
@@ -175,7 +176,7 @@ impl Host {
             _ => return None,
         };
         // Chorded with Ctrl, Alt or Meta these are the host's shortcuts, as they are a browser's.
-        // Releases always pass, so that a held Space cannot stick.
+        // Releases always pass, so that a held Space or Y cannot stick.
         let chorded =
             self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
         if pressed && chorded && key != Key::Escape {
