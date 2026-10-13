@@ -12,6 +12,11 @@ publish = false
 [lints]
 workspace = true
 
+# The example is a host, and its document's tests run with the library's.
+[[example]]
+name = "two_views"
+test = true
+
 [dependencies]
 ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }

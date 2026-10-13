@@ -112,14 +112,15 @@ pub struct NodeRecord {
 
 impl NodeRecord {
     /// Every pin, grouped or not, from top to bottom.
-    pub(crate) fn pins(&self) -> impl Iterator<Item = &Pin> {
+    pub fn pins(&self) -> impl Iterator<Item = &Pin> {
         self.rows.iter().flat_map(|row| match row {
             Row::Pin(pin) => std::slice::from_ref(pin),
             Row::Group(group) => &group.pins[..],
         })
     }
 
-    pub(crate) fn pin(&self, id: PinId) -> Option<&Pin> {
+    /// The pin with this ID, grouped or not.
+    pub fn pin(&self, id: PinId) -> Option<&Pin> {
         self.pins().find(|pin| pin.id == id)
     }
 

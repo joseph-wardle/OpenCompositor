@@ -238,8 +238,8 @@ impl Host {
         })
     }
 
-    /// Handles undo and redo, and translates the keys the views use. Returns whether the editor
-    /// used the key, so the browser should not.
+    /// Handles the host's own keys, and translates the keys the views use. Returns whether the
+    /// editor used the key, so the browser should not.
     fn key(&mut self, event: &KeyboardEvent) -> bool {
         let pressed = event.type_() == "keydown";
         // The keys belong to the page while a field or a button has focus. Releases always pass,
@@ -262,6 +262,14 @@ impl Host {
                 } else {
                     self.editor.undo()
                 };
+            }
+            "l" | "L" => {
+                let chorded = event.ctrl_key() || event.alt_key() || event.meta_key();
+                if !pressed || event.repeat() || chorded {
+                    return false;
+                }
+                self.editor.toggle_write_lock();
+                return true;
             }
             _ => return false,
         };
@@ -358,6 +366,11 @@ fn set_status(text: &str) {
     if let Some(status) = document().get_element_by_id("status") {
         status.set_text_content(Some(text));
     }
+}
+
+/// Tells the developer about an edit the host refused that a view had shown as accepted.
+pub fn report(message: &str) {
+    web_sys::console::warn_1(&message.into());
 }
 
 fn show_error(text: &str) {

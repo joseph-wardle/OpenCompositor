@@ -2414,6 +2414,50 @@ mod tests {
     }
 
     #[test]
+    fn a_dual_role_row_starts_a_wire_from_the_side_pressed_whatever_the_zoom() {
+        let mut graph = unwired();
+        for (node, pin) in [(1, 1), (2, 2)] {
+            let mut record = graph.node(NodeId(node)).unwrap().clone();
+            record.rows[pin - 1] = pin_row(pin as u64, Direction::Both);
+            graph.update_node(NodeId(node), record).unwrap();
+        }
+        let wire = |from: (u64, u64), to: (u64, u64)| ConnectionEdit {
+            remove: Vec::new(),
+            add: vec![Connection {
+                from: pin_ref(from.0, from.1),
+                to: pin_ref(to.0, to.1),
+            }],
+        };
+        let out_of_1 = wire((1, 1), (2, 1));
+        let into_1 = wire((2, 2), (1, 1));
+        let mut view = View::new(WHOLE);
+        let mut policy = Policy::default();
+        let mut drag = |view: &mut View, (x, y), (to_x, to_y)| {
+            let events = [press(x, y), move_to(to_x, to_y), release(to_x, to_y)];
+            send_judged(view, &graph, &mut policy, &events).connections
+        };
+
+        // Node 1's sides at physical x 400 and 500, node 2's second row's output side at 700.
+        assert_eq!(drag(&mut view, OUTPUT, INPUT_1), Some(out_of_1.clone()));
+        assert_eq!(
+            drag(&mut view, (400.0, 334.0), (700.0, 354.0)),
+            Some(into_1.clone())
+        );
+
+        // Two notches out about node 1's input side scale every distance from it by 1 / 1.44.
+        let zoom_out = InputEvent::Scrolled {
+            position: px(400.0, 334.0),
+            lines: -2.0,
+        };
+        let _ = view.handle_input(&graph, zoom_out, accept_all);
+        let scaled = |x: f32, y: f32| (400.0 + (x - 400.0) / 1.44, 334.0 + (y - 334.0) / 1.44);
+        let (output, input_1) = (scaled(500.0, 334.0), scaled(600.0, 334.0));
+        assert_eq!(drag(&mut view, output, input_1), Some(out_of_1));
+        let output_2 = scaled(700.0, 354.0);
+        assert_eq!(drag(&mut view, (400.0, 334.0), output_2), Some(into_1));
+    }
+
+    #[test]
     fn a_wire_drag_ends_when_its_pressed_side_goes() {
         let changes: [fn(&mut Graph); 3] = [
             |graph| graph.remove_node(NodeId(1)).unwrap(),
