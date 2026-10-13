@@ -183,26 +183,22 @@ struct Proposal {
 /// The host's judge, as the view's gestures call it.
 type Judge<'a> = dyn FnMut(&ConnectionEdit) -> Verdict + 'a;
 
-/// How a view draws its wire drag: as the host would apply it, or as the committed graph with a
-/// loose wire to the pointer.
+/// How a view draws its wire drag: the graph as the host would apply an accepted edit, or the
+/// committed graph, with a loose wire from each pin in `loose`, on `side`, to the pointer.
 #[derive(Debug)]
-pub(crate) enum WirePreview<'a> {
-    /// Lifted wires that release would remove still hang from each output in `loose` to the
-    /// pointer, so that they follow the drag rather than vanish; `loose` is otherwise empty.
-    Accepted {
-        edit: &'a ConnectionEdit,
-        displaced: &'a [Connection],
-        loose: &'a [PinRef],
-        pointer: PhysicalPoint,
-    },
-    /// There is no proposal, or the host refused it, for `reason` if it gave one. A loose wire
-    /// runs from each pin in `from`, on `side`, to the pointer.
-    Loose {
-        from: &'a [PinRef],
-        side: Side,
-        pointer: PhysicalPoint,
-        refusal: Option<&'a str>,
-    },
+pub(crate) struct WirePreview<'a> {
+    /// The edit the host accepted, if it did.
+    pub(crate) edit: Option<&'a ConnectionEdit>,
+    /// The wires the host said the edit displaces. Empty without an accepted edit.
+    pub(crate) displaced: &'a [Connection],
+    /// Without an accepted edit, the pins the dragged wires are attached to. With one, the
+    /// outputs of lifted wires that release would remove, so that they follow the drag rather
+    /// than vanish; otherwise none.
+    pub(crate) loose: &'a [PinRef],
+    pub(crate) side: Side,
+    pub(crate) pointer: PhysicalPoint,
+    /// The host's reason for refusing the proposal, if it refused it and gave one.
+    pub(crate) refusal: Option<&'a str>,
 }
 
 /// A left drag with Y held, cutting the wires its stroke crosses where this view shows them.
@@ -751,13 +747,21 @@ impl View {
             return None;
         };
         let (attached, side) = drag.attached();
-        let pointer = self.pointer.expect("a wire drag follows a press");
+        let preview = WirePreview {
+            edit: None,
+            displaced: &[],
+            loose: attached,
+            side,
+            pointer: self.pointer.expect("a wire drag follows a press"),
+            refusal: None,
+        };
         Some(match &drag.proposal {
+            None => preview,
             Some(Proposal {
                 edit,
                 verdict: Verdict::Accept { displaced },
-            }) => WirePreview::Accepted {
-                edit,
+            }) => WirePreview {
+                edit: Some(edit),
                 displaced,
                 // Over empty space only a lift has a proposal, and it removes the lifted wires.
                 loose: if drag.target == Some(Target::Space) {
@@ -765,19 +769,14 @@ impl View {
                 } else {
                     &[]
                 },
-                pointer,
+                ..preview
             },
-            proposal => WirePreview::Loose {
-                from: attached,
-                side,
-                pointer,
-                refusal: match proposal {
-                    Some(Proposal {
-                        verdict: Verdict::Refuse { reason },
-                        ..
-                    }) => reason.as_deref(),
-                    _ => None,
-                },
+            Some(Proposal {
+                verdict: Verdict::Refuse { reason },
+                ..
+            }) => WirePreview {
+                refusal: reason.as_deref(),
+                ..preview
             },
         })
     }
@@ -2339,10 +2338,11 @@ mod tests {
 
     /// The edit a wire drag previews as accepted, or the refusal it shows on a loose wire.
     fn preview(view: &View) -> Option<Result<ConnectionEdit, Option<String>>> {
-        match view.wire_preview()? {
-            WirePreview::Accepted { edit, .. } => Some(Ok(edit.clone())),
-            WirePreview::Loose { refusal, .. } => Some(Err(refusal.map(str::to_owned))),
-        }
+        let preview = view.wire_preview()?;
+        Some(match preview.edit {
+            Some(edit) => Ok(edit.clone()),
+            None => Err(preview.refusal.map(str::to_owned)),
+        })
     }
 
     #[test]
@@ -2742,11 +2742,13 @@ mod tests {
             &mut policy,
             &[press(x, y), move_to(x + 4.0, y)],
         );
-        let Some(WirePreview::Loose { from, side, .. }) = view.wire_preview() else {
-            panic!("dropping back where they were changes nothing");
-        };
+        let dropped_back = view.wire_preview().unwrap();
+        assert!(
+            dropped_back.edit.is_none(),
+            "dropping back where they were changes nothing"
+        );
         assert_eq!(
-            (from, side),
+            (dropped_back.loose, dropped_back.side),
             (&[pin_ref(1, 1), pin_ref(3, 1)][..], Side::Output)
         );
 
