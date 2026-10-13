@@ -709,6 +709,7 @@ fn opaque(color: Color) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_edit::accept_all;
     use crate::geometry::{MIN_WIDTH, ROW_HEIGHT, TITLE_HEIGHT};
     use crate::graph::{Connection, Direction, Group, GroupId, NodeRecord, Pin, PinId, Row};
     use crate::input::{Button, InputEvent, Modifiers, PhysicalPoint};
@@ -844,7 +845,7 @@ mod tests {
                 position: PhysicalPoint { x: 480.0, y: 390.0 },
             },
         ] {
-            let _ = view.handle_input(&graph, event);
+            let _ = view.handle_input(&graph, event, accept_all);
         }
 
         let [wire] = wires(&graph, &view)[..] else {
@@ -1012,7 +1013,7 @@ mod tests {
                 x: 400.0 + x,
                 y: 300.0 + TITLE_HEIGHT + ROW_HEIGHT / 2.0,
             };
-            let _ = view.handle_input(&graph, InputEvent::PointerMoved { position });
+            let _ = view.handle_input(&graph, InputEvent::PointerMoved { position }, accept_all);
         };
 
         assert_eq!(ringed(&view), [false, false]);
@@ -1065,7 +1066,7 @@ mod tests {
             button: Button::Left,
             modifiers: Modifiers::default(),
         };
-        let _ = view.handle_input(&graph, press);
+        let _ = view.handle_input(&graph, press, accept_all);
         assert_eq!(bodies(&graph, &view), [-200.0, 100.0, -50.0]);
     }
 
@@ -1237,7 +1238,7 @@ mod tests {
                 position: PhysicalPoint { x: 0.0, y: 0.0 },
                 lines: -notches,
             };
-            let _ = view.handle_input(&graph, scroll);
+            let _ = view.handle_input(&graph, scroll, accept_all);
         };
 
         assert_eq!(opacities(&view(1.0)), (Some(255), Some(255)));

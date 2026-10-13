@@ -18,8 +18,9 @@ mod native;
 mod web;
 
 use open_ng::{
-    Color, Connection, Direction, Fold, Graph, Group, GroupId, InputEvent, NodeId, NodeRecord, Pin,
-    PinId, PinRef, Point, Renderer, Response, Row, View, ViewBuffers, Viewport,
+    Color, Connection, ConnectionEdit, Direction, Fold, Graph, Group, GroupId, InputEvent, NodeId,
+    NodeRecord, Pin, PinId, PinRef, Point, Renderer, Response, Row, Verdict, View, ViewBuffers,
+    Viewport,
 };
 
 /// The physical pixels between the two views.
@@ -68,7 +69,7 @@ impl Editor {
     fn handle(&mut self, input: InputEvent) -> bool {
         let mut handled = false;
         for view in &mut self.views {
-            let response = view.handle_input(&self.graph, input);
+            let response = view.handle_input(&self.graph, input, judge);
             handled |= response.handled;
             if let Some(fold) = response.fold {
                 apply_fold(&mut self.graph, fold);
@@ -98,6 +99,12 @@ impl Editor {
     fn gesture_active(&self) -> bool {
         self.views.iter().any(View::has_active_gesture)
     }
+}
+
+/// Whether the host would apply a connection edit. The history cannot record connection edits
+/// yet, so it refuses them all.
+fn judge(_: &ConnectionEdit) -> Verdict {
+    Verdict::Refuse { reason: None }
 }
 
 /// The surface the views draw into, and everything on the GPU that draws them.

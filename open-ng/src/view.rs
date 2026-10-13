@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use crate::connection_edit::{ConnectionEdit, Verdict};
 use crate::geometry::{self, Part, Rect};
 use crate::graph::{AddStamp, Graph, GroupId, NodeId, PinRef, Point, Side};
 use crate::input::{Button, InputEvent, Key, Modifiers, PhysicalPoint};
@@ -57,6 +58,9 @@ pub struct Response {
     pub selection: Option<Vec<NodeId>>,
     /// A group to fold or unfold, from a click on its header.
     pub fold: Option<Fold>,
+    /// Connections to remove and add, from a released gesture whose last proposal the host
+    /// accepted. The host applies it as it judged it, displaced connections included.
+    pub connections: Option<ConnectionEdit>,
     /// The view used the event: the host should redraw and should not also treat it as its own
     /// shortcut.
     pub handled: bool,
@@ -237,7 +241,19 @@ impl View {
         self.space_held = false;
     }
 
-    pub fn handle_input(&mut self, graph: &Graph, event: InputEvent) -> Response {
+    /// Handles one event against the graph as it is now.
+    ///
+    /// While a gesture proposes a [`ConnectionEdit`], the view asks `judge` whether the host would
+    /// accept it, once each time the proposal changes, and previews the verdict. The verdict is
+    /// advisory: on release the view requests the edit only if the last verdict accepted it, and
+    /// the host decides again when applying it.
+    pub fn handle_input(
+        &mut self,
+        graph: &Graph,
+        event: InputEvent,
+        #[expect(unused_variables, reason = "wire drags will propose edits")]
+        judge: impl FnMut(&ConnectionEdit) -> Verdict,
+    ) -> Response {
         // Keys the view does not use leave the hover alone, so that a change to the graph since
         // the last event never reports a host shortcut as handled.
         let pointer_event = !matches!(
@@ -523,6 +539,7 @@ impl View {
             positions,
             selection: after.filter(|after| selects_other_nodes(graph, after)),
             fold,
+            connections: None,
             handled: true,
         }
     }
@@ -692,6 +709,7 @@ impl Gesture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_edit::accept_all;
     use crate::geometry::{BOTTOM_PADDING, MIN_WIDTH, TITLE_HEIGHT};
     use crate::graph::{Color, Direction, Group, NodeRecord, Pin, PinId, Row};
 
@@ -788,7 +806,7 @@ mod tests {
     fn send(view: &mut View, graph: &Graph, events: &[InputEvent]) -> Response {
         let mut last = Response::default();
         for &event in events {
-            last = view.handle_input(graph, event);
+            last = view.handle_input(graph, event, accept_all);
         }
         last
     }
@@ -852,10 +870,10 @@ mod tests {
         graph.set_selection(&ids(&[1, 2])).unwrap();
         let mut view = View::new(WHOLE);
 
-        let _ = view.handle_input(&graph, press(400.0, 300.0));
+        let _ = view.handle_input(&graph, press(400.0, 300.0), accept_all);
         assert_eq!(view.drawn_selection(&graph), ids(&[1, 2]));
 
-        let response = view.handle_input(&graph, release(400.0, 300.0));
+        let response = view.handle_input(&graph, release(400.0, 300.0), accept_all);
         assert_eq!(response.selection, Some(ids(&[1])));
     }
 
@@ -884,7 +902,7 @@ mod tests {
         );
         assert_eq!(graph.node(NodeId(1)).unwrap().position, centred(0.0, 0.0));
 
-        let response = view.handle_input(&graph, release(430.0, 340.0));
+        let response = view.handle_input(&graph, release(430.0, 340.0), accept_all);
         assert_eq!(
             response.positions,
             [
@@ -969,7 +987,7 @@ mod tests {
             view.drawn_position(&graph, NodeId(1)),
             Some(centred(0.0, 0.0))
         );
-        let response = view.handle_input(&graph, release(406.0, 294.0));
+        let response = view.handle_input(&graph, release(406.0, 294.0), accept_all);
         assert_eq!(response.positions, []);
 
         let _ = send(
@@ -1003,7 +1021,7 @@ mod tests {
         );
         assert_eq!(view.drawn_selection(&graph), ids(&[1]));
 
-        let response = view.handle_input(&graph, InputEvent::KeyPressed(Key::Escape));
+        let response = view.handle_input(&graph, InputEvent::KeyPressed(Key::Escape), accept_all);
         assert_eq!(
             response,
             Response {
@@ -1018,7 +1036,7 @@ mod tests {
         assert_eq!(view.drawn_selection(&graph), ids(&[3]));
         assert_eq!(view.zoom, 1.2);
 
-        let response = view.handle_input(&graph, release(450.0, 300.0));
+        let response = view.handle_input(&graph, release(450.0, 300.0), accept_all);
         assert_eq!(response, Response::default());
     }
 
@@ -1077,7 +1095,7 @@ mod tests {
         );
         assert_eq!(view.centre, at(10.0, 0.0));
 
-        let response = view.handle_input(&graph, release(440.0, 300.0));
+        let response = view.handle_input(&graph, release(440.0, 300.0), accept_all);
         assert_eq!(
             response.positions,
             [],
@@ -1102,16 +1120,16 @@ mod tests {
             position: px(250.0, 300.0),
             button: Button::Middle,
         };
-        let response = view.handle_input(&graph, middle_release);
+        let response = view.handle_input(&graph, middle_release, accept_all);
         assert!(response.handled && view.has_active_gesture());
 
-        let response = view.handle_input(&graph, press(600.0, 300.0));
+        let response = view.handle_input(&graph, press(600.0, 300.0), accept_all);
         assert!(response.handled && !view.has_active_gesture());
         assert_eq!(
             view.drawn_position(&graph, NodeId(1)),
             Some(centred(0.0, 0.0))
         );
-        let response = view.handle_input(&graph, release(600.0, 300.0));
+        let response = view.handle_input(&graph, release(600.0, 300.0), accept_all);
         assert_eq!(response, Response::default());
     }
 
@@ -1130,7 +1148,7 @@ mod tests {
                 position: pointer,
                 lines,
             };
-            let response = view.handle_input(&graph, scroll);
+            let response = view.handle_input(&graph, scroll, accept_all);
             assert!(response.handled);
             let now = view.to_graph(pointer);
             assert!((now.x - under.x).abs() < 1e-3 && (now.y - under.y).abs() < 1e-3);
@@ -1155,7 +1173,7 @@ mod tests {
             position: px(600.0, 300.0),
             lines: 1.0,
         };
-        assert!(!view.handle_input(&graph, scroll).handled);
+        assert!(!view.handle_input(&graph, scroll, accept_all).handled);
         assert_eq!(view.zoom, 1.0);
     }
 
@@ -1168,16 +1186,16 @@ mod tests {
             scale_factor: 2.0,
             ..WHOLE
         });
-        let _ = view.handle_input(&graph, move_to(10.0, 10.0));
+        let _ = view.handle_input(&graph, move_to(10.0, 10.0), accept_all);
 
         // All three span 500 × 30 units, so the width limits the zoom to 0.9 × 400 / 500.
-        let response = view.handle_input(&graph, InputEvent::KeyPressed(Key::H));
+        let response = view.handle_input(&graph, InputEvent::KeyPressed(Key::H), accept_all);
         assert!(response.handled);
         assert_eq!(view.centre, at(200.0, 0.0));
         assert!((view.zoom - 0.72).abs() < 1e-6);
 
         // Node 3 alone fits at 0.9 × 400 / 100.
-        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::G));
+        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::G), accept_all);
         assert_eq!(view.centre, at(400.0, 0.0));
         assert!((view.zoom - 3.6).abs() < 1e-6);
 
@@ -1186,14 +1204,14 @@ mod tests {
             scale_factor: 1.0,
             ..WHOLE
         });
-        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::G));
+        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::G), accept_all);
         assert_eq!(view.zoom, MAX_ZOOM);
 
         // A node a million units away would fit only below the minimum.
         graph
             .add_node(NodeId(4), untitled(centred(1_000_000.0, 0.0)))
             .unwrap();
-        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::H));
+        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::H), accept_all);
         assert_eq!(view.zoom, MIN_ZOOM);
     }
 
@@ -1201,17 +1219,17 @@ mod tests {
     fn keys_act_only_while_the_pointer_is_in_the_target() {
         let graph = three_nodes();
         let mut view = View::new(WHOLE);
-        let _ = view.handle_input(&graph, move_to(10.0, 10.0));
-        let _ = view.handle_input(&graph, InputEvent::PointerLeft);
+        let _ = view.handle_input(&graph, move_to(10.0, 10.0), accept_all);
+        let _ = view.handle_input(&graph, InputEvent::PointerLeft, accept_all);
 
         for key in [Key::H, Key::G, Key::Space] {
-            let response = view.handle_input(&graph, InputEvent::KeyPressed(key));
+            let response = view.handle_input(&graph, InputEvent::KeyPressed(key), accept_all);
             assert!(!response.handled, "{key:?}");
         }
         assert_eq!(view.centre, at(0.0, 0.0));
 
-        let _ = view.handle_input(&graph, move_to(10.0, 10.0));
-        let response = view.handle_input(&graph, InputEvent::KeyPressed(Key::H));
+        let _ = view.handle_input(&graph, move_to(10.0, 10.0), accept_all);
+        let response = view.handle_input(&graph, InputEvent::KeyPressed(Key::H), accept_all);
         assert!(response.handled);
         assert_eq!(view.centre, at(200.0, 0.0));
     }
@@ -1225,7 +1243,7 @@ mod tests {
             &graph,
             &[press(400.0, 300.0), move_to(420.0, 300.0)],
         );
-        let _ = view.handle_input(&graph, InputEvent::PointerLeft);
+        let _ = view.handle_input(&graph, InputEvent::PointerLeft, accept_all);
         assert_eq!(
             view.drawn_position(&graph, NodeId(1)),
             Some(centred(20.0, 0.0))
@@ -1243,7 +1261,7 @@ mod tests {
             &graph,
             &[press(100.0, 100.0), move_to(150.0, 150.0)],
         );
-        let _ = view.handle_input(&graph, InputEvent::PointerLeft);
+        let _ = view.handle_input(&graph, InputEvent::PointerLeft, accept_all);
         assert!(view.drawn_box().is_some());
     }
 
@@ -1260,7 +1278,7 @@ mod tests {
             &[press(350.0, 250.0), move_to(570.0, 300.0)],
         );
         assert_eq!(view.drawn_selection(&graph), ids(&[1, 2]));
-        let response = view.handle_input(&graph, release(570.0, 300.0));
+        let response = view.handle_input(&graph, release(570.0, 300.0), accept_all);
         assert_eq!(response.selection, Some(ids(&[1, 2])));
         accept(&mut graph, response);
 
@@ -1316,9 +1334,9 @@ mod tests {
         let mut graph = three_nodes();
         let mut view = View::new(WHOLE);
 
-        let _ = view.handle_input(&graph, press_with(400.0, 300.0, SHIFT));
+        let _ = view.handle_input(&graph, press_with(400.0, 300.0, SHIFT), accept_all);
         graph.set_selection(&ids(&[3])).unwrap();
-        let response = view.handle_input(&graph, release(400.0, 300.0));
+        let response = view.handle_input(&graph, release(400.0, 300.0), accept_all);
         assert_eq!(response.selection, Some(ids(&[3, 1])));
     }
 
@@ -1337,7 +1355,7 @@ mod tests {
         assert_eq!(view.drawn_position(&graph, NodeId(2)), None);
         assert_eq!(view.drawn_selection(&graph), ids(&[1]));
 
-        let response = view.handle_input(&graph, release(400.0, 350.0));
+        let response = view.handle_input(&graph, release(400.0, 350.0), accept_all);
         assert_eq!(response.positions, [(NodeId(1), centred(0.0, 50.0))]);
     }
 
@@ -1361,7 +1379,7 @@ mod tests {
             Some(centred(200.0, 0.0))
         );
         assert_eq!(view.drawn_selection(&graph), []);
-        let response = view.handle_input(&graph, release(600.0, 350.0));
+        let response = view.handle_input(&graph, release(600.0, 350.0), accept_all);
         assert_eq!(response.positions, []);
         assert_eq!(response.selection, None);
     }
@@ -1387,36 +1405,49 @@ mod tests {
         // The row's middle, below the 24-unit title.
         let y = 334.0;
 
-        assert!(view.handle_input(&graph, move_to(490.0, y)).handled);
+        assert!(
+            view.handle_input(&graph, move_to(490.0, y), accept_all)
+                .handled
+        );
         assert_eq!(view.hovered_side(), size(Side::Output), "past the label");
-        assert!(!view.handle_input(&graph, move_to(491.0, y)).handled);
-        let _ = view.handle_input(&graph, move_to(402.0, y));
+        assert!(
+            !view
+                .handle_input(&graph, move_to(491.0, y), accept_all)
+                .handled
+        );
+        let _ = view.handle_input(&graph, move_to(402.0, y), accept_all);
         assert_eq!(view.hovered_side(), size(Side::Input));
-        let _ = view.handle_input(&graph, move_to(395.0, y));
+        let _ = view.handle_input(&graph, move_to(395.0, y), accept_all);
         assert_eq!(
             view.hovered_side(),
             size(Side::Input),
             "a reach past the edge"
         );
-        assert!(view.handle_input(&graph, move_to(450.0, 312.0)).handled);
+        assert!(
+            view.handle_input(&graph, move_to(450.0, 312.0), accept_all)
+                .handled
+        );
         assert_eq!(view.hovered_side(), None, "the title");
 
         let _ = send(&mut view, &graph, &[move_to(490.0, y), press(490.0, y)]);
         assert_eq!(view.hovered_side(), None, "hidden during a gesture");
-        let response = view.handle_input(&graph, release(490.0, y));
+        let response = view.handle_input(&graph, release(490.0, y), accept_all);
         assert_eq!(response.selection, Some(ids(&[1])));
         assert_eq!(view.hovered_side(), size(Side::Output));
-        assert!(view.handle_input(&graph, InputEvent::PointerLeft).handled);
+        assert!(
+            view.handle_input(&graph, InputEvent::PointerLeft, accept_all)
+                .handled
+        );
         assert_eq!(view.hovered_side(), None);
 
         // Zooming in about a point just past the edge brings the reach within it.
-        let _ = view.handle_input(&graph, move_to(395.0, y));
+        let _ = view.handle_input(&graph, move_to(395.0, y), accept_all);
         assert_eq!(view.hovered_side(), size(Side::Input));
         let zoom_in = InputEvent::Scrolled {
             position: px(395.0, y),
             lines: 8.0,
         };
-        let _ = view.handle_input(&graph, zoom_in);
+        let _ = view.handle_input(&graph, zoom_in, accept_all);
         assert_eq!(view.hovered_side(), None);
     }
 
@@ -1461,9 +1492,9 @@ mod tests {
         let mut view = View::new(WHOLE);
         let (x, y) = HEADER;
 
-        let _ = view.handle_input(&graph, press(x, y));
+        let _ = view.handle_input(&graph, press(x, y), accept_all);
         assert_eq!(view.drawn_selection(&graph), ids(&[2]));
-        let response = view.handle_input(&graph, release(x, y));
+        let response = view.handle_input(&graph, release(x, y), accept_all);
         let fold = Fold {
             node: NodeId(1),
             group: GroupId(7),
@@ -1526,23 +1557,29 @@ mod tests {
             ..Response::default()
         };
 
-        let _ = view.handle_input(&graph, press(x, y));
+        let _ = view.handle_input(&graph, press(x, y), accept_all);
         let mut ungrouped = graph.node(NodeId(1)).unwrap().clone();
         ungrouped.rows.clear();
         graph.update_node(NodeId(1), ungrouped).unwrap();
-        assert_eq!(view.handle_input(&graph, release(x, y)), nothing);
+        assert_eq!(
+            view.handle_input(&graph, release(x, y), accept_all),
+            nothing
+        );
 
         let mut graph = grouped(false);
-        let _ = view.handle_input(&graph, press(x, y));
+        let _ = view.handle_input(&graph, press(x, y), accept_all);
         let record = graph.node(NodeId(1)).unwrap().clone();
         graph.remove_node(NodeId(1)).unwrap();
         graph.add_node(NodeId(1), record).unwrap();
-        assert_eq!(view.handle_input(&graph, release(x, y)), nothing);
-
-        let _ = view.handle_input(&graph, press(x, y));
-        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::Escape));
         assert_eq!(
-            view.handle_input(&graph, release(x, y)),
+            view.handle_input(&graph, release(x, y), accept_all),
+            nothing
+        );
+
+        let _ = view.handle_input(&graph, press(x, y), accept_all);
+        let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::Escape), accept_all);
+        assert_eq!(
+            view.handle_input(&graph, release(x, y), accept_all),
             Response::default()
         );
     }
@@ -1550,7 +1587,7 @@ mod tests {
     /// Sends the event to every view and accepts each response, as a host would.
     fn broadcast(graph: &mut Graph, views: &mut [View], event: InputEvent) {
         for view in views {
-            let response = view.handle_input(graph, event);
+            let response = view.handle_input(graph, event, accept_all);
             accept(graph, response);
         }
     }

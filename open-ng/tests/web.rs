@@ -11,8 +11,8 @@ use std::rc::Rc;
 
 use ab_glyph::{Font, FontRef};
 use open_ng::{
-    Color, Connection, Direction, Graph, InputEvent, NodeId, NodeRecord, PhysicalPoint, Pin, PinId,
-    PinRef, Point, Renderer, Row, View, ViewBuffers, Viewport,
+    Color, Connection, ConnectionEdit, Direction, Graph, InputEvent, NodeId, NodeRecord,
+    PhysicalPoint, Pin, PinId, PinRef, Point, Renderer, Row, Verdict, View, ViewBuffers, Viewport,
 };
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -122,7 +122,7 @@ async fn webgl2_draws_text_at_each_views_zoom_under_the_nodes_above() {
                 position: PhysicalPoint { x: 300.0, y: 50.0 },
                 lines: 1.0,
             };
-            let _ = view.handle_input(&graph, scroll);
+            let _ = view.handle_input(&graph, scroll, accept_all);
         }
         view
     });
@@ -219,7 +219,7 @@ async fn webgl2_draws_a_wire_in_its_color_and_fades_it_below_a_pixel_wide() {
                 position: PhysicalPoint { x: 300.0, y: 50.0 },
                 lines: -8.0,
             };
-            let _ = view.handle_input(&graph, scroll);
+            let _ = view.handle_input(&graph, scroll, accept_all);
         }
         view
     });
@@ -397,4 +397,11 @@ async fn draw(
 fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 3] {
     let i = ((y * WIDTH + x) * 4) as usize;
     [pixels[i], pixels[i + 1], pixels[i + 2]]
+}
+
+/// The tests only zoom, which proposes no connection edits.
+fn accept_all(_: &ConnectionEdit) -> Verdict {
+    Verdict::Accept {
+        displaced: Vec::new(),
+    }
 }
