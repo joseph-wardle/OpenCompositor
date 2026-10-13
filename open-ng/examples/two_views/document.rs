@@ -8,7 +8,7 @@
 //! spare input; connecting it makes it the next foreground and adds another spare. Wires that
 //! would make a cycle are refused.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use open_ng::{
     Color, Connection, ConnectionEdit, Direction, Fold, Graph, Group, GroupId, NodeId, NodeRecord,
@@ -62,8 +62,18 @@ struct Effect {
     displaced: Vec<Connection>,
     /// The edit's additions the graph does not have yet.
     added: Vec<Connection>,
-    records: Vec<(NodeId, Change<NodeRecord>)>,
+    spare: Option<SpareConnected>,
     sources: Vec<(PinRef, Change<Vec<PinRef>>)>,
+}
+
+/// Connecting the merge's spare input makes it the next foreground and adds a new spare under a
+/// fresh ID after it. Only those rows change, so undoing leaves the rest of the merge as it is
+/// then, such as a group folded since.
+#[derive(Debug)]
+struct SpareConnected {
+    spare: PinId,
+    foreground: String,
+    next: PinId,
 }
 
 #[derive(Debug)]
@@ -221,7 +231,7 @@ impl Document {
             return Err("That would make a cycle".to_owned());
         }
         Ok(Some(Effect {
-            records: self.spare_connected(&added),
+            spare: self.spare_connected(&added),
             sources: self.source_changes(&removed, &added),
             removed: edit.remove,
             displaced,
@@ -229,20 +239,19 @@ impl Document {
         }))
     }
 
-    /// If an addition connects the merge's spare input, the spare becomes the next foreground
-    /// and a new spare under a fresh ID follows it, in the same step, so an undo leaves no spare
-    /// behind and a redo brings back the same IDs.
-    fn spare_connected(&self, added: &[Connection]) -> Vec<(NodeId, Change<NodeRecord>)> {
+    /// The rows that change if an addition connects the merge's spare input. They change in the
+    /// same step, so an undo leaves no spare behind and a redo brings back the same IDs.
+    fn spare_connected(&self, added: &[Connection]) -> Option<SpareConnected> {
         let record = self.graph.node(MERGE).expect("the merge is never removed");
         let Some(Row::Pin(spare)) = record.rows.last() else {
-            return Vec::new();
+            return None;
         };
-        let spare = PinRef {
+        let spare_ref = PinRef {
             node: MERGE,
             pin: spare.id,
         };
-        if !added.iter().any(|c| c.to == spare) {
-            return Vec::new();
+        if !added.iter().any(|c| c.to == spare_ref) {
+            return None;
         }
         // The background, every foreground and the spare.
         let inputs = record
@@ -250,20 +259,11 @@ impl Document {
             .filter(|pin| pin.direction == Direction::Input)
             .count();
         let fresh = record.pins().map(|pin| pin.id.0).max().unwrap_or(0) + 1;
-        let mut after = record.clone();
-        if let Some(Row::Pin(spare)) = after.rows.last_mut() {
-            spare.label = format!("Foreground {}", inputs - 1);
-        }
-        after.rows.push(Row::Pin(Pin {
-            id: PinId(fresh),
-            label: SPARE_LABEL.to_owned(),
-            direction: Direction::Input,
-        }));
-        let change = Change {
-            before: record.clone(),
-            after,
-        };
-        vec![(MERGE, change)]
+        Some(SpareConnected {
+            spare: spare.id,
+            foreground: format!("Foreground {}", inputs - 1),
+            next: PinId(fresh),
+        })
     }
 
     /// New sources keep their order and join the end.
@@ -341,8 +341,8 @@ impl Effect {
         for &connection in self.removed.iter().chain(&self.displaced) {
             graph.remove_connection(connection).expect(PLANNED);
         }
-        for (id, record) in &self.records {
-            graph.update_node(*id, record.after.clone()).expect(PLANNED);
+        if let Some(spare) = &self.spare {
+            spare.redo(graph);
         }
         for &connection in &self.added {
             graph.add_connection(connection).expect(PLANNED);
@@ -352,22 +352,57 @@ impl Effect {
         }
     }
 
-    /// The old records still have every pin a removed wire used, so restoring them removes no
-    /// wire that should stay.
+    /// The merge keeps every pin a removed wire used, so undoing a connected spare removes no wire
+    /// that should stay.
     fn undo(&self, graph: &mut Graph, sources: &mut HashMap<PinRef, Vec<PinRef>>) {
         for &connection in &self.added {
             graph.remove_connection(connection).expect(PLANNED);
         }
-        for (id, record) in &self.records {
-            graph
-                .update_node(*id, record.before.clone())
-                .expect(PLANNED);
+        if let Some(spare) = &self.spare {
+            spare.undo(graph);
         }
         for &connection in self.removed.iter().chain(&self.displaced) {
             graph.add_connection(connection).expect(PLANNED);
         }
         for (input, order) in &self.sources {
             sources.insert(*input, order.before.clone());
+        }
+    }
+}
+
+impl SpareConnected {
+    fn redo(&self, graph: &mut Graph) {
+        update_merge(graph, |rows| {
+            relabel(rows, self.spare, &self.foreground);
+            rows.push(Row::Pin(Pin {
+                id: self.next,
+                label: SPARE_LABEL.to_owned(),
+                direction: Direction::Input,
+            }));
+        });
+    }
+
+    fn undo(&self, graph: &mut Graph) {
+        update_merge(graph, |rows| {
+            rows.retain(|row| !matches!(row, Row::Pin(pin) if pin.id == self.next));
+            relabel(rows, self.spare, SPARE_LABEL);
+        });
+    }
+}
+
+fn update_merge(graph: &mut Graph, change: impl FnOnce(&mut Vec<Row>)) {
+    let mut record = graph.node(MERGE).expect(PLANNED).clone();
+    change(&mut record.rows);
+    graph.update_node(MERGE, record).expect(PLANNED);
+}
+
+/// Relabels an ungrouped pin.
+fn relabel(rows: &mut [Row], id: PinId, label: &str) {
+    for row in rows {
+        if let Row::Pin(pin) = row
+            && pin.id == id
+        {
+            pin.label = label.to_owned();
         }
     }
 }
@@ -392,24 +427,27 @@ fn label(graph: &Graph, pin: PinRef) -> &str {
         .map_or("", |pin| &pin.label)
 }
 
-/// Whether the graph would have a cycle after the edit. It searches every wire from each
-/// addition, which is fine at the example's size.
+/// Whether the graph would have a cycle after the edit: whether any addition's output node is
+/// downstream of its input node.
 fn makes_cycle(graph: &Graph, removed: &[Connection], added: &[Connection]) -> bool {
-    let wires: Vec<_> = (graph.connections().iter())
-        .filter(|c| !removed.contains(c))
-        .chain(added)
-        .collect();
+    let removed: HashSet<_> = removed.iter().collect();
+    let mut downstream: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    let wires = (graph.connections().iter()).filter(|c| !removed.contains(c));
+    for wire in wires.chain(added) {
+        downstream
+            .entry(wire.from.node)
+            .or_default()
+            .push(wire.to.node);
+    }
     added.iter().any(|addition| {
         let mut unvisited = vec![addition.to.node];
-        let mut visited = Vec::new();
+        let mut visited = HashSet::new();
         while let Some(node) = unvisited.pop() {
             if node == addition.from.node {
                 return true;
             }
-            if !visited.contains(&node) {
-                visited.push(node);
-                let next = wires.iter().filter(|w| w.from.node == node);
-                unvisited.extend(next.map(|w| w.to.node));
+            if visited.insert(node) {
+                unvisited.extend(downstream.get(&node).into_iter().flatten());
             }
         }
         false
@@ -650,6 +688,44 @@ mod tests {
         assert_eq!(document.apply(connect(edit(&[], &[into_next]))), Ok(true));
         let inputs = merge_inputs(&document);
         assert_eq!(inputs[3..], [(5, "Foreground 3"), (6, SPARE_LABEL)]);
+    }
+
+    #[test]
+    fn undoing_a_connected_spare_keeps_a_fold_made_since() {
+        let mut document = Document::new();
+        let mut merge = document.graph.node(MERGE).unwrap().clone();
+        let options = Group {
+            id: GroupId(1),
+            label: "Options".to_owned(),
+            folded: false,
+            pins: vec![Pin {
+                id: PinId(9),
+                label: "Matte".to_owned(),
+                direction: Direction::Output,
+            }],
+        };
+        merge.rows.insert(1, Row::Group(options));
+        document.graph.update_node(MERGE, merge).unwrap();
+        let folded = |document: &Document| {
+            let merge = document.graph.node(MERGE).unwrap();
+            matches!(&merge.rows[1], Row::Group(group) if group.folded)
+        };
+
+        let into_spare = wire(1, 3, 4);
+        assert_eq!(document.apply(connect(edit(&[], &[into_spare]))), Ok(true));
+        let fold = Response {
+            fold: Some(Fold {
+                node: MERGE,
+                group: GroupId(1),
+                folded: true,
+            }),
+            ..Response::default()
+        };
+        assert_eq!(document.apply(fold), Ok(true));
+        assert!(document.undo());
+        assert!(folded(&document));
+        let original = [(3, "Background"), (1, "Foreground"), (4, SPARE_LABEL)];
+        assert_eq!(merge_inputs(&document), original);
     }
 
     #[test]
