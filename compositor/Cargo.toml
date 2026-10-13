@@ -8,7 +8,7 @@ repository = "https://github.com/joseph-wardle/OpenCompositor"
 publish = false
 
 [dependencies]
-open-ng = { path = "../open-ng", version = "0.2.0" }
+open-ng = { path = "../open-ng", version = "0.3.0" }
 
 [lints]
 workspace = true
