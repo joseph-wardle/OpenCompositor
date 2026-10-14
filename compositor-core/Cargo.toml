@@ -11,7 +11,7 @@ publish = false
 exr = "1.74.2"
 half = "2.7.1"
 imbl = "7.0.2"
-open-ng = { path = "../open-ng", version = "0.4.0" }
+open-ng = { path = "../open-ng", version = "0.4.1" }
 png = "0.18.1"
 pollster = "1.0.1"
 # Backends are the shell's choice; headless tests need none.
