@@ -8,7 +8,7 @@ use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 use crate::document::{NodeId, Slot};
 use crate::gpu::{Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
-use crate::loader::{LoadRequest, Loaded, Loader};
+use crate::loader::{LoadRequest, Loaded, Loader, is_empty};
 use crate::session::{Session, Viewed};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
@@ -182,10 +182,12 @@ pub enum Input {
 #[derive(Debug)]
 enum Shown {
     Nothing,
-    /// Its pixels are on the GPU if there was one when it was read.
     Image {
         request: LoadRequest,
         info: ImageInfo,
+        /// Read while there was no GPU to stage its pixels for, so the viewer draws only its
+        /// outline.
+        unstaged: bool,
     },
     /// An empty frame, never an older image.
     Failed {
@@ -541,6 +543,7 @@ impl App {
         let failed = result.is_err();
         self.shown = match result {
             Ok(decoded) => {
+                let unstaged = decoded.pixels.is_none() && !is_empty(&decoded.info);
                 match decoded.pixels {
                     Some(staged) => self.gpu.show_image(staged),
                     None => self.gpu.clear_image(),
@@ -548,6 +551,7 @@ impl App {
                 Shown::Image {
                     request,
                     info: decoded.info,
+                    unstaged,
                 }
             }
             Err(error) => {
@@ -577,7 +581,13 @@ impl App {
             self.gpu.clear_image();
             requests.push(Request::Redraw(Pane::Viewer));
         }
-        let read = wanted.filter(|wanted| Some(wanted) != self.shown.request());
+        // An image read without a GPU is read again once there is one, including a read that
+        // finished just before the GPU arrived.
+        let shown = match &self.shown {
+            Shown::Image { unstaged: true, .. } if self.gpu.has_device() => None,
+            shown => shown.request(),
+        };
+        let read = wanted.filter(|wanted| Some(wanted) != shown);
         if read.as_ref() != self.session.reading() {
             if let Some(request) = &read {
                 self.loader.request(request.clone());
@@ -622,6 +632,7 @@ impl App {
             Shown::Image {
                 request: shown,
                 info,
+                ..
             } if *shown == request => {
                 let window = info.display_window;
                 let mut caption = format!(

@@ -98,6 +98,10 @@ impl Gpu {
         self.surfaces[pane.index()].is_some()
     }
 
+    pub(crate) fn has_device(&self) -> bool {
+        self.device.is_some()
+    }
+
     /// Makes the pane's surface, and the device if there is none yet, which it returns so that
     /// the loader can stage images for it. On failure the pane draws nothing and no new device is
     /// kept; the error says why.
@@ -332,10 +336,20 @@ impl Device {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .ok_or("the surface offers no sRGB format")?;
+        Ok(Device::for_format(adapter, device, queue, format))
+    }
+
+    /// The renderers for panes of the format.
+    fn for_format(
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        format: wgpu::TextureFormat,
+    ) -> Device {
         let renderer = Renderer::new(&device, format, 1);
         let graph_buffers = ViewBuffers::new(&device, &renderer);
         let viewer = ViewerRenderer::new(&device, format);
-        Ok(Device {
+        Device {
             graph_buffers,
             renderer,
             viewer,
@@ -344,7 +358,7 @@ impl Device {
             queue,
             device,
             adapter,
-        })
+        }
     }
 }
 
@@ -505,6 +519,27 @@ impl ViewerRenderer {
 /// permissive, for tests that need wgpu objects but no GPU.
 #[cfg(test)]
 pub(crate) fn noop_device(limits: Option<wgpu::Limits>) -> wgpu::Device {
+    noop_parts(limits).1
+}
+
+#[cfg(test)]
+impl Gpu {
+    /// A GPU with a [`noop_device`] and no surfaces, and the device for the loader.
+    pub(crate) fn noop() -> (Gpu, wgpu::Device) {
+        let (adapter, device, queue) = noop_parts(None);
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let connected = device.clone();
+        let gpu = Gpu {
+            surfaces: Default::default(),
+            device: Some(Device::for_format(adapter, device, queue, format)),
+            instance: None,
+        };
+        (gpu, connected)
+    }
+}
+
+#[cfg(test)]
+fn noop_parts(limits: Option<wgpu::Limits>) -> (wgpu::Adapter, wgpu::Device, wgpu::Queue) {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::NOOP;
     descriptor.backend_options.noop = wgpu::NoopBackendOptions {
@@ -519,9 +554,9 @@ pub(crate) fn noop_device(limits: Option<wgpu::Limits>) -> wgpu::Device {
         required_limits: adapter.limits(),
         ..Default::default()
     };
-    pollster::block_on(adapter.request_device(&descriptor))
-        .expect("the noop adapter has a device")
-        .0
+    let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
+        .expect("the noop adapter has a device");
+    (adapter, device, queue)
 }
 
 #[cfg(test)]

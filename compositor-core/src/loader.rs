@@ -418,7 +418,7 @@ impl StagingSizing {
     }
 }
 
-fn is_empty(info: &ImageInfo) -> bool {
+pub(crate) fn is_empty(info: &ImageInfo) -> bool {
     info.data_window.width == 0 || info.data_window.height == 0
 }
 

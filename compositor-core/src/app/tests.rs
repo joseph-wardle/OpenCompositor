@@ -435,6 +435,32 @@ fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
 }
 
 #[test]
+fn an_image_read_before_the_gpu_arrived_is_read_again_once_it_has() {
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let request = reading(&app);
+    app.dispatch(read(&request, 4, 4));
+    assert_eq!(app.session().reading(), None);
+
+    // As a surface's creation does.
+    let (gpu, device) = Gpu::noop();
+    app.gpu = gpu;
+    app.loader.connect(device);
+    app.dispatch(Event::Draw(Pane::Viewer));
+    assert_eq!(reading(&app), request);
+    assert_eq!(app.caption, "Slot 1 · a.exr · reading…");
+
+    // A read that began before the GPU arrived finishes without pixels too.
+    app.dispatch(read(&request, 4, 4));
+    assert_eq!(reading(&app), request);
+
+    // An empty image has no pixels to stage.
+    app.dispatch(read(&request, 0, 0));
+    assert_eq!(app.session().reading(), None);
+}
+
+#[test]
 fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     let (mut app, _deliveries) = app();
     let id = create(&mut app, "/nonexistent/a.exr");
