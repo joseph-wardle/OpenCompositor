@@ -2,6 +2,8 @@
 
 use std::io::{BufRead, Seek};
 
+use ::exr::block::chunk::CompressedBlock;
+use ::exr::block::reader::ChunksReader;
 use ::exr::compression::Compression;
 use ::exr::error::Error;
 use ::exr::image::read::image::ReadLayers;
@@ -91,6 +93,11 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
         1.0
     };
 
+    if meta.headers.iter().any(|header| is_dwa(header.compression)) {
+        file.rewind()?;
+        check_dwa_leaders(&mut file)?;
+    }
+
     file.rewind()?;
     let image = ::exr::prelude::read()
         .no_deep_data()
@@ -131,6 +138,76 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
         Source::Exr(source),
         warnings,
     ))
+}
+
+/// Refuses a file with a DWA chunk whose leader declares more data than its block can hold.
+///
+/// `exr` allocates what these counters declare before checking them, and a failed allocation
+/// aborts the process, which no panic handler can catch; OpenEXR refuses such chunks. Chunks are
+/// found through the offset tables and checked against the part each names, as the decoder finds
+/// and decodes them, so no chunk it decodes goes unchecked.
+fn check_dwa_leaders(file: &mut (impl BufRead + Seek)) -> Result<(), ReadError> {
+    let mut chunks = ::exr::block::read(file, false)
+        .and_then(|reader| reader.filter_chunks(false, |_, _, _| true))
+        .map_err(decode_error)?;
+    while let Some(chunk) = chunks.next() {
+        let chunk = chunk.map_err(decode_error)?;
+        // `exr` has checked that the part exists.
+        let header = &chunks.meta_data().headers[chunk.layer_index];
+        if !is_dwa(header.compression) {
+            continue;
+        }
+        let pixels = match &chunk.compressed_block {
+            CompressedBlock::ScanLine(block) => &block.compressed_pixels_le,
+            CompressedBlock::Tile(block) => &block.compressed_pixels_le,
+            // Files with deep parts are refused before this.
+            CompressedBlock::DeepScanLine(_) | CompressedBlock::DeepTile(_) => continue,
+        };
+        let block = header
+            .get_block_data_indices(&chunk.compressed_block)
+            .and_then(|indices| header.get_absolute_block_pixel_coordinates(indices))
+            .map_err(decode_error)?;
+        let (width, height) = (block.size.width(), block.size.height());
+        let bytes = (width * height * header.channels.bytes_per_pixel) as u64;
+        // `exr` reads no leader from an empty chunk or one stored uncompressed, and refuses one
+        // too short to hold a leader.
+        if pixels.is_empty() || pixels.len() as u64 == bytes {
+            continue;
+        }
+        let Some(leader) = pixels.first_chunk::<88>() else {
+            continue;
+        };
+        // Eleven little-endian counters: the version; the unknown section's inflated and
+        // compressed sizes; the AC, DC and RLE sections' compressed sizes; the RLE section's
+        // inflated and raw sizes; the AC and DC counts; the AC coder.
+        let counter = |index: usize| {
+            u64::from_le_bytes(
+                *leader[index * 8..]
+                    .first_chunk::<8>()
+                    .expect("in the leader"),
+            )
+        };
+        // Each 8 × 8 block of each channel, the edges padded, has one DC coefficient and at most
+        // 63 AC ones.
+        let samples = (width.next_multiple_of(8) * height.next_multiple_of(8)) as u64
+            * header.channels.list.len() as u64;
+        let fits = counter(1) <= bytes
+            // An RLE token never takes more than twice the bytes it stands for.
+            && counter(6) <= 2 * bytes
+            && counter(7) <= bytes
+            && counter(8) <= samples
+            && counter(9) <= samples / 64;
+        if !fits {
+            return Err(ReadError::Decode(format!(
+                "a DWA chunk declares more data than its {width} × {height} block holds"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_dwa(compression: Compression) -> bool {
+    matches!(compression, Compression::DWAA(_) | Compression::DWAB(_))
 }
 
 fn decode_error(error: Error) -> ReadError {

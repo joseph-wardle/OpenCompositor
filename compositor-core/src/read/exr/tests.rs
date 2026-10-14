@@ -3,8 +3,8 @@ use std::io::Cursor;
 use ::exr::image::Image as ExrImage;
 use ::exr::meta::attribute::{self, Text};
 use ::exr::prelude::{
-    AnyChannel, AnyChannels, Encoding, FlatSamples, ImageAttributes, IntegerBounds, Layer,
-    LayerAttributes, WritableImage,
+    AnyChannel, AnyChannels, Blocks, Encoding, FlatSamples, ImageAttributes, IntegerBounds, Layer,
+    LayerAttributes, LineOrder, WritableImage,
 };
 
 use super::*;
@@ -367,4 +367,90 @@ fn stereo_files_show_one_view_and_name_it() {
             },
         ]
     );
+}
+
+/// 32 × 32 pixels in one DWA chunk that uses all four of its sections: half-float RGB for
+/// the lossy one, half alpha for RLE, and float Z for the lossless one.
+fn dwa(compression: Compression, blocks: Blocks) -> Vec<u8> {
+    let (width, height) = (32, 32);
+    let value = |value: fn(usize, usize) -> f32| {
+        (0..width * height).map(move |i| value(i % width, i / width))
+    };
+    let half = |name: &str, f: fn(usize, usize) -> f32| {
+        AnyChannel::new(
+            name,
+            FlatSamples::F16(value(f).map(half::f16::from_f32).collect()),
+        )
+    };
+    let layer = Layer::new(
+        (width, height),
+        LayerAttributes::default(),
+        Encoding {
+            compression,
+            blocks,
+            line_order: LineOrder::Increasing,
+        },
+        AnyChannels::sort(
+            [
+                half("R", |x, _| x as f32 / 32.0),
+                half("G", |_, y| y as f32 / 32.0),
+                half("B", |x, y| ((x * y) % 7) as f32 / 7.0),
+                half("A", |x, _| if x < 16 { 1.0 } else { 0.5 }),
+                AnyChannel::new(
+                    "Z",
+                    FlatSamples::F32(value(|x, y| (x + y) as f32).collect()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+    write(display(0, 0, width, height), vec![layer])
+}
+
+/// The byte where the file's only chunk starts its DWA leader of eleven `u64` counters.
+fn dwa_leader(bytes: &[u8], blocks: Blocks) -> usize {
+    // The offset table's one entry points just past itself.
+    let table = (0..bytes.len() - 8)
+        .find(|&at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) == at as u64 + 8)
+        .expect("a one-chunk offset table");
+    // A chunk starts with its first line's y, or its tile's four coordinates, then its byte
+    // count, each an `i32`.
+    let coordinates = match blocks {
+        Blocks::ScanLines => 1,
+        Blocks::Tiles(_) => 4,
+    };
+    table + 8 + (coordinates + 1) * 4
+}
+
+#[test]
+fn dwa_chunks_declaring_more_than_their_block_holds_are_refused() {
+    let tiles = Blocks::Tiles(Vec2(64, 64));
+    for (compression, blocks) in [
+        (Compression::DWAA(None), Blocks::ScanLines),
+        (Compression::DWAB(None), Blocks::ScanLines),
+        (Compression::DWAA(None), tiles),
+    ] {
+        let bytes = dwa(compression, blocks);
+        let leader = dwa_leader(&bytes, blocks);
+        assert_eq!(
+            bytes[leader..leader + 8],
+            2u64.to_le_bytes(),
+            "a version 2 leader"
+        );
+        check_dwa_leaders(&mut Cursor::new(&bytes)).expect("the unpatched leader fits");
+        read_bytes(&bytes).expect("the unpatched file reads");
+        // Each counter that sizes an allocation: unknown and RLE sizes, AC and DC counts. Without
+        // the check, `exr` 1.74.2 aborts the process on these.
+        for counter in [1, 6, 7, 8, 9] {
+            let mut patched = bytes.clone();
+            let at = leader + counter * 8;
+            patched[at..at + 8].copy_from_slice(&(1u64 << 40).to_le_bytes());
+            assert!(
+                check_dwa_leaders(&mut Cursor::new(&patched)).is_err(),
+                "{compression:?} counter {counter} passed the check"
+            );
+            assert!(matches!(read_bytes(&patched), Err(ReadError::Decode(_))));
+        }
+    }
 }
