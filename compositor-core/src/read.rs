@@ -107,7 +107,8 @@ pub enum Refusal {
     NoRgb {
         channels: Vec<String>,
     },
-    /// The part with R, G and B uses a compression we cannot decode.
+    /// The part with R, G and B uses a compression we cannot decode, or any part uses one too
+    /// new for `exr` to read the headers.
     Compression(String),
 }
 

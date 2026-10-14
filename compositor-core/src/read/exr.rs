@@ -1,6 +1,6 @@
 //! OpenEXR through the `exr` crate.
 
-use std::io::{BufRead, Seek};
+use std::io::{BufRead, Read, Seek};
 use std::num::NonZero;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Mutex, mpsc};
@@ -33,7 +33,16 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
     // Only the headers, nothing allocated for pixels yet. Unvalidated, because validation
     // rejects deep and subsampled parts as unsupported before they can be refused for what they
     // contain.
-    let meta = MetaData::read_from_buffered(&mut file, false).map_err(decode_error)?;
+    let meta = match MetaData::read_from_buffered(&mut file, false) {
+        Ok(meta) => meta,
+        // `exr` calls a compression newer than it knows invalid, so name it instead.
+        Err(error) => {
+            return Err(match newer_compression(&mut file) {
+                Some(name) => ReadError::Refused(Refusal::Compression(name.to_owned())),
+                None => decode_error(error),
+            });
+        }
+    };
     for header in &meta.headers {
         check_size(header.layer_size.0 as u64, header.layer_size.1 as u64)?;
     }
@@ -262,6 +271,53 @@ fn check_dwa_leader(header: &Header, chunk: &Chunk) -> Result<(), ReadError> {
 
 fn is_dwa(compression: Compression) -> bool {
     matches!(compression, Compression::DWAA(_) | Compression::DWAB(_))
+}
+
+/// The first compression in the headers that OpenEXR added after `exr`'s last, found by walking
+/// each header's attributes. None if there is none, or the headers end early or are malformed.
+fn newer_compression(file: &mut (impl BufRead + Seek)) -> Option<&'static str> {
+    const MULTIPART: u32 = 0x1000;
+    file.rewind().ok()?;
+    let mut start = [0; 8];
+    file.read_exact(&mut start).ok()?;
+    let version = u32::from_le_bytes(start[4..].try_into().expect("four bytes"));
+    let (mut name, mut kind) = (Vec::new(), Vec::new());
+    let mut header_is_empty = true;
+    loop {
+        read_text(file, &mut name)?;
+        // An empty name ends a header, and in a multi-part file an empty header ends them all.
+        if name.is_empty() {
+            if version & MULTIPART == 0 || header_is_empty {
+                return None;
+            }
+            header_is_empty = true;
+            continue;
+        }
+        header_is_empty = false;
+        read_text(file, &mut kind)?;
+        let mut size = [0; 4];
+        file.read_exact(&mut size).ok()?;
+        let size = u32::try_from(i32::from_le_bytes(size)).ok()?;
+        if kind == b"compression" && size == 1 {
+            let mut code = [0];
+            file.read_exact(&mut code).ok()?;
+            // OpenEXR's codes, after HTJ2K32's 11.
+            match code[0] {
+                12 => return Some("LJ2K"),
+                13 => return Some("ZSTD"),
+                _ => {}
+            }
+        } else {
+            file.seek_relative(size.into()).ok()?;
+        }
+    }
+}
+
+/// Reads a header's null-terminated name or type, at most 255 bytes, without the null.
+fn read_text(file: &mut impl BufRead, text: &mut Vec<u8>) -> Option<()> {
+    text.clear();
+    file.take(256).read_until(0, text).ok()?;
+    (text.pop() == Some(0)).then_some(())
 }
 
 fn decode_error(error: Error) -> ReadError {

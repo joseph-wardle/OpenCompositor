@@ -223,6 +223,37 @@ fn xyz_and_unsupported_compressions_are_refused() {
 }
 
 #[test]
+fn compressions_newer_than_exr_are_refused_by_name() {
+    // Written by OpenEXR 3.5: a 1 × 1 RGB half image with ZSTD compression.
+    let mut bytes =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/zstd.exr")).to_vec();
+    assert_eq!(refusal(&bytes), Refusal::Compression("ZSTD".into()));
+
+    // LJ2K's code.
+    patch_attribute(&mut bytes, b"compression\0compression\0", &[12]);
+    assert_eq!(refusal(&bytes), Refusal::Compression("LJ2K".into()));
+
+    // A code OpenEXR has not given out stays an error from `exr`.
+    patch_attribute(&mut bytes, b"compression\0compression\0", &[14]);
+    assert!(matches!(read_bytes(&bytes), Err(ReadError::Decode(_))));
+
+    // In a multi-part file, the second part's.
+    let parts = vec![
+        part(Some("beauty"), (0, 0), SIZE, &rgb(0.18)),
+        part(Some("depth"), (0, 0), SIZE, &[("Z", 1.0)]),
+    ];
+    let mut bytes = write(display(0, 0, 4, 3), parts);
+    let name_and_type = b"compression\0compression\0";
+    let second = bytes
+        .windows(name_and_type.len())
+        .rposition(|window| window == name_and_type)
+        .expect("the second part has a compression");
+    // After the name, the type and the value's size.
+    bytes[second + name_and_type.len() + 4] = 13;
+    assert_eq!(refusal(&bytes), Refusal::Compression("ZSTD".into()));
+}
+
+#[test]
 fn a_header_declaring_too_many_pixels_is_refused_before_decoding() {
     let declaring = |side: i32| {
         let mut bytes = grey(display(0, 0, 4, 3));
