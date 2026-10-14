@@ -1,0 +1,376 @@
+use std::io::Cursor;
+
+use ::exr::image::Image as ExrImage;
+use ::exr::meta::attribute::{self, Text};
+use ::exr::prelude::{
+    AnyChannel, AnyChannels, Encoding, FlatSamples, ImageAttributes, IntegerBounds, Layer,
+    LayerAttributes, WritableImage,
+};
+
+use super::*;
+use crate::image::Window;
+use crate::read::read_from;
+
+type Part = Layer<AnyChannels<FlatSamples>>;
+
+const SIZE: (usize, usize) = (4, 3);
+
+/// A part with each channel set to one value everywhere.
+fn part(
+    name: Option<&str>,
+    origin: (i32, i32),
+    size: (usize, usize),
+    channels: &[(&str, f32)],
+) -> Part {
+    let attributes = LayerAttributes {
+        layer_name: name.map(Text::from),
+        layer_position: Vec2(origin.0, origin.1),
+        ..LayerAttributes::default()
+    };
+    let channels = channels
+        .iter()
+        .map(|&(name, value)| AnyChannel::new(name, FlatSamples::F32(vec![value; size.0 * size.1])))
+        .collect();
+    Layer::new(
+        size,
+        attributes,
+        Encoding::FAST_LOSSLESS,
+        AnyChannels::sort(channels),
+    )
+}
+
+fn display(x: i32, y: i32, width: usize, height: usize) -> ImageAttributes {
+    ImageAttributes::new(IntegerBounds::new((x, y), (width, height)))
+}
+
+fn write(attributes: ImageAttributes, parts: Vec<Part>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    ExrImage::from_layers(attributes, parts)
+        .write()
+        .to_buffered(Cursor::new(&mut bytes))
+        .expect("an EXR writes");
+    bytes
+}
+
+fn rgb(value: f32) -> [(&'static str, f32); 3] {
+    [("R", value), ("G", value), ("B", value)]
+}
+
+/// One part of RGB 0.18 in a 4 × 3 display window.
+fn grey(attributes: ImageAttributes) -> Vec<u8> {
+    write(attributes, vec![part(None, (0, 0), SIZE, &rgb(0.18))])
+}
+
+fn read_bytes(bytes: &[u8]) -> Result<Image, ReadError> {
+    read_from(Cursor::new(bytes))
+}
+
+fn refusal(bytes: &[u8]) -> Refusal {
+    match read_bytes(bytes) {
+        Err(ReadError::Refused(refusal)) => refusal,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+fn warnings(bytes: &[u8]) -> Vec<Warning> {
+    read_bytes(bytes)
+        .expect("the image reads")
+        .warnings()
+        .to_vec()
+}
+
+/// Overwrites the value of a header attribute, found by its name and type.
+fn patch_attribute(bytes: &mut [u8], name_and_type: &[u8], value: &[u8]) {
+    let at = bytes
+        .windows(name_and_type.len())
+        .position(|window| window == name_and_type)
+        .expect("the attribute is in the header");
+    // The name and type are followed by the value's size, then the value.
+    let start = at + name_and_type.len() + 4;
+    bytes[start..start + value.len()].copy_from_slice(value);
+}
+
+#[test]
+fn pixels_keep_negative_data_windows_and_top_row_first() {
+    // Red is each pixel's x and green its y, so every pixel says where it belongs.
+    let (origin, size) = ((-7, -5), (16usize, 8usize));
+    let mut red = Vec::new();
+    let mut green = Vec::new();
+    for row in 0..size.1 as i32 {
+        for column in 0..size.0 as i32 {
+            red.push((origin.0 + column) as f32);
+            green.push((origin.1 + row) as f32);
+        }
+    }
+    let attributes = LayerAttributes {
+        layer_position: Vec2(origin.0, origin.1),
+        ..LayerAttributes::default()
+    };
+    let channels = vec![
+        AnyChannel::new("R", FlatSamples::F32(red)),
+        AnyChannel::new("G", FlatSamples::F32(green)),
+        AnyChannel::new("B", FlatSamples::F32(vec![0.0; size.0 * size.1])),
+    ];
+    let layer = Layer::new(
+        size,
+        attributes,
+        Encoding::FAST_LOSSLESS,
+        AnyChannels::sort(channels.into_iter().collect()),
+    );
+    let bytes = write(display(0, 0, 10, 10), vec![layer]);
+
+    let image = read_bytes(&bytes).unwrap();
+
+    let data_window = Window {
+        x: -7,
+        y: -5,
+        width: 16,
+        height: 8,
+    };
+    assert_eq!(image.data_window(), data_window);
+    assert_eq!(
+        image.display_window(),
+        Window {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10
+        }
+    );
+    assert_eq!(
+        &image.pixels()[..4],
+        [-7.0, -5.0, 0.0, 1.0],
+        "the first pixel is the top left"
+    );
+    for (x, y) in [(-7, -5), (8, -5), (-7, 2), (8, 2), (0, 0), (3, -1)] {
+        // A missing alpha channel reads as opaque.
+        assert_eq!(
+            image.pixel(x, y),
+            [x as f32, y as f32, 0.0, 1.0],
+            "({x}, {y})"
+        );
+    }
+    assert_eq!(
+        image.pixel(9, 9),
+        [0.0; 4],
+        "outside the data window is transparent black"
+    );
+    assert!(image.warnings().is_empty());
+}
+
+#[test]
+fn files_without_rgb_are_refused_by_what_they_contain() {
+    let only = |channels: &[(&str, f32)]| {
+        write(
+            display(0, 0, 4, 3),
+            vec![part(None, (0, 0), SIZE, channels)],
+        )
+    };
+
+    assert_eq!(
+        refusal(&only(&[("Y", 0.5)])),
+        Refusal::NoRgb {
+            channels: vec!["Y".into()]
+        }
+    );
+    assert_eq!(
+        refusal(&only(&[("A", 0.5)])),
+        Refusal::NoRgb {
+            channels: vec!["A".into()]
+        }
+    );
+    let prefixed = only(&[("beauty.R", 0.1), ("beauty.G", 0.1), ("beauty.B", 0.1)]);
+    assert_eq!(
+        refusal(&prefixed),
+        Refusal::NoRgb {
+            channels: ["beauty.B", "beauty.G", "beauty.R"]
+                .map(String::from)
+                .to_vec()
+        }
+    );
+    assert_eq!(
+        refusal(&only(&[("Y", 0.5), ("RY", 0.0), ("BY", 0.0)])),
+        Refusal::LuminanceChroma
+    );
+}
+
+#[test]
+fn deep_parts_are_skipped_and_a_deep_file_refused() {
+    // `exr` cannot write deep files, so the choice is checked on descriptions.
+    let describe = |deep: bool, channels: &[&str]| ExrPart {
+        name: None,
+        view: None,
+        channels: channels
+            .iter()
+            .map(|&name| ExrChannel {
+                name: name.into(),
+                sample_type: SampleType::F16,
+            })
+            .collect(),
+        compression: ExrCompression::Zip,
+        tiled: false,
+        deep,
+        data_window: Window {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+    };
+    let deep = describe(true, &["A", "B", "G", "R", "Z"]);
+    let flat = describe(false, &["B", "G", "R"]);
+
+    assert_eq!(choose_part(&[deep.clone(), flat]).unwrap(), 1);
+    assert!(matches!(
+        choose_part(&[deep]),
+        Err(ReadError::Refused(Refusal::Deep))
+    ));
+}
+
+#[test]
+fn xyz_and_unsupported_compressions_are_refused() {
+    let mut xyz = display(0, 0, 4, 3);
+    xyz.chromaticities = Some(attribute::Chromaticities {
+        red: Vec2(1.0, 0.0),
+        green: Vec2(0.0, 1.0),
+        blue: Vec2(0.0, 0.0),
+        white: Vec2(1.0 / 3.0, 1.0 / 3.0),
+    });
+    assert_eq!(refusal(&grey(xyz)), Refusal::XyzPrimaries);
+
+    let mut htj2k = grey(display(0, 0, 4, 3));
+    // HTJ2K256's code.
+    patch_attribute(&mut htj2k, b"compression\0compression\0", &[10]);
+    assert_eq!(refusal(&htj2k), Refusal::Compression("HTJ2K256".into()));
+}
+
+#[test]
+fn a_header_declaring_too_many_pixels_is_refused_before_decoding() {
+    let mut bytes = grey(display(0, 0, 4, 3));
+    let side: i32 = 1 << 20;
+    // xMin and yMin stay 0; xMax and yMax follow them.
+    let mut window = [0u8; 16];
+    window[8..12].copy_from_slice(&(side - 1).to_le_bytes());
+    window[12..16].copy_from_slice(&(side - 1).to_le_bytes());
+    patch_attribute(&mut bytes, b"dataWindow\0box2i\0", &window);
+
+    match read_bytes(&bytes) {
+        Err(ReadError::TooLarge { width, height }) => {
+            assert_eq!((width, height), (1 << 20, 1 << 20))
+        }
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+}
+
+#[test]
+fn colour_and_shape_the_reader_cannot_honour_load_with_warnings() {
+    let mut p3 = display(0, 0, 4, 3);
+    let p3_chromaticities = attribute::Chromaticities {
+        red: Vec2(0.680, 0.320),
+        green: Vec2(0.265, 0.690),
+        blue: Vec2(0.150, 0.060),
+        white: Vec2(0.3127, 0.3290),
+    };
+    p3.chromaticities = Some(p3_chromaticities);
+    assert!(
+        matches!(warnings(&grey(p3)).as_slice(), [Warning::Primaries(c)] if c.red == [0.680, 0.320])
+    );
+
+    let mut rec709 = display(0, 0, 4, 3);
+    rec709.chromaticities = Some(attribute::Chromaticities {
+        red: Vec2(0.64, 0.33),
+        green: Vec2(0.30, 0.60),
+        blue: Vec2(0.15, 0.06),
+        white: Vec2(0.3127, 0.3290),
+    });
+    assert_eq!(warnings(&grey(rec709)), []);
+
+    let mut anamorphic = display(0, 0, 4, 3);
+    anamorphic.pixel_aspect = 2.0;
+    let image = read_bytes(&grey(anamorphic)).unwrap();
+    assert_eq!(image.pixel_aspect(), 2.0);
+    assert_eq!(image.warnings(), [Warning::PixelAspect(2.0)]);
+}
+
+#[test]
+fn the_first_part_with_rgb_is_shown_and_the_others_named() {
+    let bytes = write(
+        display(0, 0, 4, 3),
+        vec![
+            part(Some("depth"), (0, 0), SIZE, &[("Z", 5.0)]),
+            part(Some("beauty"), (0, 0), SIZE, &rgb(0.18)),
+            part(Some("normals"), (0, 0), SIZE, &rgb(-0.5)),
+        ],
+    );
+
+    let image = read_bytes(&bytes).unwrap();
+
+    assert_eq!(image.pixel(0, 0), [0.18, 0.18, 0.18, 1.0]);
+    let Source::Exr(source) = image.source() else {
+        panic!("an EXR source")
+    };
+    assert_eq!(source.shown_part, 1);
+    let names: Vec<_> = source
+        .parts
+        .iter()
+        .map(|part| part.name.as_deref())
+        .collect();
+    assert_eq!(names, [Some("depth"), Some("beauty"), Some("normals")]);
+    assert_eq!(
+        image.warnings(),
+        [Warning::SeveralParts {
+            count: 3,
+            shown: "part 1 (beauty)".into()
+        }]
+    );
+}
+
+#[test]
+fn stereo_files_show_one_view_and_name_it() {
+    // One part, the default view's channels unprefixed.
+    let channels = [
+        ("R", 0.1),
+        ("G", 0.1),
+        ("B", 0.1),
+        ("right.R", 0.9),
+        ("right.G", 0.9),
+        ("right.B", 0.9),
+    ];
+    let mut both = part(None, (0, 0), SIZE, &channels);
+    both.attributes.multi_view_names = Some(vec![Text::from("left"), Text::from("right")]);
+    let image = read_bytes(&write(display(0, 0, 4, 3), vec![both])).unwrap();
+    assert_eq!(image.pixel(0, 0), [0.1, 0.1, 0.1, 1.0]);
+    assert_eq!(
+        image.warnings(),
+        [Warning::SeveralViews {
+            views: vec!["left".into(), "right".into()],
+            shown: "left".into()
+        }]
+    );
+
+    // A part per view.
+    let eye = |name: &str, value: f32| {
+        let mut part = part(Some(name), (0, 0), SIZE, &rgb(value));
+        part.attributes.view_name = Some(Text::from(name));
+        part
+    };
+    let image = read_bytes(&write(
+        display(0, 0, 4, 3),
+        vec![eye("left", 0.1), eye("right", 0.9)],
+    ))
+    .unwrap();
+    assert_eq!(image.pixel(0, 0), [0.1, 0.1, 0.1, 1.0]);
+    assert_eq!(
+        image.warnings(),
+        [
+            Warning::SeveralParts {
+                count: 2,
+                shown: "part 0 (left)".into()
+            },
+            Warning::SeveralViews {
+                views: vec!["left".into(), "right".into()],
+                shown: "left".into()
+            },
+        ]
+    );
+}

@@ -1,15 +1,17 @@
 [package]
 name = "opencompositor-core"
 version = "0.0.0"
-description = "OpenCompositor without its Qt shell: document, history and everything testable headless."
+description = "OpenCompositor without its Qt shell: document, history, evaluation and everything testable headless."
 edition.workspace = true
 license.workspace = true
 repository = "https://github.com/joseph-wardle/OpenCompositor"
 publish = false
 
 [dependencies]
+exr = "1.74.2"
 imbl = "7.0.2"
 open-ng = { path = "../open-ng", version = "0.4.0" }
+png = "0.18.1"
 
 [lints]
 workspace = true
