@@ -201,7 +201,8 @@ impl Gpu {
     /// Draws one frame of the pane: the graph, or the viewer's frame if it shows an image.
     /// This can wait for the display while the pane has frames it has not shown.
     ///
-    /// Returns whether to draw again: the surface was out of date and has been reconfigured.
+    /// Returns whether to draw again: the surface was out of date and has been reconfigured, or
+    /// the display took too long to free a frame, which would otherwise lose this draw.
     pub(crate) fn draw(
         &mut self,
         pane: Pane,
@@ -222,8 +223,11 @@ impl Gpu {
                 surface.configure(&device.device, config);
                 return true;
             }
-            // The pane is hidden or the display is busy; it is drawn again when exposed.
-            _ => return false,
+            wgpu::CurrentSurfaceTexture::Timeout => return true,
+            // The pane is hidden; it is drawn again when exposed.
+            wgpu::CurrentSurfaceTexture::Occluded => return false,
+            // Only under an error scope or handler, which this code does not install.
+            wgpu::CurrentSurfaceTexture::Validation => return false,
         };
         match pane {
             Pane::Graph => device.renderer.prepare(
