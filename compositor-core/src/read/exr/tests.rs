@@ -159,6 +159,60 @@ fn pixels_keep_negative_data_windows_and_top_row_first() {
 }
 
 #[test]
+fn a_tiled_zip_file_from_openexr_reads_exactly() {
+    // The image above, written by OpenEXR 3.5 as one 64 × 64 ZIP tile, so the expected pixels
+    // do not come from the `exr` crate that reads them.
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/tiled_zip.exr"
+    ));
+
+    let image = read_bytes(bytes).unwrap();
+
+    assert_eq!(
+        image.data_window(),
+        Window {
+            x: -7,
+            y: -5,
+            width: 16,
+            height: 8
+        }
+    );
+    assert_eq!(
+        image.display_window(),
+        Window {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10
+        }
+    );
+    for y in -5..=2 {
+        for x in -7..=8 {
+            assert_eq!(
+                image.pixel(x, y),
+                [x as f32, y as f32, 0.0, 1.0],
+                "({x}, {y})"
+            );
+        }
+    }
+    assert!(image.warnings().is_empty());
+}
+
+#[test]
+fn a_truncated_file_fails_to_read() {
+    let bytes = grey(display(0, 0, 4, 3));
+    // Shorter than the eight bytes that recognise a format, it is no format at all.
+    for length in 8..bytes.len() {
+        let result = read_bytes(&bytes[..length]);
+        assert!(
+            matches!(result, Err(ReadError::Decode(_) | ReadError::Io(_))),
+            "{length} bytes: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn files_without_rgb_are_refused_by_what_they_contain() {
     let only = |channels: &[(&str, f32)]| {
         write(

@@ -1,5 +1,8 @@
 //! The GPU: one device for every pane, and a surface for each pane while it has a native window.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use open_ng::{Graph, Renderer, View, ViewBuffers, Viewport};
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
 
@@ -60,6 +63,26 @@ pub(crate) struct Gpu {
     device: Option<Device>,
     /// Made with the first surface, so that headless use needs no GPU backend.
     instance: Option<wgpu::Instance>,
+    /// Only in the lifecycle check.
+    checks: Option<FrameChecks>,
+}
+
+/// What the frames a pane drew prove, for the shell's lifecycle check: that the GPU finished
+/// them, and what the last one put at the pane's centre.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameCheck {
+    /// How many of the pane's frames the GPU has finished.
+    pub finished: u64,
+    /// The centre pixel of the pane's last finished frame, as sRGB-encoded RGBA, if its surface
+    /// can be read back.
+    pub centre: Option<[u8; 4]>,
+}
+
+#[derive(Debug, Default)]
+struct FrameChecks {
+    /// Counted from the queue, which can report finished work on the loader's thread.
+    finished: [Arc<AtomicU64>; Pane::COUNT],
+    centres: [Option<[u8; 4]>; Pane::COUNT],
 }
 
 /// What the viewer pane draws: the shown image's windows, and where they appear.
@@ -91,7 +114,22 @@ impl Gpu {
             surfaces: Default::default(),
             device: None,
             instance: None,
+            checks: None,
         }
+    }
+
+    /// Records what every frame from now on proves, waiting for the GPU after each. Surfaces
+    /// attached from now on are made readable where they allow it.
+    pub(crate) fn check_frames(&mut self) {
+        self.checks.get_or_insert_default();
+    }
+
+    pub(crate) fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
+        let checks = self.checks.as_ref()?;
+        Some(FrameCheck {
+            finished: checks.finished[pane.index()].load(Ordering::Relaxed),
+            centre: checks.centres[pane.index()],
+        })
     }
 
     pub(crate) fn has_surface(&self, pane: Pane) -> bool {
@@ -134,7 +172,7 @@ impl Gpu {
             .as_ref()
             .or(self.device.as_ref())
             .expect("one exists");
-        let config = configure(device, pane, &surface, size)?;
+        let config = configure(device, pane, &surface, size, self.checks.is_some())?;
         let created = new_device.map(|new| self.device.insert(new).device.clone());
         let device = self.device.as_mut().expect("kept above if new");
         device.configs[pane.index()] = Some(config);
@@ -272,9 +310,87 @@ impl Gpu {
                 }
             }
         }
+        let readback = match &self.checks {
+            Some(_) if config.usage.contains(wgpu::TextureUsages::COPY_SRC) => {
+                Some(copy_centre(&device.device, &mut encoder, &frame.texture))
+            }
+            _ => None,
+        };
         device.queue.submit([encoder.finish()]);
+        if let Some(checks) = &mut self.checks {
+            checks.record(pane, device, readback);
+        }
         device.queue.present(frame);
         false
+    }
+}
+
+/// Copies the texture's centre pixel into a new buffer that can be mapped.
+fn copy_centre(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+) -> wgpu::Buffer {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("centre pixel"),
+        size: 4,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: texture.width() / 2,
+                y: texture.height() / 2,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            // One row needs no row pitch.
+            layout: wgpu::TexelCopyBufferLayout::default(),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    buffer
+}
+
+impl FrameChecks {
+    /// Waits for the frame just submitted, counting it once the GPU has finished it, and reads
+    /// back its centre pixel if it was copied.
+    fn record(&mut self, pane: Pane, device: &Device, readback: Option<wgpu::Buffer>) {
+        let finished = Arc::clone(&self.finished[pane.index()]);
+        device.queue.on_submitted_work_done(move || {
+            finished.fetch_add(1, Ordering::Relaxed);
+        });
+        if let Some(buffer) = &readback {
+            buffer.map_async(wgpu::MapMode::Read, .., |_| {});
+        }
+        let wait = wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        };
+        if device.device.poll(wait).is_err() {
+            return;
+        }
+        let Some(view) = readback
+            .as_ref()
+            .and_then(|buffer| buffer.get_mapped_range(..).ok())
+        else {
+            return;
+        };
+        let mut pixel: [u8; 4] = view[..4].try_into().expect("four bytes were copied");
+        if device.format == wgpu::TextureFormat::Bgra8UnormSrgb {
+            pixel.swap(0, 2);
+        }
+        self.centres[pane.index()] = Some(pixel);
     }
 }
 
@@ -284,6 +400,7 @@ fn configure(
     pane: Pane,
     surface: &wgpu::Surface,
     size: PaneSize,
+    readable: bool,
 ) -> Result<wgpu::SurfaceConfiguration, String> {
     if !device.adapter.is_surface_supported(surface) {
         return Err(format!(
@@ -298,7 +415,11 @@ fn configure(
     // only when the pane redraws faster than its screen refreshes, which the shell prevents.
     // Fifo, which every surface supports, is the fallback. The default is the driver's first
     // mode, which may be Immediate, which tears.
-    let modes = surface.get_capabilities(&device.adapter).present_modes;
+    let capabilities = surface.get_capabilities(&device.adapter);
+    if readable && capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+        config.usage |= wgpu::TextureUsages::COPY_SRC;
+    }
+    let modes = capabilities.present_modes;
     config.present_mode = if modes.contains(&wgpu::PresentMode::Mailbox) {
         wgpu::PresentMode::Mailbox
     } else {
@@ -533,6 +654,7 @@ impl Gpu {
             surfaces: Default::default(),
             device: Some(Device::for_format(adapter, device, queue, format)),
             instance: None,
+            checks: None,
         };
         (gpu, connected)
     }

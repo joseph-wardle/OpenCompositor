@@ -151,3 +151,6 @@ fn window(x: i32, y: i32, width: usize, height: usize) -> Result<Window, ReadErr
         }),
     }
 }
+
+#[cfg(test)]
+mod tests;

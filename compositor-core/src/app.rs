@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{NodeId, Slot};
-use crate::gpu::{Gpu, NativeWindow, PaneSize, ViewerFrame};
+use crate::gpu::{FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
 use crate::loader::{LoadRequest, Loaded, Loader, is_empty};
 use crate::session::{Session, Viewed};
@@ -254,6 +254,18 @@ impl App {
 
     pub fn has_surface(&self, pane: Pane) -> bool {
         self.gpu.has_surface(pane)
+    }
+
+    /// Has every frame from now on record what it proves, for the shell's lifecycle check. Each
+    /// frame then waits for the GPU. Call it before the first surface is attached, so that every
+    /// surface is made readable where it allows.
+    pub fn check_frames(&mut self) {
+        self.gpu.check_frames();
+    }
+
+    /// What the pane's frames have proved since [`App::check_frames`]; `None` before it.
+    pub fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
+        self.gpu.frame_check(pane)
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {

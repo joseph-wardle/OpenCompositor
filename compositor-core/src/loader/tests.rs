@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::gpu::noop_device;
@@ -119,18 +119,40 @@ fn dropping_the_loader_waits_for_the_delivery_in_progress() {
 #[cfg(unix)]
 #[test]
 fn dropping_the_loader_does_not_wait_for_a_decode() {
-    // Opening a named pipe blocks until something writes to it, as a long decode would.
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Reading a named pipe waits for a writer, and then for what it writes, as a long decode
+    // would.
     let pipe = directory("decode-in-progress").join("pipe.exr");
     let made = std::process::Command::new("mkfifo").arg(&pipe).status();
     assert!(made.unwrap().success());
     let (loader, deliveries) = loader();
     loader.request(request_for(&pipe));
-    std::thread::sleep(Duration::from_millis(100));
+    // Opening for writing without blocking fails until the worker has the pipe open for
+    // reading; once it succeeds, the worker waits on the read for as long as this end is open.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let writer = loop {
+        let opened = File::options()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&pipe);
+        match opened {
+            Ok(writer) => break writer,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the worker never opened the pipe"
+                );
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
 
     let drop_returned = drop_elsewhere(loader);
 
     drop_returned.recv_timeout(Duration::from_secs(1)).unwrap();
-    File::create(&pipe).unwrap();
+    drop(writer);
     assert!(
         deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
         "delivered after the drop"

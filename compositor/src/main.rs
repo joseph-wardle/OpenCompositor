@@ -15,7 +15,7 @@ use std::pin::Pin;
 
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
-use opencompositor_core::{App, Command, Event, FileIntent, Pane, Request, Slot};
+use opencompositor_core::{App, Command, Event, FileIntent, FrameCheck, Pane, Request, Slot};
 
 use crate::qt::ffi;
 
@@ -76,11 +76,14 @@ fn main() {
     let waker = ffi::new_waker();
     // SAFETY: the waker is live. Its thread handle outlives it: queueing fails once it is deleted.
     let waker_thread = unsafe { &*waker }.qt_thread();
-    let app = App::new(move |loaded| {
+    let mut app = App::new(move |loaded| {
         waker_thread
             .queue(move |_| dispatch(Event::Loaded(loaded)))
             .expect("the waker outlives the app, whose loader delivers nothing once dropped");
     });
+    if lifecycle_check.is_some() {
+        app.check_frames();
+    }
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
     let mut window = ffi::new_main_window();
@@ -293,6 +296,11 @@ pub fn has_surface(pane: Pane) -> bool {
             .as_ref()
             .is_some_and(|app| app.has_surface(pane))
     })
+}
+
+/// What the pane's frames have proved, in the lifecycle check.
+pub fn frame_check(pane: Pane) -> Option<FrameCheck> {
+    APP.with(|cell| cell.borrow().as_ref()?.frame_check(pane))
 }
 
 pub fn widgets() -> Widgets {

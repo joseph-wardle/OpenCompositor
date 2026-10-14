@@ -2,11 +2,15 @@
 //! then quits. Rerun it in a nested compositor after every Qt upgrade, because the shell relies on
 //! Qt's private Wayland API.
 //!
-//! It exits 0 if every step ran, a pane floated, docked or reopened had a surface again by the
-//! next step, the image was shown while a dialog was open, and both panes had a surface at the end;
-//! 1 if a check failed; and otherwise as a crash or protocol error does.
+//! It exits 0 if every step ran; each pane a step made draw had a surface and a frame the GPU
+//! finished by the next step; the image was shown while a dialog was open, in the caption and, where
+//! the surface can be read back, at the viewer's centre; and both panes had a surface at the end.
+//! It exits 1 if a check failed, and otherwise as a crash or protocol error does. Frames are
+//! checked as rendered, not as presented: that needs the display, as a screenshot.
+//!
+//! IMAGE must not be black at its centre.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::pin::Pin;
 
@@ -15,52 +19,61 @@ use opencompositor_core::{Event, FileIntent, Key, Pane, Request, Slot};
 
 use crate::qt::ffi;
 
-/// Each step and when it runs, in milliseconds from the start.
-const STEPS: [(i32, &str); 13] = [
-    (1000, "resize the window"),
-    (2000, "float the viewer"),
-    (3000, "dock the viewer again"),
-    (4000, "tab the viewer behind the graph"),
-    (4500, "redraw the hidden viewer"),
-    (5000, "show the viewer tab"),
-    (6000, "float the graph"),
-    (7000, "dock the graph again"),
-    (8000, "close the viewer"),
-    (9000, "reopen the viewer"),
+/// Each step, when it runs in milliseconds from the start, and the panes it makes draw: each of
+/// those has a surface and has finished a new frame by the next step.
+const STEPS: [(i32, &str, &[Pane]); 13] = [
+    (1000, "resize the window", &[Pane::Graph, Pane::Viewer]),
+    (2000, "float the viewer", &[Pane::Viewer]),
+    (3000, "dock the viewer again", &[Pane::Viewer]),
+    (4000, "tab the viewer behind the graph", &[]),
+    (4500, "redraw the hidden viewer", &[]),
+    (5000, "show the viewer tab", &[Pane::Viewer]),
+    (6000, "float the graph", &[Pane::Graph]),
+    (7000, "dock the graph again", &[Pane::Graph]),
+    (8000, "close the viewer", &[]),
+    (9000, "reopen the viewer", &[Pane::Viewer]),
     (
         10_000,
         "read the image, view it, and open a dialog while it loads",
+        &[Pane::Viewer],
     ),
-    (15_000, "close the dialog"),
-    (16_000, "quit"),
+    (15_000, "close the dialog", &[]),
+    (16_000, "quit", &[]),
 ];
 
 thread_local! {
     static IMAGE: RefCell<PathBuf> = RefCell::default();
     static FAILURES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Each pane's finished frames when the last step began.
+    static FINISHED: Cell<[u64; Pane::COUNT]> = const { Cell::new([0; Pane::COUNT]) };
 }
 
 pub fn start(image: PathBuf) {
     IMAGE.with(|cell| *cell.borrow_mut() = image);
-    for (index, &(at, _)) in STEPS.iter().enumerate() {
+    for (index, &(at, ..)) in STEPS.iter().enumerate() {
         ffi::single_shot(at, step, index);
     }
 }
 
 fn step(index: usize) {
-    eprintln!("lifecycle check: {}", STEPS[index].1);
-    let moved = match index {
-        2 | 3 | 10 => Some(Pane::Viewer),
-        7 | 8 => Some(Pane::Graph),
-        _ => None,
+    let finished = Pane::ALL.map(|pane| crate::frame_check(pane).map_or(0, |check| check.finished));
+    eprintln!(
+        "lifecycle check: {} (frames finished: graph {}, viewer {})",
+        STEPS[index].1, finished[0], finished[1]
+    );
+    let before = FINISHED.with(|cell| cell.replace(finished));
+    let (after, panes) = match index.checked_sub(1) {
+        Some(previous) => (STEPS[previous].1, STEPS[previous].2),
+        None => ("starting", &Pane::ALL[..]),
     };
-    if let Some(pane) = moved
-        && !crate::has_surface(pane)
-    {
-        fail(format!(
-            "the {pane:?} pane had no surface after the step before {:?}",
-            STEPS[index].1
-        ));
+    for &pane in panes {
+        if !crate::has_surface(pane) {
+            fail(format!("the {pane:?} pane had no surface after {after:?}"));
+        } else if finished[pane.index()] <= before[pane.index()] {
+            fail(format!(
+                "the {pane:?} pane finished no frame after {after:?}"
+            ));
+        }
     }
     let widgets = crate::widgets();
     match index {
@@ -107,6 +120,15 @@ fn step(index: usize) {
                 fail(format!(
                     "the image was not shown with the dialog open: {caption:?}"
                 ));
+            }
+            match crate::frame_check(Pane::Viewer).and_then(|check| check.centre) {
+                Some([0, 0, 0, 255]) => fail(format!(
+                    "the viewer's centre was black with the image shown: {caption:?}"
+                )),
+                Some(_) => {}
+                None => eprintln!(
+                    "lifecycle check: the viewer's surface cannot be read back, so its pixels go unchecked"
+                ),
             }
             ffi::close_modal_dialog();
         }

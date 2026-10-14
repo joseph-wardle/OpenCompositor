@@ -16,7 +16,7 @@ mod viewer;
 pub use app::{App, Command, Event, FileIntent, Input, Key, Pane, Request};
 pub use document::{Changes, Document, Node, NodeId, NodeKind, Slot};
 pub use evaluate::{EvalError, evaluate};
-pub use gpu::{NativeWindow, PaneSize};
+pub use gpu::{FrameCheck, NativeWindow, PaneSize};
 pub use image::{
     Chromaticities, Cicp, ExrChannel, ExrCompression, ExrPart, ExrSource, Image, ImageInfo,
     PngColorType, PngSource, SampleType, Source, Warning, Window,

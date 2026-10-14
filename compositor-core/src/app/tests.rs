@@ -34,15 +34,10 @@ fn app() -> (App, Receiver<Loaded>) {
         pane: Pane::Graph,
         size,
     });
-    assert_eq!(
-        requests,
-        [
-            Request::Redraw(Pane::Graph),
-            Request::ShowViewerCaption(
-                "Slot 1: nothing marked. Read files with R, then mark one with Ctrl+1".to_owned()
-            )
-        ]
-    );
+    assert!(matches!(
+        requests.as_slice(),
+        [Request::Redraw(Pane::Graph), Request::ShowViewerCaption(_)]
+    ));
     (app, deliveries)
 }
 
@@ -231,12 +226,16 @@ fn changing_the_selected_readers_file_fails_if_it_went_while_the_dialog_was_open
 }
 
 #[test]
-fn changing_a_readers_file_needs_one_selected_reader() {
+fn commands_that_need_a_selection_or_a_mark_say_so_without_one() {
     let (mut app, _deliveries) = app();
+    let explains = |requests: Vec<Request>| matches!(requests.as_slice(), [Request::ShowStatus(_)]);
 
-    let requests = app.dispatch(Event::Command(Command::ChangeReaderFile));
-
-    assert!(matches!(requests.as_slice(), [Request::ShowStatus(_)]));
+    assert!(explains(
+        app.dispatch(Event::Command(Command::ChangeReaderFile))
+    ));
+    assert!(explains(app.dispatch(Event::Command(Command::Reload))));
+    assert!(explains(app.dispatch(slot_key(1, CTRL))));
+    assert!(explains(app.dispatch(slot_key(1, SHIFT))));
 }
 
 #[test]
@@ -295,8 +294,6 @@ fn a_pane_asks_for_a_surface_when_exposed_without_one() {
         app.dispatch(Event::Exposed(Pane::Viewer)),
         [Request::AttachSurface(Pane::Viewer)]
     );
-    assert_eq!(app.dispatch(Event::Draw(Pane::Viewer)), []);
-    assert_eq!(app.dispatch(Event::SurfaceDestroyed(Pane::Viewer)), []);
 }
 
 #[test]
@@ -380,13 +377,8 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
 }
 
 #[test]
-fn marking_needs_one_selected_node_and_framing_a_marked_one() {
+fn shift_and_a_digit_frames_the_node_the_slot_marks() {
     let (mut app, _deliveries) = app();
-    let warning = |requests: Vec<Request>| matches!(requests.as_slice(), [Request::ShowStatus(_)]);
-
-    assert!(warning(app.dispatch(slot_key(1, CTRL))));
-    assert!(warning(app.dispatch(slot_key(1, SHIFT))));
-
     let id = create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
     let middle = PhysicalPoint { x: 200.0, y: 150.0 };

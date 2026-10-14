@@ -1,16 +1,13 @@
 //! The compositor without a window: a document built by the same edits the interface makes,
-//! evaluated to pixels.
+//! evaluated to pixels from files on disk. What each format reads as, and how edits undo, are
+//! the readers' and the session's own tests.
 
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-use exr::prelude::{
-    AnyChannel, AnyChannels, Encoding, FlatSamples, ImageAttributes, IntegerBounds, Layer,
-    LayerAttributes, Vec2, WritableImage,
-};
 use open_ng::Point;
-use opencompositor_core::{EvalError, NodeId, ReadError, Session, Window, evaluate};
+use opencompositor_core::{EvalError, NodeId, ReadError, Session, evaluate};
 
 /// A directory of this test's own, emptied first.
 fn directory(name: &str) -> PathBuf {
@@ -20,41 +17,12 @@ fn directory(name: &str) -> PathBuf {
     directory
 }
 
-/// A 2 × 1 EXR stored at (-1, -1) in a 4 × 4 frame: red, then green at half coverage.
-fn write_exr(path: &Path) {
-    let attributes = LayerAttributes {
-        layer_position: Vec2(-1, -1),
-        ..LayerAttributes::default()
-    };
-    let channel =
-        |name, samples: [f32; 2]| AnyChannel::new(name, FlatSamples::F32(samples.to_vec()));
-    let channels = [
-        channel("R", [1.0, 0.0]),
-        channel("G", [0.0, 0.5]),
-        channel("B", [0.0, 0.0]),
-        channel("A", [1.0, 0.5]),
-    ];
-    let layer = Layer::new(
-        (2, 1),
-        attributes,
-        Encoding::SMALL_LOSSLESS,
-        AnyChannels::sort(channels.into_iter().collect()),
-    );
-    let display = ImageAttributes::new(IntegerBounds::new((0, 0), (4, 4)));
-    exr::image::Image::from_layers(display, vec![layer])
-        .write()
-        .to_file(path)
-        .unwrap();
-}
-
-/// A 1 × 2 PNG: opaque white above transparent black.
-fn write_png(path: &Path) {
-    let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), 1, 2);
-    encoder.set_color(png::ColorType::Rgba);
+/// A 1 × 1 opaque grey PNG of one 8-bit code, which reads exactly at 0 and 255.
+fn write_png(path: &Path, code: u8) {
+    let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), 1, 1);
+    encoder.set_color(png::ColorType::Grayscale);
     let mut writer = encoder.write_header().unwrap();
-    writer
-        .write_image_data(&[255, 255, 255, 255, 0, 0, 0, 0])
-        .unwrap();
+    writer.write_image_data(&[code]).unwrap();
     writer.finish().unwrap();
 }
 
@@ -64,74 +32,28 @@ fn reader(session: &mut Session, path: PathBuf) -> NodeId {
 }
 
 #[test]
-fn a_reader_built_by_editing_evaluates_to_its_files_pixels() {
+fn a_reader_evaluates_to_the_file_it_points_at() {
     let directory = directory("reader_pixels");
-    let (plate, matte) = (directory.join("plate.exr"), directory.join("matte.png"));
-    write_exr(&plate);
-    write_png(&matte);
+    let (white, black) = (directory.join("white.png"), directory.join("black.png"));
+    write_png(&white, 255);
+    write_png(&black, 0);
     let mut session = Session::new();
 
-    let id = reader(&mut session, plate);
+    let id = reader(&mut session, white);
     let image = evaluate(session.document(), id).unwrap();
-    assert_eq!(
-        image.display_window(),
-        Window {
-            x: 0,
-            y: 0,
-            width: 4,
-            height: 4
-        }
-    );
-    assert_eq!(
-        image.data_window(),
-        Window {
-            x: -1,
-            y: -1,
-            width: 2,
-            height: 1
-        }
-    );
-    assert_eq!(image.pixel(-1, -1), [1.0, 0.0, 0.0, 1.0]);
-    assert_eq!(image.pixel(0, -1), [0.0, 0.5, 0.0, 0.5]);
-    assert_eq!(image.pixel(1, 1), [0.0; 4]);
-
-    session.set_reader_path(id, matte).unwrap();
-    let image = evaluate(session.document(), id).unwrap();
-    assert_eq!(
-        image.data_window(),
-        Window {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 2
-        }
-    );
     assert_eq!(image.pixel(0, 0), [1.0; 4]);
-    assert_eq!(image.pixel(0, 1), [0.0; 4]);
 
-    session.undo();
+    session.set_reader_path(id, black).unwrap();
     let image = evaluate(session.document(), id).unwrap();
-    assert_eq!(image.pixel(-1, -1), [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(image.pixel(0, 0), [0.0, 0.0, 0.0, 1.0]);
 }
 
 #[test]
 fn evaluation_reports_what_went_wrong() {
-    let directory = directory("reader_errors");
-    let text = directory.join("notes.exr");
-    std::fs::write(&text, "not an image, whatever its name").unwrap();
-    let missing = directory.join("missing.exr");
+    let missing = directory("reader_errors").join("missing.exr");
     let mut session = Session::new();
 
-    let id = reader(&mut session, text.clone());
-    match evaluate(session.document(), id) {
-        Err(EvalError::Read {
-            path,
-            error: ReadError::UnknownFormat,
-        }) => assert_eq!(path, text),
-        other => panic!("expected an unknown format, got {other:?}"),
-    }
-
-    session.set_reader_path(id, missing).unwrap();
+    let id = reader(&mut session, missing);
     let error = evaluate(session.document(), id).unwrap_err();
     assert!(
         matches!(&error, EvalError::Read { error: ReadError::Io(io), .. } if io.kind() == std::io::ErrorKind::NotFound),
@@ -139,7 +61,7 @@ fn evaluation_reports_what_went_wrong() {
     );
     assert!(error.to_string().contains("missing.exr"), "{error}");
 
-    session.undo();
+    // Undo is the only way to remove a node yet.
     session.undo();
     assert!(
         matches!(evaluate(session.document(), id), Err(EvalError::MissingNode(missing)) if missing == id)

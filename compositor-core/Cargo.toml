@@ -21,5 +21,9 @@ wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
 # The loader's staging, tested without a GPU.
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "noop"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+# O_NONBLOCK, to open a named pipe for writing without waiting for a reader.
+libc = "0.2"
+
 [lints]
 workspace = true

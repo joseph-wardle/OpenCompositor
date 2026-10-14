@@ -1599,6 +1599,7 @@ dependencies = [
  "exr",
  "half",
  "imbl",
+ "libc",
  "open-ng",
  "png",
  "pollster",

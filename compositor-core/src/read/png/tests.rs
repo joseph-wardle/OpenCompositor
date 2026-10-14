@@ -56,8 +56,19 @@ fn warnings(bytes: &[u8]) -> Vec<Warning> {
         .to_vec()
 }
 
-fn linear(code: u8) -> f32 {
-    srgb_to_linear(f32::from(code) / 255.0)
+/// sRGB codes 188 and 128 decoded by the IEC 61966-2-1 curve, worked out in f64 apart from the
+/// reader, so that the curve is checked against something other than itself.
+const SRGB_188: f32 = 0.502_886_5;
+const SRGB_128: f32 = 0.215_860_5;
+
+/// Compares within a few ulps, as `powf` is not exact.
+#[track_caller]
+fn assert_near<const N: usize>(actual: [f32; N], expected: [f32; N]) {
+    let near = actual
+        .iter()
+        .zip(&expected)
+        .all(|(actual, expected)| (actual - expected).abs() <= 1e-6);
+    assert!(near, "{actual:?} is not {expected:?}");
 }
 
 fn p3() -> SourceChromaticities {
@@ -126,14 +137,35 @@ fn colour_is_linearised_before_it_is_premultiplied() {
         [0.0; 4],
         "a transparent pixel stores no colour"
     );
-    let grey = linear(188) * half;
-    assert_eq!(image.pixel(1, 0), [grey, grey, grey, half]);
+    let grey = SRGB_188 * half;
+    assert_near(image.pixel(1, 0), [grey, grey, grey, half]);
     assert_eq!(image.pixel(2, 0), [1.0, 0.0, 0.0, 1.0]);
     assert_eq!(image.pixel(3, 0), [1.0 / 255.0, 0.0, 0.0, 1.0 / 255.0]);
     // Averaging across the edge, as any filter does, brings in no white.
     let [left, right] = [image.pixel(0, 0), image.pixel(2, 0)];
     let edge: Vec<f32> = (0..4).map(|i| (left[i] + right[i]) / 2.0).collect();
     assert_eq!(edge, [0.5, 0.0, 0.0, 0.5]);
+}
+
+#[test]
+fn a_truncated_file_fails_to_read() {
+    let bytes = png(
+        ColorType::Rgb,
+        BitDepth::Eight,
+        2,
+        &[0, 64, 128, 188, 255, 32],
+        |_| {},
+        &[],
+    );
+    // Shorter than the eight bytes that recognise a format, it is no format at all. Without
+    // only its empty IEND chunk, the image is whole and reads.
+    for length in 8..bytes.len() - 12 {
+        let result = read_bytes(&bytes[..length]);
+        assert!(
+            matches!(result, Err(ReadError::Decode(_) | ReadError::Io(_))),
+            "{length} bytes: {result:?}"
+        );
+    }
 }
 
 #[test]
@@ -147,10 +179,7 @@ fn every_colour_type_expands_to_rgba() {
         &[],
     );
     let image = read_bytes(&grey).unwrap();
-    assert_eq!(
-        image.pixel(1, 0),
-        [linear(188), linear(188), linear(188), 1.0]
-    );
+    assert_near(image.pixel(1, 0), [SRGB_188, SRGB_188, SRGB_188, 1.0]);
 
     let grey_alpha = png(
         ColorType::GrayscaleAlpha,
@@ -217,11 +246,11 @@ fn transfer_curves_and_narrow_range_are_honoured() {
     let gamma =
         |value| move |info: &mut Info<'static>| info.source_gamma = Some(ScaledFloat::new(value));
     assert_eq!(red(&tagged(gamma(1.0), &[])), grey);
-    assert_eq!(red(&tagged(gamma(SRGB_GAMMA), &[])), linear(128));
+    assert_near([red(&tagged(gamma(SRGB_GAMMA), &[]))], [SRGB_128]);
     assert_eq!(red(&tagged(gamma(0.5), &[])), grey * grey);
 
     let with_cicp = |transfer| red(&tagged(|_| {}, &[(*b"cICP", &cicp(1, transfer, true))]));
-    assert_eq!(with_cicp(Cicp::SRGB_TRANSFER), linear(128));
+    assert_near([with_cicp(Cicp::SRGB_TRANSFER)], [SRGB_128]);
     assert_eq!(with_cicp(Cicp::LINEAR_TRANSFER), grey);
     assert_eq!(with_cicp(Cicp::GAMMA_22_TRANSFER), grey.powf(2.2));
     assert_eq!(
