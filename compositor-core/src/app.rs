@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
+use open_ng::{Button, InputEvent, Key, Modifiers, PhysicalPoint, Point};
 
 use crate::document::NodeId;
 use crate::gpu::{Gpu, NativeWindow, PaneSize};
@@ -51,8 +51,9 @@ pub enum Event {
         pane: Pane,
         input: Input,
     },
-    /// The window lost the keyboard, as to a dialog or another application.
-    FocusLost,
+    Command(Command),
+    /// The pane lost the keyboard, as to another pane, a dialog or another application.
+    FocusLost(Pane),
     /// The files chosen in the dialog a [`Request::ChooseFiles`] opened: none if it was cancelled.
     FilesChosen {
         intent: FileIntent,
@@ -72,6 +73,26 @@ pub enum Request {
     /// Open a file dialog, then dispatch [`Event::FilesChosen`].
     ChooseFiles(FileIntent),
     ShowStatus(String),
+}
+
+/// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// A Reader for each file chosen, placed where the pointer is over the graph.
+    ReadFiles,
+    /// A new file for the one selected Reader.
+    ChangeReaderFile,
+    Undo,
+    Redo,
+}
+
+impl Command {
+    pub const ALL: [Command; 4] = [
+        Command::ReadFiles,
+        Command::ChangeReaderFile,
+        Command::Undo,
+        Command::Redo,
+    ];
 }
 
 /// What files chosen in a dialog are for. A dialog is modal, but its target can still change while
@@ -113,23 +134,9 @@ pub enum Input {
         position: PhysicalPoint,
         lines: f32,
     },
-    KeyPressed {
-        key: Key,
-        modifiers: Modifiers,
-    },
+    /// Only the keys the graph view uses.
+    KeyPressed(Key),
     KeyReleased(Key),
-}
-
-/// The keys the compositor responds to. The shell need not send any other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Key {
-    Space,
-    Escape,
-    G,
-    H,
-    R,
-    Y,
-    Z,
 }
 
 #[derive(Debug)]
@@ -138,7 +145,7 @@ pub struct App {
     gpu: Gpu,
     /// `None` once stopping.
     loader: Option<Loader>,
-    /// The pane under the pointer, which receives pane keys whichever pane has the keyboard.
+    /// The pane under the pointer, which receives keys whichever pane has the keyboard.
     hovered: Option<Pane>,
     /// The pointer's last position over the graph pane.
     graph_pointer: Option<PhysicalPoint>,
@@ -165,7 +172,8 @@ impl App {
         self.gpu.has_surface(pane)
     }
 
-    /// Stops the loader, waiting for the read in progress. Nothing is delivered afterwards.
+    /// Stops the loader without waiting for it. The read in progress, if any, may still be
+    /// delivered; nothing after it is.
     pub fn stop_loading(&mut self) {
         self.loader = None;
     }
@@ -193,10 +201,14 @@ impl App {
                 vec![Request::Redraw(pane)]
             }
             Event::Input { pane, input } => self.input(pane, input),
-            Event::FocusLost => {
+            Event::Command(command) => self.command(command),
+            // Another pane's focus loss can arrive after a press has given the graph the
+            // keyboard, so it must not cancel the gesture that press began.
+            Event::FocusLost(Pane::Graph) => {
                 self.session.cancel_graph_gesture();
                 vec![Request::Redraw(Pane::Graph)]
             }
+            Event::FocusLost(Pane::Viewer) => Vec::new(),
             Event::FilesChosen { intent, paths } => self.files_chosen(intent, paths),
             Event::Loaded(loaded) => vec![Request::ShowStatus(describe(&loaded))],
         }
@@ -249,21 +261,13 @@ impl App {
                 InputEvent::PointerReleased { position, button }
             }
             Input::Scrolled { position, lines } => InputEvent::Scrolled { position, lines },
-            Input::KeyPressed { key, modifiers } => {
-                if let Some(requests) = self.window_key(key, modifiers) {
-                    return requests;
-                }
-                match (self.hovered, view_key(key)) {
-                    (Some(Pane::Graph), Some(key)) => InputEvent::KeyPressed(key),
-                    _ => return Vec::new(),
-                }
-            }
+            Input::KeyPressed(key) => match self.hovered {
+                Some(Pane::Graph) => InputEvent::KeyPressed(key),
+                _ => return Vec::new(),
+            },
             // A release goes to the view whichever pane is under the pointer, so that a key held
             // across panes is not left held.
-            Input::KeyReleased(key) => match view_key(key) {
-                Some(key) => InputEvent::KeyReleased(key),
-                None => return Vec::new(),
-            },
+            Input::KeyReleased(key) => InputEvent::KeyReleased(key),
         };
         let is_key = matches!(
             graph_event,
@@ -275,23 +279,20 @@ impl App {
         redraw_if(Pane::Graph, self.session.graph_input(graph_event))
     }
 
-    /// Keys that act on the window whichever pane is under the pointer, or `None` for the rest.
-    fn window_key(&mut self, key: Key, modifiers: Modifiers) -> Option<Vec<Request>> {
-        let Modifiers { shift, ctrl } = modifiers;
-        Some(match (key, ctrl, shift) {
-            (Key::R, false, false) => vec![Request::ChooseFiles(FileIntent::CreateReaders {
+    fn command(&mut self, command: Command) -> Vec<Request> {
+        match command {
+            Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders {
                 at: self.graph_point_at_pointer(),
             })],
-            (Key::R, false, true) => match self.session.document().selection() {
+            Command::ChangeReaderFile => match self.session.document().selection() {
                 &[id] => vec![Request::ChooseFiles(FileIntent::SetReaderPath(id))],
                 _ => vec![Request::ShowStatus(
                     "Select one Reader to change its file".to_owned(),
                 )],
             },
-            (Key::Z, true, false) => redraw_if(Pane::Graph, !self.session.undo().is_empty()),
-            (Key::Z, true, true) => redraw_if(Pane::Graph, !self.session.redo().is_empty()),
-            _ => return None,
-        })
+            Command::Undo => redraw_if(Pane::Graph, !self.session.undo().is_empty()),
+            Command::Redo => redraw_if(Pane::Graph, !self.session.redo().is_empty()),
+        }
     }
 
     /// Where the pointer is over the graph, or the middle of the graph view if it is elsewhere.
@@ -342,18 +343,6 @@ fn redraw_if(pane: Pane, needed: bool) -> Vec<Request> {
         vec![Request::Redraw(pane)]
     } else {
         Vec::new()
-    }
-}
-
-/// The OpenNG key for a key the graph view uses.
-fn view_key(key: Key) -> Option<open_ng::Key> {
-    match key {
-        Key::Space => Some(open_ng::Key::Space),
-        Key::Escape => Some(open_ng::Key::Escape),
-        Key::G => Some(open_ng::Key::G),
-        Key::H => Some(open_ng::Key::H),
-        Key::Y => Some(open_ng::Key::Y),
-        Key::R | Key::Z => None,
     }
 }
 

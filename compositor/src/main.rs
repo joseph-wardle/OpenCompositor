@@ -8,18 +8,14 @@ mod qt;
 use std::cell::{OnceCell, RefCell};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::pin::Pin;
 
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
-use opencompositor_core::{App, Event, FileIntent, Pane, Request};
+use opencompositor_core::{App, Command, Event, FileIntent, Pane, Request};
 
 use crate::qt::ffi;
-
-/// The exit status after a panic in a callback from Qt, as for a panic in `main`.
-const PANIC_EXIT_STATUS: i32 = 101;
 
 /// `Qt::DockWidgetArea` values.
 const TOP_DOCK_AREA: i32 = 4;
@@ -30,7 +26,7 @@ thread_local! {
     /// back into the shell synchronously, as when floating a dock destroys a pane's surface.
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     static WIDGETS: OnceCell<Widgets> = const { OnceCell::new() };
-    /// Each pane's connection to Qt Wayland's `surfaceDestroyed`.
+    /// Each pane's connection to Qt Wayland's `surfaceRoleDestroyed`.
     static SURFACE_WATCHES: RefCell<[Option<QMetaObjectConnectionGuard>; Pane::COUNT]> =
         RefCell::new(Default::default());
 }
@@ -65,11 +61,11 @@ fn main() {
 
     ffi::new_application();
     let waker = ffi::new_waker();
-    // SAFETY: the waker is deleted only after the loader has stopped.
+    // SAFETY: the waker is live. Its thread handle outlives it: queueing fails once it is deleted.
     let waker_thread = unsafe { &*waker }.qt_thread();
     let app = App::new(move |loaded| {
-        // Queueing fails only once the waker is deleted, after the loader has stopped.
-        let _ = waker_thread.queue(move |_| guarded((), || dispatch(Event::Loaded(loaded))));
+        // Fails only once the waker is deleted, when a read outlasts the event loop.
+        let _ = waker_thread.queue(move |_| dispatch(Event::Loaded(loaded)));
     });
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
@@ -80,13 +76,27 @@ fn main() {
     window.pin_mut().set_dock_nesting_enabled(true);
     window.pin_mut().resize(1400, 900);
     let window_ptr = window.as_mut_ptr();
+    // SAFETY: the window is live; it owns the menus.
+    let [file_menu, edit_menu, window_menu] = ["&File", "&Edit", "&Window"]
+        .map(|title| unsafe { ffi::new_menu(window_ptr, &QString::from(title)) });
+    for (index, command) in Command::ALL.into_iter().enumerate() {
+        let (menu, text, shortcut) = match command {
+            Command::ReadFiles => (file_menu, "&Read Files…", "R"),
+            Command::ChangeReaderFile => (file_menu, "&Change the Reader's File…", "Shift+R"),
+            Command::Undo => (edit_menu, "&Undo", "Ctrl+Z"),
+            Command::Redo => (edit_menu, "&Redo", "Ctrl+Shift+Z"),
+        };
+        let [text, shortcut] = [text, shortcut].map(QString::from);
+        // SAFETY: the menu is live; it owns the action.
+        unsafe { ffi::new_action(menu, &text, &shortcut, run_command, index) };
+    }
     let docks = Pane::ALL.map(|pane| {
         let (title, area) = match pane {
             Pane::Graph => ("Node Graph", BOTTOM_DOCK_AREA),
             Pane::Viewer => ("Viewer", TOP_DOCK_AREA),
         };
-        // SAFETY: the window is live; it owns the dock.
-        unsafe { ffi::new_dock(window_ptr, &QString::from(title), area) }
+        // SAFETY: the window and menu are live; the window owns the dock.
+        unsafe { ffi::new_dock(window_ptr, window_menu, &QString::from(title), area) }
     });
     let panes = Pane::ALL.map(|pane| {
         let window = ffi::new_pane(pane.index());
@@ -109,8 +119,7 @@ fn main() {
     let status = ffi::exec();
 
     APP.with(|cell| cell.borrow_mut().as_mut().map(App::stop_loading));
-    // SAFETY: the loader has stopped, so nothing queues to the waker any more. Results it queued
-    // are dropped without running.
+    // SAFETY: nothing else deletes the waker. Results queued to it are dropped without running.
     unsafe { ffi::delete_waker(waker) };
     // Destroying the window destroys the panes' native windows, whose events drop the surfaces.
     drop(window);
@@ -128,6 +137,10 @@ pub fn dispatch(event: Event) {
     for request in requests {
         perform(request);
     }
+}
+
+fn run_command(index: usize) {
+    dispatch(Event::Command(Command::ALL[index]));
 }
 
 pub fn perform(request: Request) {
@@ -184,21 +197,11 @@ fn pane_window(pane: Pane) -> Pin<&'static mut qt::Pane> {
     unsafe { Pin::new_unchecked(&mut *window) }
 }
 
-/// Follows Qt Wayland's `surfaceDestroyed` for the pane's current window, replacing the previous
-/// connection, whose window Qt may since have replaced.
+/// Follows Qt Wayland's `surfaceRoleDestroyed` for the pane's current window, replacing the
+/// previous connection, whose window Qt may since have replaced.
 pub fn watch_surface(pane: Pane, wayland: Pin<&mut qt::QWaylandWindow>) {
-    let connection = wayland.on_surface_destroyed(move |_| {
-        guarded((), || dispatch(Event::SurfaceDestroyed(pane)));
-    });
+    let connection =
+        wayland.on_surface_role_destroyed(move |_| dispatch(Event::SurfaceDestroyed(pane)));
     let previous = SURFACE_WATCHES.with(|cell| cell.borrow_mut()[pane.index()].replace(connection));
     drop(previous);
-}
-
-/// Runs a callback from Qt. A panic unwinding into C++ would abort, so it is caught here and ends
-/// the event loop instead; the panic hook has already reported it.
-pub fn guarded<R>(on_panic: R, callback: impl FnOnce() -> R) -> R {
-    std::panic::catch_unwind(AssertUnwindSafe(callback)).unwrap_or_else(|_| {
-        ffi::exit(PANIC_EXIT_STATUS);
-        on_panic
-    })
 }

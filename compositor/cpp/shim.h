@@ -6,6 +6,7 @@
 #include <QtCore/QStringList>
 #include <QtWidgets/QDockWidget>
 #include <QtWidgets/QMainWindow>
+#include <QtWidgets/QMenu>
 #include <memory>
 #include <qpa/qplatformwindow_p.h>
 
@@ -27,7 +28,10 @@ QString qt_runtime_version();
 void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t step);
 
 std::unique_ptr<QMainWindow> new_main_window();
-QDockWidget *new_dock(QMainWindow *window, const QString &title, int area);
+QMenu *new_menu(QMainWindow *window, const QString &title);
+void new_action(QMenu *menu, const QString &text, const QString &shortcut,
+                rust::Fn<void(size_t)> triggered, size_t command);
+QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area);
 QWidget *container(Pane *pane, QDockWidget *dock);
 void tabify(QMainWindow *window, QDockWidget *first, QDockWidget *second);
 void show_status(QMainWindow *window, const QString &text);

@@ -30,13 +30,21 @@ void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t step) {
 std::unique_ptr<QMainWindow> new_main_window() {
     auto window = std::make_unique<QMainWindow>();
     window->statusBar();
-    window->menuBar()->addMenu(QStringLiteral("&Window"));
     return window;
 }
-QDockWidget *new_dock(QMainWindow *window, const QString &title, int area) {
+QMenu *new_menu(QMainWindow *window, const QString &title) {
+    return window->menuBar()->addMenu(title);
+}
+void new_action(QMenu *menu, const QString &text, const QString &shortcut,
+                rust::Fn<void(size_t)> triggered, size_t command) {
+    auto *action = menu->addAction(text);
+    action->setShortcut(QKeySequence(shortcut));
+    QObject::connect(action, &QAction::triggered, [=] { triggered(command); });
+}
+QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area) {
     auto *dock = new QDockWidget(title, window);
     window->addDockWidget(Qt::DockWidgetArea(area), dock);
-    window->menuBar()->actions().first()->menu()->addAction(dock->toggleViewAction());
+    menu->addAction(dock->toggleViewAction());
     return dock;
 }
 QWidget *container(Pane *pane, QDockWidget *dock) {

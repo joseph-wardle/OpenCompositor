@@ -3,23 +3,20 @@
 use std::io::{BufRead, Seek};
 
 use ::png::{
-    BitDepth, ColorType, Decoder, DecodingError, Limits, ScaledFloat, SourceChromaticities,
-    Transformations,
+    BitDepth, ColorType, Decoder, DecodingError, ScaledFloat, SourceChromaticities, Transformations,
 };
 
-use super::{MAX_PIXELS, ReadError, Refusal, check_size};
+use super::{ReadError, Refusal, check_size};
 use crate::image::{Chromaticities, Cicp, Image, PngColorType, PngSource, Source, Warning, Window};
 
 /// `gAMA`'s value for sRGB, which approximates sRGB's curve with a pure power.
 const SRGB_GAMMA: f32 = 1.0 / 2.2;
 
 pub(super) fn read(file: impl BufRead + Seek) -> Result<Image, ReadError> {
-    // `png` refuses its own allocations past a limit, by default far below ours: 16-bit RGBA at
-    // MAX_PIXELS, plus room for its row buffers.
-    let limits = Limits {
-        bytes: usize::try_from(MAX_PIXELS * 8 * 2).unwrap_or(usize::MAX),
-    };
-    let mut decoder = Decoder::new_with_limits(file, limits);
+    // `png`'s default limit bounds its row buffers and decompressed chunks, such as an ICC
+    // profile, not the frame, which `check_size` bounds. Raising it lets a small file with a
+    // highly compressed chunk allocate gigabytes.
+    let mut decoder = Decoder::new(file);
     // Palettes and transparency become colour and alpha, low bit depths 8 bits; 16 bits stay.
     decoder.set_transformations(Transformations::EXPAND);
     let mut reader = decoder.read_info().map_err(decode_error)?;

@@ -195,36 +195,14 @@ fn files_without_rgb_are_refused_by_what_they_contain() {
 }
 
 #[test]
-fn deep_parts_are_skipped_and_a_deep_file_refused() {
-    // `exr` cannot write deep files, so the choice is checked on descriptions.
-    let describe = |deep: bool, channels: &[&str]| ExrPart {
-        name: None,
-        view: None,
-        channels: channels
-            .iter()
-            .map(|&name| ExrChannel {
-                name: name.into(),
-                sample_type: SampleType::F16,
-            })
-            .collect(),
-        compression: ExrCompression::Zip,
-        tiled: false,
-        deep,
-        data_window: Window {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        },
-    };
-    let deep = describe(true, &["A", "B", "G", "R", "Z"]);
-    let flat = describe(false, &["B", "G", "R"]);
-
-    assert_eq!(choose_part(&[deep.clone(), flat]).unwrap(), 1);
-    assert!(matches!(
-        choose_part(&[deep]),
-        Err(ReadError::Refused(Refusal::Deep))
+fn a_file_with_any_deep_part_is_refused() {
+    // Written by OpenEXR 3.5, since `exr` cannot write deep data: a 1 × 1 deep part with Z,
+    // then a flat part with R, G and B.
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/deep_then_flat.exr"
     ));
+    assert_eq!(refusal(bytes), Refusal::Deep);
 }
 
 #[test]
@@ -290,6 +268,22 @@ fn colour_and_shape_the_reader_cannot_honour_load_with_warnings() {
     let image = read_bytes(&grey(anamorphic)).unwrap();
     assert_eq!(image.pixel_aspect(), 2.0);
     assert_eq!(image.warnings(), [Warning::PixelAspect(2.0)]);
+
+    for invalid in [f32::NAN, 0.0, -2.0, f32::INFINITY] {
+        let mut bytes = grey(display(0, 0, 4, 3));
+        patch_attribute(
+            &mut bytes,
+            b"pixelAspectRatio\0float\0",
+            &invalid.to_le_bytes(),
+        );
+        let image = read_bytes(&bytes).unwrap();
+        assert_eq!(image.pixel_aspect(), 1.0, "for {invalid}");
+        assert!(
+            matches!(image.warnings(), [Warning::PixelAspect(aspect)] if aspect.to_bits() == invalid.to_bits()),
+            "for {invalid}: {:?}",
+            image.warnings()
+        );
+    }
 }
 
 #[test]

@@ -2,8 +2,9 @@
 //! then quits. Rerun it in a nested compositor after every Qt upgrade, because the shell relies on
 //! Qt's private Wayland API.
 //!
-//! It exits 0 if every step ran, the image loaded while a dialog was open, and both panes had a
-//! surface at the end; 1 if a check failed; and otherwise as a crash or protocol error does.
+//! It exits 0 if every step ran, a pane floated, docked or reopened had a surface again by the
+//! next step, the image loaded while a dialog was open, and both panes had a surface at the end;
+//! 1 if a check failed; and otherwise as a crash or protocol error does.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -39,16 +40,25 @@ thread_local! {
 pub fn start(image: PathBuf) {
     IMAGE.with(|cell| *cell.borrow_mut() = image);
     for (index, &(at, _)) in STEPS.iter().enumerate() {
-        ffi::single_shot(at, run, index);
+        ffi::single_shot(at, step, index);
     }
-}
-
-fn run(index: usize) {
-    crate::guarded((), || step(index));
 }
 
 fn step(index: usize) {
     eprintln!("lifecycle check: {}", STEPS[index].1);
+    let moved = match index {
+        2 | 3 | 10 => Some(Pane::Viewer),
+        7 | 8 => Some(Pane::Graph),
+        _ => None,
+    };
+    if let Some(pane) = moved
+        && !crate::has_surface(pane)
+    {
+        fail(format!(
+            "the {pane:?} pane had no surface after the step before {:?}",
+            STEPS[index].1
+        ));
+    }
     let widgets = crate::widgets();
     match index {
         // SAFETY: as for `dock`.

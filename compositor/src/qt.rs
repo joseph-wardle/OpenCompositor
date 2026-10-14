@@ -14,6 +14,9 @@ pub mod ffi {
         /// Opaque: the shim reads its fields.
         #[allow(missing_debug_implementations)]
         type QEvent;
+        include!(<QtWidgets/QMenu>);
+        #[allow(missing_debug_implementations)]
+        type QMenu;
     }
 
     unsafe extern "C++Qt" {
@@ -52,11 +55,12 @@ pub mod ffi {
         #[namespace = "QNativeInterface::Private"]
         type QWaylandWindow;
 
-        /// Emitted before Qt Wayland destroys the window's `wl_surface`, including when floating a
-        /// dock recreates it without a platform surface event.
+        /// Emitted when Qt Wayland unmaps the window and before it destroys the window's
+        /// `wl_surface`, including when floating a dock recreates it without a platform surface
+        /// event. (`surfaceDestroyed` comes only after the `wl_surface` is gone.)
         #[qsignal]
-        #[cxx_name = "surfaceDestroyed"]
-        fn surface_destroyed(self: Pin<&mut QWaylandWindow>);
+        #[cxx_name = "surfaceRoleDestroyed"]
+        fn surface_role_destroyed(self: Pin<&mut QWaylandWindow>);
     }
 
     // A pane: a native window the GPU draws, inside a dock.
@@ -130,9 +134,21 @@ pub mod ffi {
         fn single_shot(ms: i32, callback: fn(usize), step: usize);
 
         fn new_main_window() -> UniquePtr<QMainWindow>;
-        /// A dock in a `Qt::DockWidgetArea`, listed in the Window menu.
+        /// A menu at the end of the window's menu bar, which owns it.
+        unsafe fn new_menu(window: *mut QMainWindow, title: &QString) -> *mut QMenu;
+        /// A menu item that calls `triggered(command)`, also from its shortcut, whichever pane has
+        /// the keyboard.
+        unsafe fn new_action(
+            menu: *mut QMenu,
+            text: &QString,
+            shortcut: &QString,
+            triggered: fn(usize),
+            command: usize,
+        );
+        /// A dock in a `Qt::DockWidgetArea`, listed in `menu`.
         unsafe fn new_dock(
             window: *mut QMainWindow,
+            menu: *mut QMenu,
             title: &QString,
             area: i32,
         ) -> *mut QDockWidget;

@@ -12,7 +12,7 @@ mod presentation;
 mod read;
 mod session;
 
-pub use app::{App, Event, FileIntent, Input, Key, Pane, Request};
+pub use app::{App, Command, Event, FileIntent, Input, Pane, Request};
 pub use document::{Changes, Document, Node, NodeId, NodeKind, Slot};
 pub use evaluate::{EvalError, evaluate};
 pub use gpu::{NativeWindow, PaneSize};

@@ -1,8 +1,8 @@
 //! Reading image files off the GUI thread.
 
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
 
 use crate::document::NodeId;
 use crate::image::Image;
@@ -27,7 +27,6 @@ pub struct Loaded {
 #[derive(Debug)]
 pub struct Loader {
     mailbox: Arc<Mailbox>,
-    worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -46,22 +45,23 @@ impl Loader {
     /// Starts the worker. It passes each result to `deliver` on its own thread.
     pub fn start(deliver: impl Fn(Loaded) + Send + 'static) -> Loader {
         let mailbox = Arc::new(Mailbox::default());
-        let worker = {
-            let mailbox = Arc::clone(&mailbox);
-            std::thread::Builder::new()
-                .name("loader".to_owned())
-                .spawn(move || {
-                    while let Some(request) = mailbox.next() {
-                        let result = read_image(&request.path);
-                        deliver(Loaded { request, result });
-                    }
-                })
-                .expect("the loader thread starts")
-        };
-        Loader {
-            mailbox,
-            worker: Some(worker),
-        }
+        let worker_mailbox = Arc::clone(&mailbox);
+        std::thread::Builder::new()
+            .name("loader".to_owned())
+            .spawn(move || {
+                while let Some(request) = worker_mailbox.next() {
+                    // A panic would end the worker and every later read with it. The panic hook
+                    // has already reported it.
+                    let result =
+                        std::panic::catch_unwind(AssertUnwindSafe(|| read_image(&request.path)))
+                            .unwrap_or_else(|_| {
+                                Err(ReadError::Decode("the reader panicked".to_owned()))
+                            });
+                    deliver(Loaded { request, result });
+                }
+            })
+            .expect("the loader thread starts");
+        Loader { mailbox }
     }
 
     pub fn request(&self, request: LoadRequest) {
@@ -97,15 +97,11 @@ impl Mailbox {
 }
 
 impl Drop for Loader {
-    /// Stops the worker and waits for it, which takes at most the rest of one read. Nothing is
-    /// delivered afterwards.
+    /// Stops the worker without waiting for it. The read in progress, if any, still finishes and
+    /// is delivered; nothing after it is.
     fn drop(&mut self) {
         self.mailbox.lock().stopping = true;
         self.mailbox.changed.notify_one();
-        if let Some(worker) = self.worker.take() {
-            // A panic in the worker was already reported by the panic hook.
-            let _ = worker.join();
-        }
     }
 }
 

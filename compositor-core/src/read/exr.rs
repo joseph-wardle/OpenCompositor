@@ -36,6 +36,10 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
         .iter()
         .map(describe_part)
         .collect::<Result<Vec<_>, _>>()?;
+    // `exr` reads no file with a deep part, not even its flat parts.
+    if parts.iter().any(|part| part.deep) {
+        return Err(ReadError::Refused(Refusal::Deep));
+    }
     let shown_part = choose_part(&parts)?;
     let header = &meta.headers[shown_part];
     let compression = parts[shown_part].compression;
@@ -80,6 +84,12 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
         chromaticities,
     };
     let warnings = warnings(&source, pixel_aspect);
+    // Unvalidated headers can hold any float here; the warning names it.
+    let pixel_aspect = if pixel_aspect.is_finite() && pixel_aspect > 0.0 {
+        pixel_aspect
+    } else {
+        1.0
+    };
 
     file.rewind()?;
     let image = ::exr::prelude::read()
@@ -101,14 +111,21 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
         .from_buffered(file)
         .map_err(decode_error)?;
     let layer = image.layer_data;
-    // `first_valid_layer` takes the first part with R, G and B, as `choose_part` does.
+    // `first_valid_layer` takes the first part with R, G and B, as `choose_part` does, so the
+    // description matches the pixels. The pixels' own window is used regardless.
     debug_assert_eq!(
         layer.attributes.layer_name.as_ref().map(Text::to_string),
         source.parts[shown_part].name
     );
+    let data_window = window(
+        layer.attributes.layer_position.0,
+        layer.attributes.layer_position.1,
+        layer.size.0,
+        layer.size.1,
+    )?;
     Ok(Image::new(
         display_window,
-        source.parts[shown_part].data_window,
+        data_window,
         layer.channel_data.pixels.rgba,
         pixel_aspect,
         Source::Exr(source),
@@ -166,18 +183,16 @@ fn describe_part(header: &Header) -> Result<ExrPart, ReadError> {
     })
 }
 
-/// The first part with R, G and B that is not deep; otherwise, why there is none.
+/// The first part with R, G and B; otherwise, why there is none.
 fn choose_part(parts: &[ExrPart]) -> Result<usize, ReadError> {
     let has = |part: &ExrPart, name: &str| part.channels.iter().any(|c| c.name == name);
     if let Some(index) = parts
         .iter()
-        .position(|part| !part.deep && ["R", "G", "B"].iter().all(|name| has(part, name)))
+        .position(|part| ["R", "G", "B"].iter().all(|name| has(part, name)))
     {
         return Ok(index);
     }
-    let refusal = if parts.iter().all(|part| part.deep) {
-        Refusal::Deep
-    } else if parts
+    let refusal = if parts
         .iter()
         .any(|part| has(part, "Y") && (has(part, "RY") || has(part, "BY")))
     {
@@ -201,7 +216,7 @@ fn warnings(source: &ExrSource, pixel_aspect: f32) -> Vec<Warning> {
     {
         warnings.push(Warning::Primaries(chromaticities));
     }
-    if (pixel_aspect - 1.0).abs() > 1e-3 {
+    if pixel_aspect.is_nan() || (pixel_aspect - 1.0).abs() > 1e-3 {
         warnings.push(Warning::PixelAspect(pixel_aspect));
     }
     let shown = &source.parts[source.shown_part];

@@ -3,8 +3,8 @@
 use std::pin::Pin;
 use std::ptr::NonNull;
 
-use open_ng::{Button, Modifiers, PhysicalPoint};
-use opencompositor_core::{Event, Input, Key, NativeWindow, Pane, PaneSize};
+use open_ng::{Button, Key, Modifiers, PhysicalPoint};
+use opencompositor_core::{Event, Input, NativeWindow, Pane, PaneSize};
 use wgpu::rwh::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
     XlibDisplayHandle, XlibWindowHandle,
@@ -35,9 +35,7 @@ mod key {
     pub const SPACE: i32 = 0x20;
     pub const G: i32 = 0x47;
     pub const H: i32 = 0x48;
-    pub const R: i32 = 0x52;
     pub const Y: i32 = 0x59;
-    pub const Z: i32 = 0x5a;
     pub const ESCAPE: i32 = 0x0100_0000;
 }
 
@@ -57,7 +55,7 @@ pub unsafe fn event(mut window: Pin<&mut qt::Pane>, pane: Pane, event: *mut ffi:
     let kind = unsafe { ffi::event_type(event) };
     // SAFETY: as above.
     let fields = || unsafe { ffi::input_fields(event) };
-    let used = crate::guarded(true, || match kind {
+    let used = match kind {
         kind::EXPOSE => {
             if window.is_exposed() {
                 crate::dispatch(Event::Exposed(pane));
@@ -80,7 +78,7 @@ pub unsafe fn event(mut window: Pin<&mut qt::Pane>, pane: Pane, event: *mut ffi:
             true
         }
         kind::FOCUS_OUT => {
-            crate::dispatch(Event::FocusLost);
+            crate::dispatch(Event::FocusLost(pane));
             false
         }
         _ => match input(kind, &fields, window.device_pixel_ratio()) {
@@ -90,7 +88,7 @@ pub unsafe fn event(mut window: Pin<&mut qt::Pane>, pane: Pane, event: *mut ffi:
             }
             None => false,
         },
-    });
+    };
     // SAFETY: as above.
     used || unsafe { window.as_mut().base_event(event) }
 }
@@ -154,22 +152,14 @@ fn input(kind: i32, fields: &impl Fn() -> ffi::InputFields, scale: f64) -> Optio
                 key::ESCAPE => Key::Escape,
                 key::G => Key::G,
                 key::H => Key::H,
-                key::R => Key::R,
                 key::Y => Key::Y,
-                key::Z => Key::Z,
                 _ => return None,
             };
             if f.auto_repeat {
                 return None;
             }
             if kind == kind::KEY_PRESS {
-                Input::KeyPressed {
-                    key,
-                    modifiers: Modifiers {
-                        shift: f.shift,
-                        ctrl: f.ctrl,
-                    },
-                }
+                Input::KeyPressed(key)
             } else {
                 Input::KeyReleased(key)
             }
@@ -178,8 +168,9 @@ fn input(kind: i32, fields: &impl Fn() -> ffi::InputFields, scale: f64) -> Optio
     })
 }
 
-/// The pane's native window, or `None` while it has none or the platform has no windows. On Wayland it also watches for Qt
-/// destroying the window's surface, which floating a dock does without a platform surface event.
+/// The pane's native window, or `None` while it has none or the platform has no windows. On
+/// Wayland it also watches for Qt destroying the window's surface, which floating a dock does
+/// without a platform surface event.
 pub fn native_window(mut window: Pin<&mut qt::Pane>, pane: Pane) -> Option<NativeWindow> {
     let (display, handle) = match String::from(&ffi::platform_name()).as_str() {
         "wayland" => {
@@ -206,6 +197,6 @@ pub fn native_window(mut window: Pin<&mut qt::Pane>, pane: Pane) -> Option<Nativ
         _ => return None,
     };
     // SAFETY: the pane dispatches `SurfaceDestroyed` on `SurfaceAboutToBeDestroyed` and on Qt
-    // Wayland's `surfaceDestroyed`, before either handle dies.
+    // Wayland's `surfaceRoleDestroyed`, before either handle dies.
     Some(unsafe { NativeWindow::new(display, handle) })
 }
