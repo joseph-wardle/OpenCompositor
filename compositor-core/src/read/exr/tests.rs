@@ -369,9 +369,9 @@ fn stereo_files_show_one_view_and_name_it() {
     );
 }
 
-/// 32 × 32 pixels in one DWA chunk that uses all four of its sections: half-float RGB for
-/// the lossy one, half alpha for RLE, and float Z for the lossless one.
-fn dwa(compression: Compression, blocks: Blocks) -> Vec<u8> {
+/// 32 × 32 pixels in one chunk. In DWA it uses all four sections: half-float RGB for the lossy
+/// one, half alpha for RLE, and float Z for the lossless one.
+fn one_chunk(compression: Compression, blocks: Blocks) -> Vec<u8> {
     let (width, height) = (32, 32);
     let value = |value: fn(usize, usize) -> f32| {
         (0..width * height).map(move |i| value(i % width, i / width))
@@ -408,8 +408,8 @@ fn dwa(compression: Compression, blocks: Blocks) -> Vec<u8> {
     write(display(0, 0, width, height), vec![layer])
 }
 
-/// The byte where the file's only chunk starts its DWA leader of eleven `u64` counters.
-fn dwa_leader(bytes: &[u8], blocks: Blocks) -> usize {
+/// The byte where the file's only chunk starts its compressed pixels.
+fn chunk_pixels(bytes: &[u8], blocks: Blocks) -> usize {
     // The offset table's one entry points just past itself.
     let table = (0..bytes.len() - 8)
         .find(|&at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) == at as u64 + 8)
@@ -431,14 +431,14 @@ fn dwa_chunks_declaring_more_than_their_block_holds_are_refused() {
         (Compression::DWAB(None), Blocks::ScanLines),
         (Compression::DWAA(None), tiles),
     ] {
-        let bytes = dwa(compression, blocks);
-        let leader = dwa_leader(&bytes, blocks);
+        let bytes = one_chunk(compression, blocks);
+        // Eleven `u64` counters, the first the version.
+        let leader = chunk_pixels(&bytes, blocks);
         assert_eq!(
             bytes[leader..leader + 8],
             2u64.to_le_bytes(),
             "a version 2 leader"
         );
-        check_dwa_leaders(&mut Cursor::new(&bytes)).expect("the unpatched leader fits");
         read_bytes(&bytes).expect("the unpatched file reads");
         // Each counter that sizes an allocation: unknown and RLE sizes, AC and DC counts. Without
         // the check, `exr` 1.74.2 aborts the process on these.
@@ -447,10 +447,27 @@ fn dwa_chunks_declaring_more_than_their_block_holds_are_refused() {
             let at = leader + counter * 8;
             patched[at..at + 8].copy_from_slice(&(1u64 << 40).to_le_bytes());
             assert!(
-                check_dwa_leaders(&mut Cursor::new(&patched)).is_err(),
+                matches!(read_bytes(&patched), Err(ReadError::Decode(reason)) if reason.contains("declares more data")),
                 "{compression:?} counter {counter} passed the check"
             );
-            assert!(matches!(read_bytes(&patched), Err(ReadError::Decode(_))));
         }
+    }
+}
+
+#[test]
+fn a_chunk_whose_decoder_panics_fails_the_read() {
+    let mut bytes = one_chunk(Compression::B44, Blocks::ScanLines);
+    let pixels = chunk_pixels(&bytes, Blocks::ScanLines);
+    // An all-zero B44 block subtracts its bias from zero. `exr` 1.74.2 does this unchecked, which
+    // panics where overflow is checked, as in tests, and wraps in release builds.
+    bytes[pixels..pixels + 14].fill(0);
+
+    let read = read_bytes(&bytes);
+
+    if cfg!(debug_assertions) {
+        assert!(
+            matches!(&read, Err(ReadError::Decode(reason)) if reason == "the decoder panicked"),
+            "{read:?}"
+        );
     }
 }

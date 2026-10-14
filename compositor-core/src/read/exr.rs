@@ -1,12 +1,16 @@
 //! OpenEXR through the `exr` crate.
 
 use std::io::{BufRead, Seek};
+use std::num::NonZero;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Mutex, mpsc};
 
-use ::exr::block::chunk::CompressedBlock;
-use ::exr::block::reader::ChunksReader;
+use ::exr::block::UncompressedBlock;
+use ::exr::block::chunk::{Chunk, CompressedBlock};
+use ::exr::block::reader::{ChunksReader, FilteredChunksReader};
 use ::exr::compression::Compression;
-use ::exr::error::Error;
-use ::exr::image::read::image::ReadLayers;
+use ::exr::error::{Error, UnitResult};
+use ::exr::image::read::image::{LayersReader, ReadLayers};
 use ::exr::image::read::layers::ReadChannels;
 use ::exr::math::Vec2;
 use ::exr::meta::attribute::{self, Text};
@@ -25,7 +29,7 @@ struct Pixels {
     rgba: Vec<f32>,
 }
 
-pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
+pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadError> {
     // Only the headers, nothing allocated for pixels yet. Unvalidated, because validation
     // rejects deep and subsampled parts as unsupported before they can be refused for what they
     // contain.
@@ -93,13 +97,8 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
         1.0
     };
 
-    if meta.headers.iter().any(|header| is_dwa(header.compression)) {
-        file.rewind()?;
-        check_dwa_leaders(&mut file)?;
-    }
-
     file.rewind()?;
-    let image = ::exr::prelude::read()
+    let read_layer = ::exr::prelude::read()
         .no_deep_data()
         .largest_resolution_level()
         .rgba_channels(
@@ -113,11 +112,20 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
                 pixels.rgba[start..start + 4].copy_from_slice(&[r, g, b, a]);
             },
         )
-        .first_valid_layer()
-        .all_attributes()
-        .from_buffered(file)
+        .first_valid_layer();
+    let chunks = ::exr::block::read(file, false).map_err(decode_error)?;
+    let mut layer_reader = read_layer
+        .create_layers_reader(chunks.headers())
         .map_err(decode_error)?;
-    let layer = image.layer_data;
+    let chunks = chunks
+        .filter_chunks(false, |meta, tile, block| {
+            layer_reader.filter_block(meta, tile, block)
+        })
+        .map_err(decode_error)?;
+    decode(chunks, |headers, block| {
+        layer_reader.read_block(headers, block)
+    })?;
+    let layer = layer_reader.into_layers();
     // `first_valid_layer` takes the first part with R, G and B, as `choose_part` does, so the
     // description matches the pixels. The pixels' own window is used regardless.
     debug_assert_eq!(
@@ -140,70 +148,116 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
     ))
 }
 
-/// Refuses a file with a DWA chunk whose leader declares more data than its block can hold.
+/// Decompresses the chunks across the machine's cores, handing each block to `insert` on this
+/// thread in whatever order they finish.
+///
+/// `exr` decompresses on a rayon pool of its own, where a panic aborts the process. Here a chunk
+/// whose decoder panics fails the read instead.
+fn decode(
+    chunks: FilteredChunksReader<impl BufRead + Seek + Send>,
+    mut insert: impl FnMut(&[Header], UncompressedBlock) -> UnitResult,
+) -> Result<(), ReadError> {
+    let meta = chunks.meta_data().clone();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, NonZero::get)
+        .min(chunks.len());
+    let chunks = Mutex::new(chunks);
+    let (sender, blocks) = mpsc::sync_channel(threads);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let (chunks, meta, sender) = (&chunks, &meta, sender.clone());
+            scope.spawn(move || {
+                loop {
+                    // A panic while reading poisons the lock, which stops the other threads.
+                    let block = catch_unwind(AssertUnwindSafe(|| {
+                        let chunk = chunks.lock().ok()?.next()?;
+                        Some(
+                            chunk
+                                .map_err(decode_error)
+                                .and_then(|chunk| decompress(chunk, meta)),
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        Some(Err(ReadError::Decode("the decoder panicked".to_owned())))
+                    });
+                    let Some(block) = block else { break };
+                    let failed = block.is_err();
+                    // The receiver is gone once the read has failed.
+                    if sender.send(block).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for block in blocks {
+            insert(&meta.headers, block?).map_err(decode_error)?;
+        }
+        Ok(())
+    })
+}
+
+fn decompress(chunk: Chunk, meta: &MetaData) -> Result<UncompressedBlock, ReadError> {
+    // `exr` has checked that the part exists.
+    let header = &meta.headers[chunk.layer_index];
+    if is_dwa(header.compression) {
+        check_dwa_leader(header, &chunk)?;
+    }
+    UncompressedBlock::decompress_chunk(chunk, meta, false).map_err(decode_error)
+}
+
+/// Refuses a DWA chunk whose leader declares more data than its block can hold.
 ///
 /// `exr` allocates what these counters declare before checking them, and a failed allocation
-/// aborts the process, which no panic handler can catch; OpenEXR refuses such chunks. Chunks are
-/// found through the offset tables and checked against the part each names, as the decoder finds
-/// and decodes them, so no chunk it decodes goes unchecked.
-fn check_dwa_leaders(file: &mut (impl BufRead + Seek)) -> Result<(), ReadError> {
-    let mut chunks = ::exr::block::read(file, false)
-        .and_then(|reader| reader.filter_chunks(false, |_, _, _| true))
+/// aborts the process, which no panic handler can catch; OpenEXR refuses such chunks.
+fn check_dwa_leader(header: &Header, chunk: &Chunk) -> Result<(), ReadError> {
+    let pixels = match &chunk.compressed_block {
+        CompressedBlock::ScanLine(block) => &block.compressed_pixels_le,
+        CompressedBlock::Tile(block) => &block.compressed_pixels_le,
+        // Files with deep parts are refused before this.
+        CompressedBlock::DeepScanLine(_) | CompressedBlock::DeepTile(_) => return Ok(()),
+    };
+    let block = header
+        .get_block_data_indices(&chunk.compressed_block)
+        .and_then(|indices| header.get_absolute_block_pixel_coordinates(indices))
         .map_err(decode_error)?;
-    while let Some(chunk) = chunks.next() {
-        let chunk = chunk.map_err(decode_error)?;
-        // `exr` has checked that the part exists.
-        let header = &chunks.meta_data().headers[chunk.layer_index];
-        if !is_dwa(header.compression) {
-            continue;
-        }
-        let pixels = match &chunk.compressed_block {
-            CompressedBlock::ScanLine(block) => &block.compressed_pixels_le,
-            CompressedBlock::Tile(block) => &block.compressed_pixels_le,
-            // Files with deep parts are refused before this.
-            CompressedBlock::DeepScanLine(_) | CompressedBlock::DeepTile(_) => continue,
-        };
-        let block = header
-            .get_block_data_indices(&chunk.compressed_block)
-            .and_then(|indices| header.get_absolute_block_pixel_coordinates(indices))
-            .map_err(decode_error)?;
-        let (width, height) = (block.size.width(), block.size.height());
-        let bytes = (width * height * header.channels.bytes_per_pixel) as u64;
-        // `exr` reads no leader from an empty chunk or one stored uncompressed, and refuses one
-        // too short to hold a leader.
-        if pixels.is_empty() || pixels.len() as u64 == bytes {
-            continue;
-        }
-        let Some(leader) = pixels.first_chunk::<88>() else {
-            continue;
-        };
-        // Eleven little-endian counters: the version; the unknown section's inflated and
-        // compressed sizes; the AC, DC and RLE sections' compressed sizes; the RLE section's
-        // inflated and raw sizes; the AC and DC counts; the AC coder.
-        let counter = |index: usize| {
-            u64::from_le_bytes(
-                *leader[index * 8..]
-                    .first_chunk::<8>()
-                    .expect("in the leader"),
-            )
-        };
-        // Each 8 × 8 block of each channel, the edges padded, has one DC coefficient and at most
-        // 63 AC ones.
-        let samples = (width.next_multiple_of(8) * height.next_multiple_of(8)) as u64
-            * header.channels.list.len() as u64;
-        let fits = counter(1) <= bytes
-            // An RLE token never takes more than twice the bytes it stands for.
-            && counter(6) <= 2 * bytes
-            && counter(7) <= bytes
-            && counter(8) <= samples
-            && counter(9) <= samples / 64;
-        if !fits {
-            return Err(ReadError::Decode(format!(
-                "a DWA chunk declares more data than its {width} × {height} block holds"
-            )));
-        }
+    let (width, height) = (block.size.width(), block.size.height());
+    let bytes = (width * height * header.channels.bytes_per_pixel) as u64;
+    // `exr` reads no leader from an empty chunk or one stored uncompressed, and refuses one too
+    // short to hold a leader.
+    if pixels.is_empty() || pixels.len() as u64 == bytes {
+        return Ok(());
     }
-    Ok(())
+    let Some(leader) = pixels.first_chunk::<88>() else {
+        return Ok(());
+    };
+    // Eleven little-endian counters: the version; the unknown section's inflated and compressed
+    // sizes; the AC, DC and RLE sections' compressed sizes; the RLE section's inflated and raw
+    // sizes; the AC and DC counts; the AC coder.
+    let counter = |index: usize| {
+        u64::from_le_bytes(
+            *leader[index * 8..]
+                .first_chunk::<8>()
+                .expect("in the leader"),
+        )
+    };
+    // Each 8 × 8 block of each channel, the edges padded, has one DC coefficient and at most 63
+    // AC ones.
+    let samples = (width.next_multiple_of(8) * height.next_multiple_of(8)) as u64
+        * header.channels.list.len() as u64;
+    let fits = counter(1) <= bytes
+        // An RLE token never takes more than twice the bytes it stands for.
+        && counter(6) <= 2 * bytes
+        && counter(7) <= bytes
+        && counter(8) <= samples
+        && counter(9) <= samples / 64;
+    if fits {
+        Ok(())
+    } else {
+        Err(ReadError::Decode(format!(
+            "a DWA chunk declares more data than its {width} × {height} block holds"
+        )))
+    }
 }
 
 fn is_dwa(compression: Compression) -> bool {

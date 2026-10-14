@@ -19,7 +19,7 @@ pub fn read_image(path: &Path) -> Result<Image, ReadError> {
     read_from(BufReader::new(File::open(path)?))
 }
 
-fn read_from(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
+fn read_from(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadError> {
     let mut signature = [0; 8];
     if let Err(error) = file.read_exact(&mut signature) {
         return Err(match error.kind() {

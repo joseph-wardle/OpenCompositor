@@ -262,8 +262,9 @@ impl Drop for Finishing<'_> {
 
 /// Reads the request's file on the worker's thread, then stages and delivers it.
 fn read(mailbox: &Arc<Mailbox>, request: LoadRequest, deliver: &impl Fn(Loaded)) {
-    // A panic would end the worker and every later read with it. The panic hook has already
-    // reported it.
+    // A panic on this thread would end the worker and every later read with it; the panic hook
+    // has already reported it. The EXR reader contains its decoding threads' panics itself. A
+    // failed allocation aborts the process regardless.
     let read = std::panic::catch_unwind(AssertUnwindSafe(|| read_image(&request.path)))
         .unwrap_or_else(|_| Err(ReadError::Decode("the reader panicked".to_owned())));
     let Some(finishing) = mailbox.start_finishing() else {
