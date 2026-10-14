@@ -3,7 +3,7 @@
 use std::pin::Pin;
 use std::ptr::NonNull;
 
-use open_ng::{Button, Key, Modifiers, PhysicalPoint};
+use open_ng::{Button, Modifiers, PhysicalPoint};
 use opencompositor_core::{Event, Input, NativeWindow, Pane, PaneSize};
 use wgpu::rwh::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
@@ -17,8 +17,6 @@ mod kind {
     pub const MOUSE_BUTTON_PRESS: i32 = 2;
     pub const MOUSE_BUTTON_RELEASE: i32 = 3;
     pub const MOUSE_MOVE: i32 = 5;
-    pub const KEY_PRESS: i32 = 6;
-    pub const KEY_RELEASE: i32 = 7;
     pub const FOCUS_OUT: i32 = 9;
     pub const ENTER: i32 = 10;
     pub const LEAVE: i32 = 11;
@@ -28,15 +26,6 @@ mod kind {
     pub const EXPOSE: i32 = 206;
     pub const PLATFORM_SURFACE: i32 = 217;
     pub const DEVICE_PIXEL_RATIO_CHANGE: i32 = 222;
-}
-
-/// `Qt::Key` values.
-mod key {
-    pub const SPACE: i32 = 0x20;
-    pub const G: i32 = 0x47;
-    pub const H: i32 = 0x48;
-    pub const Y: i32 = 0x59;
-    pub const ESCAPE: i32 = 0x0100_0000;
 }
 
 /// `Qt::MouseButton` values.
@@ -143,25 +132,6 @@ fn input(kind: i32, fields: &impl Fn() -> ffi::InputFields, scale: f64) -> Optio
             Input::Scrolled {
                 position: position(&f),
                 lines: f.wheel_y as f32 / 120.0,
-            }
-        }
-        kind::KEY_PRESS | kind::KEY_RELEASE => {
-            let f = fields();
-            let key = match f.key {
-                key::SPACE => Key::Space,
-                key::ESCAPE => Key::Escape,
-                key::G => Key::G,
-                key::H => Key::H,
-                key::Y => Key::Y,
-                _ => return None,
-            };
-            if f.auto_repeat {
-                return None;
-            }
-            if kind == kind::KEY_PRESS {
-                Input::KeyPressed(key)
-            } else {
-                Input::KeyReleased(key)
             }
         }
         _ => return None,

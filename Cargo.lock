@@ -1597,6 +1597,7 @@ name = "opencompositor-core"
 version = "0.0.0"
 dependencies = [
  "exr",
+ "half",
  "imbl",
  "open-ng",
  "png",

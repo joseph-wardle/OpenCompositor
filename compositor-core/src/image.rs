@@ -105,6 +105,24 @@ impl Image {
     pub fn warnings(&self) -> &[Warning] {
         &self.warnings
     }
+
+    /// The image without its pixels, and the pixels.
+    pub(crate) fn into_parts(self) -> (ImageInfo, Vec<f32>) {
+        let info = ImageInfo {
+            display_window: self.display_window,
+            data_window: self.data_window,
+            warnings: self.warnings,
+        };
+        (info, self.pixels)
+    }
+}
+
+/// What the viewer keeps of an image once its pixels are on the GPU.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageInfo {
+    pub display_window: Window,
+    pub data_window: Window,
+    pub warnings: Vec<Warning>,
 }
 
 /// The file an image was read from, described in our own terms so that a decoder can be replaced

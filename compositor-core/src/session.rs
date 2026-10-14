@@ -1,5 +1,6 @@
-//! One open document with its history and its presentation in OpenNG.
+//! One open document with its history, its presentation in OpenNG, and the viewer's state.
 
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,7 +8,9 @@ use std::sync::Arc;
 use open_ng::{ConnectionEdit, Graph, InputEvent, Point, Response, Verdict, View, Viewport};
 
 use crate::document::{Changes, Document, Node, NodeId, NodeKind, Slot};
+use crate::loader::LoadRequest;
 use crate::presentation::present;
+use crate::viewer::Viewer;
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
 const READER_SPACING: f32 = 70.0;
@@ -37,7 +40,68 @@ impl fmt::Display for EditError {
 
 impl std::error::Error for EditError {}
 
-/// A document with its undo history, its OpenNG graph and the view of it.
+/// What the viewer's slot leads to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Viewed {
+    Unmarked,
+    /// The slot marks a node the document no longer has.
+    Missing(NodeId),
+    Node(LoadRequest),
+}
+
+/// A node's part in reading files, shown on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoadStatus {
+    Idle,
+    /// Its file is being read for the viewer.
+    Updating,
+    /// Reading its file failed, and it would read the same file again.
+    Failed,
+}
+
+/// What the session knows of reading nodes' files. Unsaved and not undoable.
+#[derive(Debug, Default)]
+pub(crate) struct Loads {
+    /// Each node's reloads; a node never reloaded is absent.
+    reloads: HashMap<NodeId, u64>,
+    /// The read in progress for the viewer.
+    reading: Option<LoadRequest>,
+    /// Each node's last failed read.
+    failed: HashMap<NodeId, LoadRequest>,
+}
+
+impl Loads {
+    /// What reading the node's file means now.
+    fn request(&self, document: &Document, id: NodeId) -> Option<LoadRequest> {
+        let NodeKind::Reader { path } = &document.node(id)?.kind;
+        Some(LoadRequest {
+            node: id,
+            path: path.clone(),
+            reload: self.reloads.get(&id).copied().unwrap_or(0),
+        })
+    }
+
+    pub(crate) fn status(&self, document: &Document, id: NodeId) -> LoadStatus {
+        if self
+            .reading
+            .as_ref()
+            .is_some_and(|reading| reading.node == id)
+        {
+            LoadStatus::Updating
+        } else if self
+            .failed
+            .get(&id)
+            .is_some_and(|failed| self.request(document, id).as_ref() == Some(failed))
+        {
+            LoadStatus::Failed
+        } else {
+            LoadStatus::Idle
+        }
+    }
+}
+
+/// A document with its undo history, its OpenNG graph and the view of it, the viewer, and what
+/// is known of reading each node's file.
 ///
 /// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
 /// before returning the [`Changes`] it made. An edit that changes nothing records no step.
@@ -50,6 +114,8 @@ pub struct Session {
     next_id: u64,
     graph: Graph,
     graph_view: View,
+    viewer: Viewer,
+    loads: Loads,
 }
 
 impl Default for Session {
@@ -73,6 +139,8 @@ impl Session {
                 height: 0,
                 scale_factor: 1.0,
             }),
+            viewer: Viewer::new(),
+            loads: Loads::default(),
         }
     }
 
@@ -86,6 +154,74 @@ impl Session {
 
     pub fn graph_view(&self) -> &View {
         &self.graph_view
+    }
+
+    pub fn viewer(&self) -> &Viewer {
+        &self.viewer
+    }
+
+    pub(crate) fn viewer_mut(&mut self) -> &mut Viewer {
+        &mut self.viewer
+    }
+
+    /// What the viewer's slot leads to.
+    pub fn viewed(&self) -> Viewed {
+        match self.document.mark(self.viewer.slot()) {
+            None => Viewed::Unmarked,
+            Some(id) => match self.loads.request(&self.document, id) {
+                Some(request) => Viewed::Node(request),
+                None => Viewed::Missing(id),
+            },
+        }
+    }
+
+    /// The read in progress for the viewer.
+    pub fn reading(&self) -> Option<&LoadRequest> {
+        self.loads.reading.as_ref()
+    }
+
+    /// Records a read starting for the viewer, or none. Returns whether the graph changed.
+    pub(crate) fn start_reading(&mut self, request: Option<LoadRequest>) -> bool {
+        let before = std::mem::replace(&mut self.loads.reading, request);
+        let nodes = [
+            before.map(|r| r.node),
+            self.loads.reading.as_ref().map(|r| r.node),
+        ];
+        self.present_statuses(nodes.into_iter().flatten())
+    }
+
+    /// Records how the read in progress ended. Returns whether the graph changed.
+    pub(crate) fn finish_reading(&mut self, failed: bool) -> bool {
+        let Some(request) = self.loads.reading.take() else {
+            return false;
+        };
+        let node = request.node;
+        if failed {
+            self.loads.failed.insert(node, request);
+        } else {
+            self.loads.failed.remove(&node);
+        }
+        self.present_statuses([node])
+    }
+
+    /// Makes each selected node read its file again the next time it is viewed. Returns whether
+    /// any was selected.
+    pub fn reload_selected(&mut self) -> bool {
+        let selected: Vec<NodeId> = self.document.selection().to_vec();
+        for &id in &selected {
+            *self.loads.reloads.entry(id).or_default() += 1;
+        }
+        self.present_statuses(selected.iter().copied());
+        !selected.is_empty()
+    }
+
+    /// Centres the node a slot marks in the graph view. Returns whether the slot marks one.
+    pub fn frame_mark(&mut self, slot: Slot) -> bool {
+        let Some(id) = self.document.mark(slot) else {
+            return false;
+        };
+        self.graph_view.frame(&self.graph, [id.into()]);
+        true
     }
 
     /// Passes an event to the graph view and applies what it asks for. Returns whether the view
@@ -243,9 +379,19 @@ impl Session {
     }
 
     /// Updates the graph, then the view, which cannot notice a change to the graph on its own.
-    fn present(&mut self, changes: &Changes) {
-        present(&mut self.graph, &self.document, changes);
+    /// Returns whether the graph changed.
+    fn present(&mut self, changes: &Changes) -> bool {
+        let changed = present(&mut self.graph, &self.document, &self.loads, changes);
         self.graph_view.refresh(&self.graph, refuse_connections);
+        changed
+    }
+
+    /// Presents nodes whose load status may have changed. Returns whether any did.
+    fn present_statuses(&mut self, nodes: impl IntoIterator<Item = NodeId>) -> bool {
+        self.present(&Changes {
+            nodes: nodes.into_iter().collect::<BTreeSet<_>>(),
+            selection: false,
+        })
     }
 }
 

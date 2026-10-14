@@ -29,7 +29,7 @@ fn assert_presented(session: &Session) {
     for (id, node) in document.nodes() {
         assert_eq!(
             graph.node(id.into()),
-            Some(&record(document, id, node)),
+            Some(&record(document, &session.loads, id, node)),
             "{id:?}"
         );
     }
@@ -201,7 +201,7 @@ fn repathing_keeps_the_node_its_position_and_its_marks() {
         .unwrap();
 
     assert_eq!(changes.nodes.iter().copied().collect::<Vec<_>>(), [reader]);
-    assert!(!changes.marks && !changes.selection);
+    assert!(!changes.selection);
     assert_eq!(session.document().node(reader).unwrap().position, at);
     assert_eq!(session.document().mark(slot(4)), Some(reader));
     assert_eq!(

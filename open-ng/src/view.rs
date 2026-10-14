@@ -1119,9 +1119,11 @@ impl View {
         }
     }
 
-    /// Centres the nodes and zooms to fit them. Does nothing if there are none.
-    fn frame(&mut self, graph: &Graph, nodes: impl Iterator<Item = NodeId>) {
+    /// Centres the nodes and zooms to fit them, as H and G do. Nodes the graph does not have are
+    /// ignored; if it has none of them, nothing changes.
+    pub fn frame(&mut self, graph: &Graph, nodes: impl IntoIterator<Item = NodeId>) {
         let Some(bounds) = nodes
+            .into_iter()
             .filter_map(|id| graph.node_rect(id))
             .reduce(|a, b| Rect {
                 min: Point {
@@ -1871,6 +1873,12 @@ mod tests {
             .unwrap();
         let _ = view.handle_input(&graph, InputEvent::KeyPressed(Key::H), accept_all);
         assert_eq!(view.zoom, MIN_ZOOM);
+
+        // The host frames nodes itself, ignoring those the graph lacks.
+        view.frame(&graph, [NodeId(3), NodeId(99)]);
+        assert_eq!(view.centre, at(400.0, 0.0));
+        view.frame(&graph, [NodeId(99)]);
+        assert_eq!(view.centre, at(400.0, 0.0));
     }
 
     #[test]

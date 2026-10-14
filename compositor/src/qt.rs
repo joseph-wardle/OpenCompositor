@@ -17,6 +17,9 @@ pub mod ffi {
         include!(<QtWidgets/QMenu>);
         #[allow(missing_debug_implementations)]
         type QMenu;
+        include!(<QtWidgets/QLabel>);
+        #[allow(missing_debug_implementations)]
+        type QLabel;
     }
 
     unsafe extern "C++Qt" {
@@ -115,6 +118,8 @@ pub mod ffi {
         ctrl: bool,
         wheel_y: i32,
         key: i32,
+        /// The key's position on the keyboard: an XKB keycode on Wayland and X11.
+        native_scan_code: u32,
         auto_repeat: bool,
         surface_about_to_be_destroyed: bool,
     }
@@ -154,13 +159,17 @@ pub mod ffi {
         ) -> *mut QDockWidget;
         /// Puts the pane in the dock, which owns it from then on.
         unsafe fn container(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QWidget;
+        /// Puts the pane in the dock above a one-line caption, which the dock owns too.
+        unsafe fn container_with_caption(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QLabel;
+        /// Sets the caption's text, and its tooltip for when the text is clipped.
+        unsafe fn set_caption(label: *mut QLabel, text: &QString);
+        unsafe fn caption(label: *mut QLabel) -> QString;
         unsafe fn tabify(
             window: *mut QMainWindow,
             first: *mut QDockWidget,
             second: *mut QDockWidget,
         );
         unsafe fn show_status(window: *mut QMainWindow, text: &QString);
-        unsafe fn status(window: *mut QMainWindow) -> QString;
         /// Runs a modal file dialog. Its nested event loop delivers paints, resizes, timers and
         /// the loader's results, but no input to the panes.
         unsafe fn choose_files(
@@ -171,6 +180,13 @@ pub mod ffi {
         /// A path as the file system names it.
         fn encode_name(path: &QString) -> QByteArray;
         fn close_modal_dialog();
+
+        /// Calls `handle(event type, fields)` for every key press and release in the application,
+        /// before any window or widget receives it, and for the application losing the
+        /// keyboard. The event goes no further if `handle` returns true.
+        fn filter_keys(handle: fn(i32, InputFields) -> bool);
+        /// Whether a text field, a dialog or a menu has the keyboard, rather than the window.
+        fn keyboard_taken() -> bool;
 
         fn new_pane(index: usize) -> *mut Pane;
         fn new_waker() -> *mut Waker;

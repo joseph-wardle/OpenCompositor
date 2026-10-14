@@ -3,7 +3,21 @@ use std::time::Duration;
 
 use super::*;
 use crate::document::NodeKind;
+use crate::loader::{Decoded, LoadError};
 use crate::read::ReadError;
+
+const NONE: Modifiers = Modifiers {
+    shift: false,
+    ctrl: false,
+};
+const CTRL: Modifiers = Modifiers {
+    shift: false,
+    ctrl: true,
+};
+const SHIFT: Modifiers = Modifiers {
+    shift: true,
+    ctrl: false,
+};
 
 /// An app whose loader hands its results to the test, with a 400 × 300 graph pane at scale 2.
 fn app() -> (App, Receiver<Loaded>) {
@@ -20,7 +34,13 @@ fn app() -> (App, Receiver<Loaded>) {
         pane: Pane::Graph,
         size,
     });
-    assert_eq!(requests, [Request::Redraw(Pane::Graph)]);
+    assert_eq!(
+        requests,
+        [
+            Request::Redraw(Pane::Graph),
+            Request::ShowViewerCaption("Slot 1: nothing marked".to_owned())
+        ]
+    );
     (app, deliveries)
 }
 
@@ -35,6 +55,57 @@ fn reader_path(app: &App, id: NodeId) -> Option<&Path> {
         .map(|node| match &node.kind {
             NodeKind::Reader { path } => path.as_path(),
         })
+}
+
+/// Creates a Reader for the path, selected, and returns it.
+fn create(app: &mut App, path: &str) -> NodeId {
+    app.dispatch(Event::FilesChosen {
+        intent: FileIntent::CreateReaders {
+            at: Point::default(),
+        },
+        paths: vec![PathBuf::from(path)],
+    });
+    app.session().document().selection()[0]
+}
+
+fn slot_key(digit: u8, modifiers: Modifiers) -> Event {
+    Event::KeyPressed {
+        key: Key::Slot(Slot::new(digit).unwrap()),
+        modifiers,
+    }
+}
+
+/// The read the viewer is waiting for.
+fn reading(app: &App) -> LoadRequest {
+    app.session()
+        .reading()
+        .cloned()
+        .expect("a read in progress")
+}
+
+/// A finished read of a `width` × `height` image whose pixels the GPU never received.
+fn read(request: &LoadRequest, width: u32, height: u32) -> Event {
+    let window = Window {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    Event::Loaded(Loaded {
+        request: request.clone(),
+        result: Ok(Decoded {
+            info: ImageInfo {
+                display_window: window,
+                data_window: window,
+                warnings: Vec::new(),
+            },
+            pixels: None,
+        }),
+    })
+}
+
+fn title(app: &App, id: NodeId) -> String {
+    app.session().graph().node(id.into()).unwrap().title.clone()
 }
 
 fn receive(deliveries: &Receiver<Loaded>) -> Loaded {
@@ -66,25 +137,15 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
     ];
     let requests = app.dispatch(Event::FilesChosen { intent, paths });
 
-    assert_eq!(
-        requests,
-        [
-            Request::Redraw(Pane::Graph),
-            Request::ShowStatus("Reading a.exr…".to_owned())
-        ]
-    );
+    assert_eq!(requests, [Request::Redraw(Pane::Graph)]);
     let document = app.session().document();
     assert_eq!(document.nodes().count(), 2);
     let first = document.selection()[0];
     assert_eq!(document.node(first).unwrap().position, at);
-    let loaded = receive(&deliveries);
-    assert_eq!(loaded.request.node, first);
-    assert!(matches!(loaded.result, Err(ReadError::Io(_))));
-    let requests = app.dispatch(Event::Loaded(loaded));
-    let [Request::ShowStatus(status)] = requests.as_slice() else {
-        panic!("expected a status, got {requests:?}");
-    };
-    assert!(status.starts_with("a.exr: "), "{status}");
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(100)).is_err(),
+        "a Reader no slot marks was read"
+    );
 }
 
 #[test]
@@ -198,22 +259,21 @@ fn pane_keys_go_to_the_pane_under_the_pointer() {
         },
         paths: vec![PathBuf::from("/nonexistent/a.exr")],
     });
-    let frame = Input::KeyPressed(Key::H);
+    let frame = || Event::KeyPressed {
+        key: Key::H,
+        modifiers: Modifiers::default(),
+    };
 
-    // The graph pane has the keyboard, but the pointer is over the viewer.
+    // The viewer shows nothing to frame.
     app.dispatch(input(Pane::Viewer, Input::PointerEntered));
-    assert_eq!(app.dispatch(input(Pane::Graph, frame)), []);
+    assert_eq!(app.dispatch(frame()), []);
 
     let middle = PhysicalPoint { x: 200.0, y: 150.0 };
     let before = app.session().graph_view().to_graph(middle);
     app.dispatch(input(Pane::Viewer, Input::PointerLeft));
     app.dispatch(input(Pane::Graph, Input::PointerEntered));
     app.dispatch(input(Pane::Graph, Input::PointerMoved { position: middle }));
-    // The viewer pane has the keyboard, but the pointer is over the graph.
-    assert_eq!(
-        app.dispatch(input(Pane::Viewer, frame)),
-        [Request::Redraw(Pane::Graph)]
-    );
+    assert_eq!(app.dispatch(frame()), [Request::Redraw(Pane::Graph)]);
     assert_ne!(app.session().graph_view().to_graph(middle), before);
 }
 
@@ -233,16 +293,12 @@ fn a_pane_asks_for_a_surface_when_exposed_without_one() {
 fn nothing_is_read_once_loading_stops() {
     let (mut app, deliveries) = app();
     app.stop_loading();
+    create(&mut app, "/nonexistent/a.exr");
 
-    let requests = app.dispatch(Event::FilesChosen {
-        intent: FileIntent::CreateReaders {
-            at: Point::default(),
-        },
-        paths: vec![PathBuf::from("/nonexistent/a.exr")],
-    });
+    app.dispatch(slot_key(1, CTRL));
 
-    assert_eq!(requests, [Request::Redraw(Pane::Graph)]);
     assert!(deliveries.recv_timeout(Duration::from_millis(100)).is_err());
+    assert_eq!(app.caption, "Slot 1 · a.exr");
 }
 
 #[test]
@@ -286,4 +342,166 @@ fn only_the_graph_losing_the_keyboard_cancels_its_gesture() {
 
     assert_eq!(drag(Pane::Viewer), Point { x: 50.0, y: 0.0 });
     assert_eq!(drag(Pane::Graph), Point::default());
+}
+
+#[test]
+fn marking_the_selected_node_views_it_and_reads_its_file() {
+    let (mut app, deliveries) = app();
+    let other = create(&mut app, "/nonexistent/b.exr");
+    let id = create(&mut app, "/nonexistent/a.exr");
+
+    let requests = app.dispatch(slot_key(3, CTRL));
+
+    assert_eq!(
+        app.session().document().mark(Slot::new(3).unwrap()),
+        Some(id)
+    );
+    assert_eq!(app.session().viewer().slot().digit(), 3);
+    assert_eq!(title(&app, id), "a.exr [3] · updating");
+    assert_eq!(
+        requests.last(),
+        Some(&Request::ShowViewerCaption(
+            "Slot 3 · a.exr · reading…".to_owned()
+        ))
+    );
+
+    let loaded = receive(&deliveries);
+    assert_eq!(loaded.request, reading(&app));
+    app.dispatch(Event::Loaded(loaded));
+
+    // Failed: the error under the viewer, and the node coloured unlike others.
+    assert_eq!(title(&app, id), "a.exr [3]");
+    let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
+    assert_ne!(color(id), color(other));
+    assert!(
+        app.caption.starts_with("Slot 3 · a.exr · No such file"),
+        "{}",
+        app.caption
+    );
+    assert_eq!(app.session().reading(), None);
+}
+
+#[test]
+fn marking_needs_one_selected_node_and_framing_a_marked_one() {
+    let (mut app, _deliveries) = app();
+    let warning = |requests: Vec<Request>| matches!(requests.as_slice(), [Request::ShowStatus(_)]);
+
+    assert!(warning(app.dispatch(slot_key(1, CTRL))));
+    assert!(warning(app.dispatch(slot_key(1, SHIFT))));
+
+    let id = create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let middle = PhysicalPoint { x: 200.0, y: 150.0 };
+    let before = app.session().graph_view().to_graph(middle);
+    assert_eq!(
+        app.dispatch(slot_key(1, SHIFT)),
+        [Request::Redraw(Pane::Graph)]
+    );
+    let after = app.session().graph_view().to_graph(middle);
+    assert_ne!(after, before);
+    assert_eq!(app.session().document().selection(), [id]);
+}
+
+#[test]
+fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let first = reading(&app);
+    let id = create(&mut app, "/nonexistent/b.exr");
+    app.dispatch(slot_key(2, CTRL));
+    let second = reading(&app);
+    assert_eq!(second.node, id);
+
+    // The first read finishes after the viewer moved on.
+    assert_eq!(app.dispatch(read(&first, 4, 4)), []);
+    assert_eq!(app.caption, "Slot 2 · b.exr · reading…");
+
+    app.dispatch(read(&second, 8, 2));
+    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
+
+    // Back to slot 1, which is read again, showing slot 2's image until then.
+    app.dispatch(slot_key(1, NONE));
+    assert_eq!(reading(&app), first);
+    assert_eq!(
+        app.caption,
+        "Slot 1 · a.exr · reading… (showing b.exr until then)"
+    );
+    // Back to slot 2, which is shown already.
+    app.dispatch(slot_key(2, NONE));
+    assert_eq!(app.session().reading(), None);
+    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
+}
+
+#[test]
+fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
+    let (mut app, _deliveries) = app();
+    let id = create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(read(&reading(&app), 4, 4));
+    assert!(matches!(app.shown, Shown::Image { .. }));
+
+    app.dispatch(Event::Command(Command::Reload));
+    let reload = reading(&app);
+    assert_eq!(reload.reload, 1);
+    assert_eq!(title(&app, id), "a.exr [1] · updating");
+    app.dispatch(Event::Loaded(Loaded {
+        request: reload,
+        result: Err(LoadError::Read(ReadError::UnknownFormat)),
+    }));
+
+    assert!(matches!(app.shown, Shown::Failed { .. }));
+    assert_eq!(app.caption, "Slot 1 · a.exr · not an EXR or PNG file");
+    let failed = app.session().graph().node(id.into()).unwrap().color;
+
+    // Another reload makes the failure old news until the file is read again.
+    app.dispatch(Event::Command(Command::Reload));
+    assert_ne!(app.session().graph().node(id.into()).unwrap().color, failed);
+}
+
+#[test]
+fn undoing_a_mark_leaves_the_viewer_showing_nothing() {
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(read(&reading(&app), 4, 4));
+
+    let requests = app.dispatch(Event::Command(Command::Undo));
+
+    assert!(requests.contains(&Request::Redraw(Pane::Viewer)));
+    assert!(matches!(app.shown, Shown::Nothing));
+    assert_eq!(app.caption, "Slot 1: nothing marked");
+
+    // Redo marks it again, and the file is read again.
+    app.dispatch(Event::Command(Command::Redo));
+    assert_eq!(app.caption, "Slot 1 · a.exr · reading…");
+}
+
+#[test]
+fn h_fits_and_shift_h_shows_actual_size_in_the_viewer_under_the_pointer() {
+    let (mut app, _deliveries) = app();
+    app.dispatch(Event::Resized {
+        pane: Pane::Viewer,
+        size: PaneSize {
+            width: 1000,
+            height: 500,
+            scale_factor: 1.0,
+        },
+    });
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(read(&reading(&app), 4000, 2000));
+    app.dispatch(input(Pane::Viewer, Input::PointerEntered));
+    let display = app.shown.display_window().unwrap();
+    let scale = |app: &App| app.session().viewer().placement(display).scale;
+    assert_eq!(scale(&app), 0.9 / 4.0);
+
+    let key = |modifiers| Event::KeyPressed {
+        key: Key::H,
+        modifiers,
+    };
+    assert_eq!(app.dispatch(key(SHIFT)), [Request::Redraw(Pane::Viewer)]);
+    assert_eq!(scale(&app), 1.0);
+    app.dispatch(key(NONE));
+    assert_eq!(scale(&app), 0.9 / 4.0);
 }

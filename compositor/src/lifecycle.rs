@@ -3,15 +3,15 @@
 //! Qt's private Wayland API.
 //!
 //! It exits 0 if every step ran, a pane floated, docked or reopened had a surface again by the
-//! next step, the image loaded while a dialog was open, and both panes had a surface at the end;
+//! next step, the image was shown while a dialog was open, and both panes had a surface at the end;
 //! 1 if a check failed; and otherwise as a crash or protocol error does.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use open_ng::Point;
-use opencompositor_core::{Event, FileIntent, Pane, Request};
+use open_ng::{Modifiers, Point};
+use opencompositor_core::{Event, FileIntent, Key, Pane, Request, Slot};
 
 use crate::qt::ffi;
 
@@ -27,7 +27,10 @@ const STEPS: [(i32, &str); 13] = [
     (7000, "dock the graph again"),
     (8000, "close the viewer"),
     (9000, "reopen the viewer"),
-    (10_000, "read the image and open a dialog while it loads"),
+    (
+        10_000,
+        "read the image, view it, and open a dialog while it loads",
+    ),
     (15_000, "close the dialog"),
     (16_000, "quit"),
 ];
@@ -87,15 +90,22 @@ fn step(index: usize) {
                 intent: FileIntent::CreateReaders { at },
                 paths: vec![image],
             });
+            crate::dispatch(Event::KeyPressed {
+                key: Key::Slot(Slot::new(1).expect("1 is a slot")),
+                modifiers: Modifiers {
+                    shift: false,
+                    ctrl: true,
+                },
+            });
             // Returns once the next step closes the dialog.
             crate::perform(Request::ChooseFiles(FileIntent::CreateReaders { at }));
         }
         11 => {
-            // SAFETY: as for `dock`.
-            let status = String::from(&unsafe { ffi::status(widgets.window) });
-            if !status.contains(" × ") {
+            // SAFETY: the caption lives as long as the viewer's dock, as for `dock`.
+            let caption = String::from(&unsafe { ffi::caption(widgets.caption) });
+            if !caption.contains(" × ") {
                 fail(format!(
-                    "the image had not loaded with the dialog open: {status:?}"
+                    "the image was not shown with the dialog open: {caption:?}"
                 ));
             }
             ffi::close_modal_dialog();

@@ -9,12 +9,17 @@ publish = false
 
 [dependencies]
 exr = "1.74.2"
+half = "2.7.1"
 imbl = "7.0.2"
 open-ng = { path = "../open-ng", version = "0.4.0" }
 png = "0.18.1"
 pollster = "1.0.1"
 # Backends are the shell's choice; headless tests need none.
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
+
+[dev-dependencies]
+# The loader's staging, tested without a GPU.
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "noop"] }
 
 [lints]
 workspace = true

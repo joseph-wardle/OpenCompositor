@@ -107,10 +107,8 @@ impl Document {
                 DiffItem::Update { new: (&id, _), .. } => id,
             })
             .collect();
-        let mut marks = false;
         for (before, after) in self.marks.iter().zip(&after.marks) {
             if before != after {
-                marks = true;
                 // A node's marks are part of how it is presented.
                 nodes.extend(before.iter().chain(after));
             }
@@ -119,7 +117,6 @@ impl Document {
             nodes,
             selection: !Arc::ptr_eq(&self.selection, &after.selection)
                 && self.selection != after.selection,
-            marks,
         }
     }
 }
@@ -134,11 +131,10 @@ pub struct Changes {
     /// Nodes added, removed, or changed in content, position or marks.
     pub nodes: BTreeSet<NodeId>,
     pub selection: bool,
-    pub marks: bool,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && !self.selection && !self.marks
+        self.nodes.is_empty() && !self.selection
     }
 }

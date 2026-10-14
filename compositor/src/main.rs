@@ -1,6 +1,7 @@
 //! OpenCompositor's Qt shell. Qt owns the windows, docks, dialogs and event loop; the core's
 //! [`App`] owns everything else. Everything here runs on Qt's GUI thread.
 
+mod keys;
 mod lifecycle;
 mod pane;
 mod qt;
@@ -38,6 +39,8 @@ pub struct Widgets {
     pub window: *mut ffi::QMainWindow,
     pub docks: [*mut ffi::QDockWidget; Pane::COUNT],
     pub panes: [*mut qt::Pane; Pane::COUNT],
+    /// Under the viewer.
+    pub caption: *mut ffi::QLabel,
 }
 
 fn main() {
@@ -83,6 +86,7 @@ fn main() {
         let (menu, text, shortcut) = match command {
             Command::ReadFiles => (file_menu, "&Read Files…", "R"),
             Command::ChangeReaderFile => (file_menu, "&Change the Reader's File…", "Shift+R"),
+            Command::Reload => (file_menu, "Re&load the Selected Readers", ""),
             Command::Undo => (edit_menu, "&Undo", "Ctrl+Z"),
             Command::Redo => (edit_menu, "&Redo", "Ctrl+Shift+Z"),
         };
@@ -98,20 +102,23 @@ fn main() {
         // SAFETY: the window and menu are live; the window owns the dock.
         unsafe { ffi::new_dock(window_ptr, window_menu, &QString::from(title), area) }
     });
-    let panes = Pane::ALL.map(|pane| {
-        let window = ffi::new_pane(pane.index());
-        // SAFETY: the dock is live; it owns the pane from here on.
-        unsafe { ffi::container(window, docks[pane.index()]) };
-        window
-    });
+    let panes = Pane::ALL.map(|pane| ffi::new_pane(pane.index()));
+    let [graph_dock, viewer_dock] = Pane::ALL.map(|pane| docks[pane.index()]);
+    // SAFETY: the docks are live; each owns its pane, and the viewer's its caption, from here on.
+    let caption = unsafe {
+        ffi::container(panes[Pane::Graph.index()], graph_dock);
+        ffi::container_with_caption(panes[Pane::Viewer.index()], viewer_dock)
+    };
     WIDGETS.with(|cell| {
         cell.set(Widgets {
             window: window_ptr,
             docks,
             panes,
+            caption,
         })
         .expect("widgets are made once")
     });
+    keys::start();
     window.pin_mut().show();
     if let Some(image) = lifecycle_check {
         lifecycle::start(image);
@@ -168,6 +175,10 @@ pub fn perform(request: Request) {
         // SAFETY: the window is live.
         Request::ShowStatus(text) => unsafe {
             ffi::show_status(widgets.window, &QString::from(&text))
+        },
+        // SAFETY: the caption lives as long as the viewer's dock.
+        Request::ShowViewerCaption(text) => unsafe {
+            ffi::set_caption(widgets.caption, &QString::from(&text))
         },
     }
 }

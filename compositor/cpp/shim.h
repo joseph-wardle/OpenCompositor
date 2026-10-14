@@ -5,6 +5,7 @@
 #include <QtCore/QString>
 #include <QtCore/QStringList>
 #include <QtWidgets/QDockWidget>
+#include <QtWidgets/QLabel>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QMenu>
 #include <memory>
@@ -33,12 +34,17 @@ void new_action(QMenu *menu, const QString &text, const QString &shortcut,
                 rust::Fn<void(size_t)> triggered, size_t command);
 QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area);
 QWidget *container(Pane *pane, QDockWidget *dock);
+QLabel *container_with_caption(Pane *pane, QDockWidget *dock);
+void set_caption(QLabel *label, const QString &text);
+QString caption(QLabel *label);
 void tabify(QMainWindow *window, QDockWidget *first, QDockWidget *second);
 void show_status(QMainWindow *window, const QString &text);
-QString status(QMainWindow *window);
 QStringList choose_files(QMainWindow *window, const QString &title, bool several);
 QByteArray encode_name(const QString &path);
 void close_modal_dialog();
+
+void filter_keys(rust::Fn<bool(int, InputFields)> handle);
+bool keyboard_taken();
 
 Pane *new_pane(size_t index);
 Waker *new_waker();
