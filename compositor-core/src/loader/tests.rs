@@ -166,15 +166,15 @@ fn without_a_gpu_an_image_is_read_but_not_staged() {
 }
 
 #[test]
-fn the_staging_buffer_waits_for_its_return_and_grows_for_a_taller_image() {
+fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     let directory = directory("staging");
     let [small, other, tall] =
         ["small.png", "other.png", "tall.png"].map(|name| directory.join(name));
     write_png(&small, 3, 2);
     write_png(&other, 5, 1);
-    // One pixel wide, which pads each row to 256 bytes: taller than the first buffer holds.
+    // One pixel wide, which pads each row to 256 bytes: over twice what the first buffer holds.
     let (_, first_height) = FIRST_STAGING_SIZE;
-    write_png(&tall, 1, (row_bytes(4096) / 256) * first_height + 1);
+    write_png(&tall, 1, 2 * (row_bytes(4096) / 256) * first_height + 1);
     let (loader, deliveries) = loader();
     loader.connect(noop_device(None));
 
@@ -206,6 +206,12 @@ fn the_staging_buffer_waits_for_its_return_and_grows_for_a_taller_image() {
     let third = receive(&deliveries).result.unwrap().pixels.unwrap();
     assert_ne!(third.buffer(), &buffer);
     assert!(third.buffer().size() > buffer.size());
+    drop(third);
+
+    // Under half the grown buffer, which goes back to the first size.
+    loader.request(request_for(&small));
+    let fourth = receive(&deliveries).result.unwrap().pixels.unwrap();
+    assert_eq!(fourth.buffer().size(), buffer.size());
 }
 
 #[test]

@@ -95,6 +95,8 @@ pub enum Refusal {
     XyzPrimaries,
     PqTransfer,
     HlgTransfer,
+    /// A PNG `cICP` transfer, by its H.273 number, that the reader has no curve for.
+    Transfer(u8),
     LuminanceChroma,
     Deep,
     /// No part has channels named R, G and B. Every channel in the file, by part.
@@ -111,6 +113,9 @@ impl fmt::Display for Refusal {
             Refusal::XyzPrimaries => f.write_str("contains CIE XYZ, not RGB"),
             Refusal::PqTransfer => f.write_str("contains HDR video encoded with PQ"),
             Refusal::HlgTransfer => f.write_str("contains HDR video encoded with HLG"),
+            Refusal::Transfer(transfer) => {
+                write!(f, "uses cICP transfer {transfer}, which cannot be decoded")
+            }
             Refusal::LuminanceChroma => f.write_str("contains luminance and chroma, not RGB"),
             Refusal::Deep => f.write_str("contains deep data"),
             Refusal::NoRgb { channels } => {

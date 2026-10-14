@@ -15,7 +15,7 @@ use std::pin::Pin;
 
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
-use opencompositor_core::{App, Command, Event, FileIntent, Pane, Request};
+use opencompositor_core::{App, Command, Event, FileIntent, Pane, Request, Slot};
 
 use crate::qt::ffi;
 
@@ -28,6 +28,8 @@ thread_local! {
     /// back into the shell synchronously, as when floating a dock destroys a pane's surface.
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     static WIDGETS: OnceCell<Widgets> = const { OnceCell::new() };
+    /// The menus' commands, by the index each item passes to `run_command`.
+    static COMMANDS: OnceCell<Vec<Command>> = const { OnceCell::new() };
     /// Each pane's connection to Qt Wayland's `surfaceRoleDestroyed`.
     static SURFACE_WATCHES: RefCell<[Option<QMetaObjectConnectionGuard>; Pane::COUNT]> =
         RefCell::new(Default::default());
@@ -82,20 +84,66 @@ fn main() {
     window.pin_mut().resize(1400, 900);
     let window_ptr = window.as_mut_ptr();
     // SAFETY: the window is live; it owns the menus.
-    let [file_menu, edit_menu, window_menu] = ["&File", "&Edit", "&Window"]
+    let [file_menu, edit_menu, viewer_menu, window_menu] = ["&File", "&Edit", "&Viewer", "&Window"]
         .map(|title| unsafe { ffi::new_menu(window_ptr, &QString::from(title)) });
-    for (index, command) in Command::ALL.into_iter().enumerate() {
-        let (menu, text, shortcut) = match command {
-            Command::ReadFiles => (file_menu, "&Read Files…", "R"),
-            Command::ChangeReaderFile => (file_menu, "&Change the Reader's File…", "Shift+R"),
-            Command::Reload => (file_menu, "Re&load the Selected Readers", ""),
-            Command::Undo => (edit_menu, "&Undo", "Ctrl+Z"),
-            Command::Redo => (edit_menu, "&Redo", "Ctrl+Shift+Z"),
-        };
+    let mut commands = Vec::new();
+    let mut add = |menu, text: &str, shortcut: &str, command| {
         let [text, shortcut] = [text, shortcut].map(QString::from);
         // SAFETY: the menu is live; it owns the action.
-        unsafe { ffi::new_action(menu, &text, &shortcut, run_command, index) };
+        unsafe { ffi::new_action(menu, &text, &shortcut, run_command, commands.len()) };
+        commands.push(command);
+    };
+    add(file_menu, "&Read Files…", "R", Command::ReadFiles);
+    add(
+        file_menu,
+        "&Change the Reader's File…",
+        "Shift+R",
+        Command::ChangeReaderFile,
+    );
+    add(
+        file_menu,
+        "Re&load the Selected Readers",
+        "",
+        Command::Reload,
+    );
+    add(edit_menu, "&Undo", "Ctrl+Z", Command::Undo);
+    add(edit_menu, "&Redo", "Ctrl+Shift+Z", Command::Redo);
+    // The key filter takes the digit row by position and H for the pane under the pointer, so
+    // these items only name their keys, after a tab, rather than binding shortcuts.
+    let slot_menus = [
+        ("&View Slot", "", Command::ViewSlot as fn(Slot) -> Command),
+        (
+            "&Mark the Selected Node in Slot",
+            "Ctrl+",
+            Command::MarkSlot,
+        ),
+        ("&Frame the Node in Slot", "Shift+", Command::FrameMark),
+    ];
+    for (title, modifier, command) in slot_menus {
+        // SAFETY: the viewer menu is live; it owns the submenu.
+        let menu = unsafe { ffi::new_submenu(viewer_menu, &QString::from(title)) };
+        for digit in (1..=9).chain([0]) {
+            let slot = Slot::new(digit).expect("a digit");
+            add(
+                menu,
+                &format!("Slot {digit}\t{modifier}{digit}"),
+                "",
+                command(slot),
+            );
+        }
     }
+    // SAFETY: the viewer menu is live.
+    unsafe { ffi::add_separator(viewer_menu) };
+    add(viewer_menu, "&Fit the Image\tH", "", Command::FitImage);
+    add(
+        viewer_menu,
+        "&Actual Size\tShift+H",
+        "",
+        Command::ActualSize,
+    );
+    // SAFETY: the viewer menu is live; it owns the note.
+    unsafe { ffi::add_note(viewer_menu, &QString::from("Pan\tSpace+Drag, Middle-Drag")) };
+    COMMANDS.with(|cell| cell.set(commands).expect("menus are made once"));
     let docks = Pane::ALL.map(|pane| {
         let (title, area) = match pane {
             Pane::Graph => ("Node Graph", BOTTOM_DOCK_AREA),
@@ -149,7 +197,9 @@ pub fn dispatch(event: Event) {
 }
 
 fn run_command(index: usize) {
-    dispatch(Event::Command(Command::ALL[index]));
+    let command =
+        COMMANDS.with(|cell| cell.get().expect("menus are made before the event loop")[index]);
+    dispatch(Event::Command(command));
 }
 
 pub fn perform(request: Request) {

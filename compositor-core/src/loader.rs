@@ -11,7 +11,9 @@ use crate::document::NodeId;
 use crate::image::ImageInfo;
 use crate::read::{ReadError, read_image};
 
-/// The staging buffer's first size: a DCI 4K image. A larger image replaces it with one its size.
+/// The staging buffer's first size, a DCI 4K image, and its least. An image larger than the
+/// buffer replaces it with one its size, and so does one less than half its size, so that one
+/// large image does not hold its memory for the rest of the session.
 const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
 
 /// A node's file to read, as of its last reload. The worker reads the path, never the document.
@@ -321,9 +323,11 @@ fn stage(
     let Some((buffer, mapped)) = finishing.mailbox.take_staging() else {
         return Ok(None);
     };
-    let buffer = if buffer.size() < size {
+    let (first_width, first_height) = FIRST_STAGING_SIZE;
+    let fitted = size.max(staging_size(first_width, first_height));
+    let buffer = if buffer.size() < size || buffer.size() / 2 > fitted {
         buffer.destroy();
-        staging_buffer(device, size)
+        staging_buffer(device, fitted)
     } else if mapped {
         buffer
     } else {

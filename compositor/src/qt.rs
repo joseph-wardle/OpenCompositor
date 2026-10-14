@@ -124,6 +124,10 @@ pub mod ffi {
         button: i32,
         shift: bool,
         ctrl: bool,
+        /// Keys only.
+        alt: bool,
+        /// Keys only: the Super or Windows key on Linux.
+        meta: bool,
         wheel_y: i32,
         key: i32,
         /// The key's position on the keyboard: an XKB keycode on Wayland and X11.
@@ -149,6 +153,11 @@ pub mod ffi {
         fn new_main_window() -> UniquePtr<QMainWindow>;
         /// A menu at the end of the window's menu bar, which owns it.
         unsafe fn new_menu(window: *mut QMainWindow, title: &QString) -> *mut QMenu;
+        /// A menu at the end of `menu`, which owns it.
+        unsafe fn new_submenu(menu: *mut QMenu, title: &QString) -> *mut QMenu;
+        unsafe fn add_separator(menu: *mut QMenu);
+        /// A disabled menu item that only explains.
+        unsafe fn add_note(menu: *mut QMenu, text: &QString);
         /// A menu item that calls `triggered(command)`, also from its shortcut, whichever pane has
         /// the keyboard.
         unsafe fn new_action(
@@ -177,6 +186,7 @@ pub mod ffi {
             first: *mut QDockWidget,
             second: *mut QDockWidget,
         );
+        /// Shows the text in the status bar for a few seconds.
         unsafe fn show_status(window: *mut QMainWindow, text: &QString);
         /// Runs a modal file dialog. Its nested event loop delivers paints, resizes, timers and
         /// the loader's results, but no input to the panes.

@@ -98,8 +98,9 @@ impl Gpu {
         self.surfaces[pane.index()].is_some()
     }
 
-    /// Makes the pane's surface, and the device if this is the first, which it returns so that
-    /// the loader can stage images for it. On failure the pane draws nothing; the error says why.
+    /// Makes the pane's surface, and the device if there is none yet, which it returns so that
+    /// the loader can stage images for it. On failure the pane draws nothing and no new device is
+    /// kept; the error says why.
     pub(crate) fn attach(
         &mut self,
         pane: Pane,
@@ -121,35 +122,17 @@ impl Gpu {
         // SAFETY: `NativeWindow::new`'s contract keeps the handles valid until `detach`.
         let surface = unsafe { instance.create_surface_unsafe(target) }
             .map_err(|error| format!("no surface for the {pane:?} pane: {error}"))?;
-        let mut created = None;
-        let device = match &mut self.device {
-            Some(device) => device,
-            None => {
-                let device = self.device.insert(Device::new(instance, &surface)?);
-                created = Some(device.device.clone());
-                device
-            }
+        let new_device = match &self.device {
+            Some(_) => None,
+            None => Some(Device::new(instance, &surface)?),
         };
-        if !device.adapter.is_surface_supported(&surface) {
-            return Err(format!(
-                "the adapter cannot draw to the {pane:?} pane's surface"
-            ));
-        }
-        let mut config = surface
-            .get_default_config(&device.adapter, size.width.max(1), size.height.max(1))
-            .ok_or_else(|| format!("the {pane:?} pane's surface has no configuration"))?;
-        config.format = device.format;
-        // Mailbox replaces a waiting frame instead of blocking for the display, so a draw waits
-        // only when the pane redraws faster than its screen refreshes, which the shell prevents.
-        // Fifo, which every surface supports, is the fallback. The default is the driver's first
-        // mode, which may be Immediate, which tears.
-        let modes = surface.get_capabilities(&device.adapter).present_modes;
-        config.present_mode = if modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
-        } else {
-            wgpu::PresentMode::Fifo
-        };
-        surface.configure(&device.device, &config);
+        let device = new_device
+            .as_ref()
+            .or(self.device.as_ref())
+            .expect("one exists");
+        let config = configure(device, pane, &surface, size)?;
+        let created = new_device.map(|new| self.device.insert(new).device.clone());
+        let device = self.device.as_mut().expect("kept above if new");
         device.configs[pane.index()] = Some(config);
         self.surfaces[pane.index()] = Some(surface);
         Ok(created)
@@ -285,6 +268,36 @@ impl Gpu {
         device.queue.present(frame);
         false
     }
+}
+
+/// Configures a pane's surface for the device.
+fn configure(
+    device: &Device,
+    pane: Pane,
+    surface: &wgpu::Surface,
+    size: PaneSize,
+) -> Result<wgpu::SurfaceConfiguration, String> {
+    if !device.adapter.is_surface_supported(surface) {
+        return Err(format!(
+            "the adapter cannot draw to the {pane:?} pane's surface"
+        ));
+    }
+    let mut config = surface
+        .get_default_config(&device.adapter, size.width.max(1), size.height.max(1))
+        .ok_or_else(|| format!("the {pane:?} pane's surface has no configuration"))?;
+    config.format = device.format;
+    // Mailbox replaces a waiting frame instead of blocking for the display, so a draw waits
+    // only when the pane redraws faster than its screen refreshes, which the shell prevents.
+    // Fifo, which every surface supports, is the fallback. The default is the driver's first
+    // mode, which may be Immediate, which tears.
+    let modes = surface.get_capabilities(&device.adapter).present_modes;
+    config.present_mode = if modes.contains(&wgpu::PresentMode::Mailbox) {
+        wgpu::PresentMode::Mailbox
+    } else {
+        wgpu::PresentMode::Fifo
+    };
+    surface.configure(&device.device, &config);
+    Ok(config)
 }
 
 impl Device {

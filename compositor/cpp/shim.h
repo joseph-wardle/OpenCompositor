@@ -30,6 +30,9 @@ void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t argument);
 
 std::unique_ptr<QMainWindow> new_main_window();
 QMenu *new_menu(QMainWindow *window, const QString &title);
+QMenu *new_submenu(QMenu *menu, const QString &title);
+void add_separator(QMenu *menu);
+void add_note(QMenu *menu, const QString &text);
 void new_action(QMenu *menu, const QString &text, const QString &shortcut,
                 rust::Fn<void(size_t)> triggered, size_t command);
 QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area);

@@ -38,7 +38,9 @@ fn app() -> (App, Receiver<Loaded>) {
         requests,
         [
             Request::Redraw(Pane::Graph),
-            Request::ShowViewerCaption("Slot 1: nothing marked".to_owned())
+            Request::ShowViewerCaption(
+                "Slot 1: nothing marked. Read files with R, then mark one with Ctrl+1".to_owned()
+            )
         ]
     );
     (app, deliveries)
@@ -137,7 +139,15 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
     ];
     let requests = app.dispatch(Event::FilesChosen { intent, paths });
 
-    assert_eq!(requests, [Request::Redraw(Pane::Graph)]);
+    assert_eq!(
+        requests,
+        [
+            Request::Redraw(Pane::Graph),
+            Request::ShowViewerCaption(
+                "Slot 1: nothing marked. Ctrl+1 marks the selected node".to_owned()
+            )
+        ]
+    );
     let document = app.session().document();
     assert_eq!(document.nodes().count(), 2);
     let first = document.selection()[0];
@@ -243,10 +253,10 @@ fn undo_and_redo_redraw_the_graph_only_when_they_change_it() {
         },
         paths: vec![PathBuf::from("/nonexistent/a.exr")],
     });
-    let redraw = [Request::Redraw(Pane::Graph)];
-    assert_eq!(app.dispatch(Event::Command(Command::Undo)), redraw);
+    let redraws = |requests: Vec<Request>| requests.contains(&Request::Redraw(Pane::Graph));
+    assert!(redraws(app.dispatch(Event::Command(Command::Undo))));
     assert_eq!(app.session().graph().nodes().count(), 0);
-    assert_eq!(app.dispatch(Event::Command(Command::Redo)), redraw);
+    assert!(redraws(app.dispatch(Event::Command(Command::Redo))));
     assert_eq!(app.session().graph().nodes().count(), 1);
 }
 
@@ -264,9 +274,12 @@ fn pane_keys_go_to_the_pane_under_the_pointer() {
         modifiers: Modifiers::default(),
     };
 
-    // The viewer shows nothing to frame.
+    // The viewer shows nothing to frame, and says so.
     app.dispatch(input(Pane::Viewer, Input::PointerEntered));
-    assert_eq!(app.dispatch(frame()), []);
+    assert!(matches!(
+        app.dispatch(frame()).as_slice(),
+        [Request::ShowStatus(_)]
+    ));
 
     let middle = PhysicalPoint { x: 200.0, y: 150.0 };
     let before = app.session().graph_view().to_graph(middle);
@@ -345,7 +358,8 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
         Some(id)
     );
     assert_eq!(app.session().viewer().slot().digit(), 3);
-    assert_eq!(title(&app, id), "a.exr [3] · updating");
+    // Only the caption says it is reading, so the node keeps its size.
+    assert_eq!(title(&app, id), "a.exr [3]");
     assert_eq!(
         requests.last(),
         Some(&Request::ShowViewerCaption(
@@ -358,7 +372,6 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     app.dispatch(Event::Loaded(loaded));
 
     // Failed: the error under the viewer, and the node coloured unlike others.
-    assert_eq!(title(&app, id), "a.exr [3]");
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
     assert_ne!(color(id), color(other));
     assert!(
@@ -432,7 +445,6 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     app.dispatch(Event::Command(Command::Reload));
     let reload = reading(&app);
     assert_eq!(reload.reload, 1);
-    assert_eq!(title(&app, id), "a.exr [1] · updating");
     app.dispatch(Event::Loaded(Loaded {
         request: reload,
         result: Err(LoadError::Read(ReadError::UnknownFormat)),
@@ -458,7 +470,10 @@ fn undoing_a_mark_leaves_the_viewer_showing_nothing() {
 
     assert!(requests.contains(&Request::Redraw(Pane::Viewer)));
     assert!(matches!(app.shown, Shown::Nothing));
-    assert_eq!(app.caption, "Slot 1: nothing marked");
+    assert_eq!(
+        app.caption,
+        "Slot 1: nothing marked. Ctrl+1 marks the selected node"
+    );
 
     // Redo marks it again, and the file is read again.
     app.dispatch(Event::Command(Command::Redo));

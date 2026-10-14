@@ -98,16 +98,16 @@ pub enum Command {
     Reload,
     Undo,
     Redo,
-}
-
-impl Command {
-    pub const ALL: [Command; 5] = [
-        Command::ReadFiles,
-        Command::ChangeReaderFile,
-        Command::Reload,
-        Command::Undo,
-        Command::Redo,
-    ];
+    /// Views what the slot marks.
+    ViewSlot(Slot),
+    /// Marks the one selected node in the slot, and views it.
+    MarkSlot(Slot),
+    /// Centres the node the slot marks in the graph.
+    FrameMark(Slot),
+    /// Fits the viewed image's display window to the viewer.
+    FitImage,
+    /// Shows the viewed image one pixel to a physical pixel.
+    ActualSize,
 }
 
 /// The keys the window uses. The pane under the pointer receives all but the slot keys.
@@ -408,21 +408,13 @@ impl App {
     }
 
     fn viewer_key(&mut self, key: Key, modifiers: Modifiers) -> Vec<Request> {
-        let display = self.shown.display_window();
-        let viewer = self.session.viewer_mut();
-        match (key, display) {
-            (Key::Space, _) => {
-                viewer.hold_space(true);
+        match key {
+            Key::Space => {
+                self.session.viewer_mut().hold_space(true);
                 Vec::new()
             }
-            (Key::H, Some(display)) => {
-                if modifiers.shift {
-                    viewer.actual_size(display);
-                } else {
-                    viewer.fit();
-                }
-                vec![Request::Redraw(Pane::Viewer)]
-            }
+            Key::H if modifiers.shift => self.command(Command::ActualSize),
+            Key::H => self.command(Command::FitImage),
             _ => Vec::new(),
         }
     }
@@ -444,29 +436,9 @@ impl App {
 
     fn slot_key(&mut self, slot: Slot, modifiers: Modifiers) -> Vec<Request> {
         match (modifiers.ctrl, modifiers.shift) {
-            (false, false) => {
-                self.session.viewer_mut().show_slot(slot);
-                vec![Request::Redraw(Pane::Viewer)]
-            }
-            (true, false) => match self.session.document().selection() {
-                &[id] => {
-                    let changes = self.session.set_mark(slot, Some(id));
-                    debug_assert!(changes.is_ok(), "a selected node exists");
-                    self.session.viewer_mut().show_slot(slot);
-                    vec![Request::Redraw(Pane::Graph), Request::Redraw(Pane::Viewer)]
-                }
-                _ => vec![Request::ShowStatus("Select one node to mark it".to_owned())],
-            },
-            (false, true) => {
-                if self.session.frame_mark(slot) {
-                    vec![Request::Redraw(Pane::Graph)]
-                } else {
-                    vec![Request::ShowStatus(format!(
-                        "Slot {} marks nothing",
-                        slot.digit()
-                    ))]
-                }
-            }
+            (false, false) => self.command(Command::ViewSlot(slot)),
+            (true, false) => self.command(Command::MarkSlot(slot)),
+            (false, true) => self.command(Command::FrameMark(slot)),
             (true, true) => Vec::new(),
         }
     }
@@ -491,6 +463,41 @@ impl App {
             }
             Command::Undo => redraw_if(Pane::Graph, !self.session.undo().is_empty()),
             Command::Redo => redraw_if(Pane::Graph, !self.session.redo().is_empty()),
+            Command::ViewSlot(slot) => {
+                self.session.viewer_mut().show_slot(slot);
+                vec![Request::Redraw(Pane::Viewer)]
+            }
+            Command::MarkSlot(slot) => match self.session.document().selection() {
+                &[id] => {
+                    let changes = self.session.set_mark(slot, Some(id));
+                    debug_assert!(changes.is_ok(), "a selected node exists");
+                    self.session.viewer_mut().show_slot(slot);
+                    vec![Request::Redraw(Pane::Graph), Request::Redraw(Pane::Viewer)]
+                }
+                _ => vec![Request::ShowStatus("Select one node to mark it".to_owned())],
+            },
+            Command::FrameMark(slot) => {
+                if self.session.frame_mark(slot) {
+                    vec![Request::Redraw(Pane::Graph)]
+                } else {
+                    vec![Request::ShowStatus(format!(
+                        "Slot {} marks nothing",
+                        slot.digit()
+                    ))]
+                }
+            }
+            Command::FitImage | Command::ActualSize => {
+                let Some(display) = self.shown.display_window() else {
+                    return vec![Request::ShowStatus("The viewer shows no image".to_owned())];
+                };
+                let viewer = self.session.viewer_mut();
+                if command == Command::FitImage {
+                    viewer.fit();
+                } else {
+                    viewer.actual_size(display);
+                }
+                vec![Request::Redraw(Pane::Viewer)]
+            }
         }
     }
 
@@ -575,9 +582,7 @@ impl App {
             if let Some(request) = &read {
                 self.loader.request(request.clone());
             }
-            if self.session.start_reading(read) {
-                requests.push(Request::Redraw(Pane::Graph));
-            }
+            self.session.start_reading(read);
         }
         let caption = self.caption();
         if caption != self.caption {
@@ -589,7 +594,15 @@ impl App {
     fn caption(&self) -> String {
         let slot = self.session.viewer().slot().digit();
         let request = match self.session.viewed() {
-            Viewed::Unmarked => return format!("Slot {slot}: nothing marked"),
+            // The next step, for an artist who has not found the menus yet.
+            Viewed::Unmarked if self.session.document().nodes().next().is_none() => {
+                return format!(
+                    "Slot {slot}: nothing marked. Read files with R, then mark one with Ctrl+{slot}"
+                );
+            }
+            Viewed::Unmarked => {
+                return format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node");
+            }
             Viewed::Missing(_) => {
                 return format!("Slot {slot}: the node it marked no longer exists");
             }

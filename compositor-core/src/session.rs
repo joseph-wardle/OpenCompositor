@@ -49,16 +49,6 @@ pub enum Viewed {
     Node(LoadRequest),
 }
 
-/// A node's part in reading files, shown on it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LoadStatus {
-    Idle,
-    /// Its file is being read for the viewer.
-    Updating,
-    /// Reading its file failed, and it would read the same file again.
-    Failed,
-}
-
 /// What the session knows of reading nodes' files. Unsaved and not undoable.
 #[derive(Debug, Default)]
 pub(crate) struct Loads {
@@ -81,22 +71,11 @@ impl Loads {
         })
     }
 
-    pub(crate) fn status(&self, document: &Document, id: NodeId) -> LoadStatus {
-        if self
-            .reading
-            .as_ref()
-            .is_some_and(|reading| reading.node == id)
-        {
-            LoadStatus::Updating
-        } else if self
-            .failed
+    /// Whether reading the node's file failed, and it would read the same file again.
+    pub(crate) fn failed(&self, document: &Document, id: NodeId) -> bool {
+        self.failed
             .get(&id)
             .is_some_and(|failed| self.request(document, id).as_ref() == Some(failed))
-        {
-            LoadStatus::Failed
-        } else {
-            LoadStatus::Idle
-        }
     }
 }
 
@@ -180,14 +159,9 @@ impl Session {
         self.loads.reading.as_ref()
     }
 
-    /// Records a read starting for the viewer, or none. Returns whether the graph changed.
-    pub(crate) fn start_reading(&mut self, request: Option<LoadRequest>) -> bool {
-        let before = std::mem::replace(&mut self.loads.reading, request);
-        let nodes = [
-            before.map(|r| r.node),
-            self.loads.reading.as_ref().map(|r| r.node),
-        ];
-        self.present_statuses(nodes.into_iter().flatten())
+    /// Records a read starting for the viewer, or none.
+    pub(crate) fn start_reading(&mut self, request: Option<LoadRequest>) {
+        self.loads.reading = request;
     }
 
     /// Records how the read in progress ended. Returns whether the graph changed.
@@ -386,7 +360,7 @@ impl Session {
         changed
     }
 
-    /// Presents nodes whose load status may have changed. Returns whether any did.
+    /// Presents nodes whose failure to read may have changed. Returns whether any did.
     fn present_statuses(&mut self, nodes: impl IntoIterator<Item = NodeId>) -> bool {
         self.present(&Changes {
             nodes: nodes.into_iter().collect::<BTreeSet<_>>(),

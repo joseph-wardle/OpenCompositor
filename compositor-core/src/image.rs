@@ -227,16 +227,26 @@ pub enum PngColorType {
     Indexed,
 }
 
-/// A PNG `cICP` chunk's code points, as ITU-T H.273 numbers them.
+/// A PNG `cICP` chunk's code points, as ITU-T H.273 numbers them. Its matrix is always 0, RGB:
+/// `png` refuses a file with any other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cicp {
     pub primaries: u8,
     pub transfer: u8,
+    /// Whether codes span the whole range, rather than 16 to 235 at 8 bits, as video stores them.
+    pub full_range: bool,
 }
 
 impl Cicp {
     pub const BT709_PRIMARIES: u8 = 1;
+    pub const BT709_TRANSFER: u8 = 1;
+    pub const GAMMA_22_TRANSFER: u8 = 4;
+    pub const GAMMA_28_TRANSFER: u8 = 5;
+    pub const BT601_TRANSFER: u8 = 6;
+    pub const LINEAR_TRANSFER: u8 = 8;
     pub const SRGB_TRANSFER: u8 = 13;
+    pub const BT2020_10_BIT_TRANSFER: u8 = 14;
+    pub const BT2020_12_BIT_TRANSFER: u8 = 15;
     pub const PQ_TRANSFER: u8 = 16;
     pub const HLG_TRANSFER: u8 = 18;
 }
@@ -303,12 +313,10 @@ pub enum Warning {
         views: Vec<String>,
         shown: String,
     },
-    /// A PNG `gAMA` other than sRGB's, decoded as sRGB.
-    Gamma(f32),
     /// An ICC profile, ignored and decoded as sRGB.
     IccProfile,
-    /// `cICP` code points other than sRGB's, ignored and decoded as sRGB.
-    Cicp(Cicp),
+    /// `cICP` primaries other than Rec.709's, shown as if they were Rec.709's.
+    CicpPrimaries(u8),
 }
 
 impl fmt::Display for Warning {
@@ -327,12 +335,10 @@ impl fmt::Display for Warning {
             Warning::SeveralViews { views, shown } => {
                 write!(f, "views {}; showing {shown}", views.join(", "))
             }
-            Warning::Gamma(gamma) => write!(f, "gamma is {gamma}; decoded as sRGB"),
             Warning::IccProfile => f.write_str("ICC profile ignored; decoded as sRGB"),
-            Warning::Cicp(cicp) => write!(
+            Warning::CicpPrimaries(primaries) => write!(
                 f,
-                "cICP primaries {} and transfer {} ignored; decoded as sRGB",
-                cicp.primaries, cicp.transfer
+                "cICP primaries {primaries} are not Rec.709; shown as Rec.709"
             ),
         }
     }

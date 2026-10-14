@@ -48,7 +48,8 @@ fn handle(kind: i32, fields: ffi::InputFields) -> bool {
             }
             false
         }
-        KEY_PRESS if !ffi::keyboard_taken() => {
+        // Alt and Meta belong to menus' mnemonics and the desktop's shortcuts.
+        KEY_PRESS if !fields.alt && !fields.meta && !ffi::keyboard_taken() => {
             if !fields.auto_repeat {
                 let modifiers = Modifiers {
                     shift: fields.shift,

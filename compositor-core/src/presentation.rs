@@ -3,7 +3,7 @@
 use open_ng::{Color, Direction, Graph, NodeRecord, Pin, PinId, Row};
 
 use crate::document::{Changes, Document, Node, NodeId, NodeKind};
-use crate::session::{LoadStatus, Loads};
+use crate::session::Loads;
 
 const READER_COLOR: Color = Color {
     r: 70,
@@ -74,7 +74,9 @@ pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node
     let NodeKind::Reader { path } = &node.kind;
     let name = path.file_name().unwrap_or(path.as_os_str());
     let mut title = name.to_string_lossy().into_owned();
-    // Slot numbers and status go in the title and colour until OpenNG has badges.
+    // Slot numbers go in the title, and a failed read in the colour, until OpenNG has badges.
+    // Nothing shows a read in progress: the title would widen the node while it lasted, and the
+    // viewer's caption says it.
     let slots: Vec<_> = document
         .slots_marking(id)
         .map(|slot| slot.digit().to_string())
@@ -82,14 +84,10 @@ pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node
     if !slots.is_empty() {
         title = format!("{title} [{}]", slots.join(" "));
     }
-    let status = loads.status(document, id);
-    if status == LoadStatus::Updating {
-        title.push_str(" · updating");
-    }
     NodeRecord {
         position: node.position,
         title,
-        color: if status == LoadStatus::Failed {
+        color: if loads.failed(document, id) {
             FAILED_COLOR
         } else {
             READER_COLOR

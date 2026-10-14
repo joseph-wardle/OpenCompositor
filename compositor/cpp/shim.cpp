@@ -37,6 +37,9 @@ std::unique_ptr<QMainWindow> new_main_window() {
 QMenu *new_menu(QMainWindow *window, const QString &title) {
     return window->menuBar()->addMenu(title);
 }
+QMenu *new_submenu(QMenu *menu, const QString &title) { return menu->addMenu(title); }
+void add_separator(QMenu *menu) { menu->addSeparator(); }
+void add_note(QMenu *menu, const QString &text) { menu->addAction(text)->setEnabled(false); }
 void new_action(QMenu *menu, const QString &text, const QString &shortcut,
                 rust::Fn<void(size_t)> triggered, size_t command) {
     auto *action = menu->addAction(text);
@@ -77,7 +80,8 @@ void tabify(QMainWindow *window, QDockWidget *first, QDockWidget *second) {
     window->tabifyDockWidget(first, second);
 }
 void show_status(QMainWindow *window, const QString &text) {
-    window->statusBar()->showMessage(text);
+    // Long enough to read a sentence. A message answers what was just done, and goes stale.
+    window->statusBar()->showMessage(text, 6000);
 }
 QStringList choose_files(QMainWindow *window, const QString &title, bool several) {
     if (several) return QFileDialog::getOpenFileNames(window, title);
@@ -141,6 +145,8 @@ InputFields input_fields(const QEvent *event) {
         f.auto_repeat = e->isAutoRepeat();
         f.shift = e->modifiers() & Qt::ShiftModifier;
         f.ctrl = e->modifiers() & Qt::ControlModifier;
+        f.alt = e->modifiers() & Qt::AltModifier;
+        f.meta = e->modifiers() & Qt::MetaModifier;
     }
     if (auto *e = dynamic_cast<const QPlatformSurfaceEvent *>(event))
         f.surface_about_to_be_destroyed =

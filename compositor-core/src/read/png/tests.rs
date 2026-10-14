@@ -201,29 +201,56 @@ fn every_colour_type_expands_to_rgba() {
     );
 }
 
-#[test]
-fn hdr_transfers_are_refused() {
-    // BT.2020 primaries, then the transfer, then matrix and full range as cICP stores them.
-    let pq = tagged(|_| {}, &[(*b"cICP", &[9, 16, 0, 1])]);
-    let hlg = tagged(|_| {}, &[(*b"cICP", &[9, 18, 0, 1])]);
+/// The red of the one pixel `tagged` writes, as read.
+fn red(bytes: &[u8]) -> f32 {
+    read_bytes(bytes).expect("the image reads").pixel(0, 0)[0]
+}
 
-    assert!(matches!(
-        read_bytes(&pq),
-        Err(ReadError::Refused(Refusal::PqTransfer))
-    ));
-    assert!(matches!(
-        read_bytes(&hlg),
-        Err(ReadError::Refused(Refusal::HlgTransfer))
-    ));
+/// A `cICP` chunk: primaries, transfer, matrix and whether full range, as the chunk stores them.
+fn cicp(primaries: u8, transfer: u8, full_range: bool) -> [u8; 4] {
+    [primaries, transfer, 0, full_range.into()]
 }
 
 #[test]
-fn colour_chunks_other_than_srgb_load_with_warnings() {
+fn transfer_curves_and_narrow_range_are_honoured() {
+    let grey = 128.0 / 255.0;
     let gamma =
         |value| move |info: &mut Info<'static>| info.source_gamma = Some(ScaledFloat::new(value));
-    assert_eq!(warnings(&tagged(gamma(1.0), &[])), [Warning::Gamma(1.0)]);
-    assert_eq!(warnings(&tagged(gamma(SRGB_GAMMA), &[])), []);
+    assert_eq!(red(&tagged(gamma(1.0), &[])), grey);
+    assert_eq!(red(&tagged(gamma(SRGB_GAMMA), &[])), linear(128));
+    assert_eq!(red(&tagged(gamma(0.5), &[])), grey * grey);
 
+    let with_cicp = |transfer| red(&tagged(|_| {}, &[(*b"cICP", &cicp(1, transfer, true))]));
+    assert_eq!(with_cicp(Cicp::SRGB_TRANSFER), linear(128));
+    assert_eq!(with_cicp(Cicp::LINEAR_TRANSFER), grey);
+    assert_eq!(with_cicp(Cicp::GAMMA_22_TRANSFER), grey.powf(2.2));
+    assert_eq!(
+        with_cicp(Cicp::BT709_TRANSFER),
+        ((grey + 0.099) / 1.099).powf(1.0 / 0.45)
+    );
+
+    // Black, white and beyond white in narrow range, opaque, then below black and partly
+    // covered: alpha's codes are full range.
+    let narrow = png(
+        ColorType::Rgba,
+        BitDepth::Eight,
+        2,
+        &[16, 235, 255, 255, 0, 0, 0, 16],
+        |_| {},
+        &[(*b"cICP", &cicp(1, Cicp::LINEAR_TRANSFER, false))],
+    );
+    let image = read_bytes(&narrow).unwrap();
+    assert_eq!(image.pixel(0, 0), [0.0, 1.0, 20.0 / 219.0 + 1.0, 1.0]);
+    let alpha = 16.0 / 255.0;
+    let below_black = -16.0 / 219.0 * alpha;
+    assert_eq!(
+        image.pixel(1, 0),
+        [below_black, below_black, below_black, alpha]
+    );
+}
+
+#[test]
+fn primaries_and_icc_profiles_load_with_warnings() {
     let p3 = |info: &mut Info<'static>| info.source_chromaticities = Some(p3());
     assert!(matches!(
         warnings(&tagged(p3, &[])).as_slice(),
@@ -235,18 +262,43 @@ fn colour_chunks_other_than_srgb_load_with_warnings() {
         })
     ));
 
+    let bt2020 = cicp(9, Cicp::SRGB_TRANSFER, true);
+    assert_eq!(
+        warnings(&tagged(|_| {}, &[(*b"cICP", &bt2020)])),
+        [Warning::CicpPrimaries(9)]
+    );
+    let srgb = cicp(1, Cicp::SRGB_TRANSFER, true);
+    assert_eq!(warnings(&tagged(|_| {}, &[(*b"cICP", &srgb)])), []);
+
     let profile = |info: &mut Info<'static>| info.icc_profile = Some(Cow::Owned(vec![0; 128]));
     assert_eq!(warnings(&tagged(profile, &[])), [Warning::IccProfile]);
-
-    let bt2020: &[([u8; 4], &[u8])] = &[(*b"cICP", &[9, 13, 0, 1])];
+    // A profile that does not decompress, which `png` drops without a word.
+    let broken: &[u8] = b"profile\0\0not zlib";
     assert_eq!(
-        warnings(&tagged(|_| {}, bt2020)),
-        [Warning::Cicp(Cicp {
-            primaries: 9,
-            transfer: 13
-        })]
+        warnings(&tagged(|_| {}, &[(*b"iCCP", broken)])),
+        [Warning::IccProfile]
     );
-    assert_eq!(warnings(&tagged(|_| {}, &[(*b"cICP", &[1, 13, 0, 1])])), []);
+}
+
+#[test]
+fn transfers_without_a_curve_and_matrices_other_than_rgb_are_refused() {
+    let read = |chunk: [u8; 4]| read_bytes(&tagged(|_| {}, &[(*b"cICP", &chunk)]));
+
+    assert!(matches!(
+        read(cicp(9, Cicp::PQ_TRANSFER, true)),
+        Err(ReadError::Refused(Refusal::PqTransfer))
+    ));
+    assert!(matches!(
+        read(cicp(9, Cicp::HLG_TRANSFER, true)),
+        Err(ReadError::Refused(Refusal::HlgTransfer))
+    ));
+    // SMPTE ST 428's.
+    assert!(matches!(
+        read(cicp(1, 17, true)),
+        Err(ReadError::Refused(Refusal::Transfer(17)))
+    ));
+    // BT.709's YCbCr matrix.
+    assert!(matches!(read([1, 13, 1, 1]), Err(ReadError::Decode(_))));
 }
 
 #[test]
