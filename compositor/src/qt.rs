@@ -17,6 +17,9 @@ pub mod ffi {
         include!(<QtWidgets/QMenu>);
         #[allow(missing_debug_implementations)]
         type QMenu;
+        include!(<QtGui/QAction>);
+        #[allow(missing_debug_implementations)]
+        type QAction;
         include!(<QtWidgets/QLabel>);
         #[allow(missing_debug_implementations)]
         type QLabel;
@@ -166,7 +169,8 @@ pub mod ffi {
             shortcut: &QString,
             triggered: fn(usize),
             command: usize,
-        );
+        ) -> *mut QAction;
+        unsafe fn set_action(action: *mut QAction, text: &QString, enabled: bool);
         /// A dock in a `Qt::DockWidgetArea`, listed in `menu`.
         unsafe fn new_dock(
             window: *mut QMainWindow,

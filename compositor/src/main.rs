@@ -7,7 +7,7 @@ mod pace;
 mod pane;
 mod qt;
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
@@ -33,7 +33,12 @@ thread_local! {
     /// Each pane's connection to Qt Wayland's `surfaceRoleDestroyed`.
     static SURFACE_WATCHES: RefCell<[Option<QMetaObjectConnectionGuard>; Pane::COUNT]> =
         RefCell::new(Default::default());
+    /// What the Undo and Redo items name, once set.
+    static UNDO_LABELS: Cell<Option<UndoLabels>> = const { Cell::new(None) };
 }
+
+/// What undo and then redo would undo and redo, if anything.
+type UndoLabels = [Option<&'static str>; 2];
 
 /// The Qt objects the shell acts on. Docks are hidden when closed, not deleted, so all of them
 /// live until the main window is destroyed after the event loop.
@@ -44,6 +49,8 @@ pub struct Widgets {
     pub panes: [*mut qt::Pane; Pane::COUNT],
     /// Under the viewer.
     pub caption: *mut ffi::QLabel,
+    pub undo: *mut ffi::QAction,
+    pub redo: *mut ffi::QAction,
 }
 
 fn main() {
@@ -90,8 +97,10 @@ fn main() {
     let mut add = |menu, text: &str, shortcut: &str, command| {
         let [text, shortcut] = [text, shortcut].map(QString::from);
         // SAFETY: the menu is live; it owns the action.
-        unsafe { ffi::new_action(menu, &text, &shortcut, run_command, commands.len()) };
+        let action =
+            unsafe { ffi::new_action(menu, &text, &shortcut, run_command, commands.len()) };
         commands.push(command);
+        action
     };
     add(file_menu, "&Read Files…", "R", Command::ReadFiles);
     add(
@@ -106,8 +115,8 @@ fn main() {
         "",
         Command::Reload,
     );
-    add(edit_menu, "&Undo", "Ctrl+Z", Command::Undo);
-    add(edit_menu, "&Redo", "Ctrl+Shift+Z", Command::Redo);
+    let undo = add(edit_menu, "&Undo", "Ctrl+Z", Command::Undo);
+    let redo = add(edit_menu, "&Redo", "Ctrl+Shift+Z", Command::Redo);
     // The key filter takes the digit row by position and H for the pane under the pointer, so
     // these items only name their keys, after a tab, rather than binding shortcuts.
     let slot_menus = [
@@ -165,9 +174,12 @@ fn main() {
             docks,
             panes,
             caption,
+            undo,
+            redo,
         })
         .expect("widgets are made once")
     });
+    show_undo_labels([None, None]);
     keys::start();
     window.pin_mut().show();
     if let Some(image) = lifecycle_check {
@@ -187,12 +199,39 @@ fn main() {
 
 /// Hands an event to the app, then does what it asks.
 pub fn dispatch(event: Event) {
-    let requests = APP.with(|cell| match cell.borrow_mut().as_mut() {
-        Some(app) => app.dispatch(event),
-        None => Vec::new(),
+    let handled = APP.with(|cell| {
+        let mut app = cell.borrow_mut();
+        let app = app.as_mut()?;
+        let requests = app.dispatch(event);
+        let session = app.session();
+        Some((requests, [session.undo_label(), session.redo_label()]))
     });
+    let Some((requests, labels)) = handled else {
+        return;
+    };
+    // Before the requests, which may dispatch again and show newer labels.
+    show_undo_labels(labels);
     for request in requests {
         perform(request);
+    }
+}
+
+/// Names in the Edit menu what undo and redo would do, and disables either when there is nothing.
+fn show_undo_labels(labels: UndoLabels) {
+    if UNDO_LABELS.replace(Some(labels)) == Some(labels) {
+        return;
+    }
+    let widgets = widgets();
+    for ((action, verb), label) in [(widgets.undo, "&Undo"), (widgets.redo, "&Redo")]
+        .into_iter()
+        .zip(labels)
+    {
+        let text = match label {
+            Some(label) => format!("{verb} {label}"),
+            None => verb.to_owned(),
+        };
+        // SAFETY: the Edit menu owns the action, and lives as long as the window.
+        unsafe { ffi::set_action(action, &QString::from(&text), label.is_some()) };
     }
 }
 

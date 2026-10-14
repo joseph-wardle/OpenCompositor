@@ -40,11 +40,16 @@ QMenu *new_menu(QMainWindow *window, const QString &title) {
 QMenu *new_submenu(QMenu *menu, const QString &title) { return menu->addMenu(title); }
 void add_separator(QMenu *menu) { menu->addSeparator(); }
 void add_note(QMenu *menu, const QString &text) { menu->addAction(text)->setEnabled(false); }
-void new_action(QMenu *menu, const QString &text, const QString &shortcut,
-                rust::Fn<void(size_t)> triggered, size_t command) {
+QAction *new_action(QMenu *menu, const QString &text, const QString &shortcut,
+                    rust::Fn<void(size_t)> triggered, size_t command) {
     auto *action = menu->addAction(text);
     action->setShortcut(QKeySequence(shortcut));
     QObject::connect(action, &QAction::triggered, [=] { triggered(command); });
+    return action;
+}
+void set_action(QAction *action, const QString &text, bool enabled) {
+    action->setText(text);
+    action->setEnabled(enabled);
 }
 QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area) {
     auto *dock = new QDockWidget(title, window);

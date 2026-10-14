@@ -4,6 +4,7 @@
 #include <QtCore/QEvent>
 #include <QtCore/QString>
 #include <QtCore/QStringList>
+#include <QtGui/QAction>
 #include <QtWidgets/QDockWidget>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QMainWindow>
@@ -33,8 +34,9 @@ QMenu *new_menu(QMainWindow *window, const QString &title);
 QMenu *new_submenu(QMenu *menu, const QString &title);
 void add_separator(QMenu *menu);
 void add_note(QMenu *menu, const QString &text);
-void new_action(QMenu *menu, const QString &text, const QString &shortcut,
+QAction *new_action(QMenu *menu, const QString &text, const QString &shortcut,
                 rust::Fn<void(size_t)> triggered, size_t command);
+void set_action(QAction *action, const QString &text, bool enabled);
 QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area);
 QWidget *container(Pane *pane, QDockWidget *dock);
 QLabel *container_with_caption(Pane *pane, QDockWidget *dock);

@@ -15,6 +15,9 @@ const FAILED_COLOR: Color = Color {
     g: 60,
     b: 60,
 };
+/// A node is as wide as its title, so a longer file name is shortened in the middle until OpenNG
+/// elides titles itself.
+const MAX_NAME_CHARS: usize = 32;
 
 /// Brings the graph in line with the document and load statuses, for the nodes and selection
 /// `changes` names only. Returns whether the graph changed.
@@ -73,7 +76,7 @@ pub(crate) fn present(
 pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node) -> NodeRecord {
     let NodeKind::Reader { path } = &node.kind;
     let name = path.file_name().unwrap_or(path.as_os_str());
-    let mut title = name.to_string_lossy().into_owned();
+    let mut title = shorten(&name.to_string_lossy());
     // Slot numbers go in the title, and a failed read in the colour, until OpenNG has badges.
     // Nothing shows a read in progress: the title would widen the node while it lasted, and the
     // viewer's caption says it.
@@ -97,5 +100,39 @@ pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node
             label: "Image".to_owned(),
             direction: Direction::Output,
         })],
+    }
+}
+
+/// Keeps the start of a long name, often the shot, and the end, the version, frame and extension,
+/// either side of an ellipsis.
+fn shorten(name: &str) -> String {
+    let length = name.chars().count();
+    if length <= MAX_NAME_CHARS {
+        return name.to_owned();
+    }
+    let start = (MAX_NAME_CHARS - 1) / 2;
+    let end = MAX_NAME_CHARS - 1 - start;
+    let mut shortened: String = name.chars().take(start).collect();
+    shortened.push('…');
+    shortened.extend(name.chars().skip(length - end));
+    shortened
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_file_names_lose_their_middle() {
+        let fits = "a".repeat(MAX_NAME_CHARS);
+        assert_eq!(shorten(&fits), fits);
+
+        let shortened = shorten("ABC_seq020_sh0140_plate_bg01_v012.1001.exr");
+        assert_eq!(shortened, "ABC_seq020_sh01…01_v012.1001.exr");
+        assert_eq!(shortened.chars().count(), MAX_NAME_CHARS);
+
+        // Counted in characters, not bytes.
+        let accented = "é".repeat(MAX_NAME_CHARS + 1);
+        assert_eq!(shorten(&accented).chars().count(), MAX_NAME_CHARS);
     }
 }
