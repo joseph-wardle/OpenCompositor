@@ -278,8 +278,9 @@ impl Session {
         Ok(self.commit(label, document))
     }
 
-    /// Applies a view's response as one step, so that a press that selects a node and drags it
-    /// undoes at once.
+    /// Applies a view's response. A move is one step, selection included, so that a press that
+    /// selects a node and drags it undoes at once. Selecting alone records no step, as in Nuke and
+    /// Houdini: undo goes back to the last edit, not the last click, and redo survives a click.
     ///
     /// Nodes the document no longer has are left out: a window-wide undo can remove a node during
     /// a gesture. Readers have no groups and no inputs, so a response never folds or connects.
@@ -301,8 +302,11 @@ impl Session {
                 moved = true;
             }
         }
-        let label = if moved { "Move" } else { "Select" };
-        self.commit(label, document)
+        if moved {
+            self.commit("Move", document)
+        } else {
+            self.select(document)
+        }
     }
 
     /// Restores the document from before the last step. Returns no changes if there is none.
@@ -349,6 +353,16 @@ impl Session {
         });
         self.redo.clear();
         self.present(&changes);
+        changes
+    }
+
+    /// Swaps in a document that differs at most in its selection, recording no step.
+    fn select(&mut self, after: Document) -> Changes {
+        let changes = self.document.changes_to(&after);
+        if !changes.is_empty() {
+            self.document = after;
+            self.present(&changes);
+        }
         changes
     }
 

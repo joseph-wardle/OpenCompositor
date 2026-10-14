@@ -126,6 +126,60 @@ fn selecting_and_dragging_a_node_is_one_step() {
 }
 
 #[test]
+fn undo_skips_clicks_that_only_select() {
+    let mut session = Session::new();
+    let a = create(&mut session, "a.exr", ORIGIN);
+    let b = create(&mut session, "b.exr", Point { x: 0.0, y: 200.0 });
+    session.set_mark(slot(1), Some(a)).unwrap();
+    let steps = session.undo.len();
+
+    // A click on a node, then on empty canvas.
+    for selection in [vec![a.into()], Vec::new()] {
+        let click = Response {
+            selection: Some(selection),
+            ..Response::default()
+        };
+        assert!(!session.apply_response(&click).is_empty());
+        assert_presented(&session);
+    }
+    assert_eq!(session.undo.len(), steps);
+    assert_eq!(session.undo_label(), Some("Mark"));
+
+    session.undo();
+    assert_eq!(session.document().mark(slot(1)), None);
+    assert_eq!(session.document().selection(), [b]);
+    assert_presented(&session);
+}
+
+#[test]
+fn redo_survives_selecting_and_edits_that_change_nothing() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    session.set_mark(slot(2), Some(reader)).unwrap();
+    session.set_reader_path(reader, "b.exr".into()).unwrap();
+    session.undo();
+
+    let deselect = Response {
+        selection: Some(Vec::new()),
+        ..Response::default()
+    };
+    assert!(!session.apply_response(&deselect).is_empty());
+    assert!(session.set_mark(slot(2), Some(reader)).unwrap().is_empty());
+    assert!(
+        session
+            .set_reader_path(reader, "a.exr".into())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(session.redo_label(), Some("Set Reader Path"));
+
+    assert!(!session.redo().is_empty());
+    let NodeKind::Reader { path } = &session.document().node(reader).unwrap().kind;
+    assert_eq!(path, &PathBuf::from("b.exr"));
+    assert_presented(&session);
+}
+
+#[test]
 fn the_graph_matches_the_document_after_every_step() {
     let mut session = Session::new();
     let readers = session.create_readers(paths(&["a.exr", "b.png", "c.exr"]), ORIGIN);
