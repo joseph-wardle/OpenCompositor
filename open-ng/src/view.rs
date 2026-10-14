@@ -1250,7 +1250,9 @@ impl View {
         self.zoom
     }
 
-    pub(crate) fn to_graph(&self, point: PhysicalPoint) -> Point {
+    /// The graph point drawn at a point in the render target, such as where a host places a node
+    /// created at the pointer.
+    pub fn to_graph(&self, point: PhysicalPoint) -> Point {
         let centre = self.viewport.centre();
         let per_unit = self.physical_per_unit();
         Point {

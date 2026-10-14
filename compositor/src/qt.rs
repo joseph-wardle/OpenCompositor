@@ -1,0 +1,211 @@
+//! Every Qt declaration the shell uses: Qt's own headers where `cxx` can bind them, and
+//! `cpp/shim.h` one-liners where it cannot.
+
+#[cxx_qt::bridge]
+pub mod ffi {
+    unsafe extern "C++" {
+        include!("cxx-qt-lib/qstring.h");
+        type QString = cxx_qt_lib::QString;
+        include!("cxx-qt-lib/qstringlist.h");
+        type QStringList = cxx_qt_lib::QStringList;
+        include!("cxx-qt-lib/qbytearray.h");
+        type QByteArray = cxx_qt_lib::QByteArray;
+        include!(<QtCore/QEvent>);
+        /// Opaque: the shim reads its fields.
+        #[allow(missing_debug_implementations)]
+        type QEvent;
+    }
+
+    unsafe extern "C++Qt" {
+        include!(<QtWidgets/QMainWindow>);
+        include!(<QtWidgets/QDockWidget>);
+        include!(<QtWidgets/QWidget>);
+        include!(<QtGui/QWindow>);
+
+        #[qobject]
+        type QWidget;
+        #[qobject]
+        type QMainWindow;
+        #[qobject]
+        type QDockWidget;
+        #[qobject]
+        type QWindow;
+
+        fn resize(self: Pin<&mut QMainWindow>, width: i32, height: i32);
+        fn show(self: Pin<&mut QMainWindow>);
+        #[cxx_name = "setWindowTitle"]
+        fn set_window_title(self: Pin<&mut QMainWindow>, title: &QString);
+        #[cxx_name = "setDockNestingEnabled"]
+        fn set_dock_nesting_enabled(self: Pin<&mut QMainWindow>, enabled: bool);
+
+        #[cxx_name = "setFloating"]
+        fn set_floating(self: Pin<&mut QDockWidget>, floating: bool);
+        fn raise(self: Pin<&mut QDockWidget>);
+        fn show(self: Pin<&mut QDockWidget>);
+        fn close(self: Pin<&mut QDockWidget>) -> bool;
+    }
+
+    // Qt Wayland's per-window object (private QPA API), for its native surface.
+    unsafe extern "C++Qt" {
+        include!(<qpa/qplatformwindow_p.h>);
+        #[qobject]
+        #[namespace = "QNativeInterface::Private"]
+        type QWaylandWindow;
+
+        /// Emitted before Qt Wayland destroys the window's `wl_surface`, including when floating a
+        /// dock recreates it without a platform surface event.
+        #[qsignal]
+        #[cxx_name = "surfaceDestroyed"]
+        fn surface_destroyed(self: Pin<&mut QWaylandWindow>);
+    }
+
+    // A pane: a native window the GPU draws, inside a dock.
+    extern "RustQt" {
+        #[qobject]
+        #[base = QWindow]
+        type Pane = super::PaneRust;
+    }
+
+    // QWindow's constructor takes a QWindow parent, not CXX-Qt's default QObject one.
+    impl cxx_qt::Constructor<(usize,), NewArguments = (usize,)> for Pane {}
+
+    unsafe extern "RustQt" {
+        #[cxx_override]
+        unsafe fn event(self: Pin<&mut Pane>, event: *mut QEvent) -> bool;
+
+        #[inherit]
+        #[cxx_name = "event"]
+        unsafe fn base_event(self: Pin<&mut Pane>, event: *mut QEvent) -> bool;
+
+        #[inherit]
+        #[cxx_name = "requestUpdate"]
+        fn request_update(self: Pin<&mut Pane>);
+        #[inherit]
+        #[cxx_name = "devicePixelRatio"]
+        fn device_pixel_ratio(self: &Pane) -> f64;
+        #[inherit]
+        fn width(self: &Pane) -> i32;
+        #[inherit]
+        fn height(self: &Pane) -> i32;
+        #[inherit]
+        #[cxx_name = "isExposed"]
+        fn is_exposed(self: &Pane) -> bool;
+    }
+
+    // Receives the loader's results on the GUI thread. It lives as long as the event loop, unlike a
+    // pane, which closes with its dock.
+    extern "RustQt" {
+        #[qobject]
+        type Waker = super::WakerRust;
+    }
+
+    impl cxx_qt::Threading for Waker {}
+
+    /// What the shell reads from a Qt event, positions in logical pixels.
+    #[derive(Debug)]
+    struct InputFields {
+        x: f64,
+        y: f64,
+        button: i32,
+        shift: bool,
+        ctrl: bool,
+        wheel_y: i32,
+        key: i32,
+        auto_repeat: bool,
+        surface_about_to_be_destroyed: bool,
+    }
+
+    #[namespace = "shim"]
+    unsafe extern "C++" {
+        include!("shim.h");
+
+        fn new_application();
+        fn exec() -> i32;
+        fn exit(code: i32);
+        fn platform_name() -> QString;
+        /// The Qt the shim was compiled against.
+        fn qt_compiled_version() -> QString;
+        /// The Qt loaded at run time.
+        fn qt_runtime_version() -> QString;
+        fn single_shot(ms: i32, callback: fn(usize), step: usize);
+
+        fn new_main_window() -> UniquePtr<QMainWindow>;
+        /// A dock in a `Qt::DockWidgetArea`, listed in the Window menu.
+        unsafe fn new_dock(
+            window: *mut QMainWindow,
+            title: &QString,
+            area: i32,
+        ) -> *mut QDockWidget;
+        /// Puts the pane in the dock, which owns it from then on.
+        unsafe fn container(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QWidget;
+        unsafe fn tabify(
+            window: *mut QMainWindow,
+            first: *mut QDockWidget,
+            second: *mut QDockWidget,
+        );
+        unsafe fn show_status(window: *mut QMainWindow, text: &QString);
+        unsafe fn status(window: *mut QMainWindow) -> QString;
+        /// Runs a modal file dialog. Its nested event loop delivers paints, resizes, timers and
+        /// the loader's results, but no input to the panes.
+        unsafe fn choose_files(
+            window: *mut QMainWindow,
+            title: &QString,
+            several: bool,
+        ) -> QStringList;
+        /// A path as the file system names it.
+        fn encode_name(path: &QString) -> QByteArray;
+        fn close_modal_dialog();
+
+        fn new_pane(index: usize) -> *mut Pane;
+        fn new_waker() -> *mut Waker;
+        unsafe fn delete_waker(waker: *mut Waker);
+
+        unsafe fn event_type(event: *const QEvent) -> i32;
+        unsafe fn input_fields(event: *const QEvent) -> InputFields;
+        fn wayland_display() -> usize;
+        fn wayland_window(pane: Pin<&mut Pane>) -> *mut QWaylandWindow;
+        fn wayland_surface(window: Pin<&mut QWaylandWindow>) -> usize;
+        fn x11_display() -> usize;
+        fn x11_window(pane: &Pane) -> u64;
+    }
+}
+
+use std::pin::Pin;
+
+use cxx_qt::CxxQtType;
+
+pub use ffi::{Pane, QWaylandWindow};
+
+/// A pane holds only its index into [`opencompositor_core::Pane::ALL`]; the state is the app's.
+#[derive(Debug)]
+pub struct PaneRust {
+    index: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct WakerRust;
+
+impl cxx_qt::Constructor<(usize,)> for ffi::Pane {
+    type BaseArguments = ();
+    type InitializeArguments = ();
+    type NewArguments = (usize,);
+
+    fn route_arguments(arguments: (usize,)) -> ((usize,), (), ()) {
+        (arguments, (), ())
+    }
+
+    fn new((index,): (usize,)) -> PaneRust {
+        PaneRust { index }
+    }
+}
+
+impl ffi::Pane {
+    /// # Safety
+    ///
+    /// Qt passes a live event for the duration of the call.
+    unsafe fn event(self: Pin<&mut Self>, event: *mut ffi::QEvent) -> bool {
+        let pane = opencompositor_core::Pane::ALL[self.rust().index];
+        // SAFETY: as above.
+        unsafe { crate::pane::event(self, pane, event) }
+    }
+}

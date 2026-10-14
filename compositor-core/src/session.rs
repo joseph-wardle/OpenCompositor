@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use open_ng::{Graph, Point, Response};
+use open_ng::{ConnectionEdit, Graph, InputEvent, Point, Response, Verdict, View, Viewport};
 
 use crate::document::{Changes, Document, Node, NodeId, NodeKind, Slot};
 use crate::presentation::present;
@@ -37,10 +37,10 @@ impl fmt::Display for EditError {
 
 impl std::error::Error for EditError {}
 
-/// A document with its undo history and its OpenNG graph.
+/// A document with its undo history, its OpenNG graph and the view of it.
 ///
-/// Every applied change, whether an edit, an undo or a redo, updates the graph before returning
-/// the [`Changes`] it made. An edit that changes nothing records no step.
+/// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
+/// before returning the [`Changes`] it made. An edit that changes nothing records no step.
 #[derive(Debug)]
 pub struct Session {
     document: Document,
@@ -49,6 +49,7 @@ pub struct Session {
     /// Outside every snapshot, so undo never rewinds it.
     next_id: u64,
     graph: Graph,
+    graph_view: View,
 }
 
 impl Default for Session {
@@ -65,6 +66,13 @@ impl Session {
             redo: Vec::new(),
             next_id: 1,
             graph: Graph::default(),
+            graph_view: View::new(Viewport {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                scale_factor: 1.0,
+            }),
         }
     }
 
@@ -74,6 +82,30 @@ impl Session {
 
     pub fn graph(&self) -> &Graph {
         &self.graph
+    }
+
+    pub fn graph_view(&self) -> &View {
+        &self.graph_view
+    }
+
+    /// Passes an event to the graph view and applies what it asks for. Returns whether the view
+    /// needs drawing again.
+    pub fn graph_input(&mut self, event: InputEvent) -> bool {
+        let response = self
+            .graph_view
+            .handle_input(&self.graph, event, refuse_connections);
+        let asks = response.selection.is_some() || !response.positions.is_empty();
+        let changed = asks && !self.apply_response(&response).is_empty();
+        response.handled || changed
+    }
+
+    pub fn resize_graph_view(&mut self, viewport: Viewport) {
+        self.graph_view.set_viewport(viewport);
+    }
+
+    /// Ends the graph view's gesture without applying it, as when the window loses focus.
+    pub fn cancel_graph_gesture(&mut self) {
+        self.graph_view.cancel_gesture();
     }
 
     /// What undo would undo, to name it in a menu.
@@ -186,7 +218,7 @@ impl Session {
     fn restore(&mut self, step: Step) -> (Step, Changes) {
         let changes = self.document.changes_to(&step.document);
         let current = std::mem::replace(&mut self.document, step.document);
-        present(&mut self.graph, &self.document, &changes);
+        self.present(&changes);
         let reverse = Step {
             label: step.label,
             document: current,
@@ -206,9 +238,20 @@ impl Session {
             document: before,
         });
         self.redo.clear();
-        present(&mut self.graph, &self.document, &changes);
+        self.present(&changes);
         changes
     }
+
+    /// Updates the graph, then the view, which cannot notice a change to the graph on its own.
+    fn present(&mut self, changes: &Changes) {
+        present(&mut self.graph, &self.document, changes);
+        self.graph_view.refresh(&self.graph, refuse_connections);
+    }
+}
+
+/// Readers have no inputs, so nothing can be connected yet.
+fn refuse_connections(_: &ConnectionEdit) -> Verdict {
+    Verdict::Refuse { reason: None }
 }
 
 #[cfg(test)]
