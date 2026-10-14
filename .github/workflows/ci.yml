@@ -28,6 +28,9 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # aqt's Qt links against the system's GL and loads its EGL, xkbcommon and fontconfig.
+      - name: Install Qt's system libraries
+        run: sudo apt-get update && sudo apt-get install -y libgl-dev libegl1 libxkbcommon0 libfontconfig1
       # qtwayland carries the Wayland plugin; qtbase, with these archives, the private headers.
       - name: Install Qt with aqtinstall
         run: |
