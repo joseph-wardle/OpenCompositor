@@ -214,8 +214,8 @@ impl Shown {
 pub struct App {
     session: Session,
     gpu: Gpu,
-    /// `None` once stopping.
-    loader: Option<Loader>,
+    /// Nothing is delivered once the app has dropped.
+    loader: Loader,
     /// The pane under the pointer, which receives keys whichever pane has the keyboard.
     hovered: Option<Pane>,
     /// The pointer's last position over the graph pane.
@@ -233,7 +233,7 @@ impl App {
         App {
             session: Session::new(),
             gpu: Gpu::new(),
-            loader: Some(Loader::start(deliver)),
+            loader: Loader::start(deliver),
             hovered: None,
             graph_pointer: None,
             viewer_scale_factor: 1.0,
@@ -250,12 +250,6 @@ impl App {
         self.gpu.has_surface(pane)
     }
 
-    /// Stops the loader without waiting for it. The read in progress, if any, may still be
-    /// delivered; nothing after it is.
-    pub fn stop_loading(&mut self) {
-        self.loader = None;
-    }
-
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
         let mut requests = match event {
             Event::Exposed(pane) if !self.gpu.has_surface(pane) => {
@@ -265,8 +259,8 @@ impl App {
             Event::SurfaceCreated { pane, window, size } => {
                 match self.gpu.attach(pane, window, size) {
                     Ok(device) => {
-                        if let (Some(device), Some(loader)) = (device, &self.loader) {
-                            loader.connect(device);
+                        if let Some(device) = device {
+                            self.loader.connect(device);
                         }
                     }
                     Err(error) => return vec![Request::ShowStatus(error)],
@@ -576,12 +570,10 @@ impl App {
             self.gpu.clear_image();
             requests.push(Request::Redraw(Pane::Viewer));
         }
-        let read = wanted
-            .filter(|wanted| Some(wanted) != self.shown.request())
-            .filter(|_| self.loader.is_some());
+        let read = wanted.filter(|wanted| Some(wanted) != self.shown.request());
         if read.as_ref() != self.session.reading() {
-            if let (Some(request), Some(loader)) = (&read, &self.loader) {
-                loader.request(request.clone());
+            if let Some(request) = &read {
+                self.loader.request(request.clone());
             }
             if self.session.start_reading(read) {
                 requests.push(Request::Redraw(Pane::Graph));

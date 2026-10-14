@@ -167,6 +167,7 @@ pub fn native_window(mut window: Pin<&mut qt::Pane>, pane: Pane) -> Option<Nativ
         _ => return None,
     };
     // SAFETY: the pane dispatches `SurfaceDestroyed` on `SurfaceAboutToBeDestroyed` and on Qt
-    // Wayland's `surfaceRoleDestroyed`, before either handle dies.
+    // Wayland's `surfaceRoleDestroyed`, before either handle dies, and the app drops before the
+    // main window.
     Some(unsafe { NativeWindow::new(display, handle) })
 }

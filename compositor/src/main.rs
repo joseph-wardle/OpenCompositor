@@ -67,8 +67,9 @@ fn main() {
     // SAFETY: the waker is live. Its thread handle outlives it: queueing fails once it is deleted.
     let waker_thread = unsafe { &*waker }.qt_thread();
     let app = App::new(move |loaded| {
-        // Fails only once the waker is deleted, when a read outlasts the event loop.
-        let _ = waker_thread.queue(move |_| dispatch(Event::Loaded(loaded)));
+        waker_thread
+            .queue(move |_| dispatch(Event::Loaded(loaded)))
+            .expect("the waker outlives the app, whose loader delivers nothing once dropped");
     });
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
@@ -125,13 +126,13 @@ fn main() {
     }
     let status = ffi::exec();
 
-    APP.with(|cell| cell.borrow_mut().as_mut().map(App::stop_loading));
+    // The app goes before the window: its surfaces before the panes' native windows, and its
+    // requests with it, so that the events destroying the window dispatch to nothing. Its loader
+    // delivers nothing after it.
+    drop(APP.with(|cell| cell.borrow_mut().take()));
     // SAFETY: nothing else deletes the waker. Results queued to it are dropped without running.
     unsafe { ffi::delete_waker(waker) };
-    // Destroying the window destroys the panes' native windows, whose events drop the surfaces.
     drop(window);
-    // The device goes after every surface.
-    drop(APP.with(|cell| cell.borrow_mut().take()));
     std::process::exit(status);
 }
 
@@ -204,7 +205,7 @@ pub fn widgets() -> Widgets {
 fn pane_window(pane: Pane) -> Pin<&'static mut qt::Pane> {
     let window = widgets().panes[pane.index()];
     // SAFETY: a pane lives as long as its dock, which lives until the main window is destroyed,
-    // and no event that runs after that performs requests. Each use ends before the next begins.
+    // after the app, so no request is performed after that. Each use ends before the next begins.
     unsafe { Pin::new_unchecked(&mut *window) }
 }
 

@@ -290,18 +290,6 @@ fn a_pane_asks_for_a_surface_when_exposed_without_one() {
 }
 
 #[test]
-fn nothing_is_read_once_loading_stops() {
-    let (mut app, deliveries) = app();
-    app.stop_loading();
-    create(&mut app, "/nonexistent/a.exr");
-
-    app.dispatch(slot_key(1, CTRL));
-
-    assert!(deliveries.recv_timeout(Duration::from_millis(100)).is_err());
-    assert_eq!(app.caption, "Slot 1 · a.exr");
-}
-
-#[test]
 fn only_the_graph_losing_the_keyboard_cancels_its_gesture() {
     let drag = |focus_lost: Pane| {
         let (mut app, _deliveries) = app();

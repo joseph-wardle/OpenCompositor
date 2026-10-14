@@ -67,9 +67,15 @@ struct Staging {
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            self.mailbox.lock().staging = Some(buffer);
-            self.mailbox.changed.notify_one();
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        let mut state = self.mailbox.lock();
+        // A buffer returned after the loader stopped would be dropped with the mailbox, which
+        // may be on the worker's thread.
+        if !state.stopping {
+            state.staging = Some((buffer, false));
+            self.mailbox.changed.notify_all();
         }
     }
 }
@@ -116,39 +122,31 @@ struct Mailbox {
     changed: Condvar,
 }
 
+/// The device and the staging buffer belong here rather than to the worker, which may still be
+/// running when the process exits: the last reference to a GPU object must not drop on its
+/// thread after the driver has begun tearing itself down.
 #[derive(Debug, Default)]
 struct MailboxState {
     request: Option<LoadRequest>,
     stopping: bool,
-    /// The GPU's device, until the worker takes it.
+    /// The GPU's device, from `connect` until the loader drops.
     device: Option<wgpu::Device>,
-    /// The staging buffer, unmapped, while it waits for the worker.
-    staging: Option<wgpu::Buffer>,
-}
-
-/// What wakes the worker.
-enum Work {
-    Read(LoadRequest),
-    Connect(wgpu::Device),
+    /// The staging buffer while it waits for the worker, and whether it is mapped.
+    staging: Option<(wgpu::Buffer, bool)>,
+    /// Whether the worker is staging or delivering a read, and so may hold GPU objects.
+    finishing: bool,
 }
 
 impl Loader {
     /// Starts the worker. It passes each result to `deliver` on its own thread.
     pub fn start(deliver: impl Fn(Loaded) + Send + 'static) -> Loader {
         let mailbox = Arc::new(Mailbox::default());
-        let mut worker = Worker {
-            mailbox: Arc::clone(&mailbox),
-            device: None,
-            staging: None,
-        };
+        let worker = Arc::clone(&mailbox);
         std::thread::Builder::new()
             .name("loader".to_owned())
             .spawn(move || {
-                while let Some(work) = worker.mailbox.next() {
-                    match work {
-                        Work::Read(request) => worker.read(request, &deliver),
-                        Work::Connect(device) => worker.connect(device),
-                    }
+                while let Some(request) = worker.next() {
+                    read(&worker, request, &deliver);
                 }
             })
             .expect("the loader thread starts");
@@ -157,22 +155,38 @@ impl Loader {
 
     pub fn request(&self, request: LoadRequest) {
         self.mailbox.lock().request = Some(request);
-        self.mailbox.changed.notify_one();
+        self.mailbox.changed.notify_all();
     }
 
     /// Lets the worker stage pixels for `device`. Until then it reads images without them.
     pub(crate) fn connect(&self, device: wgpu::Device) {
-        self.mailbox.lock().device = Some(device);
-        self.mailbox.changed.notify_one();
+        // Mapped at creation, the buffer is zeroed here rather than during the first read.
+        let (width, height) = FIRST_STAGING_SIZE;
+        let staging = staging_buffer(&device, staging_size(width, height));
+        let mut state = self.mailbox.lock();
+        state.staging = Some((staging, true));
+        state.device = Some(device);
     }
 }
 
 impl Drop for Loader {
-    /// Stops the worker without waiting for it. The read in progress, if any, still finishes and
-    /// is delivered; nothing after it is.
+    /// Stops the worker, waiting while it stages or delivers a read but not while it decodes
+    /// one, and drops the device and the staging buffer on this thread. Nothing is delivered
+    /// after this returns.
     fn drop(&mut self) {
-        self.mailbox.lock().stopping = true;
-        self.mailbox.changed.notify_one();
+        let mut state = self.mailbox.lock();
+        state.stopping = true;
+        self.mailbox.changed.notify_all();
+        while state.finishing {
+            state = self
+                .mailbox
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let gpu = (state.staging.take(), state.device.take());
+        drop(state);
+        drop(gpu);
     }
 }
 
@@ -184,19 +198,13 @@ impl Mailbox {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Waits for work, or `None` once the loader is stopping.
-    fn next(&self) -> Option<Work> {
-        self.wait_for(|state| {
-            state
-                .device
-                .take()
-                .map(Work::Connect)
-                .or_else(|| state.request.take().map(Work::Read))
-        })
+    /// Waits for a request, or `None` once the loader is stopping.
+    fn next(&self) -> Option<LoadRequest> {
+        self.wait_for(|state| state.request.take())
     }
 
     /// Waits for the staging buffer to come back, or `None` once the loader is stopping.
-    fn take_staging(&self) -> Option<wgpu::Buffer> {
+    fn take_staging(&self) -> Option<(wgpu::Buffer, bool)> {
         self.wait_for(|state| state.staging.take())
     }
 
@@ -221,140 +229,153 @@ impl Mailbox {
         let state = self.lock();
         state.stopping || state.request.is_some()
     }
-}
 
-/// The worker thread's state.
-struct Worker {
-    mailbox: Arc<Mailbox>,
-    device: Option<wgpu::Device>,
-    /// The staging buffer while the worker holds it, and whether it is mapped.
-    staging: Option<(wgpu::Buffer, bool)>,
-}
-
-impl Worker {
-    /// Makes the staging buffer, ahead of the first read: mapping it at creation zeroes it here
-    /// rather than during that read.
-    fn connect(&mut self, device: wgpu::Device) {
-        let (width, height) = FIRST_STAGING_SIZE;
-        self.staging = Some((staging_buffer(&device, staging_size(width, height)), true));
-        self.device = Some(device);
+    /// Begins staging and delivering a read, unless it is superseded.
+    fn start_finishing(self: &Arc<Mailbox>) -> Option<Finishing<'_>> {
+        let mut state = self.lock();
+        if state.stopping || state.request.is_some() {
+            return None;
+        }
+        state.finishing = true;
+        Some(Finishing {
+            mailbox: self,
+            device: state.device.clone(),
+        })
     }
+}
 
-    fn read(&mut self, request: LoadRequest, deliver: &impl Fn(Loaded)) {
-        // A panic would end the worker and every later read with it. The panic hook has already
-        // reported it.
-        let read = std::panic::catch_unwind(AssertUnwindSafe(|| read_image(&request.path)))
-            .unwrap_or_else(|_| Err(ReadError::Decode("the reader panicked".to_owned())));
-        if self.mailbox.superseded() {
-            return;
-        }
-        let result = match read {
-            Ok(image) => {
-                let (info, pixels) = image.into_parts();
-                match self.stage(&info, pixels) {
-                    Ok(pixels) => Ok(Decoded { info, pixels }),
-                    Err(reason) => Err(LoadError::CannotShow(reason)),
-                }
+/// The worker's staging and delivery of a read. The loader's drop waits for it to end.
+struct Finishing<'a> {
+    mailbox: &'a Arc<Mailbox>,
+    device: Option<wgpu::Device>,
+}
+
+impl Drop for Finishing<'_> {
+    fn drop(&mut self) {
+        drop(self.device.take());
+        self.mailbox.lock().finishing = false;
+        self.mailbox.changed.notify_all();
+    }
+}
+
+/// Reads the request's file on the worker's thread, then stages and delivers it.
+fn read(mailbox: &Arc<Mailbox>, request: LoadRequest, deliver: &impl Fn(Loaded)) {
+    // A panic would end the worker and every later read with it. The panic hook has already
+    // reported it.
+    let read = std::panic::catch_unwind(AssertUnwindSafe(|| read_image(&request.path)))
+        .unwrap_or_else(|_| Err(ReadError::Decode("the reader panicked".to_owned())));
+    let Some(finishing) = mailbox.start_finishing() else {
+        return;
+    };
+    let result = match read {
+        Ok(image) => {
+            let (info, pixels) = image.into_parts();
+            match stage(&finishing, &info, pixels) {
+                Ok(pixels) => Ok(Decoded { info, pixels }),
+                Err(reason) => Err(LoadError::CannotShow(reason)),
             }
-            Err(error) => Err(LoadError::Read(error)),
-        };
-        if self.mailbox.superseded() {
-            return;
         }
+        Err(error) => Err(LoadError::Read(error)),
+    };
+    // The result's GPU objects, if any, go before the finishing ends.
+    if mailbox.superseded() {
+        drop(result);
+    } else {
         deliver(Loaded { request, result });
     }
+    drop(finishing);
+}
 
-    /// Converts the pixels into the staging buffer and makes their texture. `Ok(None)` without a
-    /// GPU or pixels, or if the loader stopped while waiting for the buffer, which the check for a
-    /// superseded read after this catches.
-    fn stage(&mut self, info: &ImageInfo, pixels: Vec<f32>) -> Result<Option<Staged>, String> {
-        let Some(device) = self.device.clone() else {
-            return Ok(None);
-        };
-        let window = info.data_window;
-        if is_empty(info) {
-            return Ok(None);
-        }
-        let limits = device.limits();
-        let size = staging_size(window.width, window.height);
-        let largest = window.width.max(window.height);
-        if largest > limits.max_texture_dimension_2d {
-            return Err(format!(
-                "its data window is {} × {} pixels, and this GPU's images are at most {} pixels \
-                 on a side",
-                window.width, window.height, limits.max_texture_dimension_2d
-            ));
-        }
-        if size > limits.max_buffer_size {
-            return Err(format!(
-                "its pixels take {size} bytes at half precision, and this GPU's buffers take at \
-                 most {}",
-                limits.max_buffer_size
-            ));
-        }
-        let (buffer, mapped) = match self.staging.take() {
-            Some(held) => held,
-            None => match self.mailbox.take_staging() {
-                Some(buffer) => (buffer, false),
-                None => return Ok(None),
-            },
-        };
-        let buffer = if buffer.size() < size {
-            buffer.destroy();
-            staging_buffer(&device, size)
-        } else if mapped {
-            buffer
-        } else {
-            if let Err(error) = map(&device, &buffer) {
-                self.staging = Some((buffer, false));
-                return Err(format!("the GPU could not map its staging buffer: {error}"));
-            }
-            buffer
-        };
-        let bytes_per_row = row_bytes(window.width);
-        {
-            let mut view = buffer
-                .get_mapped_range_mut(..size)
-                .expect("the buffer is mapped and large enough");
-            let mut bytes = view.slice(..);
-            let halves = bytes.len() / size_of::<f16>();
-            let start = bytes.as_raw_element_ptr().cast::<f16>();
-            // SAFETY: the mapping is `size` bytes, aligned to `wgpu::MAP_ALIGNMENT`, which is at
-            // least f16's alignment, and only this view accesses it until the view drops. Mapped
-            // memory may be write-combining, so the conversion only writes to it.
-            let out = unsafe { std::slice::from_raw_parts_mut(start.as_ptr(), halves) };
-            convert_rows(
-                &pixels,
-                window.width as usize,
-                out,
-                bytes_per_row as usize / 2,
-            );
-        }
-        drop(pixels);
-        buffer.unmap();
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("image"),
-            size: wgpu::Extent3d {
-                width: window.width,
-                height: window.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        Ok(Some(Staged {
-            texture,
-            bytes_per_row,
-            staging: Staging {
-                buffer: Some(buffer),
-                mailbox: Arc::clone(&self.mailbox),
-            },
-        }))
+/// Converts the pixels into the staging buffer and makes their texture. `Ok(None)` without a GPU
+/// or pixels, or if the loader stopped while waiting for the buffer, which the check for a
+/// superseded read after this catches.
+fn stage(
+    finishing: &Finishing,
+    info: &ImageInfo,
+    pixels: Vec<f32>,
+) -> Result<Option<Staged>, String> {
+    let Some(device) = &finishing.device else {
+        return Ok(None);
+    };
+    let window = info.data_window;
+    if is_empty(info) {
+        return Ok(None);
     }
+    let limits = device.limits();
+    let size = staging_size(window.width, window.height);
+    let largest = window.width.max(window.height);
+    if largest > limits.max_texture_dimension_2d {
+        return Err(format!(
+            "its data window is {} × {} pixels, and this GPU's images are at most {} pixels on a \
+             side",
+            window.width, window.height, limits.max_texture_dimension_2d
+        ));
+    }
+    if size > limits.max_buffer_size {
+        return Err(format!(
+            "its pixels take {size} bytes at half precision, and this GPU's buffers take at most \
+             {}",
+            limits.max_buffer_size
+        ));
+    }
+    let Some((buffer, mapped)) = finishing.mailbox.take_staging() else {
+        return Ok(None);
+    };
+    let buffer = if buffer.size() < size {
+        buffer.destroy();
+        staging_buffer(device, size)
+    } else if mapped {
+        buffer
+    } else {
+        if let Err(error) = map(device, &buffer) {
+            finishing.mailbox.lock().staging = Some((buffer, false));
+            return Err(format!("the GPU could not map its staging buffer: {error}"));
+        }
+        buffer
+    };
+    let bytes_per_row = row_bytes(window.width);
+    {
+        let mut view = buffer
+            .get_mapped_range_mut(..size)
+            .expect("the buffer is mapped and large enough");
+        let mut bytes = view.slice(..);
+        let halves = bytes.len() / size_of::<f16>();
+        let start = bytes.as_raw_element_ptr().cast::<f16>();
+        // SAFETY: the mapping is `size` bytes, aligned to `wgpu::MAP_ALIGNMENT`, which is at least
+        // f16's alignment, and only this view accesses it until the view drops. Mapped memory may
+        // be write-combining, so the conversion only writes to it.
+        let out = unsafe { std::slice::from_raw_parts_mut(start.as_ptr(), halves) };
+        convert_rows(
+            &pixels,
+            window.width as usize,
+            out,
+            bytes_per_row as usize / 2,
+        );
+    }
+    drop(pixels);
+    buffer.unmap();
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("image"),
+        size: wgpu::Extent3d {
+            width: window.width,
+            height: window.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    Ok(Some(Staged {
+        texture,
+        bytes_per_row,
+        staging: Staging {
+            buffer: Some(buffer),
+            mailbox: Arc::clone(finishing.mailbox),
+        },
+    }))
 }
 
 fn is_empty(info: &ImageInfo) -> bool {

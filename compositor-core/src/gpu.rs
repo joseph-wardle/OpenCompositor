@@ -26,8 +26,8 @@ pub struct NativeWindow {
 impl NativeWindow {
     /// # Safety
     ///
-    /// The handles must stay valid until the pane's surface is dropped, which happens when the
-    /// shell dispatches [`Event::SurfaceDestroyed`](crate::Event::SurfaceDestroyed) for the pane.
+    /// The handles must stay valid until the pane's surface is dropped: when the shell dispatches
+    /// [`Event::SurfaceDestroyed`](crate::Event::SurfaceDestroyed) for the pane, or the app drops.
     pub unsafe fn new(display: RawDisplayHandle, window: RawWindowHandle) -> NativeWindow {
         NativeWindow { display, window }
     }

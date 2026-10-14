@@ -82,6 +82,61 @@ fn a_request_replaces_any_the_worker_has_not_started() {
     );
 }
 
+/// Drops the loader on another thread, returning a receiver for the drop's return.
+fn drop_elsewhere(loader: Loader) -> Receiver<()> {
+    let (dropped, drop_returned) = mpsc::channel();
+    std::thread::spawn(move || {
+        drop(loader);
+        dropped.send(()).unwrap();
+    });
+    drop_returned
+}
+
+#[test]
+fn dropping_the_loader_waits_for_the_delivery_in_progress() {
+    let (started, delivering) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let loader = Loader::start(move |_| {
+        started.send(()).unwrap();
+        released.lock().unwrap().recv().unwrap();
+    });
+    loader.request(request("missing"));
+    delivering.recv().unwrap();
+
+    let drop_returned = drop_elsewhere(loader);
+
+    assert!(
+        drop_returned
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "returned during the delivery"
+    );
+    release.send(()).unwrap();
+    drop_returned.recv_timeout(Duration::from_secs(10)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_the_loader_does_not_wait_for_a_decode() {
+    // Opening a named pipe blocks until something writes to it, as a long decode would.
+    let pipe = directory("decode-in-progress").join("pipe.exr");
+    let made = std::process::Command::new("mkfifo").arg(&pipe).status();
+    assert!(made.unwrap().success());
+    let (loader, deliveries) = loader();
+    loader.request(request_for(&pipe));
+    std::thread::sleep(Duration::from_millis(100));
+
+    let drop_returned = drop_elsewhere(loader);
+
+    drop_returned.recv_timeout(Duration::from_secs(1)).unwrap();
+    File::create(&pipe).unwrap();
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        "delivered after the drop"
+    );
+}
+
 #[test]
 fn a_failed_read_is_delivered_with_its_request() {
     let (loader, deliveries) = loader();
