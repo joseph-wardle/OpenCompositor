@@ -224,20 +224,27 @@ fn xyz_and_unsupported_compressions_are_refused() {
 
 #[test]
 fn a_header_declaring_too_many_pixels_is_refused_before_decoding() {
-    let mut bytes = grey(display(0, 0, 4, 3));
-    let side: i32 = 1 << 20;
-    // xMin and yMin stay 0; xMax and yMax follow them.
-    let mut window = [0u8; 16];
-    window[8..12].copy_from_slice(&(side - 1).to_le_bytes());
-    window[12..16].copy_from_slice(&(side - 1).to_le_bytes());
-    patch_attribute(&mut bytes, b"dataWindow\0box2i\0", &window);
+    let declaring = |side: i32| {
+        let mut bytes = grey(display(0, 0, 4, 3));
+        // xMin and yMin stay 0; xMax and yMax follow them.
+        let mut window = [0u8; 16];
+        window[8..12].copy_from_slice(&(side - 1).to_le_bytes());
+        window[12..16].copy_from_slice(&(side - 1).to_le_bytes());
+        patch_attribute(&mut bytes, b"dataWindow\0box2i\0", &window);
+        read_bytes(&bytes)
+    };
 
-    match read_bytes(&bytes) {
-        Err(ReadError::TooLarge { width, height }) => {
-            assert_eq!((width, height), (1 << 20, 1 << 20))
-        }
+    match declaring(16384) {
+        Err(ReadError::TooLarge { width, height }) => assert_eq!((width, height), (16384, 16384)),
         other => panic!("expected TooLarge, got {other:?}"),
     }
+    // The largest square within the limit gets past the size check, and fails only on its
+    // missing chunks.
+    let at_limit = declaring(8192);
+    assert!(
+        matches!(at_limit, Err(ReadError::Decode(_))),
+        "expected Decode, got {at_limit:?}"
+    );
 }
 
 #[test]

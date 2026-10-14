@@ -12,7 +12,11 @@ mod png;
 
 /// The most pixels a file may declare. Allocating for a corrupt or hostile header's size would
 /// abort the process, which no panic handler can catch, so readers check this before allocating.
-pub const MAX_PIXELS: u64 = 1 << 28;
+///
+/// 8192 × 8192 is the largest square that fits. At the limit an image holds 1 GiB as RGBA `f32`
+/// on the host, and the loader adds about 512 MiB each for its RGBA `f16` staging buffer and
+/// texture: a stopgap that bounds one read, not a memory budget.
+pub const MAX_PIXELS: u64 = 1 << 26;
 
 /// Reads an EXR or PNG file, recognised by its signature rather than its name.
 pub fn read_image(path: &Path) -> Result<Image, ReadError> {
