@@ -435,6 +435,33 @@ fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
 }
 
 #[test]
+fn a_surface_that_fails_to_attach_shows_an_error_that_stays() {
+    let (mut app, _deliveries) = app();
+    app.gpu = Gpu::without_backends();
+    let size = PaneSize {
+        width: 400,
+        height: 300,
+        scale_factor: 1.0,
+    };
+
+    let requests = app.dispatch(Event::SurfaceCreated {
+        pane: Pane::Viewer,
+        window: NativeWindow::none(),
+        size,
+    });
+
+    assert!(
+        matches!(requests.as_slice(), [Request::ShowError(error)] if error.contains("Viewer")),
+        "{requests:?}"
+    );
+    assert!(!app.has_surface(Pane::Viewer));
+    assert_eq!(
+        app.dispatch(Event::Exposed(Pane::Viewer)),
+        [Request::AttachSurface(Pane::Viewer)]
+    );
+}
+
+#[test]
 fn an_image_read_before_the_gpu_arrived_is_read_again_once_it_has() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");

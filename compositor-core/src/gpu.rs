@@ -536,6 +536,28 @@ impl Gpu {
         };
         (gpu, connected)
     }
+
+    /// A GPU whose instance has no backends, so that every surface fails to attach.
+    pub(crate) fn without_backends() -> Gpu {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::empty();
+        Gpu {
+            instance: Some(wgpu::Instance::new(descriptor)),
+            ..Gpu::new()
+        }
+    }
+}
+
+#[cfg(test)]
+impl NativeWindow {
+    /// Handles to no window, for a GPU that never opens them.
+    pub(crate) fn none() -> NativeWindow {
+        use wgpu::rwh::{XlibDisplayHandle, XlibWindowHandle};
+        NativeWindow {
+            display: RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0)),
+            window: RawWindowHandle::Xlib(XlibWindowHandle::new(0)),
+        }
+    }
 }
 
 #[cfg(test)]

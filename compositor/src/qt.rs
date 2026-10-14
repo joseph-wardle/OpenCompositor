@@ -188,6 +188,8 @@ pub mod ffi {
         );
         /// Shows the text in the status bar for a few seconds.
         unsafe fn show_status(window: *mut QMainWindow, text: &QString);
+        /// Shows the text in the status bar until another status replaces it.
+        unsafe fn show_error(window: *mut QMainWindow, text: &QString);
         /// Runs a modal file dialog. Its nested event loop delivers paints, resizes, timers and
         /// the loader's results, but no input to the panes.
         unsafe fn choose_files(

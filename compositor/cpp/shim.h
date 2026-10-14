@@ -42,6 +42,7 @@ void set_caption(QLabel *label, const QString &text);
 QString caption(QLabel *label);
 void tabify(QMainWindow *window, QDockWidget *first, QDockWidget *second);
 void show_status(QMainWindow *window, const QString &text);
+void show_error(QMainWindow *window, const QString &text);
 QStringList choose_files(QMainWindow *window, const QString &title, bool several);
 QByteArray encode_name(const QString &path);
 void close_modal_dialog();

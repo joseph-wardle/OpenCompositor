@@ -231,6 +231,10 @@ pub fn perform(request: Request) {
         Request::ShowStatus(text) => unsafe {
             ffi::show_status(widgets.window, &QString::from(&text))
         },
+        // SAFETY: the window is live.
+        Request::ShowError(text) => unsafe {
+            ffi::show_error(widgets.window, &QString::from(&text))
+        },
         // SAFETY: the caption lives as long as the viewer's dock.
         Request::ShowViewerCaption(text) => unsafe {
             ffi::set_caption(widgets.caption, &QString::from(&text))

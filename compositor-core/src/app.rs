@@ -82,7 +82,10 @@ pub enum Request {
     AttachSurface(Pane),
     /// Open a file dialog, then dispatch [`Event::FilesChosen`].
     ChooseFiles(FileIntent),
+    /// Show the text in the status bar for a few seconds, as the answer to what was just done.
     ShowStatus(String),
+    /// Show the text in the status bar until the next status replaces it, for what stays wrong.
+    ShowError(String),
     /// Describe under the viewer what it shows, or why it shows nothing.
     ShowViewerCaption(String),
 }
@@ -265,7 +268,7 @@ impl App {
                             self.loader.connect(device);
                         }
                     }
-                    Err(error) => return vec![Request::ShowStatus(error)],
+                    Err(error) => return vec![Request::ShowError(error)],
                 }
                 self.resize(pane, size);
                 self.draw(pane)

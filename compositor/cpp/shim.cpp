@@ -83,6 +83,9 @@ void show_status(QMainWindow *window, const QString &text) {
     // Long enough to read a sentence. A message answers what was just done, and goes stale.
     window->statusBar()->showMessage(text, 6000);
 }
+void show_error(QMainWindow *window, const QString &text) {
+    window->statusBar()->showMessage(text);
+}
 QStringList choose_files(QMainWindow *window, const QString &title, bool several) {
     if (several) return QFileDialog::getOpenFileNames(window, title);
     QString file = QFileDialog::getOpenFileName(window, title);
