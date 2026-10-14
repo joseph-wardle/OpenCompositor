@@ -64,25 +64,25 @@ fn step(index: usize) {
     }
     let widgets = crate::widgets();
     match index {
-        // SAFETY: as for `dock`.
+        // SAFETY: as for `with_dock`; the reference ends with the call.
         0 => unsafe { Pin::new_unchecked(&mut *widgets.window) }.resize(1100, 700),
-        1 => dock(Pane::Viewer).set_floating(true),
-        2 => dock(Pane::Viewer).set_floating(false),
+        1 => with_dock(Pane::Viewer, |dock| dock.set_floating(true)),
+        2 => with_dock(Pane::Viewer, |dock| dock.set_floating(false)),
         3 => {
             let [graph, viewer] =
                 [Pane::Graph, Pane::Viewer].map(|pane| widgets.docks[pane.index()]);
-            // SAFETY: as for `dock`.
+            // SAFETY: as for `with_dock`.
             unsafe { ffi::tabify(widgets.window, viewer, graph) };
-            dock(Pane::Graph).raise();
+            with_dock(Pane::Graph, |dock| dock.raise());
         }
         4 => crate::perform(Request::Redraw(Pane::Viewer)),
-        5 => dock(Pane::Viewer).raise(),
-        6 => dock(Pane::Graph).set_floating(true),
-        7 => dock(Pane::Graph).set_floating(false),
+        5 => with_dock(Pane::Viewer, |dock| dock.raise()),
+        6 => with_dock(Pane::Graph, |dock| dock.set_floating(true)),
+        7 => with_dock(Pane::Graph, |dock| dock.set_floating(false)),
         8 => {
-            dock(Pane::Viewer).close();
+            with_dock(Pane::Viewer, |dock| dock.close());
         }
-        9 => dock(Pane::Viewer).show(),
+        9 => with_dock(Pane::Viewer, |dock| dock.show()),
         10 => {
             let at = Point::default();
             let image = IMAGE.with(|cell| cell.borrow().clone());
@@ -101,7 +101,7 @@ fn step(index: usize) {
             crate::perform(Request::ChooseFiles(FileIntent::CreateReaders { at }));
         }
         11 => {
-            // SAFETY: the caption lives as long as the viewer's dock, as for `dock`.
+            // SAFETY: the caption lives as long as the viewer's dock, as for `with_dock`.
             let caption = String::from(&unsafe { ffi::caption(widgets.caption) });
             if !caption.contains(" × ") {
                 fail(format!(
@@ -125,10 +125,13 @@ fn step(index: usize) {
     }
 }
 
-fn dock(pane: Pane) -> Pin<&'static mut ffi::QDockWidget> {
+/// Calls `use_dock` with the pane's dock. The reference ends with it.
+fn with_dock<R>(pane: Pane, use_dock: impl FnOnce(Pin<&mut ffi::QDockWidget>) -> R) -> R {
+    let dock = crate::widgets().docks[pane.index()];
     // SAFETY: the window and docks live until the main window is destroyed after the event loop,
-    // which ends at the last step at the earliest.
-    unsafe { Pin::new_unchecked(&mut *crate::widgets().docks[pane.index()]) }
+    // which ends at the last step at the earliest. Steps run from timers, so no other reference to
+    // the dock is live.
+    use_dock(unsafe { Pin::new_unchecked(&mut *dock) })
 }
 
 fn fail(failure: String) {

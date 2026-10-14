@@ -154,10 +154,13 @@ fn run_command(index: usize) {
 pub fn perform(request: Request) {
     let widgets = widgets();
     match request {
-        Request::Redraw(pane) => pane_window(pane).request_update(),
+        Request::Redraw(pane) => with_pane_window(pane, |window| window.request_update()),
         Request::AttachSurface(pane) => {
-            let size = pane::size(&pane_window(pane));
-            if let Some(window) = pane::native_window(pane_window(pane), pane) {
+            let attached = with_pane_window(pane, |mut window| {
+                let size = pane::size(&window);
+                pane::native_window(window.as_mut(), pane).map(|native| (native, size))
+            });
+            if let Some((window, size)) = attached {
                 dispatch(Event::SurfaceCreated { pane, window, size });
             }
         }
@@ -202,11 +205,15 @@ pub fn widgets() -> Widgets {
     WIDGETS.with(|cell| *cell.get().expect("widgets are made before the event loop"))
 }
 
-fn pane_window(pane: Pane) -> Pin<&'static mut qt::Pane> {
+/// Calls `use_window` with the pane's window. The reference ends with it.
+fn with_pane_window<R>(pane: Pane, use_window: impl FnOnce(Pin<&mut qt::Pane>) -> R) -> R {
     let window = widgets().panes[pane.index()];
-    // SAFETY: a pane lives as long as its dock, which lives until the main window is destroyed,
-    // after the app, so no request is performed after that. Each use ends before the next begins.
-    unsafe { Pin::new_unchecked(&mut *window) }
+    // SAFETY: a pane lives as long as its dock, until the main window is destroyed after the app,
+    // and requests come only from the app or the lifecycle check's steps in the event loop. The
+    // reference may overlap the one Qt passes to the pane's `event` further up the stack, since
+    // requests are performed while dispatching its events, but `Pane` is a zero-sized opaque type:
+    // neither covers memory that Rust reads or writes, and Qt reaches the window only from C++.
+    use_window(unsafe { Pin::new_unchecked(&mut *window) })
 }
 
 /// Follows Qt Wayland's `surfaceRoleDestroyed` for the pane's current window, replacing the
