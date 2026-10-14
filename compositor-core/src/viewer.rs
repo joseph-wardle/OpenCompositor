@@ -74,6 +74,10 @@ impl Viewer {
         self.slot = slot;
     }
 
+    pub(crate) fn scale_factor(&self) -> f32 {
+        self.size.scale_factor
+    }
+
     pub(crate) fn resize(&mut self, size: PaneSize) {
         self.size = size;
     }

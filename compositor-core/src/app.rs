@@ -225,8 +225,9 @@ pub struct App {
     hovered: Option<Pane>,
     /// The pointer's last position over the graph pane.
     graph_pointer: Option<PhysicalPoint>,
-    viewer_scale_factor: f32,
     shown: Shown,
+    /// The read in progress for the viewer.
+    reading: Option<LoadRequest>,
     /// The viewer's caption as last requested.
     caption: String,
 }
@@ -241,8 +242,8 @@ impl App {
             loader: Loader::start(deliver),
             hovered: None,
             graph_pointer: None,
-            viewer_scale_factor: 1.0,
             shown: Shown::Nothing,
+            reading: None,
             caption: String::new(),
         }
     }
@@ -309,7 +310,7 @@ impl App {
                 placement: self.session.viewer().placement(info.display_window),
                 display_window: info.display_window,
                 data_window: info.data_window,
-                scale_factor: self.viewer_scale_factor,
+                scale_factor: self.session.viewer().scale_factor(),
             }),
             Shown::Nothing | Shown::Failed { .. } => None,
         };
@@ -322,10 +323,7 @@ impl App {
     fn resize(&mut self, pane: Pane, size: PaneSize) {
         match pane {
             Pane::Graph => self.session.resize_graph_view(size.viewport()),
-            Pane::Viewer => {
-                self.session.viewer_mut().resize(size);
-                self.viewer_scale_factor = size.scale_factor;
-            }
+            Pane::Viewer => self.session.viewer_mut().resize(size),
         }
     }
 
@@ -539,9 +537,9 @@ impl App {
     /// Shows a finished read if the viewer still wants it. Otherwise it is dropped, which returns
     /// its staging buffer to the loader.
     fn loaded(&mut self, loaded: Loaded) -> Vec<Request> {
-        if self.session.reading() != Some(&loaded.request) {
+        let Some(read) = self.reading.take_if(|reading| *reading == loaded.request) else {
             return Vec::new();
-        }
+        };
         let Loaded { request, result } = loaded;
         let failed = result.is_err();
         self.shown = match result {
@@ -566,7 +564,7 @@ impl App {
             }
         };
         let mut requests = vec![Request::Redraw(Pane::Viewer)];
-        if self.session.finish_reading(failed) {
+        if self.session.record_read(read, failed) {
             requests.push(Request::Redraw(Pane::Graph));
         }
         requests
@@ -591,11 +589,11 @@ impl App {
             shown => shown.request(),
         };
         let read = wanted.filter(|wanted| Some(wanted) != shown);
-        if read.as_ref() != self.session.reading() {
+        if read != self.reading {
             if let Some(request) = &read {
                 self.loader.request(request.clone());
             }
-            self.session.start_reading(read);
+            self.reading = read;
         }
         let caption = self.caption();
         if caption != self.caption {
@@ -622,7 +620,7 @@ impl App {
             Viewed::Node(request) => request,
         };
         let name = file_name(&request.path);
-        if self.session.reading() == Some(&request) {
+        if self.reading.as_ref() == Some(&request) {
             return match &self.shown {
                 Shown::Image { request: shown, .. } if shown.node != request.node => format!(
                     "Slot {slot} · {name} · reading… (showing {} until then)",

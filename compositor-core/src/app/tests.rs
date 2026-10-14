@@ -79,10 +79,7 @@ fn slot_key(digit: u8, modifiers: Modifiers) -> Event {
 
 /// The read the viewer is waiting for.
 fn reading(app: &App) -> LoadRequest {
-    app.session()
-        .reading()
-        .cloned()
-        .expect("a read in progress")
+    app.reading.clone().expect("a read in progress")
 }
 
 /// A finished read of a `width` × `height` image whose pixels the GPU never received.
@@ -379,7 +376,7 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
         "{}",
         app.caption
     );
-    assert_eq!(app.session().reading(), None);
+    assert_eq!(app.reading.as_ref(), None);
 }
 
 #[test]
@@ -430,7 +427,7 @@ fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
     );
     // Back to slot 2, which is shown already.
     app.dispatch(slot_key(2, NONE));
-    assert_eq!(app.session().reading(), None);
+    assert_eq!(app.reading.as_ref(), None);
     assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
 }
 
@@ -468,7 +465,7 @@ fn an_image_read_before_the_gpu_arrived_is_read_again_once_it_has() {
     app.dispatch(slot_key(1, CTRL));
     let request = reading(&app);
     app.dispatch(read(&request, 4, 4));
-    assert_eq!(app.session().reading(), None);
+    assert_eq!(app.reading.as_ref(), None);
 
     // As a surface's creation does.
     let (gpu, device) = Gpu::noop();
@@ -484,7 +481,7 @@ fn an_image_read_before_the_gpu_arrived_is_read_again_once_it_has() {
 
     // An empty image has no pixels to stage.
     app.dispatch(read(&request, 0, 0));
-    assert_eq!(app.session().reading(), None);
+    assert_eq!(app.reading.as_ref(), None);
 }
 
 #[test]

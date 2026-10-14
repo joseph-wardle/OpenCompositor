@@ -54,8 +54,6 @@ pub enum Viewed {
 pub(crate) struct Loads {
     /// Each node's reloads; a node never reloaded is absent.
     reloads: HashMap<NodeId, u64>,
-    /// The read in progress for the viewer.
-    reading: Option<LoadRequest>,
     /// Each node's last failed read.
     failed: HashMap<NodeId, LoadRequest>,
 }
@@ -154,21 +152,8 @@ impl Session {
         }
     }
 
-    /// The read in progress for the viewer.
-    pub fn reading(&self) -> Option<&LoadRequest> {
-        self.loads.reading.as_ref()
-    }
-
-    /// Records a read starting for the viewer, or none.
-    pub(crate) fn start_reading(&mut self, request: Option<LoadRequest>) {
-        self.loads.reading = request;
-    }
-
-    /// Records how the read in progress ended. Returns whether the graph changed.
-    pub(crate) fn finish_reading(&mut self, failed: bool) -> bool {
-        let Some(request) = self.loads.reading.take() else {
-            return false;
-        };
+    /// Records how a read of a node's file ended. Returns whether the graph changed.
+    pub(crate) fn record_read(&mut self, request: LoadRequest, failed: bool) -> bool {
         let node = request.node;
         if failed {
             self.loads.failed.insert(node, request);
