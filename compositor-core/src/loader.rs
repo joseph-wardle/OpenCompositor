@@ -11,10 +11,11 @@ use crate::document::NodeId;
 use crate::image::ImageInfo;
 use crate::read::{ReadError, read_image};
 
-/// The staging buffer's first size, a DCI 4K image, and its least. An image larger than the
-/// buffer replaces it with one its size, and so does one less than half its size, so that one
-/// large image does not hold its memory for the rest of the session.
+/// The staging buffer's first size, a DCI 4K image, and its least.
 const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
+
+/// Loads in a row that fit in half the staging buffer before it shrinks to fit them.
+const LOADS_BEFORE_SHRINKING: u32 = 3;
 
 /// A node's file to read, as of its last reload. The worker reads the path, never the document.
 ///
@@ -147,8 +148,9 @@ impl Loader {
         std::thread::Builder::new()
             .name("loader".to_owned())
             .spawn(move || {
+                let mut sizing = StagingSizing::default();
                 while let Some(request) = worker.next() {
-                    read(&worker, request, &deliver);
+                    read(&worker, request, &deliver, &mut sizing);
                 }
             })
             .expect("the loader thread starts");
@@ -261,7 +263,12 @@ impl Drop for Finishing<'_> {
 }
 
 /// Reads the request's file on the worker's thread, then stages and delivers it.
-fn read(mailbox: &Arc<Mailbox>, request: LoadRequest, deliver: &impl Fn(Loaded)) {
+fn read(
+    mailbox: &Arc<Mailbox>,
+    request: LoadRequest,
+    deliver: &impl Fn(Loaded),
+    sizing: &mut StagingSizing,
+) {
     // A panic on this thread would end the worker and every later read with it; the panic hook
     // has already reported it. The EXR reader contains its decoding threads' panics itself. A
     // failed allocation aborts the process regardless.
@@ -273,7 +280,7 @@ fn read(mailbox: &Arc<Mailbox>, request: LoadRequest, deliver: &impl Fn(Loaded))
     let result = match read {
         Ok(image) => {
             let (info, pixels) = image.into_parts();
-            match stage(&finishing, &info, pixels) {
+            match stage(&finishing, &info, pixels, sizing) {
                 Ok(pixels) => Ok(Decoded { info, pixels }),
                 Err(reason) => Err(LoadError::CannotShow(reason)),
             }
@@ -296,6 +303,7 @@ fn stage(
     finishing: &Finishing,
     info: &ImageInfo,
     pixels: Vec<f32>,
+    sizing: &mut StagingSizing,
 ) -> Result<Option<Staged>, String> {
     let Some(device) = &finishing.device else {
         return Ok(None);
@@ -324,11 +332,9 @@ fn stage(
     let Some((buffer, mapped)) = finishing.mailbox.take_staging() else {
         return Ok(None);
     };
-    let (first_width, first_height) = FIRST_STAGING_SIZE;
-    let fitted = size.max(staging_size(first_width, first_height));
-    let buffer = if buffer.size() < size || buffer.size() / 2 > fitted {
+    let buffer = if let Some(replacement) = sizing.replacement(buffer.size(), size) {
         buffer.destroy();
-        staging_buffer(device, fitted)
+        staging_buffer(device, replacement)
     } else if mapped {
         buffer
     } else {
@@ -381,6 +387,35 @@ fn stage(
             mailbox: Arc::clone(finishing.mailbox),
         },
     }))
+}
+
+/// When the worker replaces its staging buffer. It grows to fit any larger image, and shrinks
+/// only after several loads in a row would fit in half of it, so that one large image does not
+/// hold its memory for the rest of the session, and alternating large and small images does not
+/// make a buffer for each.
+#[derive(Debug, Default)]
+struct StagingSizing {
+    loads_fitting_half: u32,
+}
+
+impl StagingSizing {
+    /// The size of buffer to replace a `current`-byte one with, to stage `needed` bytes, or
+    /// `None` to keep it.
+    fn replacement(&mut self, current: u64, needed: u64) -> Option<u64> {
+        let (first_width, first_height) = FIRST_STAGING_SIZE;
+        let fitted = needed.max(staging_size(first_width, first_height));
+        if current / 2 > fitted {
+            self.loads_fitting_half += 1;
+        } else {
+            self.loads_fitting_half = 0;
+        }
+        if current < needed || self.loads_fitting_half == LOADS_BEFORE_SHRINKING {
+            self.loads_fitting_half = 0;
+            Some(fitted)
+        } else {
+            None
+        }
+    }
 }
 
 fn is_empty(info: &ImageInfo) -> bool {

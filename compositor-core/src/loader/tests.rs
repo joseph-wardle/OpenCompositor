@@ -206,12 +206,46 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     let third = receive(&deliveries).result.unwrap().pixels.unwrap();
     assert_ne!(third.buffer(), &buffer);
     assert!(third.buffer().size() > buffer.size());
+    let grown = third.buffer().clone();
     drop(third);
 
-    // Under half the grown buffer, which goes back to the first size.
+    // Under half the grown buffer, which goes back to the first size after enough such loads.
+    for _ in 1..LOADS_BEFORE_SHRINKING {
+        loader.request(request_for(&small));
+        let kept = receive(&deliveries).result.unwrap().pixels.unwrap();
+        assert_eq!(kept.buffer(), &grown);
+    }
     loader.request(request_for(&small));
-    let fourth = receive(&deliveries).result.unwrap().pixels.unwrap();
-    assert_eq!(fourth.buffer().size(), buffer.size());
+    let shrunk = receive(&deliveries).result.unwrap().pixels.unwrap();
+    assert_eq!(shrunk.buffer().size(), buffer.size());
+}
+
+#[test]
+fn alternating_large_and_small_images_keeps_one_staging_buffer() {
+    let (first_width, first_height) = FIRST_STAGING_SIZE;
+    let mut current = staging_size(first_width, first_height);
+    let uhd = staging_size(3840, 2160);
+    let eight_k = staging_size(8192, 4320);
+    let mut sizing = StagingSizing::default();
+    let mut replacements = Vec::new();
+
+    for _ in 0..10 {
+        for needed in [uhd, eight_k] {
+            if let Some(size) = sizing.replacement(current, needed) {
+                replacements.push(size);
+                current = size;
+            }
+        }
+    }
+    assert_eq!(replacements, [eight_k]);
+
+    // A run of small images gives the memory back.
+    for _ in 0..LOADS_BEFORE_SHRINKING {
+        if let Some(size) = sizing.replacement(current, uhd) {
+            current = size;
+        }
+    }
+    assert_eq!(current, staging_size(first_width, first_height));
 }
 
 #[test]
