@@ -25,8 +25,8 @@ void exit(int code) { QCoreApplication::exit(code); }
 QString platform_name() { return QGuiApplication::platformName(); }
 QString qt_compiled_version() { return QStringLiteral(QT_VERSION_STR); }
 QString qt_runtime_version() { return QString::fromLatin1(qVersion()); }
-void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t step) {
-    QTimer::singleShot(ms, qApp, [=] { callback(step); });
+void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t argument) {
+    QTimer::singleShot(ms, qApp, [=] { callback(argument); });
 }
 
 std::unique_ptr<QMainWindow> new_main_window() {

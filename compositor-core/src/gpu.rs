@@ -139,6 +139,16 @@ impl Gpu {
             .get_default_config(&device.adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| format!("the {pane:?} pane's surface has no configuration"))?;
         config.format = device.format;
+        // Mailbox replaces a waiting frame instead of blocking for the display, so a draw waits
+        // only when the pane redraws faster than its screen refreshes, which the shell prevents.
+        // Fifo, which every surface supports, is the fallback. The default is the driver's first
+        // mode, which may be Immediate, which tears.
+        let modes = surface.get_capabilities(&device.adapter).present_modes;
+        config.present_mode = if modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
         surface.configure(&device.device, &config);
         device.configs[pane.index()] = Some(config);
         self.surfaces[pane.index()] = Some(surface);
@@ -206,7 +216,7 @@ impl Gpu {
     }
 
     /// Draws one frame of the pane: the graph, or the viewer's frame if it shows an image.
-    /// With Fifo presentation this can wait for the display.
+    /// This can wait for the display while the pane has frames it has not shown.
     ///
     /// Returns whether to draw again: the surface was out of date and has been reconfigured.
     pub(crate) fn draw(

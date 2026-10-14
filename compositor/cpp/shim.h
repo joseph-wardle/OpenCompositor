@@ -26,7 +26,7 @@ void exit(int code);
 QString platform_name();
 QString qt_compiled_version();
 QString qt_runtime_version();
-void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t step);
+void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t argument);
 
 std::unique_ptr<QMainWindow> new_main_window();
 QMenu *new_menu(QMainWindow *window, const QString &title);

@@ -27,6 +27,7 @@ pub mod ffi {
         include!(<QtWidgets/QDockWidget>);
         include!(<QtWidgets/QWidget>);
         include!(<QtGui/QWindow>);
+        include!(<QtGui/QScreen>);
 
         #[qobject]
         type QWidget;
@@ -36,6 +37,8 @@ pub mod ffi {
         type QDockWidget;
         #[qobject]
         type QWindow;
+        #[qobject]
+        type QScreen;
 
         fn resize(self: Pin<&mut QMainWindow>, width: i32, height: i32);
         fn show(self: Pin<&mut QMainWindow>);
@@ -49,6 +52,9 @@ pub mod ffi {
         fn raise(self: Pin<&mut QDockWidget>);
         fn show(self: Pin<&mut QDockWidget>);
         fn close(self: Pin<&mut QDockWidget>) -> bool;
+
+        #[cxx_name = "refreshRate"]
+        fn refresh_rate(self: &QScreen) -> f64;
     }
 
     // Qt Wayland's per-window object (private QPA API), for its native surface.
@@ -95,6 +101,8 @@ pub mod ffi {
         #[inherit]
         fn height(self: &Pane) -> i32;
         #[inherit]
+        fn screen(self: &Pane) -> *mut QScreen;
+        #[inherit]
         #[cxx_name = "isExposed"]
         fn is_exposed(self: &Pane) -> bool;
     }
@@ -136,7 +144,7 @@ pub mod ffi {
         fn qt_compiled_version() -> QString;
         /// The Qt loaded at run time.
         fn qt_runtime_version() -> QString;
-        fn single_shot(ms: i32, callback: fn(usize), step: usize);
+        fn single_shot(ms: i32, callback: fn(usize), argument: usize);
 
         fn new_main_window() -> UniquePtr<QMainWindow>;
         /// A menu at the end of the window's menu bar, which owns it.

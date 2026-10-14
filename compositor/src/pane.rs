@@ -63,6 +63,7 @@ pub unsafe fn event(mut window: Pin<&mut qt::Pane>, pane: Pane, event: *mut ffi:
             false
         }
         kind::UPDATE_REQUEST => {
+            crate::pace::drawing(pane);
             crate::dispatch(Event::Draw(pane));
             true
         }

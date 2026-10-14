@@ -3,6 +3,7 @@
 
 mod keys;
 mod lifecycle;
+mod pace;
 mod pane;
 mod qt;
 
@@ -154,7 +155,7 @@ fn run_command(index: usize) {
 pub fn perform(request: Request) {
     let widgets = widgets();
     match request {
-        Request::Redraw(pane) => with_pane_window(pane, |window| window.request_update()),
+        Request::Redraw(pane) => pace::redraw(pane),
         Request::AttachSurface(pane) => {
             let attached = with_pane_window(pane, |mut window| {
                 let size = pane::size(&window);
