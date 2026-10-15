@@ -9,6 +9,7 @@ use open_ng::{ConnectionEdit, Graph, InputEvent, Point, Response, Verdict, View,
 
 use crate::document::{Changes, Document, Node, NodeId, NodeKind, Slot};
 use crate::loader::LoadRequest;
+use crate::parameter::{Value, ValueError};
 use crate::presentation::present;
 use crate::viewer::Viewer;
 
@@ -23,14 +24,32 @@ struct Step {
     document: Document,
 }
 
+/// An edit applied to the live document as it happens, recorded as one step when it finishes:
+/// a slider drag, or a script setting several values.
+#[derive(Debug)]
+struct EditInProgress {
+    label: &'static str,
+    /// The edit belongs to this node, not to the selection.
+    node: NodeId,
+    /// The document from when the edit began, which finishing records and cancelling restores.
+    before: Document,
+}
+
 /// An edit refused before applying.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EditError {
     /// The target no longer exists, such as a dialog's node removed by an undo while the dialog
     /// was open.
     MissingNode(NodeId),
     /// The node is of a type the edit does not apply to.
     WrongKind(NodeId),
+    /// Values change only between beginning and finishing an edit.
+    NoEditInProgress,
+    InvalidValue {
+        node: NodeId,
+        parameter: String,
+        error: ValueError,
+    },
 }
 
 impl fmt::Display for EditError {
@@ -38,11 +57,24 @@ impl fmt::Display for EditError {
         match self {
             EditError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
             EditError::WrongKind(id) => write!(f, "node {} has no such setting", id.0),
+            EditError::NoEditInProgress => write!(f, "no edit is in progress"),
+            EditError::InvalidValue {
+                node,
+                parameter,
+                error,
+            } => write!(f, "node {}, {parameter}: {error}", node.0),
         }
     }
 }
 
-impl std::error::Error for EditError {}
+impl std::error::Error for EditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EditError::InvalidValue { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// What the viewer's slot leads to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,11 +122,17 @@ impl Loads {
 ///
 /// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
 /// before returning the [`Changes`] it made. An edit that changes nothing records no step.
+///
+/// Parameter values change through an edit in progress: [`begin_edit`](Session::begin_edit),
+/// any number of value changes, then [`finish_edit`](Session::finish_edit) to record them as one
+/// step or [`cancel_edit`](Session::cancel_edit) to restore the document from the beginning. A
+/// one-shot change is a begin, one change and a finish.
 #[derive(Debug)]
 pub struct Session {
     document: Document,
     undo: Vec<Step>,
     redo: Vec<Step>,
+    editing: Option<EditInProgress>,
     /// Outside every snapshot, so undo never rewinds it.
     next_id: u64,
     graph: Graph,
@@ -115,6 +153,7 @@ impl Session {
             document: Document::default(),
             undo: Vec::new(),
             redo: Vec::new(),
+            editing: None,
             next_id: 1,
             graph: Graph::default(),
             graph_view: View::new(Viewport {
@@ -314,26 +353,102 @@ impl Session {
         if moved {
             self.commit("Move", document)
         } else {
-            self.select(document)
+            self.swap_in(document)
         }
     }
 
-    /// Restores the document from before the last step. Returns no changes if there is none.
-    pub fn undo(&mut self) -> Changes {
-        let Some(step) = self.undo.pop() else {
-            return Changes::default();
+    /// Begins an edit of a node's values, finishing any edit in progress first.
+    pub fn begin_edit(&mut self, node: NodeId, label: &'static str) -> Result<(), EditError> {
+        if self.document.node(node).is_none() {
+            return Err(EditError::MissingNode(node));
+        }
+        self.finish_edit();
+        self.editing = Some(EditInProgress {
+            label,
+            node,
+            before: self.document.clone(),
+        });
+        Ok(())
+    }
+
+    /// The node an edit in progress belongs to.
+    pub fn editing(&self) -> Option<NodeId> {
+        self.editing.as_ref().map(|edit| edit.node)
+    }
+
+    /// Sets a value of the edited node in the live document, recording no step yet. A value equal
+    /// to the default stays set.
+    pub fn set_value(&mut self, parameter: &str, value: Value) -> Result<Changes, EditError> {
+        self.edit_value(parameter, |node| node.set_value(parameter, value))
+    }
+
+    /// Removes a value of the edited node in the live document, so it reads as its default.
+    pub fn reset_value(&mut self, parameter: &str) -> Result<Changes, EditError> {
+        self.edit_value(parameter, |node| node.reset(parameter))
+    }
+
+    fn edit_value(
+        &mut self,
+        parameter: &str,
+        edit: impl FnOnce(&mut Node) -> Result<(), ValueError>,
+    ) -> Result<Changes, EditError> {
+        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
+        let mut document = self.document.clone();
+        // Every recorded edit, undo and redo ends the edit first, so its node still exists.
+        let node = document.nodes.get_mut(&id).expect("the edited node exists");
+        let mut edited = Node::clone(node);
+        edit(&mut edited).map_err(|error| EditError::InvalidValue {
+            node: id,
+            parameter: parameter.to_owned(),
+            error,
+        })?;
+        if edited != **node {
+            *node = Arc::new(edited);
+        }
+        Ok(self.swap_in(document))
+    }
+
+    /// Records the edit in progress as one step, unless it changed nothing.
+    pub fn finish_edit(&mut self) {
+        let Some(edit) = self.editing.take() else {
+            return;
         };
-        let (redo, changes) = self.restore(step);
-        self.redo.push(redo);
+        if !edit.before.changes_to(&self.document).is_empty() {
+            self.undo.push(Step {
+                label: edit.label,
+                document: edit.before,
+            });
+            self.redo.clear();
+        }
+    }
+
+    /// Ends the edit in progress, restoring the document from when it began.
+    pub fn cancel_edit(&mut self) -> Changes {
+        match self.editing.take() {
+            Some(edit) => self.swap_in(edit.before),
+            None => Changes::default(),
+        }
+    }
+
+    /// Restores the document from before the last step, cancelling any edit in progress first.
+    pub fn undo(&mut self) -> Changes {
+        let mut changes = self.cancel_edit();
+        if let Some(step) = self.undo.pop() {
+            let (redo, undone) = self.restore(step);
+            self.redo.push(redo);
+            changes.extend(undone);
+        }
         changes
     }
 
+    /// Reapplies the last undone step, cancelling any edit in progress first.
     pub fn redo(&mut self) -> Changes {
-        let Some(step) = self.redo.pop() else {
-            return Changes::default();
-        };
-        let (undo, changes) = self.restore(step);
-        self.undo.push(undo);
+        let mut changes = self.cancel_edit();
+        if let Some(step) = self.redo.pop() {
+            let (undo, redone) = self.restore(step);
+            self.undo.push(undo);
+            changes.extend(redone);
+        }
         changes
     }
 
@@ -350,11 +465,15 @@ impl Session {
     }
 
     /// Records an edit as one step, unless it changed nothing. A new step clears redo.
+    ///
+    /// An edit in progress is finished first as its own step: steps are whole documents, so
+    /// otherwise undoing one would undo or half-restore the other.
     fn commit(&mut self, label: &'static str, after: Document) -> Changes {
         let changes = self.document.changes_to(&after);
         if changes.is_empty() {
             return changes;
         }
+        self.finish_edit();
         let before = std::mem::replace(&mut self.document, after);
         self.undo.push(Step {
             label,
@@ -365,8 +484,9 @@ impl Session {
         changes
     }
 
-    /// Swaps in a document that differs at most in its selection, recording no step.
-    fn select(&mut self, after: Document) -> Changes {
+    /// Swaps in a document without recording a step: a change of selection, or of the edit in
+    /// progress.
+    fn swap_in(&mut self, after: Document) -> Changes {
         let changes = self.document.changes_to(&after);
         if !changes.is_empty() {
             self.document = after;

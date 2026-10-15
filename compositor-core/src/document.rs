@@ -116,14 +116,14 @@ impl Node {
 
     /// Sets a parameter's value, refusing one its description does not allow. A value equal to
     /// the default stays set.
-    pub fn set_value(&mut self, name: &str, value: Value) -> Result<(), ValueError> {
+    pub(crate) fn set_value(&mut self, name: &str, value: Value) -> Result<(), ValueError> {
         let (name, value) = validate(self.kind.parameters(), name, value)?;
         self.authored.insert(name, value);
         Ok(())
     }
 
     /// Removes a parameter's authored value, so it reads as its default again.
-    pub fn reset(&mut self, name: &str) -> Result<(), ValueError> {
+    pub(crate) fn reset(&mut self, name: &str) -> Result<(), ValueError> {
         let parameter = describe(self.kind.parameters(), name)?;
         self.authored.remove(parameter.name);
         Ok(())
@@ -210,5 +210,11 @@ pub struct Changes {
 impl Changes {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty() && !self.selection
+    }
+
+    /// Adds what a later change touched.
+    pub(crate) fn extend(&mut self, later: Changes) {
+        self.nodes.extend(later.nodes);
+        self.selection |= later.selection;
     }
 }
