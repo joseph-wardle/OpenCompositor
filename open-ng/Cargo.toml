@@ -1,6 +1,6 @@
 [package]
 name = "open-ng"
-version = "0.4.0"
+version = "0.4.1"
 description = "A programmable node editor library for native and browser applications."
 edition.workspace = true
 # The bundled font in fonts/ is under the SIL Open Font License.

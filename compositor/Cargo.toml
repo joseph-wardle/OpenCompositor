@@ -8,7 +8,17 @@ repository = "https://github.com/joseph-wardle/OpenCompositor"
 publish = false
 
 [dependencies]
-open-ng = { path = "../open-ng", version = "0.4.0" }
+cxx = "1.0.205"
+cxx-qt = "0.10.0"
+cxx-qt-lib = { version = "0.10.0", features = ["qt_gui"] }
+open-ng = { path = "../open-ng", version = "0.4.1" }
+opencompositor-core = { path = "../compositor-core" }
+# The backends the shell draws with. The core leaves them to it.
+wgpu = "30"
+
+[build-dependencies]
+cxx-qt-build = "0.10.0"
+qt-build-utils = "0.10.0"
 
 [lints]
 workspace = true

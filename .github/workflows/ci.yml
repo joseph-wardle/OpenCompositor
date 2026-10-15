@@ -15,9 +15,34 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo build --workspace --all-targets --locked
-      - run: cargo test --workspace --locked
+      # The shell needs Qt, which the `shell` job installs.
+      - run: cargo clippy --workspace --exclude opencompositor --all-targets --locked -- -D warnings
+      - run: cargo build --workspace --exclude opencompositor --all-targets --locked
+      - run: cargo test --workspace --exclude opencompositor --locked
+
+  shell:
+    runs-on: ubuntu-latest
+    env:
+      QT_VERSION: 6.12.0
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # aqt's Qt links against the system's GL and loads its EGL, xkbcommon and fontconfig.
+      - name: Install Qt's system libraries
+        run: sudo apt-get update && sudo apt-get install -y libgl-dev libegl1 libxkbcommon0 libfontconfig1
+      # qtwayland carries the Wayland plugin; qtbase, with these archives, the private headers.
+      - name: Install Qt with aqtinstall
+        run: |
+          pipx install aqtinstall==3.3.0
+          aqt install-qt linux desktop "$QT_VERSION" linux_gcc_64 --outputdir "$RUNNER_TEMP/qt" --archives qtbase qtwayland icu
+          qt="$RUNNER_TEMP/qt/$QT_VERSION/gcc_64"
+          echo "QMAKE=$qt/bin/qmake" >> "$GITHUB_ENV"
+          # The binary has no rpath, and would otherwise load a system Qt without a word.
+          echo "LD_LIBRARY_PATH=$qt/lib" >> "$GITHUB_ENV"
+      - run: cargo clippy -p opencompositor --all-targets --locked -- -D warnings
+      - run: cargo build -p opencompositor --locked
+      - run: cargo test -p opencompositor --locked
 
   open-ng:
     runs-on: ubuntu-latest
