@@ -7,7 +7,9 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use open_ng::Point;
-use opencompositor_core::{Channel, EvalError, NodeId, ReadError, Session, evaluate};
+use opencompositor_core::{
+    Channel, EvalError, ExposureVersion, NodeId, NodeKind, ReadError, Session, evaluate,
+};
 
 /// A directory of this test's own, emptied first.
 fn directory(name: &str) -> PathBuf {
@@ -68,5 +70,23 @@ fn evaluation_reports_what_went_wrong() {
     session.undo();
     assert!(
         matches!(evaluate(session.document(), id), Err(EvalError::MissingNode(missing)) if missing == id)
+    );
+}
+
+#[test]
+fn an_exposure_node_reports_that_it_has_no_input() {
+    let mut session = Session::new();
+    let changes = session.create_node(
+        NodeKind::Exposure {
+            version: ExposureVersion::CURRENT,
+        },
+        Point { x: 0.0, y: 0.0 },
+    );
+    let id = *changes.nodes.first().unwrap();
+
+    let error = evaluate(session.document(), id).unwrap_err();
+    assert!(
+        matches!(error, EvalError::NoInput(node) if node == id),
+        "{error:?}"
     );
 }

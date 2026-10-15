@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point, Verdict, View, Viewport};
 
 use super::*;
+use crate::document::ExposureVersion;
 use crate::presentation::record;
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
@@ -14,6 +15,13 @@ fn paths(names: &[&str]) -> Vec<PathBuf> {
 fn create(session: &mut Session, name: &str, at: Point) -> NodeId {
     let changes = session.create_readers(paths(&[name]), at);
     *changes.nodes.first().expect("one node created")
+}
+
+fn reader_path(session: &Session, id: NodeId) -> &Path {
+    match &session.document().node(id).expect("the node exists").kind {
+        NodeKind::Reader { path } => path,
+        kind => panic!("{kind:?} is not a Reader"),
+    }
 }
 
 fn slot(digit: u8) -> Slot {
@@ -73,8 +81,7 @@ fn a_new_edit_clears_redo() {
 
     assert_eq!(session.redo_label(), None);
     assert!(session.redo().is_empty());
-    let NodeKind::Reader { path } = &session.document().node(reader).unwrap().kind;
-    assert_eq!(path, &PathBuf::from("a.exr"));
+    assert_eq!(reader_path(&session, reader), Path::new("a.exr"));
     assert_presented(&session);
 }
 
@@ -174,8 +181,7 @@ fn redo_survives_selecting_and_edits_that_change_nothing() {
     assert_eq!(session.redo_label(), Some("Set Reader Path"));
 
     assert!(!session.redo().is_empty());
-    let NodeKind::Reader { path } = &session.document().node(reader).unwrap().kind;
-    assert_eq!(path, &PathBuf::from("b.exr"));
+    assert_eq!(reader_path(&session, reader), Path::new("b.exr"));
     assert_presented(&session);
 }
 
@@ -282,4 +288,55 @@ fn edits_to_a_node_an_undo_removed_are_refused() {
     };
     assert!(session.apply_response(&stale).is_empty());
     assert_presented(&session);
+}
+
+#[test]
+fn an_exposure_node_is_created_selected_and_undoable() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let at = Point { x: 0.0, y: 100.0 };
+    let exposure = NodeKind::Exposure {
+        version: ExposureVersion::CURRENT,
+    };
+
+    let changes = session.create_node(exposure.clone(), at);
+
+    let id = *changes.nodes.first().expect("one node created");
+    assert!(changes.selection);
+    assert_eq!(session.document().selection(), [id]);
+    assert_eq!(
+        session.document().node(id),
+        Some(&Node {
+            kind: exposure,
+            position: at
+        })
+    );
+    assert_eq!(session.graph().node(id.into()).unwrap().title, "Exposure");
+    assert_eq!(session.undo_label(), Some("Create Exposure"));
+    assert_presented(&session);
+
+    session.undo();
+    assert_eq!(session.document().node(id), None);
+    assert_eq!(session.document().selection(), [reader]);
+    assert_presented(&session);
+}
+
+#[test]
+fn an_exposure_node_has_no_input_and_no_reader_path() {
+    let mut session = Session::new();
+    let changes = session.create_node(
+        NodeKind::Exposure {
+            version: ExposureVersion::CURRENT,
+        },
+        ORIGIN,
+    );
+    let id = *changes.nodes.first().expect("one node created");
+    session.set_mark(slot(1), Some(id)).unwrap();
+
+    assert_eq!(session.viewed(), Viewed::NoInput(id));
+    assert_eq!(
+        session.set_reader_path(id, "a.exr".into()),
+        Err(EditError::WrongKind(id))
+    );
+    assert_eq!(session.undo_label(), Some("Mark"));
 }

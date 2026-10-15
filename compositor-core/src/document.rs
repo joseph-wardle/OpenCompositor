@@ -8,6 +8,8 @@ use imbl::OrdMap;
 use imbl::ordmap::DiffItem;
 use open_ng::Point;
 
+use crate::parameter::{FloatParameter, Parameter, ParameterKind};
+
 /// A node's identity. A session never gives two nodes the same ID, even after undoing the
 /// creation of one, so caches, loads in flight and OpenNG gestures cannot confuse them.
 ///
@@ -47,7 +49,44 @@ impl Slot {
 pub enum NodeKind {
     /// Reads one image file. The path is kept as the artist chose it.
     Reader { path: PathBuf },
+    /// Multiplies R, G and B by two to the power of its Stops and leaves A. On premultiplied
+    /// pixels that equals unpremultiplying, scaling and premultiplying again.
+    Exposure { version: ExposureVersion },
 }
+
+impl NodeKind {
+    /// What the node offers to be set, as its version describes it.
+    pub fn parameters(&self) -> &'static [Parameter] {
+        match self {
+            NodeKind::Reader { .. } => &[],
+            NodeKind::Exposure {
+                version: ExposureVersion::V1,
+            } => EXPOSURE_V1,
+        }
+    }
+}
+
+/// The parameter descriptions an Exposure node was created with. A changed default is a new
+/// version, so a node keeps the defaults its values were authored against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExposureVersion {
+    V1,
+}
+
+impl ExposureVersion {
+    pub const CURRENT: ExposureVersion = ExposureVersion::V1;
+}
+
+const EXPOSURE_V1: &[Parameter] = &[Parameter {
+    name: "stops",
+    label: "Stops",
+    kind: ParameterKind::Float(FloatParameter {
+        default: 0.0,
+        slider: -6.0..=6.0,
+        // Keeps the gain, two to these powers, many orders of magnitude inside f32's range.
+        limits: -64.0..=64.0,
+    }),
+}];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {

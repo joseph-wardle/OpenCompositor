@@ -10,6 +10,11 @@ const READER_COLOR: Color = Color {
     g: 110,
     b: 150,
 };
+const EXPOSURE_COLOR: Color = Color {
+    r: 90,
+    g: 130,
+    b: 80,
+};
 const FAILED_COLOR: Color = Color {
     r: 160,
     g: 60,
@@ -74,9 +79,13 @@ pub(crate) fn present(
 }
 
 pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node) -> NodeRecord {
-    let NodeKind::Reader { path } = &node.kind;
-    let name = path.file_name().unwrap_or(path.as_os_str());
-    let mut title = shorten(&name.to_string_lossy());
+    let (mut title, color) = match &node.kind {
+        NodeKind::Reader { path } => {
+            let name = path.file_name().unwrap_or(path.as_os_str());
+            (shorten(&name.to_string_lossy()), READER_COLOR)
+        }
+        NodeKind::Exposure { .. } => ("Exposure".to_owned(), EXPOSURE_COLOR),
+    };
     // Slot numbers go in the title, and a failed read in the colour, until OpenNG has badges.
     // Nothing shows a read in progress: the title would widen the node while it lasted, and the
     // viewer's caption says it.
@@ -93,7 +102,7 @@ pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node
         color: if loads.failed(document, id) {
             FAILED_COLOR
         } else {
-            READER_COLOR
+            color
         },
         rows: vec![Row::Pin(Pin {
             id: PinId(0),

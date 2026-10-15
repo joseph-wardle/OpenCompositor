@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use open_ng::{ConnectionEdit, Graph, InputEvent, Point, Response, Verdict, View, Viewport};
@@ -23,17 +23,21 @@ struct Step {
     document: Document,
 }
 
-/// An edit refused because its target no longer exists, such as a dialog's node removed by an
-/// undo while the dialog was open.
+/// An edit refused before applying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditError {
+    /// The target no longer exists, such as a dialog's node removed by an undo while the dialog
+    /// was open.
     MissingNode(NodeId),
+    /// The node is of a type the edit does not apply to.
+    WrongKind(NodeId),
 }
 
 impl fmt::Display for EditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EditError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
+            EditError::WrongKind(id) => write!(f, "node {} has no such setting", id.0),
         }
     }
 }
@@ -46,6 +50,8 @@ pub enum Viewed {
     Unmarked,
     /// The slot marks a node the document no longer has.
     Missing(NodeId),
+    /// The slot marks a node that needs an input it does not have.
+    NoInput(NodeId),
     Node(LoadRequest),
 }
 
@@ -59,21 +65,23 @@ pub(crate) struct Loads {
 }
 
 impl Loads {
-    /// What reading the node's file means now.
-    fn request(&self, document: &Document, id: NodeId) -> Option<LoadRequest> {
-        let NodeKind::Reader { path } = &document.node(id)?.kind;
-        Some(LoadRequest {
+    /// What reading a Reader's file means now.
+    fn request(&self, id: NodeId, path: &Path) -> LoadRequest {
+        LoadRequest {
             node: id,
-            path: path.clone(),
+            path: path.to_owned(),
             reload: self.reloads.get(&id).copied().unwrap_or(0),
-        })
+        }
     }
 
     /// Whether reading the node's file failed, and it would read the same file again.
     pub(crate) fn failed(&self, document: &Document, id: NodeId) -> bool {
+        let Some(NodeKind::Reader { path }) = document.node(id).map(|node| &node.kind) else {
+            return false;
+        };
         self.failed
             .get(&id)
-            .is_some_and(|failed| self.request(document, id).as_ref() == Some(failed))
+            .is_some_and(|failed| *failed == self.request(id, path))
     }
 }
 
@@ -145,9 +153,10 @@ impl Session {
     pub fn viewed(&self) -> Viewed {
         match self.document.mark(self.viewer.slot()) {
             None => Viewed::Unmarked,
-            Some(id) => match self.loads.request(&self.document, id) {
-                Some(request) => Viewed::Node(request),
+            Some(id) => match self.document.node(id).map(|node| &node.kind) {
                 None => Viewed::Missing(id),
+                Some(NodeKind::Reader { path }) => Viewed::Node(self.loads.request(id, path)),
+                Some(NodeKind::Exposure { .. }) => Viewed::NoInput(id),
             },
         }
     }
@@ -235,6 +244,22 @@ impl Session {
         self.commit("Create Reader", document)
     }
 
+    /// Creates a node of a kind at `at` and selects it alone.
+    pub fn create_node(&mut self, kind: NodeKind, at: Point) -> Changes {
+        let label = match kind {
+            NodeKind::Reader { .. } => "Create Reader",
+            NodeKind::Exposure { .. } => "Create Exposure",
+        };
+        let id = NodeId(self.next_id);
+        self.next_id += 1;
+        let mut document = self.document.clone();
+        document
+            .nodes
+            .insert(id, Arc::new(Node { kind, position: at }));
+        document.selection = [id].into();
+        self.commit(label, document)
+    }
+
     /// Points a Reader at another file. It keeps its ID, position, marks and selection.
     pub fn set_reader_path(&mut self, id: NodeId, path: PathBuf) -> Result<Changes, EditError> {
         let mut document = self.document.clone();
@@ -242,10 +267,11 @@ impl Session {
             .nodes
             .get_mut(&id)
             .ok_or(EditError::MissingNode(id))?;
-        let NodeKind::Reader { path: current } = &node.kind;
+        let NodeKind::Reader { path: current } = &node.kind else {
+            return Err(EditError::WrongKind(id));
+        };
         if *current != path {
-            let NodeKind::Reader { path: current } = &mut Arc::make_mut(node).kind;
-            *current = path;
+            Arc::make_mut(node).kind = NodeKind::Reader { path };
         }
         Ok(self.commit("Set Reader Path", document))
     }
@@ -268,7 +294,7 @@ impl Session {
     /// Houdini: undo goes back to the last edit, not the last click, and redo survives a click.
     ///
     /// Nodes the document no longer has are left out: a window-wide undo can remove a node during
-    /// a gesture. Readers have no groups and no inputs, so a response never folds or connects.
+    /// a gesture. No node has groups or inputs yet, so a response never folds or connects.
     pub fn apply_response(&mut self, response: &Response) -> Changes {
         let mut document = self.document.clone();
         if let Some(selection) = &response.selection {
@@ -368,7 +394,7 @@ impl Session {
     }
 }
 
-/// Readers have no inputs, so nothing can be connected yet.
+/// No node has inputs yet, so nothing can be connected.
 fn refuse_connections(_: &ConnectionEdit) -> Verdict {
     Verdict::Refuse { reason: None }
 }
