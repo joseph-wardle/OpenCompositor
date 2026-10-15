@@ -23,7 +23,9 @@ pub use image::{
     ImageInfo, PngColorType, PngSource, SampleType, Source, Warning, Window,
 };
 pub use loader::{Decoded, LoadError, LoadRequest, Loaded};
-pub use parameter::{FloatParameter, Parameter, ParameterKind};
+pub use parameter::{
+    FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,
+};
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Session, Viewed};
 pub use viewer::{Placement, Viewer};

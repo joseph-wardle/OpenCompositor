@@ -1,6 +1,6 @@
 //! The document: everything undo restores, and nothing else.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,7 +8,9 @@ use imbl::OrdMap;
 use imbl::ordmap::DiffItem;
 use open_ng::Point;
 
-use crate::parameter::{FloatParameter, Parameter, ParameterKind};
+use crate::parameter::{
+    FloatParameter, Parameter, ParameterKind, Value, ValueError, describe, validate,
+};
 
 /// A node's identity. A session never gives two nodes the same ID, even after undoing the
 /// creation of one, so caches, loads in flight and OpenNG gestures cannot confuse them.
@@ -93,6 +95,39 @@ pub struct Node {
     pub kind: NodeKind,
     /// The node's top-left corner in graph units, y down, as OpenNG places it.
     pub position: Point,
+    /// Only the values the artist set, each valid for its parameter. An absent value reads as its
+    /// version's default, so a changed default never alters what was authored.
+    authored: BTreeMap<&'static str, Value>,
+}
+
+impl Node {
+    pub(crate) fn new(kind: NodeKind, position: Point) -> Node {
+        Node {
+            kind,
+            position,
+            authored: BTreeMap::new(),
+        }
+    }
+
+    /// The value the artist set for a parameter, if they set one.
+    pub fn authored_value(&self, name: &str) -> Option<Value> {
+        self.authored.get(name).copied()
+    }
+
+    /// Sets a parameter's value, refusing one its description does not allow. A value equal to
+    /// the default stays set.
+    pub fn set_value(&mut self, name: &str, value: Value) -> Result<(), ValueError> {
+        let (name, value) = validate(self.kind.parameters(), name, value)?;
+        self.authored.insert(name, value);
+        Ok(())
+    }
+
+    /// Removes a parameter's authored value, so it reads as its default again.
+    pub fn reset(&mut self, name: &str) -> Result<(), ValueError> {
+        let parameter = describe(self.kind.parameters(), name)?;
+        self.authored.remove(parameter.name);
+        Ok(())
+    }
 }
 
 /// Everything undo restores, and nothing else. Decoded images, GPU resources, Qt objects, the ID

@@ -228,13 +228,13 @@ impl Session {
         for (row, path) in paths.into_iter().enumerate() {
             let id = NodeId(self.next_id);
             self.next_id += 1;
-            let node = Node {
-                kind: NodeKind::Reader { path },
-                position: Point {
+            let node = Node::new(
+                NodeKind::Reader { path },
+                Point {
                     x: at.x,
                     y: at.y + row as f32 * READER_SPACING,
                 },
-            };
+            );
             document.nodes.insert(id, Arc::new(node));
             created.push(id);
         }
@@ -253,9 +253,7 @@ impl Session {
         let id = NodeId(self.next_id);
         self.next_id += 1;
         let mut document = self.document.clone();
-        document
-            .nodes
-            .insert(id, Arc::new(Node { kind, position: at }));
+        document.nodes.insert(id, Arc::new(Node::new(kind, at)));
         document.selection = [id].into();
         self.commit(label, document)
     }

@@ -304,13 +304,7 @@ fn an_exposure_node_is_created_selected_and_undoable() {
     let id = *changes.nodes.first().expect("one node created");
     assert!(changes.selection);
     assert_eq!(session.document().selection(), [id]);
-    assert_eq!(
-        session.document().node(id),
-        Some(&Node {
-            kind: exposure,
-            position: at
-        })
-    );
+    assert_eq!(session.document().node(id), Some(&Node::new(exposure, at)));
     assert_eq!(session.graph().node(id.into()).unwrap().title, "Exposure");
     assert_eq!(session.undo_label(), Some("Create Exposure"));
     assert_presented(&session);
