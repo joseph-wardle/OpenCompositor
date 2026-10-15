@@ -107,10 +107,11 @@ fn the_first_row_is_the_top_and_the_windows_are_the_frame() {
         (image.display_window(), image.data_window()),
         (frame, frame)
     );
-    assert_eq!(image.pixel(0, 0), [1.0, 0.0, 0.0, 1.0]);
-    assert_eq!(image.pixel(1, 0), [0.0, 1.0, 0.0, 1.0]);
-    assert_eq!(image.pixel(0, 1), [0.0, 0.0, 1.0, 1.0]);
-    assert_eq!(image.pixel(1, 1), [1.0; 4]);
+    // Image coordinates count rows up from the bottom.
+    assert_eq!(image.pixel(0, 1), [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(image.pixel(1, 1), [0.0, 1.0, 0.0, 1.0]);
+    assert_eq!(image.pixel(0, 0), [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(image.pixel(1, 0), [1.0; 4]);
 }
 
 #[test]

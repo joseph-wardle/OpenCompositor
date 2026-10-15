@@ -90,9 +90,25 @@ fn patch_attribute(bytes: &mut [u8], name_and_type: &[u8], value: &[u8]) {
     bytes[start..start + value.len()].copy_from_slice(value);
 }
 
+/// Checks every pixel of the data window: red is the pixel's x and green its row counted down,
+/// as EXR counts them, with `top` the y-up row of EXR's row 0.
+fn assert_rows_counted_down(image: &Image, top: i32) {
+    let window = image.data_window();
+    for y in window.y..window.y + window.height as i32 {
+        for x in window.x..window.x + window.width as i32 {
+            // A missing alpha channel reads as opaque.
+            assert_eq!(
+                image.pixel(x, y),
+                [x as f32, (top - y) as f32, 0.0, 1.0],
+                "({x}, {y})"
+            );
+        }
+    }
+}
+
 #[test]
-fn pixels_keep_negative_data_windows_and_top_row_first() {
-    // Red is each pixel's x and green its y, so every pixel says where it belongs.
+fn windows_turn_y_up_about_the_display_window_and_keep_negative_origins() {
+    // Red is each pixel's x and green its y, counted down, so every pixel says where it belongs.
     let (origin, size) = ((-7, -5), (16usize, 8usize));
     let mut red = Vec::new();
     let mut green = Vec::new();
@@ -117,51 +133,52 @@ fn pixels_keep_negative_data_windows_and_top_row_first() {
         Encoding::FAST_LOSSLESS,
         AnyChannels::sort(channels.into_iter().collect()),
     );
-    let bytes = write(display(0, 0, 10, 10), vec![layer]);
+    // Rows 3 to 12 counted down, so row 12 becomes row 0 and row 3 becomes row 9.
+    let bytes = write(display(2, 3, 10, 6), vec![layer]);
 
     let image = read_bytes(&bytes).unwrap();
 
-    let data_window = Window {
-        x: -7,
-        y: -5,
-        width: 16,
-        height: 8,
-    };
-    assert_eq!(image.data_window(), data_window);
     assert_eq!(
         image.display_window(),
         Window {
-            x: 0,
+            x: 2,
             y: 0,
             width: 10,
-            height: 10
+            height: 6
         }
     );
+    // Rows -5 to 2 counted down become rows 10 down to 3: below the display window's top, and
+    // overhanging it.
+    assert_eq!(
+        image.data_window(),
+        Window {
+            x: -7,
+            y: 6,
+            width: 16,
+            height: 8
+        }
+    );
+    assert_rows_counted_down(&image, 8);
     assert_eq!(
         &image.pixels()[..4],
         [-7.0, -5.0, 0.0, 1.0],
-        "the first pixel is the top left"
+        "the first pixel stored is the top left"
     );
-    for (x, y) in [(-7, -5), (8, -5), (-7, 2), (8, 2), (0, 0), (3, -1)] {
-        // A missing alpha channel reads as opaque.
+    for (x, y) in [(-8, 6), (9, 6), (-7, 5), (-7, 14)] {
         assert_eq!(
             image.pixel(x, y),
-            [x as f32, y as f32, 0.0, 1.0],
-            "({x}, {y})"
+            [0.0; 4],
+            "outside the data window is transparent black"
         );
     }
-    assert_eq!(
-        image.pixel(9, 9),
-        [0.0; 4],
-        "outside the data window is transparent black"
-    );
     assert!(image.warnings().is_empty());
 }
 
 #[test]
 fn a_tiled_zip_file_from_openexr_reads_exactly() {
-    // The image above, written by OpenEXR 3.5 as one 64 × 64 ZIP tile, so the expected pixels
-    // do not come from the `exr` crate that reads them.
+    // A 16 × 8 data window at (-7, -5) counted down in a 10 × 10 display window, red each pixel's
+    // x and green its row, written by OpenEXR 3.5 as one 64 × 64 ZIP tile, so the expected
+    // pixels do not come from the `exr` crate that reads them.
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/testdata/tiled_zip.exr"
@@ -173,7 +190,7 @@ fn a_tiled_zip_file_from_openexr_reads_exactly() {
         image.data_window(),
         Window {
             x: -7,
-            y: -5,
+            y: 7,
             width: 16,
             height: 8
         }
@@ -187,15 +204,7 @@ fn a_tiled_zip_file_from_openexr_reads_exactly() {
             height: 10
         }
     );
-    for y in -5..=2 {
-        for x in -7..=8 {
-            assert_eq!(
-                image.pixel(x, y),
-                [x as f32, y as f32, 0.0, 1.0],
-                "({x}, {y})"
-            );
-        }
-    }
+    assert_rows_counted_down(&image, 9);
     assert!(image.warnings().is_empty());
 }
 

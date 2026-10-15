@@ -1,6 +1,6 @@
 use super::*;
 
-/// A 1920 × 1080 display window whose top-left is at (100, 50).
+/// A 1920 × 1080 display window whose bottom-left is at (100, 50).
 const DISPLAY: Window = Window {
     x: 100,
     y: 50,
@@ -108,6 +108,8 @@ fn actual_size_shows_one_image_pixel_per_physical_pixel_about_the_display_centre
     let placement = viewer.placement(DISPLAY);
     assert_eq!(placement.scale, 1.0);
     assert_near(placement.to_image(at(500.0, 400.0)), [1060.0, 590.0]);
+    // The pane counts rows down and the image up, so higher in the pane is higher in the image.
+    assert_near(placement.to_image(at(500.0, 300.0)), [1060.0, 690.0]);
 
     viewer.fit();
     assert_eq!(viewer.placement(DISPLAY), fitted);

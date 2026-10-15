@@ -2,10 +2,12 @@
 
 use std::fmt;
 
-/// A rectangle of whole pixels in image coordinates: y down, so `y` is the top row. Either
-/// corner may be negative.
+/// A rectangle of whole pixels in image coordinates: y up, so `(x, y)` is the bottom-left pixel.
+/// Either corner may be negative.
 ///
-/// Y down is EXR's convention; OpenFX's y-up CPU images take it through negative row bytes.
+/// Y up is Nuke's and OpenFX's convention; readers convert files that count rows down, such as
+/// EXR, keeping the display window's bottom row at 0 so that images of differing formats align
+/// at their bottom-left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window {
     pub x: i32,
@@ -17,9 +19,9 @@ pub struct Window {
 impl Window {
     pub fn contains(self, x: i32, y: i32) -> bool {
         let (x, y) = (i64::from(x), i64::from(y));
-        let (left, top) = (i64::from(self.x), i64::from(self.y));
+        let (left, bottom) = (i64::from(self.x), i64::from(self.y));
         (left..left + i64::from(self.width)).contains(&x)
-            && (top..top + i64::from(self.height)).contains(&y)
+            && (bottom..bottom + i64::from(self.height)).contains(&y)
     }
 }
 
@@ -85,7 +87,8 @@ impl Image {
             return [0.0; 4];
         }
         let column = (i64::from(x) - i64::from(window.x)) as usize;
-        let row = (i64::from(y) - i64::from(window.y)) as usize;
+        // Rows are stored top first.
+        let row = (i64::from(window.y) + i64::from(window.height) - 1 - i64::from(y)) as usize;
         let start = (row * window.width as usize + column) * 4;
         let mut pixel = [0.0; 4];
         pixel.copy_from_slice(&self.pixels[start..start + 4]);

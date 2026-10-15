@@ -20,7 +20,7 @@ use ::exr::meta::{BlockDescription, MetaData};
 use super::{ReadError, Refusal, check_size, window};
 use crate::image::{
     Chromaticities, ExrChannel, ExrCompression, ExrPart, ExrSource, Image, SampleType, Source,
-    Warning,
+    Warning, Window,
 };
 
 /// The data window's pixels as `exr` delivers them, collected into the image's layout.
@@ -79,12 +79,7 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
         return Err(ReadError::Refused(Refusal::XyzPrimaries));
     }
     let display = header.shared_attributes.display_window;
-    let display_window = window(
-        display.position.0,
-        display.position.1,
-        display.size.0,
-        display.size.1,
-    )?;
+    let display_window = window(display.position.0, 0, display.size.0, display.size.1)?;
     let pixel_aspect = header.shared_attributes.pixel_aspect;
     let source = ExrSource {
         views: header
@@ -141,12 +136,7 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
         layer.attributes.layer_name.as_ref().map(Text::to_string),
         source.parts[shown_part].name
     );
-    let data_window = window(
-        layer.attributes.layer_position.0,
-        layer.attributes.layer_position.1,
-        layer.size.0,
-        layer.size.1,
-    )?;
+    let data_window = flipped(header, layer.attributes.layer_position, layer.size)?;
     Ok(Image::new(
         display_window,
         data_window,
@@ -361,13 +351,21 @@ fn describe_part(header: &Header) -> Result<ExrPart, ReadError> {
         },
         tiled: matches!(header.blocks, BlockDescription::Tiles(_)),
         deep: header.deep,
-        data_window: window(
-            attributes.layer_position.0,
-            attributes.layer_position.1,
-            header.layer_size.0,
-            header.layer_size.1,
-        )?,
+        data_window: flipped(header, attributes.layer_position, header.layer_size)?,
     })
+}
+
+/// A window from EXR's y-down position and size, in y-up coordinates whose row 0 is the display
+/// window's bottom row.
+fn flipped(header: &Header, position: Vec2<i32>, size: Vec2<usize>) -> Result<Window, ReadError> {
+    let display = header.shared_attributes.display_window;
+    // The y-down edge below the display window, less the one below this window.
+    let bottom = i64::from(display.position.1) + display.size.1 as i64
+        - (i64::from(position.1) + size.1 as i64);
+    let y = i32::try_from(bottom).map_err(|_| {
+        ReadError::Decode(format!("a window's bottom row, {bottom}, is out of range"))
+    })?;
+    window(position.0, y, size.0, size.1)
 }
 
 /// The first part with R, G and B; otherwise, why there is none.
