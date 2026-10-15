@@ -1,6 +1,7 @@
 //! Images as evaluation produces them, with a description of the file they came from.
 
 use std::fmt;
+use std::sync::Arc;
 
 /// A rectangle of whole pixels in image coordinates: y up, so `(x, y)` is the bottom-left pixel.
 /// Either corner may be negative.
@@ -25,41 +26,68 @@ impl Window {
     }
 }
 
-/// Scene-linear premultiplied RGBA in 32-bit float, in a working space assumed to be linear
-/// Rec.709 until colour management arrives.
+/// One of an image's channels. Only R, G, B and A exist until a workflow needs more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    R,
+    G,
+    B,
+    A,
+}
+
+impl Channel {
+    pub const ALL: [Channel; 4] = [Channel::R, Channel::G, Channel::B, Channel::A];
+
+    /// As files and artists name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Channel::R => "R",
+            Channel::G => "G",
+            Channel::B => "B",
+            Channel::A => "A",
+        }
+    }
+}
+
+/// Scene-linear colour in 32-bit float, in a working space assumed to be linear Rec.709 until
+/// colour management arrives.
 ///
 /// The display window is the frame the artist sees; the data window is where pixels are stored.
 /// They are independent: the data window may be smaller, larger (overscan) or elsewhere.
+///
+/// Every channel is a plane: the data window's values, bottom row first, shared between images
+/// that leave it unchanged. Every image has R, G, B and A; a file without alpha reads as opaque.
+/// Colour is always premultiplied by A.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Image {
     display_window: Window,
     data_window: Window,
-    /// The data window's pixels, interleaved RGBA, top row first.
-    pixels: Vec<f32>,
+    /// In `Channel::ALL`'s order.
+    planes: [Arc<[f32]>; 4],
     pixel_aspect: f32,
     source: Source,
     warnings: Vec<Warning>,
 }
 
 impl Image {
+    /// `planes` are in `Channel::ALL`'s order.
     pub(crate) fn new(
         display_window: Window,
         data_window: Window,
-        pixels: Vec<f32>,
+        planes: [Arc<[f32]>; 4],
         pixel_aspect: f32,
         source: Source,
         warnings: Vec<Warning>,
     ) -> Image {
         let area = data_window.width as usize * data_window.height as usize;
-        assert_eq!(
-            pixels.len(),
-            area * 4,
-            "one RGBA pixel per data window pixel"
+        assert!(
+            planes.iter().all(|plane| plane.len() == area),
+            "one value per data window pixel"
         );
         Image {
             display_window,
             data_window,
-            pixels,
+            planes,
             pixel_aspect,
             source,
             warnings,
@@ -74,25 +102,21 @@ impl Image {
         self.data_window
     }
 
-    /// The data window's pixels, interleaved RGBA, top row first.
-    pub fn pixels(&self) -> &[f32] {
-        &self.pixels
+    /// The channel's values over the data window, bottom row first.
+    pub fn plane(&self, channel: Channel) -> &Arc<[f32]> {
+        &self.planes[channel as usize]
     }
 
-    /// The pixel at a position in image coordinates. Outside the data window, an image is
-    /// transparent black.
-    pub fn pixel(&self, x: i32, y: i32) -> [f32; 4] {
+    /// The channel's value at a position in image coordinates. Outside the data window, an image
+    /// is transparent black.
+    pub fn value(&self, channel: Channel, x: i32, y: i32) -> f32 {
         let window = self.data_window;
         if !window.contains(x, y) {
-            return [0.0; 4];
+            return 0.0;
         }
         let column = (i64::from(x) - i64::from(window.x)) as usize;
-        // Rows are stored top first.
-        let row = (i64::from(window.y) + i64::from(window.height) - 1 - i64::from(y)) as usize;
-        let start = (row * window.width as usize + column) * 4;
-        let mut pixel = [0.0; 4];
-        pixel.copy_from_slice(&self.pixels[start..start + 4]);
-        pixel
+        let row = (i64::from(y) - i64::from(window.y)) as usize;
+        self.plane(channel)[row * window.width as usize + column]
     }
 
     /// A pixel's width over its height. Pixels are shown square for now.
@@ -109,15 +133,22 @@ impl Image {
         &self.warnings
     }
 
-    /// The image without its pixels, and the pixels.
-    pub(crate) fn into_parts(self) -> (ImageInfo, Vec<f32>) {
+    /// The image without its planes, and the planes in `Channel::ALL`'s order.
+    pub(crate) fn into_parts(self) -> (ImageInfo, [Arc<[f32]>; 4]) {
         let info = ImageInfo {
             display_window: self.display_window,
             data_window: self.data_window,
             warnings: self.warnings,
         };
-        (info, self.pixels)
+        (info, self.planes)
     }
+}
+
+/// A plane of `len` zeros for a reader to fill before anything else shares it.
+pub(crate) fn zeroed_plane(len: usize) -> Arc<[f32]> {
+    // SAFETY: all zero bits are the f32 0.0. Zeroed memory comes from the allocator already
+    // cleared, where a safe fill would write every value once more before the reader does.
+    unsafe { Arc::new_zeroed_slice(len).assume_init() }
 }
 
 /// What the viewer keeps of an image once its pixels are on the GPU.

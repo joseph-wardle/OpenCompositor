@@ -8,8 +8,9 @@ use ::exr::prelude::{
 };
 
 use super::*;
-use crate::image::Window;
+use crate::image::{Channel, Window};
 use crate::read::read_from;
+use crate::read::tests::rgba;
 
 type Part = Layer<AnyChannels<FlatSamples>>;
 
@@ -98,7 +99,7 @@ fn assert_rows_counted_down(image: &Image, top: i32) {
         for x in window.x..window.x + window.width as i32 {
             // A missing alpha channel reads as opaque.
             assert_eq!(
-                image.pixel(x, y),
+                rgba(image, x, y),
                 [x as f32, (top - y) as f32, 0.0, 1.0],
                 "({x}, {y})"
             );
@@ -159,19 +160,47 @@ fn windows_turn_y_up_about_the_display_window_and_keep_negative_origins() {
         }
     );
     assert_rows_counted_down(&image, 8);
+    let first = [Channel::R, Channel::G].map(|channel| image.plane(channel)[0]);
     assert_eq!(
-        &image.pixels()[..4],
-        [-7.0, -5.0, 0.0, 1.0],
-        "the first pixel stored is the top left"
+        first,
+        [-7.0, 2.0],
+        "the first value stored is the bottom left's"
     );
     for (x, y) in [(-8, 6), (9, 6), (-7, 5), (-7, 14)] {
         assert_eq!(
-            image.pixel(x, y),
+            rgba(&image, x, y),
             [0.0; 4],
             "outside the data window is transparent black"
         );
     }
     assert!(image.warnings().is_empty());
+}
+
+#[test]
+fn every_sample_type_reads_as_f32_and_other_channels_are_skipped() {
+    let area = SIZE.0 * SIZE.1;
+    let half = |value: f32| FlatSamples::F16(vec![half::f16::from_f32(value); area]);
+    let channels = vec![
+        AnyChannel::new("R", half(0.5)),
+        AnyChannel::new("G", FlatSamples::F32(vec![0.25; area])),
+        AnyChannel::new("B", FlatSamples::U32(vec![7; area])),
+        AnyChannel::new("A", half(0.75)),
+        // Stored between G and R, which are stored in name order.
+        AnyChannel::new("N.x", FlatSamples::F32(vec![9.0; area])),
+    ];
+    let layer = Layer::new(
+        SIZE,
+        LayerAttributes::default(),
+        Encoding::FAST_LOSSLESS,
+        AnyChannels::sort(channels.into_iter().collect()),
+    );
+    let bytes = write(display(0, 0, SIZE.0, SIZE.1), vec![layer]);
+
+    let image = read_bytes(&bytes).unwrap();
+
+    for (x, y) in [(0, 0), (3, 2)] {
+        assert_eq!(rgba(&image, x, y), [0.5, 0.25, 7.0, 0.75]);
+    }
 }
 
 #[test]
@@ -400,7 +429,7 @@ fn the_first_part_with_rgb_is_shown_and_the_others_named() {
 
     let image = read_bytes(&bytes).unwrap();
 
-    assert_eq!(image.pixel(0, 0), [0.18, 0.18, 0.18, 1.0]);
+    assert_eq!(rgba(&image, 0, 0), [0.18, 0.18, 0.18, 1.0]);
     let Source::Exr(source) = image.source() else {
         panic!("an EXR source")
     };
@@ -434,7 +463,7 @@ fn stereo_files_show_one_view_and_name_it() {
     let mut both = part(None, (0, 0), SIZE, &channels);
     both.attributes.multi_view_names = Some(vec![Text::from("left"), Text::from("right")]);
     let image = read_bytes(&write(display(0, 0, 4, 3), vec![both])).unwrap();
-    assert_eq!(image.pixel(0, 0), [0.1, 0.1, 0.1, 1.0]);
+    assert_eq!(rgba(&image, 0, 0), [0.1, 0.1, 0.1, 1.0]);
     assert_eq!(
         image.warnings(),
         [Warning::SeveralViews {
@@ -454,7 +483,7 @@ fn stereo_files_show_one_view_and_name_it() {
         vec![eye("left", 0.1), eye("right", 0.9)],
     ))
     .unwrap();
-    assert_eq!(image.pixel(0, 0), [0.1, 0.1, 0.1, 1.0]);
+    assert_eq!(rgba(&image, 0, 0), [0.1, 0.1, 0.1, 1.0]);
     assert_eq!(
         image.warnings(),
         [

@@ -3,31 +3,25 @@
 use std::io::{BufRead, Read, Seek};
 use std::num::NonZero;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
-use ::exr::block::UncompressedBlock;
 use ::exr::block::chunk::{Chunk, CompressedBlock};
 use ::exr::block::reader::{ChunksReader, FilteredChunksReader};
+use ::exr::block::{BlockIndex, UncompressedBlock};
 use ::exr::compression::Compression;
-use ::exr::error::{Error, UnitResult};
-use ::exr::image::read::image::{LayersReader, ReadLayers};
-use ::exr::image::read::layers::ReadChannels;
+use ::exr::error::Error;
 use ::exr::math::Vec2;
 use ::exr::meta::attribute::{self, Text};
 use ::exr::meta::header::Header;
 use ::exr::meta::{BlockDescription, MetaData};
+use half::f16;
+use half::slice::HalfFloatSliceExt;
 
 use super::{ReadError, Refusal, check_size, window};
 use crate::image::{
-    Chromaticities, ExrChannel, ExrCompression, ExrPart, ExrSource, Image, SampleType, Source,
-    Warning, Window,
+    Channel, Chromaticities, ExrChannel, ExrCompression, ExrPart, ExrSource, Image, SampleType,
+    Source, Warning, Window, zeroed_plane,
 };
-
-/// The data window's pixels as `exr` delivers them, collected into the image's layout.
-struct Pixels {
-    width: usize,
-    rgba: Vec<f32>,
-}
 
 pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadError> {
     // Only the headers, nothing allocated for pixels yet. Unvalidated, because validation
@@ -102,49 +96,117 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
     };
 
     file.rewind()?;
-    let read_layer = ::exr::prelude::read()
-        .no_deep_data()
-        .largest_resolution_level()
-        .rgba_channels(
-            |size, _| Pixels {
-                width: size.width(),
-                rgba: vec![0.0; size.area() * 4],
-            },
-            // A missing alpha channel reads as 1. EXR stores premultiplied colour.
-            |pixels: &mut Pixels, Vec2(x, y), (r, g, b, a): (f32, f32, f32, f32)| {
-                let start = (y * pixels.width + x) * 4;
-                pixels.rgba[start..start + 4].copy_from_slice(&[r, g, b, a]);
-            },
-        )
-        .first_valid_layer();
-    let chunks = ::exr::block::read(file, false).map_err(decode_error)?;
-    let mut layer_reader = read_layer
-        .create_layers_reader(chunks.headers())
-        .map_err(decode_error)?;
-    let chunks = chunks
-        .filter_chunks(false, |meta, tile, block| {
-            layer_reader.filter_block(meta, tile, block)
-        })
-        .map_err(decode_error)?;
-    decode(chunks, |headers, block| {
-        layer_reader.read_block(headers, block)
-    })?;
-    let layer = layer_reader.into_layers();
-    // `first_valid_layer` takes the first part with R, G and B, as `choose_part` does, so the
-    // description matches the pixels. The pixels' own window is used regardless.
-    debug_assert_eq!(
-        layer.attributes.layer_name.as_ref().map(Text::to_string),
-        source.parts[shown_part].name
-    );
-    let data_window = flipped(header, layer.attributes.layer_position, layer.size)?;
+    let planes = read_planes(file, shown_part)?;
+    let data_window = flipped(
+        header,
+        header.own_attributes.layer_position,
+        header.layer_size,
+    )?;
     Ok(Image::new(
         display_window,
         data_window,
-        layer.channel_data.pixels.rgba,
+        planes,
         pixel_aspect,
         Source::Exr(source),
         warnings,
     ))
+}
+
+/// The part's R, G, B and A at its largest resolution, in `Channel::ALL`'s order, bottom row
+/// first. A missing A reads as 1. EXR stores premultiplied colour.
+fn read_planes(
+    file: impl BufRead + Seek + Send,
+    part: usize,
+) -> Result<[Arc<[f32]>; 4], ReadError> {
+    let chunks = ::exr::block::read(file, false).map_err(decode_error)?;
+    let header = &chunks.headers()[part];
+    let (width, height) = (header.layer_size.width(), header.layer_size.height());
+    let bytes_per_pixel = header.channels.bytes_per_pixel;
+    // Each of R, G, B and A in a block's line: its plane, the bytes per pixel of the channels
+    // before it, and its sample type.
+    let mut sources = Vec::new();
+    let mut before = 0;
+    for channel in &header.channels.list {
+        if channel.sampling != Vec2(1, 1) {
+            return Err(ReadError::Decode(format!(
+                "channel {} is subsampled",
+                channel.name
+            )));
+        }
+        let name = channel.name.to_string();
+        if let Some(plane) = Channel::ALL.iter().position(|c| c.name() == name) {
+            sources.push((plane, before, channel.sample_type));
+        }
+        before += channel.sample_type.bytes_per_sample();
+    }
+    let area = width * height;
+    let mut planes: [Arc<[f32]>; 4] = std::array::from_fn(|_| zeroed_plane(area));
+    if !sources
+        .iter()
+        .any(|&(plane, ..)| plane == Channel::A as usize)
+    {
+        planes[Channel::A as usize] = std::iter::repeat_n(1.0, area).collect();
+    }
+    let mut out = planes
+        .each_mut()
+        .map(|plane| Arc::get_mut(plane).expect("not yet shared"));
+    let chunks = chunks
+        .filter_chunks(false, |_, tile, block| {
+            block.layer == part && tile.is_largest_resolution_level()
+        })
+        .map_err(decode_error)?;
+    let mut halves = Vec::new();
+    decode(chunks, |block| {
+        let BlockIndex {
+            pixel_position: Vec2(left, top),
+            pixel_size: Vec2(block_width, block_height),
+            ..
+        } = block.index;
+        if left + block_width > width
+            || top + block_height > height
+            || block.data.len() != block_width * block_height * bytes_per_pixel
+        {
+            return Err(ReadError::Decode(
+                "a block does not fit its part's data window".to_owned(),
+            ));
+        }
+        let lines = block.data.chunks_exact(block_width * bytes_per_pixel);
+        for (line, bytes) in (top..).zip(lines) {
+            // EXR counts rows down; planes start at the bottom.
+            let start = (height - 1 - line) * width + left;
+            // A line holds each channel's samples in turn, in native byte order.
+            for &(plane, before, sample_type) in &sources {
+                let samples = &bytes[before * block_width..];
+                let target = &mut out[plane][start..start + block_width];
+                match sample_type {
+                    attribute::SampleType::F16 => {
+                        let (samples, _) = samples.as_chunks();
+                        halves.clear();
+                        halves.extend(
+                            samples[..block_width]
+                                .iter()
+                                .map(|&b| f16::from_ne_bytes(b)),
+                        );
+                        halves.convert_to_f32_slice(target);
+                    }
+                    attribute::SampleType::F32 => {
+                        let (samples, _) = samples.as_chunks();
+                        for (value, &sample) in target.iter_mut().zip(samples) {
+                            *value = f32::from_ne_bytes(sample);
+                        }
+                    }
+                    attribute::SampleType::U32 => {
+                        let (samples, _) = samples.as_chunks();
+                        for (value, &sample) in target.iter_mut().zip(samples) {
+                            *value = u32::from_ne_bytes(sample) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(planes)
 }
 
 /// Decompresses the chunks across the machine's cores, handing each block to `insert` on this
@@ -154,7 +216,7 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
 /// whose decoder panics fails the read instead.
 fn decode(
     chunks: FilteredChunksReader<impl BufRead + Seek + Send>,
-    mut insert: impl FnMut(&[Header], UncompressedBlock) -> UnitResult,
+    mut insert: impl FnMut(UncompressedBlock) -> Result<(), ReadError>,
 ) -> Result<(), ReadError> {
     let meta = chunks.meta_data().clone();
     let threads = std::thread::available_parallelism()
@@ -190,7 +252,7 @@ fn decode(
         }
         drop(sender);
         for block in blocks {
-            insert(&meta.headers, block?).map_err(decode_error)?;
+            insert(block?)?;
         }
         Ok(())
     })

@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
 use super::*;
+use crate::image::Channel;
 
 #[test]
 fn files_are_recognised_by_signature_not_name() {
@@ -11,4 +12,9 @@ fn files_are_recognised_by_signature_not_name() {
     assert!(unknown(b"\x89PNG"));
     assert!(unknown(&[0x76, 0x2f, 0x31, 0x01]));
     assert!(unknown(b""));
+}
+
+/// The image's R, G, B and A at a position, for comparing whole pixels.
+pub(crate) fn rgba(image: &Image, x: i32, y: i32) -> [f32; 4] {
+    Channel::ALL.map(|channel| image.value(channel, x, y))
 }

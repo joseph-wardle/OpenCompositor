@@ -36,8 +36,8 @@ fn corner(vertex: u32) -> vec2<f32> {
 
 struct ImageVertex {
     @builtin(position) position: vec4<f32>,
-    // From the data window's top-left corner, in image pixels down, as the texture's rows are
-    // stored.
+    // From the data window's bottom-left corner, in image pixels up: the texture's rows are
+    // stored bottom first, as the image's planes are.
     @location(0) pixel: vec2<f32>,
 }
 
@@ -45,8 +45,7 @@ struct ImageVertex {
 fn image_vertex(@builtin(vertex_index) vertex: u32) -> ImageVertex {
     let from_bottom_left = corner(vertex) * frame.data_window.zw;
     let point = frame.data_window.xy + from_bottom_left;
-    let pixel = vec2(from_bottom_left.x, frame.data_window.w - from_bottom_left.y);
-    return ImageVertex(to_clip(placed(point)), pixel);
+    return ImageVertex(to_clip(placed(point)), from_bottom_left);
 }
 
 // Clamped to what the display shows. A NaN's comparisons may be optimised away, so its bits are

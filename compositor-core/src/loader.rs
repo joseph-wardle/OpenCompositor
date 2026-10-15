@@ -43,7 +43,8 @@ pub struct Decoded {
     pub(crate) pixels: Option<Staged>,
 }
 
-/// An image's pixels, RGBA f16 rows in the loader's staging buffer, and the texture for them.
+/// An image's pixels, RGBA f16 rows bottom first in the loader's staging buffer, and the texture
+/// for them.
 ///
 /// The GUI thread copies the rows into the texture with its own queue. Dropping this returns the
 /// buffer to the worker, which waits for the copy before writing to it again.
@@ -279,8 +280,8 @@ fn read(
     };
     let result = match read {
         Ok(image) => {
-            let (info, pixels) = image.into_parts();
-            match stage(&finishing, &info, pixels, sizing) {
+            let (info, planes) = image.into_parts();
+            match stage(&finishing, &info, planes, sizing) {
                 Ok(pixels) => Ok(Decoded { info, pixels }),
                 Err(reason) => Err(LoadError::CannotShow(reason)),
             }
@@ -296,13 +297,13 @@ fn read(
     drop(finishing);
 }
 
-/// Converts the pixels into the staging buffer and makes their texture. `Ok(None)` without a GPU
+/// Converts the planes into the staging buffer and makes their texture. `Ok(None)` without a GPU
 /// or pixels, or if the loader stopped while waiting for the buffer, which the check for a
 /// superseded read after this catches.
 fn stage(
     finishing: &Finishing,
     info: &ImageInfo,
-    pixels: Vec<f32>,
+    planes: [Arc<[f32]>; 4],
     sizing: &mut StagingSizing,
 ) -> Result<Option<Staged>, String> {
     let Some(device) = &finishing.device else {
@@ -357,13 +358,13 @@ fn stage(
         // be write-combining, so the conversion only writes to it.
         let out = unsafe { std::slice::from_raw_parts_mut(start.as_ptr(), halves) };
         convert_rows(
-            &pixels,
+            planes.each_ref().map(|plane| &plane[..]),
             window.width as usize,
             out,
             bytes_per_row as usize / 2,
         );
     }
-    drop(pixels);
+    drop(planes);
     buffer.unmap();
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("image"),
@@ -460,11 +461,22 @@ fn map(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<(), String> {
     }
 }
 
-/// Converts interleaved RGBA rows of `width` pixels to f16, `halves_per_row` apart in `out`.
-fn convert_rows(pixels: &[f32], width: usize, out: &mut [f16], halves_per_row: usize) {
-    let row = width * 4;
-    for (source, target) in pixels.chunks_exact(row).zip(out.chunks_mut(halves_per_row)) {
-        half::slice::HalfFloatSliceExt::convert_from_f32_slice(&mut target[..row], source);
+/// Interleaves planes of rows `width` pixels long, in `Channel::ALL`'s order, into RGBA f16 rows
+/// `halves_per_row` apart in `out`, in the planes' row order.
+fn convert_rows(planes: [&[f32]; 4], width: usize, out: &mut [f16], halves_per_row: usize) {
+    // A row is interleaved where it stays in cache, then converted in one call, which only writes
+    // to `out` and uses the CPU's f16 instructions where it has them.
+    let mut interleaved = vec![[0.0; 4]; width];
+    let rows = out.chunks_mut(halves_per_row);
+    for (start, target) in (0..planes[0].len()).step_by(width).zip(rows) {
+        let [r, g, b, a] = planes.map(|plane| &plane[start..start + width]);
+        for (x, pixel) in interleaved.iter_mut().enumerate() {
+            *pixel = [r[x], g[x], b[x], a[x]];
+        }
+        half::slice::HalfFloatSliceExt::convert_from_f32_slice(
+            &mut target[..width * 4],
+            interleaved.as_flattened(),
+        );
     }
 }
 
