@@ -49,8 +49,9 @@ fn reader_path(app: &App, id: NodeId) -> Option<&Path> {
     app.session()
         .document()
         .node(id)
-        .map(|node| match &node.kind {
-            NodeKind::Reader { path } => path.as_path(),
+        .and_then(|node| match &node.kind {
+            NodeKind::Reader { path } => Some(&**path),
+            NodeKind::Exposure { .. } => None,
         })
 }
 

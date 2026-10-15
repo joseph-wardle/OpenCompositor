@@ -16,22 +16,29 @@ pub fn evaluate(document: &Document, id: NodeId) -> Result<Image, EvalError> {
     let node = document.node(id).ok_or(EvalError::MissingNode(id))?;
     match &node.kind {
         NodeKind::Reader { path } => read_image(path).map_err(|error| EvalError::Read {
-            path: path.clone(),
+            path: path.to_path_buf(),
             error,
         }),
+        NodeKind::Exposure { .. } => Err(EvalError::NoInput(id)),
     }
 }
 
 #[derive(Debug)]
 pub enum EvalError {
     MissingNode(NodeId),
-    Read { path: PathBuf, error: ReadError },
+    /// The node needs an input it does not have. Until connections arrive, no node has one.
+    NoInput(NodeId),
+    Read {
+        path: PathBuf,
+        error: ReadError,
+    },
 }
 
 impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EvalError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
+            EvalError::NoInput(id) => write!(f, "node {} has no input", id.0),
             EvalError::Read { path, error } => write!(f, "{}: {error}", path.display()),
         }
     }
@@ -40,7 +47,7 @@ impl fmt::Display for EvalError {
 impl std::error::Error for EvalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            EvalError::MissingNode(_) => None,
+            EvalError::MissingNode(_) | EvalError::NoInput(_) => None,
             EvalError::Read { error, .. } => Some(error),
         }
     }
