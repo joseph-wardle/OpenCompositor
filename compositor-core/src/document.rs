@@ -1,7 +1,7 @@
 //! The document: everything undo restores, and nothing else.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use imbl::OrdMap;
@@ -49,8 +49,9 @@ impl Slot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
-    /// Reads one image file. The path is kept as the artist chose it.
-    Reader { path: PathBuf },
+    /// Reads one image file. The path is kept as the artist chose it, and shared, so cloning the
+    /// node to move it does not copy the path.
+    Reader { path: Arc<Path> },
     /// Multiplies R, G and B by two to the power of its Stops and leaves A. On premultiplied
     /// pixels that equals unpremultiplying, scaling and premultiplying again.
     Exposure { version: ExposureVersion },

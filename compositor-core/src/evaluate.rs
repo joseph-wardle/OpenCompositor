@@ -16,7 +16,7 @@ pub fn evaluate(document: &Document, id: NodeId) -> Result<Image, EvalError> {
     let node = document.node(id).ok_or(EvalError::MissingNode(id))?;
     match &node.kind {
         NodeKind::Reader { path } => read_image(path).map_err(|error| EvalError::Read {
-            path: path.clone(),
+            path: path.to_path_buf(),
             error,
         }),
         NodeKind::Exposure { .. } => Err(EvalError::NoInput(id)),

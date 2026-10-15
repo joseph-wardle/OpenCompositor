@@ -268,7 +268,7 @@ impl Session {
             let id = NodeId(self.next_id);
             self.next_id += 1;
             let node = Node::new(
-                NodeKind::Reader { path },
+                NodeKind::Reader { path: path.into() },
                 Point {
                     x: at.x,
                     y: at.y + row as f32 * READER_SPACING,
@@ -307,8 +307,8 @@ impl Session {
         let NodeKind::Reader { path: current } = &node.kind else {
             return Err(EditError::WrongKind(id));
         };
-        if *current != path {
-            Arc::make_mut(node).kind = NodeKind::Reader { path };
+        if **current != *path {
+            Arc::make_mut(node).kind = NodeKind::Reader { path: path.into() };
         }
         Ok(self.commit("Set Reader Path", document))
     }

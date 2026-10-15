@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use open_ng::Point;
 
@@ -22,7 +23,7 @@ fn stops(node: &Node) -> Option<Value> {
 fn built_in() -> [NodeKind; 2] {
     [
         NodeKind::Reader {
-            path: "a.exr".into(),
+            path: Path::new("a.exr").into(),
         },
         NodeKind::Exposure {
             version: ExposureVersion::V1,
@@ -111,7 +112,7 @@ fn values_the_description_does_not_allow_are_refused() {
 fn a_reader_has_no_parameters_to_set() {
     let mut reader = Node::new(
         NodeKind::Reader {
-            path: "a.exr".into(),
+            path: Path::new("a.exr").into(),
         },
         Point { x: 0.0, y: 0.0 },
     );
