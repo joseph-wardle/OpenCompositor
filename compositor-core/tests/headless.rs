@@ -7,7 +7,7 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use open_ng::Point;
-use opencompositor_core::{EvalError, NodeId, ReadError, Session, evaluate};
+use opencompositor_core::{Channel, EvalError, NodeId, ReadError, Session, evaluate};
 
 /// A directory of this test's own, emptied first.
 fn directory(name: &str) -> PathBuf {
@@ -41,11 +41,14 @@ fn a_reader_evaluates_to_the_file_it_points_at() {
 
     let id = reader(&mut session, white);
     let image = evaluate(session.document(), id).unwrap();
-    assert_eq!(image.pixel(0, 0), [1.0; 4]);
+    assert_eq!(Channel::ALL.map(|c| image.value(c, 0, 0)), [1.0; 4]);
 
     session.set_reader_path(id, black).unwrap();
     let image = evaluate(session.document(), id).unwrap();
-    assert_eq!(image.pixel(0, 0), [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(
+        Channel::ALL.map(|c| image.value(c, 0, 0)),
+        [0.0, 0.0, 0.0, 1.0]
+    );
 }
 
 #[test]

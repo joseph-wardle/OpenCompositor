@@ -1,13 +1,16 @@
 //! PNG through the `png` crate.
 
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use ::png::{
     BitDepth, ColorType, Decoder, DecodingError, ScaledFloat, SourceChromaticities, Transformations,
 };
 
 use super::{ReadError, Refusal, check_size};
-use crate::image::{Chromaticities, Cicp, Image, PngColorType, PngSource, Source, Warning, Window};
+use crate::image::{
+    Chromaticities, Cicp, Image, PngColorType, PngSource, Source, Warning, Window, zeroed_plane,
+};
 
 /// `gAMA`'s value for sRGB, which approximates sRGB's curve with a pure power.
 const SRGB_GAMMA: f32 = 1.0 / 2.2;
@@ -59,8 +62,9 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
     let mut buffer = vec![0; size];
     let frame = reader.next_frame(&mut buffer).map_err(decode_error)?;
     let (color_type, bit_depth) = reader.output_color_type();
-    let pixels = premultiplied_linear(
+    let planes = premultiplied_linear(
         &buffer[..frame.buffer_size()],
+        width as usize,
         color_type,
         bit_depth,
         decoding,
@@ -74,7 +78,7 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
     Ok(Image::new(
         window,
         window,
-        pixels,
+        planes,
         pixel_aspect,
         Source::Png(source),
         warnings,
@@ -228,17 +232,19 @@ impl Decoding {
     }
 }
 
-/// Converts expanded samples to linear premultiplied RGBA.
+/// Converts expanded samples, rows of `width` pixels, to linear premultiplied planes in
+/// `Channel::ALL`'s order. A grey image's R, G and B are one plane.
 ///
 /// PNG stores straight alpha over encoded colour. Colour is decoded to linear before it is
 /// multiplied by alpha: the other order darkens every soft edge. Fully transparent pixels become
 /// zero, whatever colour they stored, so filtering at an edge never brings in a fringe.
 fn premultiplied_linear(
     samples: &[u8],
+    width: usize,
     color_type: ColorType,
     bit_depth: BitDepth,
     decoding: Decoding,
-) -> Vec<f32> {
+) -> [Arc<[f32]>; 4] {
     let sixteen = bit_depth == BitDepth::Sixteen;
     let max = if sixteen { u16::MAX } else { u8::MAX.into() };
     // One decode per code value rather than per sample.
@@ -250,24 +256,45 @@ fn premultiplied_linear(
         ColorType::Rgba => 4,
         ColorType::Indexed => unreachable!("EXPAND turns palettes into colour"),
     };
-    let sample_size = if sixteen { 2 } else { 1 };
-    let mut pixels = Vec::with_capacity(samples.len() / (channels * sample_size) * 4);
-    for pixel in samples.chunks_exact(channels * sample_size) {
-        let code = |index: usize| match sixteen {
-            true => u16::from_be_bytes([pixel[index * 2], pixel[index * 2 + 1]]),
-            false => pixel[index].into(),
-        };
-        let (r, g, b, a) = match channels {
-            1 => (code(0), code(0), code(0), max),
-            2 => (code(0), code(0), code(0), code(1)),
-            3 => (code(0), code(1), code(2), max),
-            _ => (code(0), code(1), code(2), code(3)),
-        };
-        let a = f32::from(a) / f32::from(max);
-        let [r, g, b] = [r, g, b].map(|code| linear[usize::from(code)] * a);
-        pixels.extend_from_slice(&[r, g, b, a]);
+    let colours = if channels < 3 { 1 } else { 3 };
+    let pixel_size = channels * if sixteen { 2 } else { 1 };
+    let area = samples.len() / pixel_size;
+    let mut colour: Vec<Arc<[f32]>> = (0..colours).map(|_| zeroed_plane(area)).collect();
+    let mut alpha = zeroed_plane(area);
+    // A row is decoded where it stays in cache, a buffer for each channel, then copied out.
+    let mut decoded = [(); 4].map(|_| vec![0.0; width]);
+    // PNG stores rows top first; planes start at the bottom.
+    let rows = samples.chunks_exact(width * pixel_size).rev();
+    for (row, start) in rows.zip((0..area).step_by(width)) {
+        let [r_row, g_row, b_row, a_row] = decoded.each_mut().map(|row| &mut row[..width]);
+        for (x, pixel) in row.chunks_exact(pixel_size).enumerate() {
+            let code = |index: usize| match sixteen {
+                true => u16::from_be_bytes([pixel[index * 2], pixel[index * 2 + 1]]),
+                false => pixel[index].into(),
+            };
+            let (r, g, b, a) = match channels {
+                1 => (code(0), code(0), code(0), max),
+                2 => (code(0), code(0), code(0), code(1)),
+                3 => (code(0), code(1), code(2), max),
+                _ => (code(0), code(1), code(2), code(3)),
+            };
+            let a = f32::from(a) / f32::from(max);
+            [r_row[x], g_row[x], b_row[x]] = [r, g, b].map(|code| linear[usize::from(code)] * a);
+            a_row[x] = a;
+        }
+        let planes = colour.iter_mut().chain([&mut alpha]);
+        for (plane, channel) in planes.zip([0, 1, 2].into_iter().take(colours).chain([3])) {
+            let plane = Arc::get_mut(plane).expect("not yet shared");
+            plane[start..start + width].copy_from_slice(&decoded[channel]);
+        }
     }
-    pixels
+    match <[Arc<[f32]>; 3]>::try_from(colour) {
+        Ok([r, g, b]) => [r, g, b, alpha],
+        Err(mut grey) => {
+            let grey = grey.pop().expect("one grey plane");
+            [Arc::clone(&grey), Arc::clone(&grey), grey, alpha]
+        }
+    }
 }
 
 /// The inverse of BT.709's camera curve.

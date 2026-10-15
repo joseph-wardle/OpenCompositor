@@ -18,8 +18,8 @@ pub use document::{Changes, Document, Node, NodeId, NodeKind, Slot};
 pub use evaluate::{EvalError, evaluate};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};
 pub use image::{
-    Chromaticities, Cicp, ExrChannel, ExrCompression, ExrPart, ExrSource, Image, ImageInfo,
-    PngColorType, PngSource, SampleType, Source, Warning, Window,
+    Channel, Chromaticities, Cicp, ExrChannel, ExrCompression, ExrPart, ExrSource, Image,
+    ImageInfo, PngColorType, PngSource, SampleType, Source, Warning, Window,
 };
 pub use loader::{Decoded, LoadError, LoadRequest, Loaded};
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};

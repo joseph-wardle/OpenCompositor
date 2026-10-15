@@ -1,23 +1,28 @@
 // The viewer: an image's data window, and an outline around its display window.
 //
-// Positions are in image pixels, y down, until `to_clip`. The target is sRGB, so fragments are
-// linear values that the target encodes.
+// Positions are in image pixels, y up, until `placed` turns them into the pane's physical pixels,
+// y down. The target is sRGB, so fragments are linear values that the target encodes.
 
 struct Frame {
-    // An image point lands at `point * scale + offset` in the pane's physical pixels.
+    // An image point lands at `(x * scale + offset.x, offset.y - y * scale)` in the pane's
+    // physical pixels.
     offset: vec2<f32>,
     scale: f32,
     // The outline's width in physical pixels.
     line: f32,
     // The pane's size in physical pixels.
     target_size: vec2<f32>,
-    // x, y, width, height in image pixels.
+    // x, y, width, height in image pixels; (x, y) is the bottom-left corner.
     data_window: vec4<f32>,
     display_window: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(1) @binding(0) var image: texture_2d<f32>;
+
+fn placed(point: vec2<f32>) -> vec2<f32> {
+    return vec2(point.x * frame.scale + frame.offset.x, frame.offset.y - point.y * frame.scale);
+}
 
 fn to_clip(physical: vec2<f32>) -> vec4<f32> {
     let ndc = physical / frame.target_size * vec2(2.0, -2.0) + vec2(-1.0, 1.0);
@@ -31,15 +36,16 @@ fn corner(vertex: u32) -> vec2<f32> {
 
 struct ImageVertex {
     @builtin(position) position: vec4<f32>,
-    // From the data window's top-left corner, in image pixels.
+    // From the data window's bottom-left corner, in image pixels up: the texture's rows are
+    // stored bottom first, as the image's planes are.
     @location(0) pixel: vec2<f32>,
 }
 
 @vertex
 fn image_vertex(@builtin(vertex_index) vertex: u32) -> ImageVertex {
-    let pixel = corner(vertex) * frame.data_window.zw;
-    let point = frame.data_window.xy + pixel;
-    return ImageVertex(to_clip(point * frame.scale + frame.offset), pixel);
+    let from_bottom_left = corner(vertex) * frame.data_window.zw;
+    let point = frame.data_window.xy + from_bottom_left;
+    return ImageVertex(to_clip(placed(point)), from_bottom_left);
 }
 
 // Clamped to what the display shows. A NaN's comparisons may be optimised away, so its bits are
@@ -67,8 +73,9 @@ fn outline_vertex(
     @builtin(instance_index) side: u32,
 ) -> @builtin(position) vec4<f32> {
     let window = frame.display_window;
-    let low = window.xy * frame.scale + frame.offset;
-    let high = (window.xy + window.zw) * frame.scale + frame.offset;
+    // The window's top-left and bottom-right in physical pixels, y down.
+    let low = placed(window.xy + vec2(0.0, window.w));
+    let high = placed(window.xy + vec2(window.z, 0.0));
     let line = frame.line;
     var top_left: vec2<f32>;
     var bottom_right: vec2<f32>;

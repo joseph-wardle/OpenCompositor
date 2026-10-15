@@ -5,7 +5,9 @@ use ::png::chunk::ChunkType;
 use ::png::{Encoder, Info, PixelDimensions, Unit};
 
 use super::*;
+use crate::image::Channel;
 use crate::read::read_from;
+use crate::read::tests::rgba;
 
 /// A one-row PNG; `configure` sets its chunks, and `extra` adds chunks as they are given.
 fn png(
@@ -107,10 +109,11 @@ fn the_first_row_is_the_top_and_the_windows_are_the_frame() {
         (image.display_window(), image.data_window()),
         (frame, frame)
     );
-    assert_eq!(image.pixel(0, 0), [1.0, 0.0, 0.0, 1.0]);
-    assert_eq!(image.pixel(1, 0), [0.0, 1.0, 0.0, 1.0]);
-    assert_eq!(image.pixel(0, 1), [0.0, 0.0, 1.0, 1.0]);
-    assert_eq!(image.pixel(1, 1), [1.0; 4]);
+    // Image coordinates count rows up from the bottom.
+    assert_eq!(rgba(&image, 0, 1), [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(rgba(&image, 1, 1), [0.0, 1.0, 0.0, 1.0]);
+    assert_eq!(rgba(&image, 0, 0), [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(rgba(&image, 1, 0), [1.0; 4]);
 }
 
 #[test]
@@ -133,16 +136,16 @@ fn colour_is_linearised_before_it_is_premultiplied() {
 
     let half = 128.0 / 255.0;
     assert_eq!(
-        image.pixel(0, 0),
+        rgba(&image, 0, 0),
         [0.0; 4],
         "a transparent pixel stores no colour"
     );
     let grey = SRGB_188 * half;
-    assert_near(image.pixel(1, 0), [grey, grey, grey, half]);
-    assert_eq!(image.pixel(2, 0), [1.0, 0.0, 0.0, 1.0]);
-    assert_eq!(image.pixel(3, 0), [1.0 / 255.0, 0.0, 0.0, 1.0 / 255.0]);
+    assert_near(rgba(&image, 1, 0), [grey, grey, grey, half]);
+    assert_eq!(rgba(&image, 2, 0), [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(rgba(&image, 3, 0), [1.0 / 255.0, 0.0, 0.0, 1.0 / 255.0]);
     // Averaging across the edge, as any filter does, brings in no white.
-    let [left, right] = [image.pixel(0, 0), image.pixel(2, 0)];
+    let [left, right] = [rgba(&image, 0, 0), rgba(&image, 2, 0)];
     let edge: Vec<f32> = (0..4).map(|i| (left[i] + right[i]) / 2.0).collect();
     assert_eq!(edge, [0.5, 0.0, 0.0, 0.5]);
 }
@@ -179,7 +182,7 @@ fn every_colour_type_expands_to_rgba() {
         &[],
     );
     let image = read_bytes(&grey).unwrap();
-    assert_near(image.pixel(1, 0), [SRGB_188, SRGB_188, SRGB_188, 1.0]);
+    assert_near(rgba(&image, 1, 0), [SRGB_188, SRGB_188, SRGB_188, 1.0]);
 
     let grey_alpha = png(
         ColorType::GrayscaleAlpha,
@@ -189,9 +192,12 @@ fn every_colour_type_expands_to_rgba() {
         |_| {},
         &[],
     );
-    assert_eq!(
-        read_bytes(&grey_alpha).unwrap().pixel(0, 0),
-        [0.2, 0.2, 0.2, 0.2]
+    let image = read_bytes(&grey_alpha).unwrap();
+    assert_eq!(rgba(&image, 0, 0), [0.2, 0.2, 0.2, 0.2]);
+    let [r, g, b] = [Channel::R, Channel::G, Channel::B].map(|channel| image.plane(channel));
+    assert!(
+        Arc::ptr_eq(r, g) && Arc::ptr_eq(g, b),
+        "grey is one plane, shared"
     );
 
     let palette = png(
@@ -206,9 +212,9 @@ fn every_colour_type_expands_to_rgba() {
         &[],
     );
     let image = read_bytes(&palette).unwrap();
-    assert_eq!(image.pixel(0, 0), [0.2, 0.0, 0.0, 0.2]);
+    assert_eq!(rgba(&image, 0, 0), [0.2, 0.0, 0.0, 0.2]);
     assert_eq!(
-        image.pixel(1, 0),
+        rgba(&image, 1, 0),
         [0.0, 0.0, 1.0, 1.0],
         "entries past tRNS are opaque"
     );
@@ -220,7 +226,7 @@ fn every_colour_type_expands_to_rgba() {
     let rgba16 = png(ColorType::Rgba, BitDepth::Sixteen, 1, &sixteen, |_| {}, &[]);
     let image = read_bytes(&rgba16).unwrap();
     let alpha = 32768.0 / 65535.0;
-    assert_eq!(image.pixel(0, 0), [alpha, 0.0, 0.0, alpha]);
+    assert_eq!(rgba(&image, 0, 0), [alpha, 0.0, 0.0, alpha]);
     let Source::Png(source) = image.source() else {
         panic!("a PNG source")
     };
@@ -232,7 +238,9 @@ fn every_colour_type_expands_to_rgba() {
 
 /// The red of the one pixel `tagged` writes, as read.
 fn red(bytes: &[u8]) -> f32 {
-    read_bytes(bytes).expect("the image reads").pixel(0, 0)[0]
+    read_bytes(bytes)
+        .expect("the image reads")
+        .value(Channel::R, 0, 0)
 }
 
 /// A `cICP` chunk: primaries, transfer, matrix and whether full range, as the chunk stores them.
@@ -269,11 +277,11 @@ fn transfer_curves_and_narrow_range_are_honoured() {
         &[(*b"cICP", &cicp(1, Cicp::LINEAR_TRANSFER, false))],
     );
     let image = read_bytes(&narrow).unwrap();
-    assert_eq!(image.pixel(0, 0), [0.0, 1.0, 20.0 / 219.0 + 1.0, 1.0]);
+    assert_eq!(rgba(&image, 0, 0), [0.0, 1.0, 20.0 / 219.0 + 1.0, 1.0]);
     let alpha = 16.0 / 255.0;
     let below_black = -16.0 / 219.0 * alpha;
     assert_eq!(
-        image.pixel(1, 0),
+        rgba(&image, 1, 0),
         [below_black, below_black, below_black, alpha]
     );
 }

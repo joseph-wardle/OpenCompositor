@@ -288,13 +288,13 @@ fn an_image_larger_than_the_gpu_allows_is_read_but_cannot_be_shown() {
 }
 
 #[test]
-fn staged_rows_are_half_floats_padded_to_the_copy_alignment() {
+fn staged_rows_are_interleaved_half_floats_padded_to_the_copy_alignment() {
     // Two rows of one pixel each; the second has a NaN and a value beyond f16's range.
-    let pixels = [0.5, 1.0, -2.0, 0.25, f32::NAN, 1e6, 0.0, 1.0];
+    let planes = [[0.5, f32::NAN], [1.0, 1e6], [-2.0, 0.0], [0.25, 1.0]];
     let padding = f16::from_f32(7.0);
     let mut out = vec![padding; 2 * 128];
 
-    convert_rows(&pixels, 1, &mut out, 128);
+    convert_rows(planes.each_ref().map(|plane| &plane[..]), 1, &mut out, 128);
 
     let row = |index: usize| out[index * 128..index * 128 + 4].to_vec();
     assert_eq!(row(0), [0.5, 1.0, -2.0, 0.25].map(f16::from_f32));
@@ -303,4 +303,31 @@ fn staged_rows_are_half_floats_padded_to_the_copy_alignment() {
     assert_eq!(second[1], f16::INFINITY);
     assert_eq!(second[2..], [0.0, 1.0].map(f16::from_f32));
     assert!(out[4..128].iter().all(|&half| half == padding));
+}
+
+#[test]
+fn a_file_is_staged_bottom_row_first() {
+    // A 16 × 8 data window at (-7, 7) in a 10 × 10 display window, red each pixel's x and green
+    // its row counted down from row 9, written by OpenEXR.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/tiled_zip.exr");
+    let (info, planes) = read_image(&path).unwrap().into_parts();
+    let window = info.data_window;
+    let (width, halves_per_row) = (window.width as usize, row_bytes(window.width) as usize / 2);
+    let mut out = vec![f16::ZERO; halves_per_row * window.height as usize];
+
+    convert_rows(
+        planes.each_ref().map(|plane| &plane[..]),
+        width,
+        &mut out,
+        halves_per_row,
+    );
+
+    for (row, y) in (window.y..).take(window.height as usize).enumerate() {
+        for (column, x) in (window.x..).take(width).enumerate() {
+            let start = row * halves_per_row + column * 4;
+            let staged = out[start..start + 4].iter().map(|half| half.to_f32());
+            let expected = [x as f32, (9 - y) as f32, 0.0, 1.0];
+            assert!(staged.eq(expected), "({x}, {y})");
+        }
+    }
 }
