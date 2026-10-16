@@ -1,5 +1,6 @@
 //! The GPU: one device for every pane, and a surface for each pane while it has a native window.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -369,11 +370,7 @@ impl FrameChecks {
         if let Some(buffer) = &readback {
             buffer.map_async(wgpu::MapMode::Read, .., |_| {});
         }
-        let wait = wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        };
-        if device.device.poll(wait).is_err() {
+        if wait_for_device(&device.device).is_err() {
             return;
         }
         let Some(view) = readback
@@ -387,6 +384,22 @@ impl FrameChecks {
             pixel.swap(0, 2);
         }
         self.centres[pane.index()] = Some(pixel);
+    }
+}
+
+/// Waits until the device has finished its submitted work and run the callbacks it made ready.
+pub(crate) fn wait_for_device(device: &wgpu::Device) -> Result<(), String> {
+    let wait = wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    };
+    // wgpu 30 panics rather than returning an error when the driver reports the device lost
+    // during a poll, because `WaitIdleError::Device` has no `PollError`. The panic is raised after
+    // wgpu has released its locks, so catching it leaves wgpu usable.
+    match std::panic::catch_unwind(AssertUnwindSafe(|| device.poll(wait))) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("the GPU device was lost".to_owned()),
     }
 }
 

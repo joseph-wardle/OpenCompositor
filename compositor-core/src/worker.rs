@@ -8,6 +8,7 @@ use half::f16;
 
 use crate::document::NodeId;
 use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, ResultKey};
+use crate::gpu::wait_for_device;
 use crate::image::ImageInfo;
 
 /// The staging buffer's first size, a DCI 4K image, and its least.
@@ -504,12 +505,7 @@ fn map(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<(), String> {
         let _ = sender.send(result);
     });
     loop {
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|error| error.to_string())?;
+        wait_for_device(device)?;
         if let Ok(result) = receiver.try_recv() {
             return result.map_err(|error| error.to_string());
         }
