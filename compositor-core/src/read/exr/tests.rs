@@ -430,7 +430,7 @@ fn the_first_part_with_rgb_is_shown_and_the_others_named() {
     let image = read_bytes(&bytes).unwrap();
 
     assert_eq!(rgba(&image, 0, 0), [0.18, 0.18, 0.18, 1.0]);
-    let Source::Exr(source) = image.source() else {
+    let Some(Source::Exr(source)) = image.source() else {
         panic!("an EXR source")
     };
     assert_eq!(source.shown_part, 1);

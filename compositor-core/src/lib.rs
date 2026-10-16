@@ -19,7 +19,7 @@ pub use document::{
     Assignment, Changes, ConnectionError, Document, ExposureVersion, Node, NodeId, NodeInput,
     NodeKind, Slot,
 };
-pub use evaluate::{EvalError, Reloads, ResultKey, evaluate, result_key};
+pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};
 pub use image::{
     Channel, Chromaticities, Cicp, ExrChannel, ExrCompression, ExrPart, ExrSource, Image,

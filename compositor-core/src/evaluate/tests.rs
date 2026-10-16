@@ -1,7 +1,12 @@
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::PathBuf;
+
 use open_ng::Point;
 
 use super::*;
 use crate::document::Assignment;
+use crate::image::Channel;
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 
@@ -9,10 +14,10 @@ const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 const DEEP_CHAIN: u64 = 10_000;
 const DEEP_STACK: usize = 64 << 20;
 
-fn reader(path: &str) -> Node {
+fn reader(path: impl AsRef<Path>) -> Node {
     Node::new(
         NodeKind::Reader {
-            path: Path::new(path).into(),
+            path: path.as_ref().into(),
         },
         ORIGIN,
     )
@@ -29,6 +34,40 @@ fn exposure(stops: Option<f64>) -> Node {
         node.set_value("stops", Value::Float(stops)).unwrap();
     }
     node
+}
+
+/// A directory of this test's own, emptied first.
+fn directory(name: &str) -> PathBuf {
+    let directory = std::env::temp_dir()
+        .join(format!("opencompositor-evaluate-{}", std::process::id()))
+        .join(name);
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    directory
+}
+
+/// A 2 × 1 opaque PNG whose red is one 8-bit code and green and blue lower ones, replacing any
+/// file at `path`.
+fn write_png(path: &Path, code: u8) {
+    let pixel = [code, code / 2, code / 4, 255];
+    write(path, png::ColorType::Rgba, &[pixel, pixel].concat());
+}
+
+/// A 2 × 1 opaque grey PNG of one 8-bit code.
+fn write_grey_png(path: &Path, code: u8) {
+    write(
+        path,
+        png::ColorType::GrayscaleAlpha,
+        &[code, 255, code, 255],
+    );
+}
+
+fn write(path: &Path, color: png::ColorType, data: &[u8]) {
+    let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), 2, 1);
+    encoder.set_color(color);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(data).unwrap();
+    writer.finish().unwrap();
 }
 
 /// A document of these nodes, with IDs from 1, each Exposure taking the image of the node before
@@ -136,6 +175,224 @@ fn a_deep_chain_keys_without_recursion() {
             assert!(first == second);
             assert!(first != shallower);
         })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn run(evaluator: &mut Evaluator, key: &ResultKey) -> Result<Image, EvalError> {
+    evaluator.evaluate(key, || false).expect("nothing stops it")
+}
+
+fn red(image: &Image) -> f32 {
+    image.value(Channel::R, 0, 0)
+}
+
+/// A Reader of a file, and an Exposure of each of `stops` on it, the keys of the second
+/// and third nodes.
+fn exposure_keys(path: &Path, stops: [f64; 2]) -> [ResultKey; 2] {
+    stops.map(|stops| key(&chain([reader(path), exposure(Some(stops))]), 2))
+}
+
+#[test]
+fn exposure_scales_colour_and_shares_alpha() {
+    let path = directory("exposure").join("image.png");
+    write_png(&path, 255);
+    let document = chain([reader(&path), exposure(Some(-2.0))]);
+    let mut evaluator = Evaluator::new();
+
+    let read = run(&mut evaluator, &key(&document, 1)).unwrap();
+    let exposed = run(&mut evaluator, &key(&document, 2)).unwrap();
+
+    for channel in [Channel::R, Channel::G, Channel::B] {
+        let expected: Vec<f32> = read.plane(channel).iter().map(|v| v * 0.25).collect();
+        assert_eq!(**exposed.plane(channel), *expected);
+    }
+    assert!(Arc::ptr_eq(
+        read.plane(Channel::A),
+        exposed.plane(Channel::A)
+    ));
+    assert_eq!(exposed.data_window(), read.data_window());
+    assert_eq!(exposed.source(), read.source());
+}
+
+#[test]
+fn exposure_keeps_a_grey_image_one_plane() {
+    let path = directory("grey").join("grey.png");
+    write_grey_png(&path, 255);
+    let mut evaluator = Evaluator::new();
+    let [exposed, _] = exposure_keys(&path, [1.0, 1.0]);
+
+    let image = run(&mut evaluator, &exposed).unwrap();
+
+    assert!(Arc::ptr_eq(
+        image.plane(Channel::R),
+        image.plane(Channel::G)
+    ));
+    assert!(Arc::ptr_eq(
+        image.plane(Channel::R),
+        image.plane(Channel::B)
+    ));
+    assert_eq!(red(&image), 2.0);
+}
+
+#[test]
+fn an_unconnected_input_gives_the_empty_image() {
+    let mut evaluator = Evaluator::new();
+    let image = run(&mut evaluator, &key(&chain([exposure(Some(3.0))]), 1)).unwrap();
+    assert_eq!(image.display_window().width, 0);
+    assert_eq!(image.data_window().height, 0);
+    assert!(image.plane(Channel::R).is_empty());
+    assert_eq!(image.source(), None);
+}
+
+#[test]
+fn a_stops_edit_reuses_the_read_and_reload_reads_again() {
+    let path = directory("stops_edit").join("image.png");
+    write_png(&path, 255);
+    let mut evaluator = Evaluator::new();
+    let [one, two] = exposure_keys(&path, [1.0, 2.0]);
+    let before = red(&run(&mut evaluator, &one).unwrap());
+
+    // A re-read would see black.
+    write_png(&path, 0);
+    assert_eq!(red(&run(&mut evaluator, &two).unwrap()), before * 2.0);
+
+    let mut reloads = Reloads::default();
+    reloads.reload(path.as_path().into());
+    let document = chain([reader(&path), exposure(Some(2.0))]);
+    let reloaded = result_key(&document, &reloads, NodeId(2)).unwrap();
+    assert_eq!(red(&run(&mut evaluator, &reloaded).unwrap()), 0.0);
+}
+
+#[test]
+fn viewing_an_unrelated_chain_releases_the_old_one() {
+    let directory = directory("release");
+    let (a, b) = (directory.join("a.png"), directory.join("b.png"));
+    write_png(&a, 255);
+    write_png(&b, 255);
+    let mut evaluator = Evaluator::new();
+    let [exposed, _] = exposure_keys(&a, [1.0, 1.0]);
+    let before = red(&run(&mut evaluator, &exposed).unwrap());
+    assert_eq!(evaluator.retained.len(), 2);
+
+    run(&mut evaluator, &key(&chain([reader(&b)]), 1)).unwrap();
+    assert_eq!(evaluator.retained.len(), 1);
+
+    write_png(&a, 0);
+    let after = red(&run(&mut evaluator, &exposed).unwrap());
+    assert_ne!(after, before);
+}
+
+#[test]
+fn stopping_keeps_what_was_completed() {
+    let path = directory("stopping").join("image.png");
+    write_png(&path, 255);
+    let mut evaluator = Evaluator::new();
+    let [exposed, _] = exposure_keys(&path, [1.0, 1.0]);
+    let asked = std::cell::Cell::new(0);
+    let stop = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 1
+    };
+
+    assert!(evaluator.evaluate(&exposed, stop).is_none());
+    assert_eq!(asked.get(), 2);
+    assert_eq!(evaluator.retained.len(), 1);
+
+    write_png(&path, 0);
+    assert_ne!(red(&run(&mut evaluator, &exposed).unwrap()), 0.0);
+}
+
+#[test]
+fn the_cap_keeps_readers_first_and_never_a_result_without_its_inputs() {
+    let path = directory("cap").join("image.png");
+    write_png(&path, 255);
+    let [one, two] = exposure_keys(&path, [1.0, 2.0]);
+    let image_bytes = 4 * 2 * 4;
+
+    // Room for the read, not for the Exposure's three new planes.
+    let mut evaluator = Evaluator::with_cap(image_bytes);
+    let before = red(&run(&mut evaluator, &one).unwrap());
+    assert_eq!(evaluator.retained.len(), 1);
+    assert_eq!(evaluator.retained_bytes, image_bytes);
+    write_png(&path, 0);
+    assert_eq!(red(&run(&mut evaluator, &two).unwrap()), before * 2.0);
+
+    // No room for the read, so none for what is computed from it either.
+    write_png(&path, 255);
+    let mut evaluator = Evaluator::with_cap(image_bytes - 1);
+    run(&mut evaluator, &one).unwrap();
+    assert!(evaluator.retained.is_empty());
+    assert_eq!(evaluator.retained_bytes, 0);
+    write_png(&path, 0);
+    assert_eq!(red(&run(&mut evaluator, &two).unwrap()), 0.0);
+}
+
+#[test]
+fn released_planes_are_no_longer_counted() {
+    let path = directory("counting").join("image.png");
+    write_png(&path, 255);
+    let mut evaluator = Evaluator::new();
+    let [exposed, _] = exposure_keys(&path, [1.0, 1.0]);
+
+    run(&mut evaluator, &exposed).unwrap();
+    // The Exposure shares the read's alpha.
+    assert_eq!(evaluator.retained_bytes, 7 * 2 * 4);
+    assert_eq!(evaluator.planes.len(), 7);
+
+    run(&mut evaluator, &key(&chain([exposure(None)]), 1)).unwrap();
+    assert_eq!(evaluator.retained.len(), 1);
+    assert_eq!(evaluator.retained_bytes, 0);
+}
+
+#[test]
+fn a_failure_carries_the_key_of_the_node_it_happened_at() {
+    let missing = directory("failure").join("missing.png");
+    let document = chain([reader(&missing), exposure(Some(1.0))]);
+    let mut evaluator = Evaluator::new();
+
+    let error = run(&mut evaluator, &key(&document, 2)).unwrap_err();
+
+    assert_eq!(*error.origin(), key(&document, 1));
+    assert!(
+        matches!(&error, EvalError::Read { error: ReadError::Io(io), .. } if io.kind() == std::io::ErrorKind::NotFound),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("missing.png"), "{error}");
+}
+
+#[test]
+fn a_panicking_operation_fails_its_node() {
+    // An Exposure whose key says it is connected, given no image, panics.
+    let exposure = key(&chain([reader("a.png"), exposure(None)]), 2);
+    let error = compute(&exposure, &[]).unwrap_err();
+    assert!(matches!(error, EvalError::Panicked { origin } if origin == exposure));
+}
+
+#[test]
+fn a_deep_chain_evaluates_without_recursion() {
+    let path = directory("deep").join("image.png");
+    write_png(&path, 255);
+    let nodes = |top: f64| {
+        std::iter::once(reader(&path))
+            .chain((1..DEEP_CHAIN - 1).map(|_| exposure(None)))
+            .chain([exposure(Some(top))])
+    };
+    let (first, second) = (
+        key(&chain(nodes(0.0)), DEEP_CHAIN),
+        key(&chain(nodes(1.0)), DEEP_CHAIN),
+    );
+    let mut evaluator = Evaluator::new();
+
+    let before = red(&run(&mut evaluator, &first).unwrap());
+    write_png(&path, 0);
+    assert_eq!(red(&run(&mut evaluator, &second).unwrap()), before * 2.0);
+    assert_eq!(evaluator.retained.len(), DEEP_CHAIN as usize);
+
+    std::thread::Builder::new()
+        .stack_size(DEEP_STACK)
+        .spawn(move || drop((evaluator, first, second)))
         .unwrap()
         .join()
         .unwrap();
