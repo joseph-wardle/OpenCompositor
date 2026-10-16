@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::document::NodeKind;
-use crate::loader::{Decoded, LoadError};
 use crate::read::ReadError;
+use crate::worker::ViewerImage;
 
 const NONE: Modifiers = Modifiers {
     shift: false,
@@ -19,11 +19,11 @@ const SHIFT: Modifiers = Modifiers {
     ctrl: false,
 };
 
-/// An app whose loader hands its results to the test, with a 400 × 300 graph pane at scale 2.
-fn app() -> (App, Receiver<Loaded>) {
+/// An app whose worker hands its results to the test, with a 400 × 300 graph pane at scale 2.
+fn app() -> (App, Receiver<Evaluated>) {
     let (delivered, deliveries) = mpsc::channel();
-    let mut app = App::new(move |loaded| {
-        let _ = delivered.send(loaded);
+    let mut app = App::new(move |evaluated| {
+        let _ = delivered.send(evaluated);
     });
     let size = PaneSize {
         width: 400,
@@ -73,22 +73,22 @@ fn slot_key(digit: u8, modifiers: Modifiers) -> Event {
     }
 }
 
-/// The read the viewer is waiting for.
-fn reading(app: &App) -> LoadRequest {
-    app.reading.clone().expect("a read in progress")
+/// The key the worker was last asked for.
+fn sent(app: &App) -> ResultKey {
+    app.sent.clone().expect("a key was sent")
 }
 
-/// A finished read of a `width` × `height` image whose pixels the GPU never received.
-fn read(request: &LoadRequest, width: u32, height: u32) -> Event {
+/// A finished evaluation of a `width` × `height` image whose pixels the GPU never received.
+fn read(key: &ResultKey, width: u32, height: u32) -> Event {
     let window = Window {
         x: 0,
         y: 0,
         width,
         height,
     };
-    Event::Loaded(Loaded {
-        request: request.clone(),
-        result: Ok(Decoded {
+    Event::Evaluated(Evaluated {
+        key: key.clone(),
+        result: Ok(ViewerImage {
             info: ImageInfo {
                 display_window: window,
                 data_window: window,
@@ -103,10 +103,10 @@ fn title(app: &App, id: NodeId) -> String {
     app.session().graph().node(id.into()).unwrap().title.clone()
 }
 
-fn receive(deliveries: &Receiver<Loaded>) -> Loaded {
+fn receive(deliveries: &Receiver<Evaluated>) -> Evaluated {
     deliveries
         .recv_timeout(Duration::from_secs(10))
-        .expect("the loader delivers")
+        .expect("the worker delivers")
 }
 
 #[test]
@@ -362,9 +362,9 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
         ))
     );
 
-    let loaded = receive(&deliveries);
-    assert_eq!(loaded.request, reading(&app));
-    app.dispatch(Event::Loaded(loaded));
+    let evaluated = receive(&deliveries);
+    assert_eq!(evaluated.key, sent(&app));
+    app.dispatch(Event::Evaluated(evaluated));
 
     // Failed: the error under the viewer, and the node coloured unlike others.
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
@@ -374,7 +374,6 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
         "{}",
         app.caption
     );
-    assert_eq!(app.reading.as_ref(), None);
 }
 
 #[test]
@@ -398,11 +397,11 @@ fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let first = reading(&app);
-    let id = create(&mut app, "/nonexistent/b.exr");
+    let first = sent(&app);
+    create(&mut app, "/nonexistent/b.exr");
     app.dispatch(slot_key(2, CTRL));
-    let second = reading(&app);
-    assert_eq!(second.node, id);
+    let second = sent(&app);
+    assert_ne!(second, first);
 
     // The first read finishes after the viewer moved on.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
@@ -413,14 +412,15 @@ fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
 
     // Back to slot 1, which is read again, showing slot 2's image until then.
     app.dispatch(slot_key(1, NONE));
-    assert_eq!(reading(&app), first);
+    assert_eq!(sent(&app), first);
     assert_eq!(
         app.caption,
         "Slot 1 · a.exr · reading… (showing b.exr until then)"
     );
-    // Back to slot 2, which is shown already.
+    // Back to slot 2, which is shown already and asked for again, so that the worker lets slot
+    // 1's read go.
     app.dispatch(slot_key(2, NONE));
-    assert_eq!(app.reading.as_ref(), None);
+    assert_eq!(sent(&app), second);
     assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
 }
 
@@ -452,45 +452,23 @@ fn a_surface_that_fails_to_attach_shows_an_error_that_stays() {
 }
 
 #[test]
-fn an_image_read_before_the_gpu_arrived_is_read_again_once_it_has() {
-    let (mut app, _deliveries) = app();
-    create(&mut app, "/nonexistent/a.exr");
-    app.dispatch(slot_key(1, CTRL));
-    let request = reading(&app);
-    app.dispatch(read(&request, 4, 4));
-    assert_eq!(app.reading.as_ref(), None);
-
-    // As a surface's creation does.
-    let (gpu, device) = Gpu::noop();
-    app.gpu = gpu;
-    app.loader.connect(device);
-    app.dispatch(Event::Draw(Pane::Viewer));
-    assert_eq!(reading(&app), request);
-    assert_eq!(app.caption, "Slot 1 · a.exr · reading…");
-
-    // A read that began before the GPU arrived finishes without pixels too.
-    app.dispatch(read(&request, 4, 4));
-    assert_eq!(reading(&app), request);
-
-    // An empty image has no pixels to stage.
-    app.dispatch(read(&request, 0, 0));
-    assert_eq!(app.reading.as_ref(), None);
-}
-
-#[test]
 fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     let (mut app, _deliveries) = app();
     let id = create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    app.dispatch(read(&reading(&app), 4, 4));
+    let before = sent(&app);
+    app.dispatch(read(&before, 4, 4));
     assert!(matches!(app.shown, Shown::Image { .. }));
 
     app.dispatch(Event::Command(Command::Reload));
-    let reload = reading(&app);
-    assert_eq!(reload.reload, 1);
-    app.dispatch(Event::Loaded(Loaded {
-        request: reload,
-        result: Err(LoadError::Read(ReadError::UnknownFormat)),
+    let reload = sent(&app);
+    assert_ne!(reload, before);
+    app.dispatch(Event::Evaluated(Evaluated {
+        key: reload.clone(),
+        result: Err(ViewerError::Eval(EvalError::Read {
+            origin: reload,
+            error: ReadError::UnknownFormat,
+        })),
     }));
 
     assert!(matches!(app.shown, Shown::Failed { .. }));
@@ -507,7 +485,7 @@ fn undoing_a_mark_leaves_the_viewer_showing_nothing() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    app.dispatch(read(&reading(&app), 4, 4));
+    app.dispatch(read(&sent(&app), 4, 4));
 
     let requests = app.dispatch(Event::Command(Command::Undo));
 
@@ -536,7 +514,7 @@ fn h_fits_and_shift_h_shows_actual_size_in_the_viewer_under_the_pointer() {
     });
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    app.dispatch(read(&reading(&app), 4000, 2000));
+    app.dispatch(read(&sent(&app), 4000, 2000));
     app.dispatch(input(Pane::Viewer, Input::PointerEntered));
     let display = app.shown.display_window().unwrap();
     let scale = |app: &App| app.session().viewer().placement(display).scale;
@@ -575,7 +553,7 @@ fn delete_in_the_graph_deletes_the_selection_and_the_viewer_lets_go() {
     assert_eq!(app.session().document().node(id), None);
     assert!(app.session().document().node(kept).is_some());
     assert_eq!(app.session().undo_label(), Some("Delete"));
-    assert_eq!(app.reading, None);
+    assert_eq!(app.sent, None);
     assert_eq!(
         app.caption,
         "Slot 1: nothing marked. Ctrl+1 marks the selected node"
@@ -605,7 +583,7 @@ fn a_viewed_exposure_names_its_missing_input_then_says_it_is_not_computed() {
     app.session.connect(exposure, "source", reader).unwrap();
     app.dispatch(slot_key(2, NONE));
     assert_eq!(app.caption, "Slot 2 · Exposure · not computed yet");
-    assert_eq!(app.reading, None);
+    assert_eq!(app.sent, None);
 }
 
 #[test]

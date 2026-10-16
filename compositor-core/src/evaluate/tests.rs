@@ -10,9 +10,8 @@ use crate::image::Channel;
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 
-/// A key at most this deep is compared and dropped on a thread with this stack.
+/// A key at most this deep is compared and dropped on a thread with a `DEEP_STACK`.
 const DEEP_CHAIN: u64 = 10_000;
-const DEEP_STACK: usize = 64 << 20;
 
 fn reader(path: impl AsRef<Path>) -> Node {
     Node::new(
@@ -282,6 +281,23 @@ fn viewing_an_unrelated_chain_releases_the_old_one() {
     write_png(&a, 0);
     let after = red(&run(&mut evaluator, &exposed).unwrap());
     assert_ne!(after, before);
+}
+
+#[test]
+fn releasing_everything_reads_again() {
+    let path = directory("release-all").join("image.png");
+    write_png(&path, 255);
+    let mut evaluator = Evaluator::new();
+    let [exposed, _] = exposure_keys(&path, [1.0, 1.0]);
+    run(&mut evaluator, &exposed).unwrap();
+
+    evaluator.release_all();
+
+    assert!(evaluator.retained.is_empty());
+    assert!(evaluator.planes.is_empty());
+    assert_eq!(evaluator.retained_bytes, 0);
+    write_png(&path, 0);
+    assert_eq!(red(&run(&mut evaluator, &exposed).unwrap()), 0.0);
 }
 
 #[test]

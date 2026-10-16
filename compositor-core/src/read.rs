@@ -14,7 +14,7 @@ mod png;
 /// abort the process, which no panic handler can catch, so readers check this before allocating.
 ///
 /// 8192 × 8192 is the largest square that fits. At the limit an image holds 1 GiB as RGBA `f32`
-/// on the host, and the loader adds about 512 MiB each for its RGBA `f16` staging buffer and
+/// on the host, and the viewer adds about 512 MiB each for its RGBA `f16` staging buffer and
 /// texture: a stopgap that bounds one read, not a memory budget.
 pub const MAX_PIXELS: u64 = 1 << 26;
 

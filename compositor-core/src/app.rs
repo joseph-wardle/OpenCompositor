@@ -1,4 +1,5 @@
-//! The interactive compositor: a session, the GPU that draws its panes, and the loader, changed
+//! The interactive compositor: a session, the GPU that draws its panes, and the evaluator's
+//! worker, changed
 //! only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
 
 use std::path::{Path, PathBuf};
@@ -6,10 +7,11 @@ use std::path::{Path, PathBuf};
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{ExposureVersion, NodeId, NodeKind, Slot};
+use crate::evaluate::{EvalError, ResultKey, result_key};
 use crate::gpu::{FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
-use crate::loader::{LoadRequest, Loaded, Loader, is_empty};
-use crate::session::{Session, Viewed};
+use crate::session::{LoadRequest, Session, Viewed};
+use crate::worker::{Evaluated, ViewerError, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,8 +71,8 @@ pub enum Event {
         intent: FileIntent,
         paths: Vec<PathBuf>,
     },
-    /// A read finished on the loader's thread.
-    Loaded(Loaded),
+    /// An evaluation finished on the evaluator's thread.
+    Evaluated(Evaluated),
 }
 
 /// What the shell does for [`App::dispatch`], after it returns.
@@ -193,9 +195,6 @@ enum Shown {
     Image {
         request: LoadRequest,
         info: ImageInfo,
-        /// Read while there was no GPU to stage its pixels for, so the viewer draws only its
-        /// outline.
-        unstaged: bool,
     },
     /// An empty frame, never an older image.
     Failed {
@@ -205,13 +204,6 @@ enum Shown {
 }
 
 impl Shown {
-    fn request(&self) -> Option<&LoadRequest> {
-        match self {
-            Shown::Nothing => None,
-            Shown::Image { request, .. } | Shown::Failed { request, .. } => Some(request),
-        }
-    }
-
     fn display_window(&self) -> Option<Window> {
         match self {
             Shown::Image { info, .. } => Some(info.display_window),
@@ -225,30 +217,30 @@ pub struct App {
     session: Session,
     gpu: Gpu,
     /// Nothing is delivered once the app has dropped.
-    loader: Loader,
+    worker: Worker,
+    /// What the worker was last asked for.
+    sent: Option<ResultKey>,
     /// The pane under the pointer, which receives keys whichever pane has the keyboard.
     hovered: Option<Pane>,
     /// The pointer's last position over the graph pane.
     graph_pointer: Option<PhysicalPoint>,
     shown: Shown,
-    /// The read in progress for the viewer.
-    reading: Option<LoadRequest>,
     /// The viewer's caption as last requested.
     caption: String,
 }
 
 impl App {
-    /// `deliver` receives each finished read on the loader's thread, and must hand it to the GUI
-    /// thread as an [`Event::Loaded`].
-    pub fn new(deliver: impl Fn(Loaded) + Send + 'static) -> App {
+    /// `deliver` receives each finished evaluation on the evaluator's thread, and must hand it to
+    /// the GUI thread as an [`Event::Evaluated`].
+    pub fn new(deliver: impl Fn(Evaluated) + Send + 'static) -> App {
         App {
             session: Session::new(),
             gpu: Gpu::new(),
-            loader: Loader::start(deliver),
+            worker: Worker::start(deliver),
+            sent: None,
             hovered: None,
             graph_pointer: None,
             shown: Shown::Nothing,
-            reading: None,
             caption: String::new(),
         }
     }
@@ -283,7 +275,7 @@ impl App {
                 match self.gpu.attach(pane, window, size) {
                     Ok(device) => {
                         if let Some(device) = device {
-                            self.loader.connect(device);
+                            self.worker.connect(device);
                         }
                     }
                     Err(error) => return vec![Request::ShowError(error)],
@@ -315,7 +307,7 @@ impl App {
                 Vec::new()
             }
             Event::FilesChosen { intent, paths } => self.files_chosen(intent, paths),
-            Event::Loaded(loaded) => self.loaded(loaded),
+            Event::Evaluated(evaluated) => self.evaluated(evaluated),
         };
         self.follow_viewer(&mut requests);
         requests
@@ -572,66 +564,72 @@ impl App {
         vec![Request::Redraw(Pane::Graph)]
     }
 
-    /// Shows a finished read if the viewer still wants it. Otherwise it is dropped, which returns
-    /// its staging buffer to the loader.
-    fn loaded(&mut self, loaded: Loaded) -> Vec<Request> {
-        let Some(read) = self.reading.take_if(|reading| *reading == loaded.request) else {
+    /// Shows a finished evaluation if the viewer still wants it. Otherwise it is dropped, which
+    /// returns its staging buffer to the worker.
+    fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
+        let Some((request, _)) = self.wanted().filter(|(_, key)| *key == evaluated.key) else {
             return Vec::new();
         };
-        let Loaded { request, result } = loaded;
-        let failed = result.is_err();
-        self.shown = match result {
-            Ok(decoded) => {
-                let unstaged = decoded.pixels.is_none() && !is_empty(&decoded.info);
-                match decoded.pixels {
+        let failed = evaluated.result.is_err();
+        self.shown = match evaluated.result {
+            Ok(image) => {
+                match image.pixels {
                     Some(staged) => self.gpu.show_image(staged),
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
-                    request,
-                    info: decoded.info,
-                    unstaged,
+                    request: request.clone(),
+                    info: image.info,
                 }
             }
             Err(error) => {
                 self.gpu.clear_image();
+                // The caption names the file already.
+                let error = match error {
+                    ViewerError::Eval(EvalError::Read { error, .. }) => error.to_string(),
+                    error => error.to_string(),
+                };
                 Shown::Failed {
-                    request,
-                    error: error.to_string(),
+                    request: request.clone(),
+                    error,
                 }
             }
         };
         let mut requests = vec![Request::Redraw(Pane::Viewer)];
-        if self.session.record_read(read, failed) {
+        if self.session.record_read(request, failed) {
             requests.push(Request::Redraw(Pane::Graph));
         }
         requests
     }
 
-    /// Keeps the viewer on what its slot leads to: reads it unless it is shown or being read,
-    /// shows nothing if the slot leads nowhere, and describes the result.
-    fn follow_viewer(&mut self, requests: &mut Vec<Request>) {
-        let wanted = match self.session.viewed() {
-            Viewed::Node(request) => Some(request),
-            Viewed::Unmarked | Viewed::NoInput { .. } | Viewed::NotImplemented(_) => None,
+    /// What the viewer's slot leads to as a Reader's file, and its key.
+    fn wanted(&self) -> Option<(LoadRequest, ResultKey)> {
+        let Viewed::Node(request) = self.session.viewed() else {
+            return None;
         };
+        let key = result_key(
+            self.session.document(),
+            self.session.reloads(),
+            request.node,
+        )?;
+        Some((request, key))
+    }
+
+    /// Keeps the viewer on what its slot leads to: asks the worker for it, shows nothing if the
+    /// slot leads nowhere, and describes the result.
+    fn follow_viewer(&mut self, requests: &mut Vec<Request>) {
+        let wanted = self.wanted().map(|(_, key)| key);
         if wanted.is_none() && !matches!(self.shown, Shown::Nothing) {
             self.shown = Shown::Nothing;
             self.gpu.clear_image();
             requests.push(Request::Redraw(Pane::Viewer));
         }
-        // An image read without a GPU is read again once there is one, including a read that
-        // finished just before the GPU arrived.
-        let shown = match &self.shown {
-            Shown::Image { unstaged: true, .. } if self.gpu.has_device() => None,
-            shown => shown.request(),
-        };
-        let read = wanted.filter(|wanted| Some(wanted) != shown);
-        if read != self.reading {
-            if let Some(request) = &read {
-                self.loader.request(request.clone());
-            }
-            self.reading = read;
+        // Compared with what was sent, not with what is shown: a key already shown is sent again
+        // so that the worker releases what the last request retained, and stops working on it.
+        // Nothing is sent too, which releases everything.
+        if wanted != self.sent {
+            self.worker.request(wanted.clone());
+            self.sent = wanted;
         }
         let caption = self.caption();
         if caption != self.caption {
@@ -665,20 +663,10 @@ impl App {
             Viewed::Node(request) => request,
         };
         let name = file_name(&request.path);
-        if self.reading.as_ref() == Some(&request) {
-            return match &self.shown {
-                Shown::Image { request: shown, .. } if shown.node != request.node => format!(
-                    "Slot {slot} · {name} · reading… (showing {} until then)",
-                    file_name(&shown.path)
-                ),
-                _ => format!("Slot {slot} · {name} · reading…"),
-            };
-        }
         match &self.shown {
             Shown::Image {
                 request: shown,
                 info,
-                ..
             } if *shown == request => {
                 let window = info.display_window;
                 let mut caption = format!(
@@ -695,8 +683,11 @@ impl App {
                 request: shown,
                 error,
             } if *shown == request => format!("Slot {slot} · {name} · {error}"),
-            // Nothing is being read once loading stops.
-            _ => format!("Slot {slot} · {name}"),
+            Shown::Image { request: shown, .. } if shown.node != request.node => format!(
+                "Slot {slot} · {name} · reading… (showing {} until then)",
+                file_name(&shown.path)
+            ),
+            _ => format!("Slot {slot} · {name} · reading…"),
         }
     }
 }

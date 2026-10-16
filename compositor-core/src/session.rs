@@ -11,7 +11,6 @@ use crate::document::{
     Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, Slot,
 };
 use crate::evaluate::Reloads;
-use crate::loader::LoadRequest;
 use crate::parameter::{Value, ValueError};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
@@ -80,6 +79,16 @@ impl std::error::Error for EditError {
             _ => None,
         }
     }
+}
+
+/// A Reader's file as of its last reload, which names its read in the viewer's caption and its
+/// status in the graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadRequest {
+    pub node: NodeId,
+    pub path: PathBuf,
+    /// How many times the file had been reloaded.
+    pub reload: u64,
 }
 
 /// What the viewer's slot leads to.

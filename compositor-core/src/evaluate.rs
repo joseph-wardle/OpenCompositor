@@ -185,6 +185,10 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
     }
 }
 
+/// A stack that holds comparing and dropping the deepest key the deep-chain tests evaluate, ten
+/// thousand nodes: both recurse once per node, and overflowing a stack aborts the process.
+pub(crate) const DEEP_STACK: usize = 64 << 20;
+
 /// The most bytes of planes an evaluator retains. Provisional, until a budget sets it.
 const RETAINED_BYTES_CAP: u64 = 4 << 30;
 
@@ -347,6 +351,13 @@ impl Evaluator {
             placed.insert(address, steps.len() - 1);
         }
         steps
+    }
+
+    /// Releases every retained result, as when the viewer wants nothing.
+    pub fn release_all(&mut self) {
+        self.retained.clear();
+        self.planes.clear();
+        self.retained_bytes = 0;
     }
 
     /// Releases every retained result the request does not contain.

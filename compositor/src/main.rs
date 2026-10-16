@@ -76,10 +76,10 @@ fn main() {
     let waker = ffi::new_waker();
     // SAFETY: the waker is live. Its thread handle outlives it: queueing fails once it is deleted.
     let waker_thread = unsafe { &*waker }.qt_thread();
-    let mut app = App::new(move |loaded| {
+    let mut app = App::new(move |evaluated| {
         waker_thread
-            .queue(move |_| dispatch(Event::Loaded(loaded)))
-            .expect("the waker outlives the app, whose loader delivers nothing once dropped");
+            .queue(move |_| dispatch(Event::Evaluated(evaluated)))
+            .expect("the waker outlives the app, whose worker delivers nothing once dropped");
     });
     if lifecycle_check.is_some() {
         app.check_frames();
@@ -193,7 +193,7 @@ fn main() {
     let status = ffi::exec();
 
     // The app goes before the window: its surfaces before the panes' native windows, and its
-    // requests with it, so that the events destroying the window dispatch to nothing. Its loader
+    // requests with it, so that the events destroying the window dispatch to nothing. Its worker
     // delivers nothing after it.
     drop(APP.with(|cell| cell.borrow_mut().take()));
     // SAFETY: nothing else deletes the waker. Results queued to it are dropped without running.
