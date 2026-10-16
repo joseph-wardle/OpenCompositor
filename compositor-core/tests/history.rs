@@ -81,6 +81,8 @@ fn a_value_edit_retains_its_node_and_map_path_alone() {
         Point { x: 0.0, y: 0.0 },
     );
     let exposure = *changes.nodes.first().expect("one node created");
+    let reader = session.document().nodes().next().expect("a Reader").0;
+    session.connect(exposure, "source", reader).unwrap();
 
     let retained = retained_by(|| {
         session.begin_edit(exposure, "Set Stops").unwrap();
@@ -111,5 +113,35 @@ fn moving_a_reader_retains_no_copy_of_its_path() {
         retained[0] <= STEP_BUDGET,
         "a move retained {} bytes",
         retained[0]
+    );
+}
+
+#[test]
+fn connecting_retains_its_node_and_map_path_alone() {
+    let mut session = session_of(10_000, 16);
+    let changes = session.create_node(
+        NodeKind::Exposure {
+            version: ExposureVersion::CURRENT,
+        },
+        Point { x: 0.0, y: 0.0 },
+    );
+    let exposure = *changes.nodes.first().expect("one node created");
+    let readers: Vec<_> = session
+        .document()
+        .nodes()
+        .map(|(id, _)| id)
+        .take(2)
+        .collect();
+    let [first, second] = readers[..] else {
+        panic!("two Readers")
+    };
+    session.connect(exposure, "source", first).unwrap();
+
+    let retained = retained_by(|| {
+        session.connect(exposure, "source", second).unwrap();
+    });
+    assert!(
+        retained <= STEP_BUDGET,
+        "a connection retained {retained} bytes"
     );
 }

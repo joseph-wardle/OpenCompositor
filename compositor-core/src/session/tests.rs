@@ -540,3 +540,95 @@ fn an_edit_begins_only_on_an_existing_node() {
     );
     assert_eq!(session.editing(), None);
 }
+
+fn source_of(session: &Session, consumer: NodeId) -> Option<NodeId> {
+    session.document().node(consumer).unwrap().input("source")
+}
+
+#[test]
+fn replacing_a_wire_is_one_step_and_undo_restores_it() {
+    let mut session = Session::new();
+    let first = create(&mut session, "a.exr", ORIGIN);
+    let second = create(&mut session, "b.exr", ORIGIN);
+    let exposure = create_exposure(&mut session, ORIGIN);
+    session.connect(exposure, "source", first).unwrap();
+    let steps = session.undo.len();
+
+    session.connect(exposure, "source", second).unwrap();
+    assert_eq!(source_of(&session, exposure), Some(second));
+    assert_eq!(session.undo.len(), steps + 1);
+    assert_eq!(session.undo_label(), Some("Connect"));
+
+    session.undo();
+    assert_eq!(source_of(&session, exposure), Some(first));
+
+    session.disconnect(exposure, "source").unwrap();
+    assert_eq!(source_of(&session, exposure), None);
+    assert_eq!(session.undo_label(), Some("Disconnect"));
+    session.undo();
+    assert_eq!(source_of(&session, exposure), Some(first));
+}
+
+#[test]
+fn refused_connections_leave_the_document_and_history_unchanged() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let upstream = create_exposure(&mut session, ORIGIN);
+    let downstream = create_exposure(&mut session, ORIGIN);
+    session.connect(downstream, "source", upstream).unwrap();
+    let gone = create(&mut session, "b.exr", ORIGIN);
+    session.undo();
+    let before = session.document().clone();
+    let steps = session.undo.len();
+
+    let refusals = [
+        (upstream, "source", downstream, ConnectionError::Cycle),
+        (
+            upstream,
+            "source",
+            upstream,
+            ConnectionError::SelfConnection,
+        ),
+        (reader, "source", upstream, ConnectionError::UnknownInput),
+        (upstream, "mask", reader, ConnectionError::UnknownInput),
+        (upstream, "source", gone, ConnectionError::MissingNode(gone)),
+    ];
+    for (consumer, input, source, reason) in refusals {
+        assert_eq!(
+            session.connect(consumer, input, source),
+            Err(EditError::Connection(reason))
+        );
+    }
+    assert_eq!(
+        session.disconnect(gone, "source"),
+        Err(EditError::Connection(ConnectionError::MissingNode(gone)))
+    );
+    assert!(before.changes_to(session.document()).is_empty());
+    assert_eq!(session.undo.len(), steps);
+    assert_eq!(session.redo_label(), Some("Create Reader"));
+}
+
+#[test]
+fn connections_that_change_nothing_keep_redo() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let connected = create_exposure(&mut session, ORIGIN);
+    let unconnected = create_exposure(&mut session, ORIGIN);
+    session.connect(connected, "source", reader).unwrap();
+    session.set_mark(slot(1), Some(connected)).unwrap();
+    session.undo();
+
+    assert!(
+        session
+            .connect(connected, "source", reader)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        session
+            .disconnect(unconnected, "source")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(session.redo_label(), Some("Mark"));
+}

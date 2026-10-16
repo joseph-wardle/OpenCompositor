@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use open_ng::{ConnectionEdit, Graph, InputEvent, Point, Response, Verdict, View, Viewport};
 
-use crate::document::{Changes, Document, Node, NodeId, NodeKind, Slot};
+use crate::document::{
+    Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, Slot,
+};
 use crate::loader::LoadRequest;
 use crate::parameter::{Value, ValueError};
 use crate::presentation::present;
@@ -50,6 +52,7 @@ pub enum EditError {
         parameter: String,
         error: ValueError,
     },
+    Connection(ConnectionError),
 }
 
 impl fmt::Display for EditError {
@@ -63,6 +66,7 @@ impl fmt::Display for EditError {
                 parameter,
                 error,
             } => write!(f, "node {}, {parameter}: {error}", node.0),
+            EditError::Connection(error) => write!(f, "{error}"),
         }
     }
 }
@@ -71,6 +75,7 @@ impl std::error::Error for EditError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             EditError::InvalidValue { error, .. } => Some(error),
+            EditError::Connection(error) => Some(error),
             _ => None,
         }
     }
@@ -326,6 +331,42 @@ impl Session {
         Ok(self.commit(label, document))
     }
 
+    /// Connects a node's input to the output of `source`, replacing what the input took.
+    pub fn connect(
+        &mut self,
+        consumer: NodeId,
+        input: &str,
+        source: NodeId,
+    ) -> Result<Changes, EditError> {
+        self.assign_inputs(&[Assignment {
+            consumer,
+            input,
+            source: Some(source),
+        }])
+    }
+
+    /// Disconnects a node's input.
+    pub fn disconnect(&mut self, consumer: NodeId, input: &str) -> Result<Changes, EditError> {
+        self.assign_inputs(&[Assignment {
+            consumer,
+            input,
+            source: None,
+        }])
+    }
+
+    /// Applies connection assignments as one step, or none of them.
+    fn assign_inputs(&mut self, assignments: &[Assignment]) -> Result<Changes, EditError> {
+        let document = self
+            .document
+            .assign_inputs(assignments)
+            .map_err(EditError::Connection)?;
+        let connects = assignments
+            .iter()
+            .any(|assignment| assignment.source.is_some());
+        let label = if connects { "Connect" } else { "Disconnect" };
+        Ok(self.commit(label, document))
+    }
+
     /// Applies a view's response. A move is one step, selection included, so that a press that
     /// selects a node and drags it undoes at once. Selecting alone records no step, as in Nuke and
     /// Houdini: undo goes back to the last edit, not the last click, and redo survives a click.
@@ -512,7 +553,7 @@ impl Session {
     }
 }
 
-/// No node has inputs yet, so nothing can be connected.
+/// The graph shows no inputs yet, so nothing can be connected there.
 fn refuse_connections(_: &ConnectionEdit) -> Verdict {
     Verdict::Refuse { reason: None }
 }
