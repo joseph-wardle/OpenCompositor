@@ -305,6 +305,11 @@ pub fn frame_check(pane: Pane) -> Option<FrameCheck> {
     APP.with(|cell| cell.borrow().as_ref()?.frame_check(pane))
 }
 
+/// How many GPU errors this session went uncaptured.
+pub fn gpu_errors() -> u64 {
+    APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))
+}
+
 pub fn widgets() -> Widgets {
     WIDGETS.with(|cell| *cell.get().expect("widgets are made before the event loop"))
 }

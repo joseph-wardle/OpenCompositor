@@ -4,9 +4,10 @@
 //!
 //! It exits 0 if every step ran; each pane a step made draw had a surface and a frame the GPU
 //! finished by the next step; the image was shown while a dialog was open, in the caption and, where
-//! the surface can be read back, at the viewer's centre; and both panes had a surface at the end.
-//! It exits 1 if a check failed, and otherwise as a crash or protocol error does. Frames are
-//! checked as rendered, not as presented: that needs the display, as a screenshot.
+//! the surface can be read back, at the viewer's centre; both panes had a surface at the end; and
+//! the GPU reported no uncaptured error. It exits 1 if a check failed, and otherwise as a crash or
+//! protocol error does. Frames are checked as rendered, not as presented: that needs the display,
+//! as a screenshot.
 //!
 //! IMAGE must not be black at its centre.
 
@@ -137,6 +138,10 @@ fn step(index: usize) {
                 if !crate::has_surface(pane) {
                     fail(format!("the {pane:?} pane has no surface"));
                 }
+            }
+            match crate::gpu_errors() {
+                0 => {}
+                errors => fail(format!("the GPU reported {errors} uncaptured errors")),
             }
             let failures = FAILURES.with(|cell| cell.take());
             for failure in &failures {

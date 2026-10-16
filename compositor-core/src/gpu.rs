@@ -2,7 +2,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use open_ng::{Graph, Renderer, View, ViewBuffers, Viewport};
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
@@ -66,6 +66,8 @@ pub(crate) struct Gpu {
     instance: Option<wgpu::Instance>,
     /// Only in the lifecycle check.
     checks: Option<FrameChecks>,
+    /// Uncaptured errors on every device of the session.
+    errors: Arc<AtomicU64>,
 }
 
 /// What the frames a pane drew prove, for the shell's lifecycle check: that the GPU finished
@@ -116,7 +118,13 @@ impl Gpu {
             device: None,
             instance: None,
             checks: None,
+            errors: Arc::default(),
         }
+    }
+
+    /// How many GPU errors no error scope captured this session: each is a bug.
+    pub(crate) fn errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
     }
 
     /// Records what every frame from now on proves, waiting for the GPU after each. Surfaces
@@ -163,7 +171,7 @@ impl Gpu {
             .map_err(|error| format!("no surface for the {pane:?} pane: {error}"))?;
         let new_device = match &self.device {
             Some(_) => None,
-            None => Some(Device::new(instance, &surface)?),
+            None => Some(Device::new(instance, &surface, &self.errors)?),
         };
         let device = new_device
             .as_ref()
@@ -438,8 +446,52 @@ fn configure(
     Ok(config)
 }
 
+/// Errors logged in full; later ones are only counted, so a bug repeated every frame does not
+/// flood the log.
+const LOGGED_ERRORS: u64 = 20;
+
+/// Counts the errors on one device that no error scope captured, until the device is lost: work
+/// on a lost device fails without being a bug.
+#[derive(Debug)]
+struct ErrorCounter {
+    counted: Arc<AtomicU64>,
+    lost: AtomicBool,
+}
+
+impl ErrorCounter {
+    /// Replaces wgpu's default handler, which panics, so that a bug in one frame does not end the
+    /// session. The handler and the lost callback run inside wgpu's calls, on any thread, so they
+    /// only count and log.
+    fn install(device: &wgpu::Device, counted: &Arc<AtomicU64>) {
+        let counter = Arc::new(ErrorCounter {
+            counted: Arc::clone(counted),
+            lost: AtomicBool::new(false),
+        });
+        let handler = Arc::clone(&counter);
+        device.on_uncaptured_error(Arc::new(move |error| handler.count(&error)));
+        device.set_device_lost_callback(move |_, _| counter.lost.store(true, Ordering::Relaxed));
+    }
+
+    fn count(&self, error: &wgpu::Error) {
+        if self.lost.load(Ordering::Relaxed) {
+            return;
+        }
+        let number = self.counted.fetch_add(1, Ordering::Relaxed) + 1;
+        if number <= LOGGED_ERRORS {
+            eprintln!("GPU error {number}: {error}");
+        }
+        if number == LOGGED_ERRORS {
+            eprintln!("later GPU errors are counted, not logged");
+        }
+    }
+}
+
 impl Device {
-    fn new(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>) -> Result<Device, String> {
+    fn new(
+        instance: &wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        errors: &Arc<AtomicU64>,
+    ) -> Result<Device, String> {
         // WGPU_ADAPTER_NAME and WGPU_POWER_PREF choose the adapter.
         let adapter = pollster::block_on(wgpu::util::initialize_adapter_from_env_or_default(
             instance,
@@ -458,6 +510,7 @@ impl Device {
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
             .map_err(|error| format!("no GPU device: {error}"))?;
+        ErrorCounter::install(&device, errors);
         // Panes draw clamped linear values, which an sRGB format encodes. Encoding in a shader too
         // would encode twice.
         let formats = surface.get_capabilities(&adapter).formats;
@@ -701,6 +754,22 @@ fn noop_parts(limits: Option<wgpu::Limits>) -> (wgpu::Adapter, wgpu::Device, wgp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncaptured_errors_are_counted_instead_of_panicking() {
+        let device = noop_device(None);
+        let counted = Arc::default();
+        ErrorCounter::install(&device, &counted);
+        for _ in 0..2 {
+            let _buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("no usage"),
+                size: 4,
+                usage: wgpu::BufferUsages::empty(),
+                mapped_at_creation: false,
+            });
+        }
+        assert_eq!(counted.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn the_viewers_shader_and_pipelines_validate() {

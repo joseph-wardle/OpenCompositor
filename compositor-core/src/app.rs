@@ -280,6 +280,12 @@ impl App {
         self.gpu.frame_check(pane)
     }
 
+    /// How many GPU errors this session went uncaptured. Each is a bug, logged on standard error
+    /// up to a limit, after which drawing continues.
+    pub fn gpu_errors(&self) -> u64 {
+        self.gpu.errors()
+    }
+
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
         let mut requests = match event {
             Event::Exposed(pane) if !self.gpu.has_surface(pane) => {
