@@ -282,6 +282,7 @@ pub fn perform(request: Request) {
         Request::ShowViewerCaption(text) => unsafe {
             ffi::set_caption(widgets.caption, &QString::from(&text))
         },
+        Request::ShowGpuLabel(_) | Request::RetryDeviceCreation { .. } => {}
     }
 }
 

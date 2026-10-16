@@ -217,12 +217,22 @@ impl Worker {
     /// evaluates images without them. The worker makes its staging buffer when it first stages,
     /// off the caller's thread.
     pub(crate) fn connect(&self, device: wgpu::Device, device_generation: u64) {
-        let mut state = self.mailbox.lock();
-        let replaced = state.connection.replace(Connection {
+        self.replace_connection(Some(Connection {
             generation: device_generation,
             device,
             staging: StagingSlot::Empty,
-        });
+        }));
+    }
+
+    /// Stops staging pixels for the connected device, which was lost, and delivers the last
+    /// request again without them, since a result finished for that device is dropped.
+    pub(crate) fn disconnect(&self) {
+        self.replace_connection(None);
+    }
+
+    fn replace_connection(&self, connection: Option<Connection>) {
+        let mut state = self.mailbox.lock();
+        let replaced = std::mem::replace(&mut state.connection, connection);
         if state.request.is_none() && state.started.is_some() {
             state.request = Some(state.started.clone());
         }

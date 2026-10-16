@@ -175,35 +175,43 @@ impl Gpu {
         })
     }
 
+    pub(crate) fn has_device(&self) -> bool {
+        self.device.is_some()
+    }
+
     /// Whether the pane has a configured surface to draw to.
     pub(crate) fn has_surface(&self, pane: Pane) -> bool {
         (self.device.as_ref()).is_some_and(|device| device.surfaces[pane.index()].is_some())
     }
 
-    /// Keeps the pane's native window and makes its surface on the device, or makes a device if
-    /// there is none, which it returns. On failure the pane draws nothing; the error says why.
+    pub(crate) fn has_window(&self, pane: Pane) -> bool {
+        self.windows[pane.index()].is_some()
+    }
+
+    /// Keeps the pane's native window, for every device made from now on, and makes its surface
+    /// on the device if there is one. On failure the pane draws nothing; the error says why.
     pub(crate) fn attach(
         &mut self,
         pane: Pane,
         window: NativeWindow,
         size: PaneSize,
-    ) -> Result<Option<NewDevice>, String> {
+    ) -> Result<(), String> {
         self.windows[pane.index()] = Some(PaneWindow { window, size });
         let Some(device) = &mut self.device else {
-            return self.make_device().map(Some);
+            return Ok(());
         };
         let instance = self.instance.as_ref().expect("made before the device");
         let surface = make_surface(instance, pane, window)?;
         device.surfaces[pane.index()] =
             Some(device.configure(pane, surface, size, self.checks.is_some())?);
-        Ok(None)
+        Ok(())
     }
 
     /// Makes a device with a surface on it for each pane with a native window: the one way a
     /// device is made, first and after a loss. A pane whose surface fails does not stop the
     /// others, but with none the attempt fails and no device is kept. Each attempt is a new
     /// generation.
-    fn make_device(&mut self) -> Result<NewDevice, String> {
+    pub(crate) fn make_device(&mut self) -> Result<NewDevice, String> {
         self.device_generation += 1;
         let instance = self.instance.get_or_insert_with(|| {
             let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
@@ -883,6 +891,34 @@ impl Gpu {
             ..Gpu::new(Waker::channel().0)
         }
     }
+
+    /// A GPU with a noop device of generation 1 that draws no pane, and the viewer's native
+    /// window, kept for the next device. Every later attempt fails: the noop backend makes
+    /// surfaces it cannot draw to, so no adapter suits them.
+    pub(crate) fn with_noop_device(waker: Waker) -> Gpu {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop.enable = true;
+        let mut gpu = Gpu {
+            instance: Some(wgpu::Instance::new(descriptor)),
+            device_generation: 1,
+            ..Gpu::new(waker)
+        };
+        let window = PaneWindow {
+            window: NativeWindow::none(),
+            size: PaneSize {
+                width: 400,
+                height: 300,
+                scale_factor: 1.0,
+            },
+        };
+        gpu.windows[Pane::Viewer.index()] = Some(window);
+        let (adapter, device, queue) = noop_parts(None);
+        ErrorCounter::install(&device, &gpu.errors, 1, &gpu.waker);
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        gpu.device = Some(Device::for_format(adapter, device, queue, format));
+        gpu
+    }
 }
 
 #[cfg(test)]
@@ -922,25 +958,12 @@ fn noop_parts(limits: Option<wgpu::Limits>) -> (wgpu::Adapter, wgpu::Device, wgp
 mod tests {
     use super::*;
 
-    fn size() -> PaneSize {
-        PaneSize {
-            width: 400,
-            height: 300,
-            scale_factor: 1.0,
-        }
-    }
-
     #[test]
     fn a_stale_loss_notice_keeps_the_device_and_its_own_notice_retires_it() {
         let (waker, notices) = Waker::channel();
-        let mut gpu = Gpu::new(waker);
-        gpu.device_generation = 2;
-        let (adapter, device, queue) = noop_parts(None);
-        ErrorCounter::install(&device, &gpu.errors, 2, &gpu.waker);
-        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        gpu.device = Some(Device::for_format(adapter, device, queue, format));
+        let mut gpu = Gpu::with_noop_device(waker);
 
-        assert!(!gpu.retire_lost_device(1));
+        assert!(!gpu.retire_lost_device(0));
         let device = &gpu.device.as_ref().expect("kept").device;
         device.destroy();
         // `destroy` calls the lost callback in the next poll that finds the queue empty.
@@ -957,27 +980,21 @@ mod tests {
 
     #[test]
     fn a_failed_attempt_keeps_no_device_but_the_window_and_the_next_is_a_new_generation() {
-        // The noop backend makes surfaces it cannot draw to, so no adapter suits them.
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = wgpu::Backends::NOOP;
-        descriptor.backend_options.noop.enable = true;
-        let mut gpu = Gpu {
-            instance: Some(wgpu::Instance::new(descriptor)),
-            ..Gpu::new(Waker::channel().0)
-        };
+        let mut gpu = Gpu::with_noop_device(Waker::channel().0);
+        assert!(gpu.retire_lost_device(1));
 
-        for generation in [1, 2] {
+        for generation in [2, 3] {
             let error = gpu
-                .attach(Pane::Viewer, NativeWindow::none(), size())
+                .make_device()
                 .expect_err("no adapter can draw to the surface");
             assert!(error.contains("adapter"), "{error}");
             assert_eq!(gpu.device_generation, generation);
         }
-        assert!(gpu.device.is_none());
-        assert!(!gpu.has_surface(Pane::Viewer));
-        assert!(gpu.windows[Pane::Viewer.index()].is_some());
+        assert!(!gpu.has_device());
+        assert!(gpu.has_window(Pane::Viewer));
         gpu.detach(Pane::Viewer);
-        assert!(gpu.windows[Pane::Viewer.index()].is_none());
+        assert!(!gpu.has_window(Pane::Viewer));
+        assert!(gpu.make_device().is_err());
     }
 
     #[test]

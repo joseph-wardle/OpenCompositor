@@ -488,6 +488,29 @@ fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
 }
 
 #[test]
+fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels() {
+    let [first, second] = two_images("disconnect");
+    let (worker, deliveries) = worker();
+    worker.connect(noop_device(None), 1);
+    worker.request(Some(on(1, key(&first))));
+    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+
+    // Waiting for the buffer the test holds when the device is lost.
+    worker.request(Some(on(1, key(&second))));
+    wait_until_finishing(&worker);
+    worker.disconnect();
+
+    let evaluated = receive(&deliveries);
+    assert_eq!(evaluated.wanted.key, key(&second));
+    assert!(evaluated.result.unwrap().pixels.is_none());
+    drop(held);
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the image finishing for the lost device was delivered"
+    );
+}
+
+#[test]
 fn staged_rows_are_interleaved_half_floats_padded_to_the_copy_alignment() {
     // Two rows of one pixel each; the second has a NaN and a value beyond f16's range.
     let planes = [[0.5, f32::NAN], [1.0, 1e6], [-2.0, 0.0], [0.25, 1.0]];
