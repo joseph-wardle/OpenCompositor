@@ -144,6 +144,11 @@ impl Node {
         self.inputs.get(name).copied()
     }
 
+    /// Each connected input with the node it takes its image from, by input name.
+    pub fn inputs(&self) -> impl Iterator<Item = (&'static str, NodeId)> {
+        self.inputs.iter().map(|(&name, &source)| (name, source))
+    }
+
     /// The value the artist set for a parameter, if they set one.
     pub fn authored_value(&self, name: &str) -> Option<Value> {
         self.authored.get(name).copied()

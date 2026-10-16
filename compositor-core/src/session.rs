@@ -5,14 +5,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use open_ng::{ConnectionEdit, Graph, InputEvent, Point, Response, Verdict, View, Viewport};
+use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 
 use crate::document::{
     Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, Slot,
 };
 use crate::loader::LoadRequest;
 use crate::parameter::{Value, ValueError};
-use crate::presentation::present;
+use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
@@ -241,10 +241,13 @@ impl Session {
     /// Passes an event to the graph view and applies what it asks for. Returns whether the view
     /// needs drawing again.
     pub fn graph_input(&mut self, event: InputEvent) -> bool {
+        let document = &self.document;
         let response = self
             .graph_view
-            .handle_input(&self.graph, event, refuse_connections);
-        let asks = response.selection.is_some() || !response.positions.is_empty();
+            .handle_input(&self.graph, event, |edit| judge(document, edit));
+        let asks = response.selection.is_some()
+            || !response.positions.is_empty()
+            || response.connections.is_some();
         let changed = asks && !self.apply_response(&response).is_empty();
         response.handled || changed
     }
@@ -380,19 +383,18 @@ impl Session {
             .document
             .assign_inputs(assignments)
             .map_err(EditError::Connection)?;
-        let connects = assignments
-            .iter()
-            .any(|assignment| assignment.source.is_some());
-        let label = if connects { "Connect" } else { "Disconnect" };
-        Ok(self.commit(label, document))
+        Ok(self.commit(connection_label(assignments), document))
     }
 
     /// Applies a view's response. A move is one step, selection included, so that a press that
     /// selects a node and drags it undoes at once. Selecting alone records no step, as in Nuke and
     /// Houdini: undo goes back to the last edit, not the last click, and redo survives a click.
     ///
+    /// A connection edit is decided again against the document as it is now, and applied whole,
+    /// with any move, as one step, or not at all.
+    ///
     /// Nodes the document no longer has are left out: a window-wide undo can remove a node during
-    /// a gesture. No node has groups or inputs yet, so a response never folds or connects.
+    /// a gesture. No node has groups yet, so a response never folds.
     pub fn apply_response(&mut self, response: &Response) -> Changes {
         let mut document = self.document.clone();
         if let Some(selection) = &response.selection {
@@ -411,7 +413,15 @@ impl Session {
                 moved = true;
             }
         }
-        if moved {
+        let connected = response.connections.as_ref().and_then(|edit| {
+            let assignments = assignments(&document, edit).ok()?;
+            let connected = document.assign_inputs(&assignments).ok()?;
+            let changed = !document.changes_to(&connected).is_empty();
+            changed.then(|| (connection_label(&assignments), connected))
+        });
+        if let Some((label, connected)) = connected {
+            self.commit(label, connected)
+        } else if moved {
             self.commit("Move", document)
         } else {
             self.swap_in(document)
@@ -560,7 +570,9 @@ impl Session {
     /// Returns whether the graph changed.
     fn present(&mut self, changes: &Changes) -> bool {
         let changed = present(&mut self.graph, &self.document, &self.loads, changes);
-        self.graph_view.refresh(&self.graph, refuse_connections);
+        let document = &self.document;
+        self.graph_view
+            .refresh(&self.graph, |edit| judge(document, edit));
         changed
     }
 
@@ -573,9 +585,15 @@ impl Session {
     }
 }
 
-/// The graph shows no inputs yet, so nothing can be connected there.
-fn refuse_connections(_: &ConnectionEdit) -> Verdict {
-    Verdict::Refuse { reason: None }
+fn connection_label(assignments: &[Assignment]) -> &'static str {
+    if assignments
+        .iter()
+        .any(|assignment| assignment.source.is_some())
+    {
+        "Connect"
+    } else {
+        "Disconnect"
+    }
 }
 
 #[cfg(test)]
