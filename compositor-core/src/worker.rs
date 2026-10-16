@@ -238,6 +238,8 @@ impl Worker {
         }
         drop(state);
         self.mailbox.changed.notify_all();
+        // Hypothesis, untested: a lost device's staging buffer still mapped here keeps its memory,
+        // since wgpu 30 destroys a lost device's buffers without unmapping them.
         drop(replaced);
     }
 }

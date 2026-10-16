@@ -286,7 +286,7 @@ impl Shown {
 }
 
 /// Waited for before the first attempt after a loss, so that the shell paints the GPU label
-/// before the attempt blocks the GUI thread.
+/// before the attempt blocks the GUI thread (a hypothesis, untested).
 const FIRST_RETRY: Duration = Duration::from_millis(100);
 /// Waited for after a failed attempt, doubling up to the longest wait.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(1);
@@ -299,7 +299,8 @@ const LONGEST_RETRY: Duration = Duration::from_secs(30);
 enum Drawing {
     /// The panes draw on a device, or none has been needed yet.
     Ready { recovered: Option<Recovered> },
-    /// No device: the attempt numbered `attempt` makes one after `delay`.
+    /// No device: the attempt numbered `attempt` makes one after `delay`. Editing continues
+    /// unseen, since the panes are not redrawn: a fallback drawn by Qt is not worth its cost.
     Unavailable { attempt: u64, delay: Duration },
 }
 

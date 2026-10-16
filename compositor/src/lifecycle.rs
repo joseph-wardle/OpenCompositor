@@ -52,6 +52,7 @@ const STEPS: [(i32, &str, &[Pane]); 14] = [
 ];
 
 /// The longest an attempt to make a device may block the GUI thread, warm, on the workstation.
+/// Hypothesis, untested: after a real reset the same adapter returns, so its shader cache is warm.
 const REBUILD_BUDGET: Duration = Duration::from_millis(250);
 
 thread_local! {

@@ -522,7 +522,9 @@ pub(crate) fn wait_for_device(device: &wgpu::Device) -> Result<(), String> {
     };
     // wgpu 30 panics rather than returning an error when the driver reports the device lost
     // during a poll, because `WaitIdleError::Device` has no `PollError`. The panic is raised after
-    // wgpu has released its locks, so catching it leaves wgpu usable.
+    // wgpu has released its locks, so catching it leaves wgpu usable. Hypothesis, untested since
+    // it needs a real reset: Vulkan's waits return `DEVICE_LOST` promptly after one, rather than
+    // holding the worker and the frame checks here.
     match std::panic::catch_unwind(AssertUnwindSafe(|| device.poll(wait))) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(error.to_string()),
@@ -598,6 +600,10 @@ impl ErrorCounter {
     /// Replaces wgpu's default handler, which panics, so that a bug in one frame does not end the
     /// session. The handler and the lost callback run inside wgpu's calls, on any thread, so they
     /// only count, log and wake the GUI thread.
+    ///
+    /// A real loss calls the lost callback at once, in the call that failed; `destroy` calls it
+    /// only at a later poll. Nothing polls while the panes are idle or hidden: a loss then is
+    /// noticed at the next use of the GPU, and until then nothing visible depends on it.
     fn install(device: &wgpu::Device, counted: &Arc<AtomicU64>, generation: u64, waker: &Waker) {
         let counter = Arc::new(ErrorCounter {
             counted: Arc::clone(counted),
@@ -647,6 +653,7 @@ impl Device {
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
             .map_err(|error| format!("no GPU device: {error}"))?;
+        // Hypothesis, untested: a loss before the callback is set is never noticed.
         ErrorCounter::install(&device, errors, generation, waker);
         // Panes draw clamped linear values, which an sRGB format encodes. Encoding in a shader too
         // would encode twice.
