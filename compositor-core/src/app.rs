@@ -587,7 +587,7 @@ impl App {
     fn follow_viewer(&mut self, requests: &mut Vec<Request>) {
         let wanted = match self.session.viewed() {
             Viewed::Node(request) => Some(request),
-            Viewed::Unmarked | Viewed::Missing(_) | Viewed::NoInput(_) => None,
+            Viewed::Unmarked | Viewed::NoInput(_) => None,
         };
         if wanted.is_none() && !matches!(self.shown, Shown::Nothing) {
             self.shown = Shown::Nothing;
@@ -625,9 +625,6 @@ impl App {
             }
             Viewed::Unmarked => {
                 return format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node");
-            }
-            Viewed::Missing(_) => {
-                return format!("Slot {slot}: the node it marked no longer exists");
             }
             Viewed::NoInput(_) => {
                 return format!("Slot {slot} · Exposure · no input");

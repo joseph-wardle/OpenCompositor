@@ -632,3 +632,69 @@ fn connections_that_change_nothing_keep_redo() {
     );
     assert_eq!(session.redo_label(), Some("Mark"));
 }
+
+#[test]
+fn deleting_is_one_step_that_undo_restores_whole() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let exposure = create_exposure(&mut session, ORIGIN);
+    session.connect(exposure, "source", reader).unwrap();
+    session.set_mark(slot(1), Some(reader)).unwrap();
+    session.set_mark(slot(2), Some(exposure)).unwrap();
+    session.apply_response(&Response {
+        selection: Some(vec![exposure.into(), reader.into()]),
+        ..Response::default()
+    });
+    let before = session.document().clone();
+    let steps = session.undo.len();
+
+    session.delete_nodes(&[reader]).unwrap();
+    assert_eq!(session.undo.len(), steps + 1);
+    assert_eq!(session.undo_label(), Some("Delete"));
+    assert_eq!(session.document().node(reader), None);
+    assert_eq!(source_of(&session, exposure), None);
+    assert_eq!(session.document().mark(slot(1)), None);
+    assert_eq!(session.document().selection(), [exposure]);
+    assert_eq!(session.viewed(), Viewed::Unmarked);
+    assert_presented(&session);
+
+    session.undo();
+    assert!(before.changes_to(session.document()).is_empty());
+    assert_eq!(source_of(&session, exposure), Some(reader));
+    assert_eq!(session.document().selection(), [exposure, reader]);
+    assert_presented(&session);
+}
+
+#[test]
+fn deleting_is_refused_whole_if_a_node_is_gone() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let gone = create(&mut session, "b.exr", ORIGIN);
+    session.undo();
+    let steps = session.undo.len();
+
+    assert_eq!(
+        session.delete_nodes(&[reader, gone]),
+        Err(EditError::MissingNode(gone))
+    );
+    assert!(session.delete_nodes(&[]).unwrap().is_empty());
+    assert!(session.document().node(reader).is_some());
+    assert_eq!(session.undo.len(), steps);
+    assert_eq!(session.redo_label(), Some("Create Reader"));
+}
+
+#[test]
+fn deleting_the_edited_node_records_its_edit_as_its_own_step() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+    session.begin_edit(exposure, "Set Stops").unwrap();
+    session.set_value("stops", Value::Float(1.0)).unwrap();
+
+    session.delete_nodes(&[exposure]).unwrap();
+    assert_eq!(session.editing(), None);
+    assert_eq!(session.undo_label(), Some("Delete"));
+
+    session.undo();
+    assert_eq!(stops(&session, exposure), Some(Value::Float(1.0)));
+    assert_eq!(session.undo_label(), Some("Set Stops"));
+}

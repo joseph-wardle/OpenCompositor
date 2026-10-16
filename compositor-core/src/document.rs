@@ -176,6 +176,7 @@ pub struct Document {
     /// In selection order, as OpenNG keeps it: the last node is the most recently selected. A
     /// per-node flag or a set would lose the order on undo.
     pub(crate) selection: Arc<[NodeId]>,
+    /// Each names a node the document has: deleting a node clears its marks.
     pub(crate) marks: [Option<NodeId>; Slot::COUNT],
 }
 
@@ -257,6 +258,44 @@ impl Document {
             }
         }
         Ok(document)
+    }
+
+    /// This document without the given nodes, and without every input, mark and selection entry
+    /// that named one.
+    pub(crate) fn without_nodes(&self, ids: &[NodeId]) -> Document {
+        let deleted: BTreeSet<NodeId> = ids.iter().copied().collect();
+        let mut document = self.clone();
+        for id in &deleted {
+            document.nodes.remove(id);
+        }
+        let consumers: Vec<NodeId> = document
+            .nodes()
+            .filter(|(_, node)| node.inputs.values().any(|source| deleted.contains(source)))
+            .map(|(id, _)| id)
+            .collect();
+        for id in consumers {
+            let node = document
+                .nodes
+                .get_mut(&id)
+                .expect("the consumer was found above");
+            Arc::make_mut(node)
+                .inputs
+                .retain(|_, source| !deleted.contains(source));
+        }
+        if self.selection.iter().any(|id| deleted.contains(id)) {
+            document.selection = self
+                .selection
+                .iter()
+                .copied()
+                .filter(|id| !deleted.contains(id))
+                .collect();
+        }
+        for mark in &mut document.marks {
+            if mark.is_some_and(|id| deleted.contains(&id)) {
+                *mark = None;
+            }
+        }
+        document
     }
 
     /// Whether `node` feeds `from`, directly or through other nodes.

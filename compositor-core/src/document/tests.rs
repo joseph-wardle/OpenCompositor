@@ -118,3 +118,26 @@ fn an_edit_that_changes_nothing_shares_every_node() {
         .unwrap();
     assert!(before.changes_to(&after).is_empty());
 }
+
+#[test]
+fn deleting_nodes_clears_what_named_them() {
+    // 1 and 2 take 0, and 3 takes 2.
+    let mut before = document_of(3)
+        .assign_inputs(&[connect(1, 0), connect(2, 0), connect(3, 2)])
+        .unwrap();
+    before.selection = [NodeId(3), NodeId(0), NodeId(1)].into();
+    before.marks[1] = Some(NodeId(0));
+    before.marks[2] = Some(NodeId(3));
+
+    let after = before.without_nodes(&[NodeId(0), NodeId(2)]);
+
+    assert_eq!(
+        after.nodes().map(|(id, _)| id).collect::<Vec<_>>(),
+        [NodeId(1), NodeId(3)]
+    );
+    assert_eq!(source_of(&after, 1), None);
+    assert_eq!(source_of(&after, 3), None);
+    assert_eq!(after.selection(), [NodeId(3), NodeId(1)]);
+    assert_eq!(after.marks[1], None);
+    assert_eq!(after.marks[2], Some(NodeId(3)));
+}

@@ -85,8 +85,6 @@ impl std::error::Error for EditError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Viewed {
     Unmarked,
-    /// The slot marks a node the document no longer has.
-    Missing(NodeId),
     /// The slot marks a node that needs an input it does not have.
     NoInput(NodeId),
     Node(LoadRequest),
@@ -197,10 +195,14 @@ impl Session {
     pub fn viewed(&self) -> Viewed {
         match self.document.mark(self.viewer.slot()) {
             None => Viewed::Unmarked,
-            Some(id) => match self.document.node(id).map(|node| &node.kind) {
-                None => Viewed::Missing(id),
-                Some(NodeKind::Reader { path }) => Viewed::Node(self.loads.request(id, path)),
-                Some(NodeKind::Exposure { .. }) => Viewed::NoInput(id),
+            Some(id) => match &self
+                .document
+                .node(id)
+                .expect("marks name existing nodes")
+                .kind
+            {
+                NodeKind::Reader { path } => Viewed::Node(self.loads.request(id, path)),
+                NodeKind::Exposure { .. } => Viewed::NoInput(id),
             },
         }
     }
@@ -329,6 +331,24 @@ impl Session {
         document.marks[usize::from(slot.digit())] = node;
         let label = if node.is_some() { "Mark" } else { "Clear Mark" };
         Ok(self.commit(label, document))
+    }
+
+    /// Deletes nodes as one step, disconnecting every input that took one and clearing their
+    /// marks and selection. Refused whole if any of them is already gone.
+    ///
+    /// A gesture in the graph view ends unapplied, since it may hold a deleted node. Reads of a
+    /// deleted node are left alone: IDs are never reused, so nothing can mistake them.
+    pub fn delete_nodes(&mut self, ids: &[NodeId]) -> Result<Changes, EditError> {
+        if let Some(&missing) = ids.iter().find(|&&id| self.document.node(id).is_none()) {
+            return Err(EditError::MissingNode(missing));
+        }
+        if ids.is_empty() {
+            return Ok(Changes::default());
+        }
+        self.graph_view.cancel_gesture();
+        let document = self.document.without_nodes(ids);
+        // Committing finishes an edit in progress, which may belong to a deleted node.
+        Ok(self.commit("Delete", document))
     }
 
     /// Connects a node's input to the output of `source`, replacing what the input took.
