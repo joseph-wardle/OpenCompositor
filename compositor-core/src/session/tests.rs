@@ -9,6 +9,7 @@ use open_ng::{
 
 use super::*;
 use crate::document::ExposureVersion;
+use crate::evaluate::result_key;
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
 
@@ -355,6 +356,32 @@ fn an_exposure_node_views_its_missing_input_and_has_no_reader_path() {
     let reader = create(&mut session, "a.exr", ORIGIN);
     session.connect(id, "source", reader).unwrap();
     assert_eq!(session.viewed(), Viewed::NotImplemented(id));
+}
+
+#[test]
+fn reloading_a_reader_reloads_every_reader_of_its_file() {
+    let mut session = Session::new();
+    let other = create(&mut session, "b.exr", ORIGIN);
+    let twin = create(&mut session, "a.exr", ORIGIN);
+    let selected = create(&mut session, "a.exr", ORIGIN);
+    assert_eq!(session.document().selection(), [selected]);
+    let key = |session: &Session, id| result_key(session.document(), session.reloads(), id);
+    let before = [selected, twin, other].map(|id| key(&session, id));
+    let failed = session.loads.request(twin, Path::new("a.exr"));
+    session.record_read(failed, true);
+    assert!(session.loads.failed(session.document(), twin));
+
+    assert!(session.reload_selected());
+
+    let after = [selected, twin, other].map(|id| key(&session, id));
+    assert_ne!(after[0], before[0]);
+    assert_eq!(after[0], after[1]);
+    assert_eq!(after[2], before[2]);
+    assert!(!session.loads.failed(session.document(), twin));
+    assert_presented(&session);
+
+    create_exposure(&mut session, ORIGIN);
+    assert!(!session.reload_selected());
 }
 
 fn create_exposure(session: &mut Session, at: Point) -> NodeId {

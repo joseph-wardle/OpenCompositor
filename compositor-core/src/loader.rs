@@ -17,7 +17,7 @@ const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
 /// Loads in a row that fit in half the staging buffer before it shrinks to fit them.
 const LOADS_BEFORE_SHRINKING: u32 = 3;
 
-/// A node's file to read, as of its last reload. The worker reads the path, never the document.
+/// A node's file to read, as of the file's last reload. The worker reads the path, never the document.
 ///
 /// The request is also the result's key: the viewer shows a result only while its request is the
 /// one it wants.
@@ -25,7 +25,7 @@ const LOADS_BEFORE_SHRINKING: u32 = 3;
 pub struct LoadRequest {
     pub node: NodeId,
     pub path: PathBuf,
-    /// How many times the node's file had been reloaded, so that a reload reads it again.
+    /// How many times the file had been reloaded, so that a reload reads it again.
     pub reload: u64,
 }
 

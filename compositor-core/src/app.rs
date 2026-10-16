@@ -99,7 +99,8 @@ pub enum Command {
     CreateExposure,
     /// A new file for the one selected Reader.
     ChangeReaderFile,
-    /// Reads the selected Readers' files again when they are next viewed, at once if they are.
+    /// Reads the selected Readers' files again, for every Reader of them, when they are next
+    /// viewed, at once if they are.
     Reload,
     Undo,
     Redo,

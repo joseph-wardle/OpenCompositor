@@ -10,6 +10,7 @@ use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 use crate::document::{
     Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, Slot,
 };
+use crate::evaluate::Reloads;
 use crate::loader::LoadRequest;
 use crate::parameter::{Value, ValueError};
 use crate::presentation::{assignments, judge, present};
@@ -98,8 +99,7 @@ pub enum Viewed {
 /// What the session knows of reading nodes' files. Unsaved and not undoable.
 #[derive(Debug, Default)]
 pub(crate) struct Loads {
-    /// Each node's reloads; a node never reloaded is absent.
-    reloads: HashMap<NodeId, u64>,
+    reloads: Reloads,
     /// Each node's last failed read.
     failed: HashMap<NodeId, LoadRequest>,
 }
@@ -110,7 +110,7 @@ impl Loads {
         LoadRequest {
             node: id,
             path: path.to_owned(),
-            reload: self.reloads.get(&id).copied().unwrap_or(0),
+            reload: self.reloads.count(path),
         }
     }
 
@@ -227,15 +227,31 @@ impl Session {
         self.present_statuses([node])
     }
 
-    /// Makes each selected node read its file again the next time it is viewed. Returns whether
-    /// any was selected.
+    /// How many times each file has been reloaded.
+    pub fn reloads(&self) -> &Reloads {
+        &self.loads.reloads
+    }
+
+    /// Makes every Reader of each selected Reader's file read it again the next time it is
+    /// viewed. Returns whether any Reader was selected.
     pub fn reload_selected(&mut self) -> bool {
-        let selected: Vec<NodeId> = self.document.selection().to_vec();
-        for &id in &selected {
-            *self.loads.reloads.entry(id).or_default() += 1;
+        let paths: BTreeSet<Arc<Path>> = (self.document.selection().iter())
+            .filter_map(|&id| match &self.document.node(id)?.kind {
+                NodeKind::Reader { path } => Some(path.clone()),
+                NodeKind::Exposure { .. } => None,
+            })
+            .collect();
+        let readers: Vec<NodeId> = (self.document.nodes())
+            .filter(
+                |(_, node)| matches!(&node.kind, NodeKind::Reader { path } if paths.contains(path)),
+            )
+            .map(|(id, _)| id)
+            .collect();
+        for path in &paths {
+            self.loads.reloads.reload(path.clone());
         }
-        self.present_statuses(selected.iter().copied());
-        !selected.is_empty()
+        self.present_statuses(readers);
+        !paths.is_empty()
     }
 
     /// Centres the node a slot marks in the graph view. Returns whether the slot marks one.
