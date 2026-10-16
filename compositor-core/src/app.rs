@@ -1,7 +1,9 @@
 //! The interactive compositor: a session, the GPU that draws its panes, and the evaluator's
 //! worker, changed only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
 
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
@@ -72,6 +74,56 @@ pub enum Event {
     },
     /// An evaluation finished on the evaluator's thread.
     Evaluated(Evaluated),
+    /// The GPU device of the generation was lost.
+    DeviceLost(u64),
+}
+
+/// What another thread, or wgpu inside a call, tells the GUI thread through the waker
+/// [`App::new`] takes. The shell dispatches it as an [`Event`].
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "moved once to the GUI thread and never stored, where a box would allocate per result"
+)]
+pub enum Notice {
+    Evaluated(Evaluated),
+    DeviceLost(u64),
+}
+
+impl From<Notice> for Event {
+    fn from(notice: Notice) -> Event {
+        match notice {
+            Notice::Evaluated(evaluated) => Event::Evaluated(evaluated),
+            Notice::DeviceLost(generation) => Event::DeviceLost(generation),
+        }
+    }
+}
+
+/// Hands a [`Notice`] to the GUI thread, from any thread.
+#[derive(Clone)]
+pub(crate) struct Waker(Arc<dyn Fn(Notice) + Send + Sync>);
+
+impl Waker {
+    pub(crate) fn wake(&self, notice: Notice) {
+        (self.0)(notice);
+    }
+}
+
+#[cfg(test)]
+impl Waker {
+    pub(crate) fn channel() -> (Waker, std::sync::mpsc::Receiver<Notice>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waker = Waker(Arc::new(move |notice| {
+            let _ = sender.send(notice);
+        }));
+        (waker, receiver)
+    }
+}
+
+impl fmt::Debug for Waker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Waker")
+    }
 }
 
 /// What the shell does for [`App::dispatch`], after it returns.
@@ -244,13 +296,15 @@ pub struct App {
 }
 
 impl App {
-    /// `deliver` receives each finished evaluation on the evaluator's thread, and must hand it to
-    /// the GUI thread as an [`Event::Evaluated`].
-    pub fn new(deliver: impl Fn(Evaluated) + Send + 'static) -> App {
+    /// `wake` receives each [`Notice`] on the thread that raised it, which may hold wgpu's locks,
+    /// and must hand it to the GUI thread to dispatch.
+    pub fn new(wake: impl Fn(Notice) + Send + Sync + 'static) -> App {
+        let waker = Waker(Arc::new(wake));
+        let deliver = waker.clone();
         App {
             session: Session::new(),
-            gpu: Gpu::new(),
-            worker: Worker::start(deliver),
+            gpu: Gpu::new(waker),
+            worker: Worker::start(move |evaluated| deliver.wake(Notice::Evaluated(evaluated))),
             sent: None,
             requests_sent: 0,
             hovered: None,
@@ -293,16 +347,20 @@ impl App {
             }
             Event::Exposed(pane) | Event::Draw(pane) => self.draw(pane),
             Event::SurfaceCreated { pane, window, size } => {
+                let mut requests = Vec::new();
                 match self.gpu.attach(pane, window, size) {
-                    Ok(device) => {
-                        if let Some(device) = device {
-                            self.worker.connect(device, self.gpu.device_generation());
+                    Ok(None) => {}
+                    Ok(Some(new)) => {
+                        self.worker.connect(new.device, new.generation);
+                        if !new.pane_errors.is_empty() {
+                            requests.push(Request::ShowError(new.pane_errors.join("; ")));
                         }
                     }
                     Err(error) => return vec![Request::ShowError(error)],
                 }
                 self.resize(pane, size);
-                self.draw(pane)
+                requests.extend(self.draw(pane));
+                requests
             }
             Event::SurfaceDestroyed(pane) => {
                 self.gpu.detach(pane);
@@ -329,6 +387,10 @@ impl App {
             }
             Event::FilesChosen { intent, paths } => self.files_chosen(intent, paths),
             Event::Evaluated(evaluated) => self.evaluated(evaluated),
+            Event::DeviceLost(generation) => {
+                self.gpu.retire_lost_device(generation);
+                Vec::new()
+            }
         };
         self.follow_viewer(&mut requests);
         requests

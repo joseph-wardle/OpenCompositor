@@ -24,8 +24,10 @@ const SHIFT: Modifiers = Modifiers {
 /// An app whose worker hands its results to the test, with a 400 × 300 graph pane at scale 2.
 fn app() -> (App, Receiver<Evaluated>) {
     let (delivered, deliveries) = mpsc::channel();
-    let mut app = App::new(move |evaluated| {
-        let _ = delivered.send(evaluated);
+    let mut app = App::new(move |notice| {
+        if let Notice::Evaluated(evaluated) = notice {
+            let _ = delivered.send(evaluated);
+        }
     });
     let size = PaneSize {
         width: 400,

@@ -55,6 +55,11 @@ pub(crate) struct Staged {
 }
 
 impl Staged {
+    /// The generation of the device the image was staged for.
+    pub(crate) fn device_generation(&self) -> u64 {
+        self.staging.device_generation
+    }
+
     pub(crate) fn buffer(&self) -> &wgpu::Buffer {
         self.staging.buffer.as_ref().expect("held until dropped")
     }
