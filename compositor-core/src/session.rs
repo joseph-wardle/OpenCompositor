@@ -85,8 +85,13 @@ impl std::error::Error for EditError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Viewed {
     Unmarked,
-    /// The slot marks a node that needs an input it does not have.
-    NoInput(NodeId),
+    /// The slot marks a node with an input that takes no image.
+    NoInput {
+        node: NodeId,
+        input: &'static str,
+    },
+    /// The slot marks a node that nothing computes yet.
+    NotImplemented(NodeId),
     Node(LoadRequest),
 }
 
@@ -195,15 +200,19 @@ impl Session {
     pub fn viewed(&self) -> Viewed {
         match self.document.mark(self.viewer.slot()) {
             None => Viewed::Unmarked,
-            Some(id) => match &self
-                .document
-                .node(id)
-                .expect("marks name existing nodes")
-                .kind
-            {
-                NodeKind::Reader { path } => Viewed::Node(self.loads.request(id, path)),
-                NodeKind::Exposure { .. } => Viewed::NoInput(id),
-            },
+            Some(id) => {
+                let node = self.document.node(id).expect("marks name existing nodes");
+                if let Some(input) = node.unconnected_input() {
+                    return Viewed::NoInput {
+                        node: id,
+                        input: input.name,
+                    };
+                }
+                match &node.kind {
+                    NodeKind::Reader { path } => Viewed::Node(self.loads.request(id, path)),
+                    NodeKind::Exposure { .. } => Viewed::NotImplemented(id),
+                }
+            }
         }
     }
 

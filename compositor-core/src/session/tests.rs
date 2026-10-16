@@ -328,7 +328,7 @@ fn an_exposure_node_is_created_selected_and_undoable() {
 }
 
 #[test]
-fn an_exposure_node_has_no_input_and_no_reader_path() {
+fn an_exposure_node_views_its_missing_input_and_has_no_reader_path() {
     let mut session = Session::new();
     let changes = session.create_node(
         NodeKind::Exposure {
@@ -339,12 +339,22 @@ fn an_exposure_node_has_no_input_and_no_reader_path() {
     let id = *changes.nodes.first().expect("one node created");
     session.set_mark(slot(1), Some(id)).unwrap();
 
-    assert_eq!(session.viewed(), Viewed::NoInput(id));
+    assert_eq!(
+        session.viewed(),
+        Viewed::NoInput {
+            node: id,
+            input: "source"
+        }
+    );
     assert_eq!(
         session.set_reader_path(id, "a.exr".into()),
         Err(EditError::WrongKind(id))
     );
     assert_eq!(session.undo_label(), Some("Mark"));
+
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    session.connect(id, "source", reader).unwrap();
+    assert_eq!(session.viewed(), Viewed::NotImplemented(id));
 }
 
 fn create_exposure(session: &mut Session, at: Point) -> NodeId {

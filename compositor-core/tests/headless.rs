@@ -66,15 +66,14 @@ fn evaluation_reports_what_went_wrong() {
     );
     assert!(error.to_string().contains("missing.exr"), "{error}");
 
-    // Undo is the only way to remove a node yet.
-    session.undo();
+    session.delete_nodes(&[id]).unwrap();
     assert!(
         matches!(evaluate(session.document(), id), Err(EvalError::MissingNode(missing)) if missing == id)
     );
 }
 
 #[test]
-fn an_exposure_node_reports_that_it_has_no_input() {
+fn an_exposure_node_reports_its_missing_input_then_that_it_is_not_computed() {
     let mut session = Session::new();
     let changes = session.create_node(
         NodeKind::Exposure {
@@ -86,7 +85,16 @@ fn an_exposure_node_reports_that_it_has_no_input() {
 
     let error = evaluate(session.document(), id).unwrap_err();
     assert!(
-        matches!(error, EvalError::NoInput(node) if node == id),
+        matches!(error, EvalError::NoInput { node, input: "source" } if node == id),
+        "{error:?}"
+    );
+
+    let source = reader(&mut session, directory("reader_errors").join("missing.exr"));
+    session.connect(id, "source", source).unwrap();
+    // The Exposure does not read its input, so its source's failure does not reach it yet.
+    let error = evaluate(session.document(), id).unwrap_err();
+    assert!(
+        matches!(error, EvalError::NotImplemented(node) if node == id),
         "{error:?}"
     );
 }

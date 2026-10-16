@@ -144,6 +144,11 @@ impl Node {
         self.inputs.get(name).copied()
     }
 
+    /// The first input, in declaration order, that takes no image.
+    pub fn unconnected_input(&self) -> Option<&'static NodeInput> {
+        (self.kind.inputs().iter()).find(|input| !self.inputs.contains_key(input.name))
+    }
+
     /// Each connected input with the node it takes its image from, by input name.
     pub fn inputs(&self) -> impl Iterator<Item = (&'static str, NodeId)> {
         self.inputs.iter().map(|(&name, &source)| (name, source))
