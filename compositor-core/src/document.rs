@@ -1,6 +1,7 @@
 //! The document: everything undo restores, and nothing else.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -67,10 +68,29 @@ impl NodeKind {
             } => EXPOSURE_V1,
         }
     }
+
+    /// The images the node takes, as its version declares them.
+    pub fn inputs(&self) -> &'static [NodeInput] {
+        match self {
+            NodeKind::Reader { .. } => &[],
+            NodeKind::Exposure {
+                version: ExposureVersion::V1,
+            } => EXPOSURE_V1_INPUTS,
+        }
+    }
 }
 
-/// The parameter descriptions an Exposure node was created with. A changed default is a new
-/// version, so a node keeps the defaults its values were authored against.
+/// One image a node type takes, from another node's output.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeInput {
+    /// Unchanged across labels: connections and scripts address it. Renaming or removing an
+    /// input, or changing what it means, makes a new version of its node type.
+    pub name: &'static str,
+    pub label: &'static str,
+}
+
+/// The parameter and input descriptions an Exposure node was created with. A changed default is
+/// a new version, so a node keeps the defaults its values were authored against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExposureVersion {
     V1,
@@ -91,6 +111,11 @@ const EXPOSURE_V1: &[Parameter] = &[Parameter {
     }),
 }];
 
+const EXPOSURE_V1_INPUTS: &[NodeInput] = &[NodeInput {
+    name: "source",
+    label: "Source",
+}];
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub kind: NodeKind,
@@ -99,6 +124,9 @@ pub struct Node {
     /// Only the values the artist set, each valid for its parameter. An absent value reads as its
     /// version's default, so a changed default never alters what was authored.
     authored: BTreeMap<&'static str, Value>,
+    /// Only the connected inputs, each naming the node whose output it takes. An unconnected
+    /// input is legal and reports itself when evaluated.
+    inputs: BTreeMap<&'static str, NodeId>,
 }
 
 impl Node {
@@ -107,7 +135,13 @@ impl Node {
             kind,
             position,
             authored: BTreeMap::new(),
+            inputs: BTreeMap::new(),
         }
+    }
+
+    /// The node an input takes its image from, if the input is connected.
+    pub fn input(&self, name: &str) -> Option<NodeId> {
+        self.inputs.get(name).copied()
     }
 
     /// The value the artist set for a parameter, if they set one.
@@ -171,6 +205,77 @@ impl Document {
             .filter(move |&slot| self.mark(slot) == Some(id))
     }
 
+    /// This document with every assignment applied, refused whole if any assignment names a
+    /// missing node or an input its node does not declare, or if the result connects a node to
+    /// itself or has a cycle.
+    ///
+    /// Only the result is judged, so a batch can move a wire that would form a cycle while the
+    /// wire it replaces is still in place. An assignment that changes nothing keeps its node
+    /// shared, so a batch of them yields no changes.
+    pub fn assign_inputs(&self, assignments: &[Assignment]) -> Result<Document, ConnectionError> {
+        let mut document = self.clone();
+        let mut assigned = BTreeSet::new();
+        for assignment in assignments {
+            let consumer = self
+                .node(assignment.consumer)
+                .ok_or(ConnectionError::MissingNode(assignment.consumer))?;
+            let input = consumer
+                .kind
+                .inputs()
+                .iter()
+                .find(|input| input.name == assignment.input)
+                .ok_or(ConnectionError::UnknownInput)?;
+            if let Some(source) = assignment.source {
+                if !self.nodes.contains_key(&source) {
+                    return Err(ConnectionError::MissingNode(source));
+                }
+                if source == assignment.consumer {
+                    return Err(ConnectionError::SelfConnection);
+                }
+            }
+            if !assigned.insert((assignment.consumer, input.name)) {
+                return Err(ConnectionError::InputAssignedTwice);
+            }
+            if consumer.input(input.name) == assignment.source {
+                continue;
+            }
+            let node = document
+                .nodes
+                .get_mut(&assignment.consumer)
+                .expect("the consumer was found above");
+            let node = Arc::make_mut(node);
+            match assignment.source {
+                Some(source) => node.inputs.insert(input.name, source),
+                None => node.inputs.remove(input.name),
+            };
+        }
+        for assignment in assignments {
+            if let Some(source) = assignment.source
+                && document.is_upstream_of(assignment.consumer, source)
+            {
+                return Err(ConnectionError::Cycle);
+            }
+        }
+        Ok(document)
+    }
+
+    /// Whether `node` feeds `from`, directly or through other nodes.
+    fn is_upstream_of(&self, node: NodeId, from: NodeId) -> bool {
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![from];
+        while let Some(id) = pending.pop() {
+            if id == node {
+                return true;
+            }
+            if visited.insert(id)
+                && let Some(next) = self.node(id)
+            {
+                pending.extend(next.inputs.values());
+            }
+        }
+        false
+    }
+
     /// What differs from this document to `after`. Subtrees and nodes the two share are skipped
     /// without comparing them.
     pub(crate) fn changes_to(&self, after: &Document) -> Changes {
@@ -196,6 +301,42 @@ impl Document {
     }
 }
 
+/// One input connected to a source, or disconnected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Assignment<'a> {
+    pub consumer: NodeId,
+    pub input: &'a str,
+    /// The node whose output the input takes, or `None` to disconnect it. A node has one output
+    /// for now; naming outputs would make this a node and an output name.
+    pub source: Option<NodeId>,
+}
+
+/// Why a connection edit was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionError {
+    MissingNode(NodeId),
+    /// The node's type has no input of that name.
+    UnknownInput,
+    SelfConnection,
+    /// One edit gave an input two sources.
+    InputAssignedTwice,
+    Cycle,
+}
+
+impl fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectionError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
+            ConnectionError::UnknownInput => write!(f, "no such input"),
+            ConnectionError::SelfConnection => write!(f, "a node cannot take its own image"),
+            ConnectionError::InputAssignedTwice => write!(f, "an input takes one wire"),
+            ConnectionError::Cycle => write!(f, "the connection would make a cycle"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectionError {}
+
 /// What one applied change touched: an edit, an undo or a redo.
 ///
 /// Presentation updates from this alone. How the document is stored and compared stays behind
@@ -219,3 +360,6 @@ impl Changes {
         self.selection |= later.selection;
     }
 }
+
+#[cfg(test)]
+mod tests;

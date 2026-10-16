@@ -15,7 +15,10 @@ mod session;
 mod viewer;
 
 pub use app::{App, Command, Event, FileIntent, Input, Key, Pane, Request};
-pub use document::{Changes, Document, ExposureVersion, Node, NodeId, NodeKind, Slot};
+pub use document::{
+    Assignment, Changes, ConnectionError, Document, ExposureVersion, Node, NodeId, NodeInput,
+    NodeKind, Slot,
+};
 pub use evaluate::{EvalError, evaluate};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};
 pub use image::{
