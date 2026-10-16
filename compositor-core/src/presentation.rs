@@ -1,9 +1,19 @@
-//! How the document appears in OpenNG.
+//! How the document appears in OpenNG, and what OpenNG's connection edits mean to it.
 
-use open_ng::{Color, Direction, Graph, NodeRecord, Pin, PinId, Row};
+use std::collections::{BTreeMap, HashSet};
 
-use crate::document::{Changes, Document, Node, NodeId, NodeKind};
+use open_ng::{
+    Color, Connection, ConnectionEdit, Direction, Graph, NodeRecord, Pin, PinId, PinRef, Row,
+    Verdict,
+};
+
+use crate::document::{Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind};
 use crate::session::Loads;
+
+/// Every node's one output. An input's pin is its declaration index plus one, so pins are
+/// derived from the node's version and never stored: a version that reorders or removes inputs
+/// would need pins of its own that are never reused.
+const OUTPUT_PIN: PinId = PinId(0);
 
 const READER_COLOR: Color = Color {
     r: 70,
@@ -69,6 +79,29 @@ pub(crate) fn present(
     graph
         .set_node_positions(&moved)
         .expect("moved nodes are shown");
+    // Every node is shown now, so each changed node's wires can be made to match its inputs.
+    let wanted: HashSet<Connection> = changes
+        .nodes
+        .iter()
+        .filter_map(|&id| Some((id, document.node(id)?)))
+        .flat_map(|(id, node)| wires_into(id, node))
+        .collect();
+    let unwanted: Vec<Connection> = graph
+        .connections()
+        .iter()
+        .filter(|wire| changes.nodes.contains(&wire.to.node.into()) && !wanted.contains(wire))
+        .copied()
+        .collect();
+    for &wire in &unwanted {
+        graph.remove_connection(wire).expect("the wire is shown");
+        changed = true;
+    }
+    for &wire in &wanted {
+        if !graph.contains_connection(wire) {
+            graph.add_connection(wire).expect("both pins are shown");
+            changed = true;
+        }
+    }
     if changes.selection {
         let selection: Vec<_> = document.selection().iter().map(|&id| id.into()).collect();
         graph
@@ -104,11 +137,122 @@ pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node
         } else {
             color
         },
-        rows: vec![Row::Pin(Pin {
-            id: PinId(0),
+        rows: std::iter::once(Pin {
+            id: OUTPUT_PIN,
             label: "Image".to_owned(),
             direction: Direction::Output,
-        })],
+        })
+        .chain(
+            node.kind
+                .inputs()
+                .iter()
+                .enumerate()
+                .map(|(index, input)| Pin {
+                    id: input_pin(index),
+                    label: input.label.to_owned(),
+                    direction: Direction::Input,
+                }),
+        )
+        .map(Row::Pin)
+        .collect(),
+    }
+}
+
+fn input_pin(index: usize) -> PinId {
+    PinId(index as u64 + 1)
+}
+
+/// The name of the input a pin shows on a node of this kind.
+fn input_named(kind: &NodeKind, pin: PinId) -> Option<&'static str> {
+    let index = usize::try_from(pin.0.checked_sub(1)?).ok()?;
+    Some(kind.inputs().get(index)?.name)
+}
+
+/// The wires a node's connected inputs show.
+pub(crate) fn wires_into(id: NodeId, node: &Node) -> impl Iterator<Item = Connection> {
+    node.inputs()
+        .map(move |(name, source)| wire(id, &node.kind, name, source))
+}
+
+fn wire(consumer: NodeId, kind: &NodeKind, input: &str, source: NodeId) -> Connection {
+    let index = kind
+        .inputs()
+        .iter()
+        .position(|declared| declared.name == input)
+        .expect("a connected input is declared");
+    Connection {
+        from: PinRef {
+            node: source.into(),
+            pin: OUTPUT_PIN,
+        },
+        to: PinRef {
+            node: consumer.into(),
+            pin: input_pin(index),
+        },
+    }
+}
+
+/// What a connection edit from OpenNG assigns: each removed wire's input disconnected, unless the
+/// edit also wires that input, and each added wire's input connected. Refused if a pin names no
+/// input, or if two added wires enter one input.
+pub(crate) fn assignments(
+    document: &Document,
+    edit: &ConnectionEdit,
+) -> Result<Vec<Assignment<'static>>, ConnectionError> {
+    let input = |pin: PinRef| {
+        let consumer = NodeId::from(pin.node);
+        let node = document
+            .node(consumer)
+            .ok_or(ConnectionError::MissingNode(consumer))?;
+        let name = input_named(&node.kind, pin.pin).ok_or(ConnectionError::UnknownInput)?;
+        Ok((consumer, name))
+    };
+    let mut sources = BTreeMap::new();
+    for wire in &edit.remove {
+        sources.insert(input(wire.to)?, None);
+    }
+    for wire in &edit.add {
+        // A node's only pin with an output side is its output, so the source is its node.
+        let source = Some(NodeId::from(wire.from.node));
+        if sources.insert(input(wire.to)?, source).flatten().is_some() {
+            return Err(ConnectionError::InputAssignedTwice);
+        }
+    }
+    Ok(sources
+        .into_iter()
+        .map(|((consumer, input), source)| Assignment {
+            consumer,
+            input,
+            source,
+        })
+        .collect())
+}
+
+/// Whether the document would take a proposed connection edit, and which wires it would replace.
+pub(crate) fn judge(document: &Document, edit: &ConnectionEdit) -> Verdict {
+    let assignments = match assignments(document, edit) {
+        Ok(assignments) => assignments,
+        Err(error) => return refuse(error),
+    };
+    if let Err(error) = document.assign_inputs(&assignments) {
+        return refuse(error);
+    }
+    let displaced = assignments
+        .iter()
+        .filter(|assignment| assignment.source.is_some())
+        .filter_map(|assignment| {
+            let node = document.node(assignment.consumer)?;
+            let current = node.input(assignment.input)?;
+            let wire = wire(assignment.consumer, &node.kind, assignment.input, current);
+            (Some(current) != assignment.source && !edit.remove.contains(&wire)).then_some(wire)
+        })
+        .collect();
+    Verdict::Accept { displaced }
+}
+
+fn refuse(error: ConnectionError) -> Verdict {
+    Verdict::Refuse {
+        reason: Some(error.to_string()),
     }
 }
 

@@ -551,3 +551,83 @@ fn h_fits_and_shift_h_shows_actual_size_in_the_viewer_under_the_pointer() {
     app.dispatch(key(NONE));
     assert_eq!(scale(&app), 0.9 / 4.0);
 }
+
+#[test]
+fn delete_in_the_graph_deletes_the_selection_and_the_viewer_lets_go() {
+    let (mut app, _deliveries) = app();
+    let kept = create(&mut app, "/nonexistent/b.exr");
+    let id = create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let delete = || Event::KeyPressed {
+        key: Key::Delete,
+        modifiers: NONE,
+    };
+
+    // Over the viewer, Delete does nothing.
+    app.dispatch(input(Pane::Viewer, Input::PointerEntered));
+    assert!(app.dispatch(delete()).is_empty());
+    assert!(app.session().document().node(id).is_some());
+
+    app.dispatch(input(Pane::Viewer, Input::PointerLeft));
+    app.dispatch(input(Pane::Graph, Input::PointerEntered));
+    let requests = app.dispatch(delete());
+    assert!(requests.contains(&Request::Redraw(Pane::Graph)));
+    assert_eq!(app.session().document().node(id), None);
+    assert!(app.session().document().node(kept).is_some());
+    assert_eq!(app.session().undo_label(), Some("Delete"));
+    assert_eq!(app.reading, None);
+    assert_eq!(
+        app.caption,
+        "Slot 1: nothing marked. Ctrl+1 marks the selected node"
+    );
+
+    assert!(matches!(
+        app.dispatch(delete()).as_slice(),
+        [Request::ShowStatus(_)]
+    ));
+}
+
+#[test]
+fn a_viewed_exposure_names_its_missing_input_then_says_it_is_not_computed() {
+    let (mut app, _deliveries) = app();
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    app.session.create_node(
+        NodeKind::Exposure {
+            version: crate::document::ExposureVersion::CURRENT,
+        },
+        Point::default(),
+    );
+    let exposure = app.session().document().selection()[0];
+
+    app.dispatch(slot_key(2, CTRL));
+    assert_eq!(app.caption, "Slot 2 · Exposure · Source is not connected");
+
+    app.session.connect(exposure, "source", reader).unwrap();
+    app.dispatch(slot_key(2, NONE));
+    assert_eq!(app.caption, "Slot 2 · Exposure · not computed yet");
+    assert_eq!(app.reading, None);
+}
+
+#[test]
+fn an_exposure_node_is_created_where_the_pointer_is_over_the_graph() {
+    let (mut app, _deliveries) = app();
+    let pointer = PhysicalPoint { x: 300.0, y: 50.0 };
+    app.dispatch(input(Pane::Graph, Input::PointerEntered));
+    app.dispatch(input(
+        Pane::Graph,
+        Input::PointerMoved { position: pointer },
+    ));
+
+    let requests = app.dispatch(Event::Command(Command::CreateExposure));
+
+    assert!(requests.contains(&Request::Redraw(Pane::Graph)));
+    let document = app.session().document();
+    let &[id] = document.selection() else {
+        panic!("one node selected")
+    };
+    let node = document.node(id).unwrap();
+    assert!(matches!(node.kind, NodeKind::Exposure { .. }));
+    // The graph origin is at the centre, 200 × 150 physical pixels, and a unit is 2 pixels.
+    assert_eq!(node.position, Point { x: 50.0, y: -50.0 });
+    assert_eq!(app.session().undo_label(), Some("Create Exposure"));
+}

@@ -94,8 +94,9 @@ fn main() {
     window.pin_mut().resize(1400, 900);
     let window_ptr = window.as_mut_ptr();
     // SAFETY: the window is live; it owns the menus.
-    let [file_menu, edit_menu, viewer_menu, window_menu] = ["&File", "&Edit", "&Viewer", "&Window"]
-        .map(|title| unsafe { ffi::new_menu(window_ptr, &QString::from(title)) });
+    let [file_menu, edit_menu, node_menu, viewer_menu, window_menu] =
+        ["&File", "&Edit", "&Node", "&Viewer", "&Window"]
+            .map(|title| unsafe { ffi::new_menu(window_ptr, &QString::from(title)) });
     let mut commands = Vec::new();
     let mut add = |menu, text: &str, shortcut: &str, command| {
         let [text, shortcut] = [text, shortcut].map(QString::from);
@@ -120,6 +121,7 @@ fn main() {
     );
     let undo = add(edit_menu, "&Undo", "Ctrl+Z", Command::Undo);
     let redo = add(edit_menu, "&Redo", "Ctrl+Shift+Z", Command::Redo);
+    add(node_menu, "&Exposure", "E", Command::CreateExposure);
     // The key filter takes the digit row by position and H for the pane under the pointer, so
     // these items only name their keys, after a tab, rather than binding shortcuts.
     let slot_menus = [
