@@ -8,7 +8,7 @@ use open_ng::Point;
 
 use super::*;
 use crate::evaluate::result_key;
-use crate::gpu::noop_device;
+use crate::gpu::{noop_device, noop_device_pair};
 use crate::read::{ReadError, read_image};
 use crate::session::Session;
 
@@ -218,7 +218,7 @@ fn connecting_a_gpu_delivers_the_last_key_again_with_its_pixels() {
     worker.request(Some(on(1, key(&path))));
     assert!(receive(&deliveries).result.unwrap().pixels.is_none());
 
-    worker.connect(noop_device(None));
+    worker.connect(noop_device(None), 1);
 
     let evaluated = receive(&deliveries);
     assert_eq!(evaluated.wanted.key, key(&path));
@@ -257,7 +257,7 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     let (_, first_height) = FIRST_STAGING_SIZE;
     write_png(&tall, 1, 2 * (row_bytes(4096) / 256) * first_height + 1);
     let (worker, deliveries) = worker();
-    worker.connect(noop_device(None));
+    worker.connect(noop_device(None), 1);
 
     worker.request(Some(on(1, key(&small))));
     let first = receive(&deliveries).result.unwrap().pixels.unwrap();
@@ -335,10 +335,13 @@ fn an_image_larger_than_the_gpu_allows_is_read_but_cannot_be_shown() {
     let path = directory.join("wide.png");
     write_png(&path, 3, 2);
     let (worker, deliveries) = worker();
-    worker.connect(noop_device(Some(wgpu::Limits {
-        max_texture_dimension_2d: 2,
-        ..wgpu::Limits::downlevel_defaults()
-    })));
+    worker.connect(
+        noop_device(Some(wgpu::Limits {
+            max_texture_dimension_2d: 2,
+            ..wgpu::Limits::downlevel_defaults()
+        })),
+        1,
+    );
 
     worker.request(Some(on(1, key(&path))));
 
@@ -367,7 +370,7 @@ fn a_newer_request_for_another_node_ends_the_wait_for_the_staging_buffer() {
     write_png(&first, 3, 2);
     write_png(&second, 3, 2);
     let (worker, deliveries) = worker();
-    worker.connect(noop_device(None));
+    worker.connect(noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
     let held = receive(&deliveries).result.unwrap().pixels.unwrap();
 
@@ -395,7 +398,7 @@ fn a_newer_request_for_the_same_node_lets_the_started_one_be_delivered() {
         write_png(path, 3, 2);
     }
     let (worker, deliveries) = worker();
-    worker.connect(noop_device(None));
+    worker.connect(noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
     let held = receive(&deliveries).result.unwrap().pixels.unwrap();
 
@@ -411,6 +414,77 @@ fn a_newer_request_for_the_same_node_lets_the_started_one_be_delivered() {
     };
     assert_eq!(staged(receive(&deliveries)), key(&second));
     assert_eq!(staged(receive(&deliveries)), key(&third));
+}
+
+/// Two white images in a directory of the test's own.
+fn two_images(name: &str) -> [PathBuf; 2] {
+    let directory = directory(name);
+    let paths = ["first.png", "second.png"].map(|name| directory.join(name));
+    for path in &paths {
+        write_png(path, 3, 2);
+    }
+    paths
+}
+
+#[test]
+fn a_staging_buffer_returned_after_its_device_was_replaced_is_dropped() {
+    let [first, second] = two_images("replaced-return");
+    let (worker, deliveries) = worker();
+    let [replaced, replacement] = noop_device_pair();
+    worker.connect(replaced, 1);
+    worker.request(Some(on(1, key(&first))));
+    let old = receive(&deliveries).result.unwrap().pixels.unwrap();
+
+    worker.connect(replacement, 2);
+    let new = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let buffer = new.buffer().clone();
+    drop(new);
+    drop(old);
+
+    worker.request(Some(on(1, key(&second))));
+    let staged = receive(&deliveries).result.unwrap().pixels.unwrap();
+    assert_eq!(staged.buffer(), &buffer);
+}
+
+#[test]
+fn an_image_finishing_for_a_replaced_device_is_staged_again_for_the_new_one() {
+    let [first, second] = two_images("replaced-finishing");
+    let (worker, deliveries) = worker();
+    worker.connect(noop_device(None), 1);
+    worker.request(Some(on(1, key(&first))));
+    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+
+    // Waiting for the buffer the test holds when the device is replaced.
+    worker.request(Some(on(1, key(&second))));
+    wait_until_finishing(&worker);
+    worker.connect(noop_device(None), 2);
+
+    let evaluated = receive(&deliveries);
+    assert_eq!(evaluated.wanted.key, key(&second));
+    assert!(evaluated.result.unwrap().pixels.is_some());
+    drop(held);
+}
+
+#[test]
+fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
+    let [first, second] = two_images("lost-staging");
+    let (worker, deliveries) = worker();
+    let device = noop_device(None);
+    worker.connect(device.clone(), 1);
+    worker.request(Some(on(1, key(&first))));
+    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+
+    device.destroy();
+    // Returned unmapped, the buffer must be mapped again on the lost device.
+    drop(held);
+    worker.request(Some(on(1, key(&second))));
+    let error = receive(&deliveries).result.unwrap_err();
+    assert!(matches!(error, ViewerError::CannotShow(_)), "{error}");
+
+    worker.connect(noop_device(None), 2);
+    let evaluated = receive(&deliveries);
+    assert_eq!(evaluated.wanted.key, key(&second));
+    assert!(evaluated.result.unwrap().pixels.is_some());
 }
 
 #[test]

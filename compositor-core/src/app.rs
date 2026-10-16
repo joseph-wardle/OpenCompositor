@@ -296,7 +296,7 @@ impl App {
                 match self.gpu.attach(pane, window, size) {
                     Ok(device) => {
                         if let Some(device) = device {
-                            self.worker.connect(device);
+                            self.worker.connect(device, self.gpu.device_generation());
                         }
                     }
                     Err(error) => return vec![Request::ShowError(error)],

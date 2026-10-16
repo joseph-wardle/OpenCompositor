@@ -60,26 +60,36 @@ impl Staged {
     }
 }
 
-/// The worker's staging buffer, returned to its mailbox when dropped, by whichever thread holds
-/// it, so that neither a skipped result nor a panic loses it.
+/// The worker's staging buffer, returned unmapped to its connection's slot when dropped, by
+/// whichever thread holds it, so that neither a skipped result nor a panic loses it. Without a
+/// buffer, as after a failure, it leaves the slot empty for the worker to fill. A buffer for a
+/// device no longer connected drops here instead, so that it can never occupy the slot of the
+/// device that replaced it.
 #[derive(Debug)]
 struct Staging {
     buffer: Option<wgpu::Buffer>,
+    device_generation: u64,
     mailbox: Arc<Mailbox>,
 }
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        let Some(buffer) = self.buffer.take() else {
+        let buffer = self.buffer.take();
+        let mut state = self.mailbox.lock();
+        let Some(connection) = &mut state.connection else {
             return;
         };
-        let mut state = self.mailbox.lock();
-        // A buffer returned after the worker stopped would be dropped with the mailbox, which
-        // may be on the worker's thread.
-        if !state.stopping {
-            state.staging = Some((buffer, false));
-            self.mailbox.changed.notify_all();
+        if connection.generation != self.device_generation {
+            return;
         }
+        connection.staging = match buffer {
+            Some(buffer) => StagingSlot::Waiting {
+                buffer,
+                mapped: false,
+            },
+            None => StagingSlot::Empty,
+        };
+        self.mailbox.changed.notify_all();
     }
 }
 
@@ -142,12 +152,29 @@ struct MailboxState {
     /// The request the worker started last.
     started: Option<Wanted>,
     stopping: bool,
-    /// The GPU's device, from `connect` until the worker drops.
-    device: Option<wgpu::Device>,
-    /// The staging buffer while it waits for the worker, and whether it is mapped.
-    staging: Option<(wgpu::Buffer, bool)>,
+    /// The device the worker stages for, from `connect` until the worker drops.
+    connection: Option<Connection>,
     /// Whether the worker is staging or delivering a result, and so may hold GPU objects.
     finishing: bool,
+}
+
+#[derive(Debug)]
+struct Connection {
+    /// Tells this device's staged images apart from those of the device it replaced.
+    generation: u64,
+    device: wgpu::Device,
+    staging: StagingSlot,
+}
+
+/// Where a connection's staging buffer is.
+#[derive(Debug)]
+enum StagingSlot {
+    /// None yet, or the last staging failed: the worker makes one when it next stages.
+    Empty,
+    /// Waiting for the worker, mapped for writing or not.
+    Waiting { buffer: wgpu::Buffer, mapped: bool },
+    /// With the worker, or with an image staged in it.
+    Out,
 }
 
 impl Worker {
@@ -180,19 +207,23 @@ impl Worker {
         self.mailbox.changed.notify_all();
     }
 
-    /// Lets the worker stage pixels for `device`, and delivers the last request again, under its
-    /// number, now with its pixels. Until then it evaluates images without them.
-    pub(crate) fn connect(&self, device: wgpu::Device) {
-        // Mapped at creation, the buffer is zeroed here rather than during the first evaluation.
-        let (width, height) = FIRST_STAGING_SIZE;
-        let staging = staging_buffer(&device, staging_size(width, height));
+    /// Lets the worker stage pixels for `device`, replacing any device connected before, and
+    /// delivers the last request again, under its number, now with its pixels. Until then it
+    /// evaluates images without them. The worker makes its staging buffer when it first stages,
+    /// off the caller's thread.
+    pub(crate) fn connect(&self, device: wgpu::Device, device_generation: u64) {
         let mut state = self.mailbox.lock();
-        state.staging = Some((staging, true));
-        state.device = Some(device);
+        let replaced = state.connection.replace(Connection {
+            generation: device_generation,
+            device,
+            staging: StagingSlot::Empty,
+        });
         if state.request.is_none() && state.started.is_some() {
             state.request = Some(state.started.clone());
         }
+        drop(state);
         self.mailbox.changed.notify_all();
+        drop(replaced);
     }
 }
 
@@ -211,9 +242,9 @@ impl Drop for Worker {
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        let gpu = (state.staging.take(), state.device.take());
+        let connection = state.connection.take();
         drop(state);
-        drop(gpu);
+        drop(connection);
     }
 }
 
@@ -234,17 +265,31 @@ impl Mailbox {
         })
     }
 
-    /// Waits for the staging buffer to come back, or `None` once the started request is
-    /// superseded or the worker is stopping.
-    fn take_staging(&self) -> Option<(wgpu::Buffer, bool)> {
+    /// Waits for the device's staging buffer to come back and takes it, with whether it is
+    /// mapped, or takes its empty slot to fill. `None` once the started request is superseded,
+    /// the device is no longer connected or the worker is stopping.
+    fn take_staging(self: &Arc<Mailbox>, device_generation: u64) -> Option<(Staging, bool)> {
         let taken = self.wait_for(|state| {
-            if state.superseded() {
-                Some(None)
-            } else {
-                state.staging.take().map(Some)
+            let superseded = state.superseded();
+            let connection = match &mut state.connection {
+                Some(connection) if connection.generation == device_generation && !superseded => {
+                    connection
+                }
+                _ => return Some(None),
+            };
+            match std::mem::replace(&mut connection.staging, StagingSlot::Out) {
+                StagingSlot::Empty => Some(Some((None, false))),
+                StagingSlot::Waiting { buffer, mapped } => Some(Some((Some(buffer), mapped))),
+                StagingSlot::Out => None,
             }
         });
-        taken.flatten()
+        let (buffer, mapped) = taken.flatten()?;
+        let staging = Staging {
+            buffer,
+            device_generation,
+            mailbox: Arc::clone(self),
+        };
+        Some((staging, mapped))
     }
 
     fn wait_for<T>(&self, mut take: impl FnMut(&mut MailboxState) -> Option<T>) -> Option<T> {
@@ -274,9 +319,11 @@ impl Mailbox {
             return None;
         }
         state.finishing = true;
+        let device = (state.connection.as_ref())
+            .map(|connection| (connection.device.clone(), connection.generation));
         Some(Finishing {
             mailbox: self,
-            device: state.device.clone(),
+            device,
         })
     }
 }
@@ -294,7 +341,22 @@ impl MailboxState {
 /// The worker's staging and delivery of a result. The worker's drop waits for it to end.
 struct Finishing<'a> {
     mailbox: &'a Arc<Mailbox>,
-    device: Option<wgpu::Device>,
+    /// The device connected when it began, and its generation.
+    device: Option<(wgpu::Device, u64)>,
+}
+
+impl Finishing<'_> {
+    /// Whether another device, or none, has been connected since this began.
+    fn device_replaced(&self) -> bool {
+        let state = self.mailbox.lock();
+        let current = state
+            .connection
+            .as_ref()
+            .map(|connection| connection.generation);
+        self.device
+            .as_ref()
+            .is_some_and(|&(_, began)| current != Some(began))
+    }
 }
 
 impl Drop for Finishing<'_> {
@@ -344,8 +406,10 @@ fn evaluate(
         }
         Err(error) => Err(ViewerError::Eval(error)),
     };
-    // The result's GPU objects, if any, go before the finishing ends.
-    if mailbox.superseded() {
+    // The result's GPU objects, if any, go before the finishing ends. A result finished for a
+    // replaced device is dropped, even a failure, which may be that device's: connecting the
+    // new one asks for the request again.
+    if mailbox.superseded() || finishing.device_replaced() {
         drop(result);
     } else {
         deliver(Evaluated { wanted, result });
@@ -362,7 +426,7 @@ fn stage(
     planes: [Arc<[f32]>; 4],
     sizing: &mut StagingSizing,
 ) -> Result<Option<Staged>, String> {
-    let Some(device) = &finishing.device else {
+    let Some((device, device_generation)) = &finishing.device else {
         return Ok(None);
     };
     let window = info.data_window;
@@ -386,26 +450,32 @@ fn stage(
             limits.max_buffer_size
         ));
     }
-    let Some((buffer, mapped)) = finishing.mailbox.take_staging() else {
+    let Some((mut staging, mapped)) = finishing.mailbox.take_staging(*device_generation) else {
         return Ok(None);
     };
-    let buffer = if let Some(replacement) = sizing.replacement(buffer.size(), size) {
-        buffer.destroy();
-        staging_buffer(device, replacement)
-    } else if mapped {
-        buffer
-    } else {
-        if let Err(error) = map(device, &buffer) {
-            finishing.mailbox.lock().staging = Some((buffer, false));
-            return Err(format!("the GPU could not map its staging buffer: {error}"));
-        }
-        buffer
+    // Until the buffer is back in `staging`, a failure drops it, leaving the slot empty.
+    let buffer = match staging.buffer.take() {
+        Some(buffer) => match sizing.replacement(buffer.size(), size) {
+            None if mapped => buffer,
+            None => {
+                map(device, &buffer).map_err(|error| {
+                    format!("the GPU could not map its staging buffer: {error}")
+                })?;
+                buffer
+            }
+            Some(replacement) => {
+                // Destroyed first, so that the two buffers never hold memory together.
+                buffer.destroy();
+                staging_buffer(device, replacement)?
+            }
+        },
+        None => staging_buffer(device, sizing.first(size))?,
     };
     let bytes_per_row = row_bytes(window.width);
     {
         let mut view = buffer
             .get_mapped_range_mut(..size)
-            .expect("the buffer is mapped and large enough");
+            .map_err(|error| format!("the GPU could not write its staging buffer: {error}"))?;
         let mut bytes = view.slice(..);
         let halves = bytes.len() / size_of::<f16>();
         let start = bytes.as_raw_element_ptr().cast::<f16>();
@@ -422,27 +492,27 @@ fn stage(
     }
     drop(planes);
     buffer.unmap();
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("image"),
-        size: wgpu::Extent3d {
-            width: window.width,
-            height: window.height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
+    staging.buffer = Some(buffer);
+    let texture = allocate(device, "the image", || {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("image"),
+            size: wgpu::Extent3d {
+                width: window.width,
+                height: window.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })
+    })?;
     Ok(Some(Staged {
         texture,
         bytes_per_row,
-        staging: Staging {
-            buffer: Some(buffer),
-            mailbox: Arc::clone(finishing.mailbox),
-        },
+        staging,
     }))
 }
 
@@ -456,11 +526,16 @@ struct StagingSizing {
 }
 
 impl StagingSizing {
+    /// The size of buffer to make, where there is none, to stage `needed` bytes.
+    fn first(&mut self, needed: u64) -> u64 {
+        self.images_fitting_half = 0;
+        fitted(needed)
+    }
+
     /// The size of buffer to replace a `current`-byte one with, to stage `needed` bytes, or
     /// `None` to keep it.
     fn replacement(&mut self, current: u64, needed: u64) -> Option<u64> {
-        let (first_width, first_height) = FIRST_STAGING_SIZE;
-        let fitted = needed.max(staging_size(first_width, first_height));
+        let fitted = fitted(needed);
         if current / 2 > fitted {
             self.images_fitting_half += 1;
         } else {
@@ -473,6 +548,12 @@ impl StagingSizing {
             None
         }
     }
+}
+
+/// The size of buffer that stages `needed` bytes, and at least a first-size image.
+fn fitted(needed: u64) -> u64 {
+    let (first_width, first_height) = FIRST_STAGING_SIZE;
+    needed.max(staging_size(first_width, first_height))
 }
 
 pub(crate) fn is_empty(info: &ImageInfo) -> bool {
@@ -489,13 +570,27 @@ fn staging_size(width: u32, height: u32) -> u64 {
 }
 
 /// A staging buffer, mapped for writing.
-fn staging_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("image staging"),
-        size,
-        usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: true,
+fn staging_buffer(device: &wgpu::Device, size: u64) -> Result<wgpu::Buffer, String> {
+    allocate(device, "its staging buffer", || {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        })
     })
+}
+
+/// Makes a buffer or texture, failing if the GPU has no memory for it. wgpu reports that for
+/// these without losing the device, so it fails one image rather than the session.
+fn allocate<T>(device: &wgpu::Device, what: &str, make: impl FnOnce() -> T) -> Result<T, String> {
+    // Error scopes belong to the thread that pushes them, so the GUI thread's errors stay out.
+    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let made = make();
+    match pollster::block_on(scope.pop()) {
+        Some(error) => Err(format!("the GPU has no memory for {what}: {error}")),
+        None => Ok(made),
+    }
 }
 
 /// Maps the buffer for writing once the GPU has finished copying out of it.

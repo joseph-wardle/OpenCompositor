@@ -68,6 +68,8 @@ pub(crate) struct Gpu {
     checks: Option<FrameChecks>,
     /// Uncaptured errors on every device of the session.
     errors: Arc<AtomicU64>,
+    /// Counts the devices made, telling each one's staged images apart.
+    device_generation: u64,
 }
 
 /// What the frames a pane drew prove, for the shell's lifecycle check: that the GPU finished
@@ -119,6 +121,7 @@ impl Gpu {
             instance: None,
             checks: None,
             errors: Arc::default(),
+            device_generation: 0,
         }
     }
 
@@ -139,6 +142,11 @@ impl Gpu {
             finished: checks.finished[pane.index()].load(Ordering::Relaxed),
             centre: checks.centres[pane.index()],
         })
+    }
+
+    /// The generation of the device made last.
+    pub(crate) fn device_generation(&self) -> u64 {
+        self.device_generation
     }
 
     pub(crate) fn has_surface(&self, pane: Pane) -> bool {
@@ -178,7 +186,10 @@ impl Gpu {
             .or(self.device.as_ref())
             .expect("one exists");
         let config = configure(device, pane, &surface, size, self.checks.is_some())?;
-        let created = new_device.map(|new| self.device.insert(new).device.clone());
+        let created = new_device.map(|new| {
+            self.device_generation += 1;
+            self.device.insert(new).device.clone()
+        });
         let device = self.device.as_mut().expect("kept above if new");
         device.configs[pane.index()] = Some(config);
         self.surfaces[pane.index()] = Some(surface);
@@ -703,6 +714,20 @@ impl ViewerRenderer {
 #[cfg(test)]
 pub(crate) fn noop_device(limits: Option<wgpu::Limits>) -> wgpu::Device {
     noop_parts(limits).1
+}
+
+/// Two noop devices from one adapter. Objects of devices from separate instances can compare
+/// equal, since each instance numbers its objects from the same start.
+#[cfg(test)]
+pub(crate) fn noop_device_pair() -> [wgpu::Device; 2] {
+    let (adapter, first, _) = noop_parts(None);
+    let descriptor = wgpu::DeviceDescriptor {
+        required_limits: adapter.limits(),
+        ..Default::default()
+    };
+    let (second, _) = pollster::block_on(adapter.request_device(&descriptor))
+        .expect("the noop adapter has a second device");
+    [first, second]
 }
 
 #[cfg(test)]
