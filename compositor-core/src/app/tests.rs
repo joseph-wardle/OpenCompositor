@@ -1,8 +1,10 @@
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use super::*;
 use crate::document::NodeKind;
+use crate::evaluate::EvalError;
 use crate::read::ReadError;
 use crate::worker::ViewerImage;
 
@@ -353,12 +355,12 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
         Some(id)
     );
     assert_eq!(app.session().viewer().slot().digit(), 3);
-    // Only the caption says it is reading, so the node keeps its size.
+    // Only the caption says it is updating, so the node keeps its size.
     assert_eq!(title(&app, id), "a.exr [3]");
     assert_eq!(
         requests.last(),
         Some(&Request::ShowViewerCaption(
-            "Slot 3 · a.exr · reading…".to_owned()
+            "Slot 3 · a.exr · updating…".to_owned()
         ))
     );
 
@@ -370,7 +372,8 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
     assert_ne!(color(id), color(other));
     assert!(
-        app.caption.starts_with("Slot 3 · a.exr · No such file"),
+        app.caption
+            .starts_with("Slot 3 · a.exr · /nonexistent/a.exr: No such file"),
         "{}",
         app.caption
     );
@@ -405,7 +408,7 @@ fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
 
     // The first read finishes after the viewer moved on.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
-    assert_eq!(app.caption, "Slot 2 · b.exr · reading…");
+    assert_eq!(app.caption, "Slot 2 · b.exr · updating…");
 
     app.dispatch(read(&second, 8, 2));
     assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
@@ -413,10 +416,8 @@ fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
     // Back to slot 1, which is read again, showing slot 2's image until then.
     app.dispatch(slot_key(1, NONE));
     assert_eq!(sent(&app), first);
-    assert_eq!(
-        app.caption,
-        "Slot 1 · a.exr · reading… (showing b.exr until then)"
-    );
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert!(matches!(app.shown, Shown::Image { .. }));
     // Back to slot 2, which is shown already and asked for again, so that the worker lets slot
     // 1's read go.
     app.dispatch(slot_key(2, NONE));
@@ -472,7 +473,10 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     }));
 
     assert!(matches!(app.shown, Shown::Failed { .. }));
-    assert_eq!(app.caption, "Slot 1 · a.exr · not an EXR or PNG file");
+    assert_eq!(
+        app.caption,
+        "Slot 1 · a.exr · /nonexistent/a.exr: not an EXR or PNG file"
+    );
     let failed = app.session().graph().node(id.into()).unwrap().color;
 
     // Another reload makes the failure old news until the file is read again.
@@ -498,7 +502,7 @@ fn undoing_a_mark_leaves_the_viewer_showing_nothing() {
 
     // Redo marks it again, and the file is read again.
     app.dispatch(Event::Command(Command::Redo));
-    assert_eq!(app.caption, "Slot 1 · a.exr · reading…");
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
 }
 
 #[test]
@@ -565,25 +569,58 @@ fn delete_in_the_graph_deletes_the_selection_and_the_viewer_lets_go() {
     ));
 }
 
+fn create_exposure(app: &mut App) -> NodeId {
+    let kind = NodeKind::Exposure {
+        version: crate::document::ExposureVersion::CURRENT,
+    };
+    let changes = app.session.create_node(kind, Point::default());
+    *changes.nodes.first().unwrap()
+}
+
 #[test]
-fn a_viewed_exposure_names_its_missing_input_then_says_it_is_not_computed() {
+fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     let (mut app, _deliveries) = app();
     let reader = create(&mut app, "/nonexistent/a.exr");
-    app.session.create_node(
-        NodeKind::Exposure {
-            version: crate::document::ExposureVersion::CURRENT,
-        },
-        Point::default(),
-    );
-    let exposure = app.session().document().selection()[0];
+    let first = create_exposure(&mut app);
+    let second = create_exposure(&mut app);
+    app.session.connect(second, "source", first).unwrap();
 
     app.dispatch(slot_key(2, CTRL));
-    assert_eq!(app.caption, "Slot 2 · Exposure · Source is not connected");
+    assert_eq!(
+        app.caption,
+        "Slot 2 · Exposure · updating…; Source of Exposure is not connected"
+    );
+    // The empty image, which the viewer does not frame.
+    app.dispatch(read(&sent(&app), 0, 0));
+    assert_eq!(
+        app.caption,
+        "Slot 2 · Exposure · Source of Exposure is not connected"
+    );
+    assert_eq!(app.shown.display_window(), None);
 
-    app.session.connect(exposure, "source", reader).unwrap();
-    app.dispatch(slot_key(2, NONE));
-    assert_eq!(app.caption, "Slot 2 · Exposure · not computed yet");
-    assert_eq!(app.sent, None);
+    app.session.connect(first, "source", reader).unwrap();
+    app.dispatch(Event::Draw(Pane::Viewer));
+    assert_eq!(app.caption, "Slot 2 · Exposure · updating…");
+    let key = |app: &App, id| {
+        let session = app.session();
+        result_key(session.document(), session.reloads(), id).unwrap()
+    };
+    let requests = app.dispatch(Event::Evaluated(Evaluated {
+        key: sent(&app),
+        result: Err(ViewerError::Eval(EvalError::Read {
+            origin: key(&app, reader),
+            error: ReadError::UnknownFormat,
+        })),
+    }));
+
+    assert!(requests.contains(&Request::Redraw(Pane::Graph)));
+    assert_eq!(
+        app.caption,
+        "Slot 2 · Exposure · /nonexistent/a.exr: not an EXR or PNG file"
+    );
+    let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
+    assert_ne!(color(reader), color(second));
+    assert_eq!(color(first), color(second));
 }
 
 #[test]

@@ -52,6 +52,22 @@ impl PartialEq for ResultKey {
 
 impl Eq for ResultKey {}
 
+impl ResultKey {
+    /// This key and every key inside it, each once, without recursion.
+    pub(crate) fn with_upstream(&self) -> Vec<&ResultKey> {
+        let mut found = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![self];
+        while let Some(key) = pending.pop() {
+            if seen.insert(Arc::as_ptr(&key.0)) {
+                found.push(key);
+                pending.extend(key.0.inputs());
+            }
+        }
+        found
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Recipe {
     Reader {
@@ -140,11 +156,25 @@ impl Recipe {
 /// however deep the chain.
 pub fn result_key(document: &Document, reloads: &Reloads, node: NodeId) -> Option<ResultKey> {
     document.node(node)?;
+    keys(document, reloads, [node]).remove(&node)
+}
+
+/// The key of every node in the document, each upstream node visited once.
+pub(crate) fn result_keys(document: &Document, reloads: &Reloads) -> BTreeMap<NodeId, ResultKey> {
+    keys(document, reloads, document.nodes().map(|(id, _)| id))
+}
+
+/// The keys of existing nodes and of everything upstream of them.
+fn keys(
+    document: &Document,
+    reloads: &Reloads,
+    nodes: impl IntoIterator<Item = NodeId>,
+) -> BTreeMap<NodeId, ResultKey> {
     let mut built: BTreeMap<NodeId, ResultKey> = BTreeMap::new();
     let mut entered = BTreeSet::new();
     // A node is entered when it first reaches the top, pushing its inputs above it, and built
     // when it reaches the top again, after all of them.
-    let mut pending = vec![node];
+    let mut pending: Vec<NodeId> = nodes.into_iter().collect();
     while let Some(&id) = pending.last() {
         let current = document.node(id).expect("inputs name existing nodes");
         if entered.insert(id) {
@@ -159,7 +189,7 @@ pub fn result_key(document: &Document, reloads: &Reloads, node: NodeId) -> Optio
             built.insert(id, key);
         }
     }
-    built.remove(&node)
+    built
 }
 
 /// A node's recipe, from the keys of its inputs.

@@ -1,16 +1,15 @@
 //! The interactive compositor: a session, the GPU that draws its panes, and the evaluator's
-//! worker, changed
-//! only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
+//! worker, changed only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{ExposureVersion, NodeId, NodeKind, Slot};
-use crate::evaluate::{EvalError, ResultKey, result_key};
+use crate::document::{ExposureVersion, Node, NodeId, NodeKind, Slot, unconnected_inputs};
+use crate::evaluate::{ResultKey, result_key};
 use crate::gpu::{FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
-use crate::session::{LoadRequest, Session, Viewed};
+use crate::session::Session;
 use crate::worker::{Evaluated, ViewerError, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
@@ -193,22 +192,34 @@ pub enum Input {
 enum Shown {
     Nothing,
     Image {
-        request: LoadRequest,
+        key: ResultKey,
         info: ImageInfo,
     },
     /// An empty frame, never an older image.
     Failed {
-        request: LoadRequest,
+        key: ResultKey,
         error: String,
     },
 }
 
 impl Shown {
-    fn display_window(&self) -> Option<Window> {
+    fn key(&self) -> Option<&ResultKey> {
         match self {
-            Shown::Image { info, .. } => Some(info.display_window),
-            Shown::Nothing | Shown::Failed { .. } => None,
+            Shown::Nothing => None,
+            Shown::Image { key, .. } | Shown::Failed { key, .. } => Some(key),
         }
+    }
+
+    /// The image the viewer frames: none for an empty display window, which has no size to fit.
+    fn framed(&self) -> Option<&ImageInfo> {
+        match self {
+            Shown::Image { info, .. } if !is_empty(info.display_window) => Some(info),
+            Shown::Image { .. } | Shown::Nothing | Shown::Failed { .. } => None,
+        }
+    }
+
+    fn display_window(&self) -> Option<Window> {
+        self.framed().map(|info| info.display_window)
     }
 }
 
@@ -314,15 +325,12 @@ impl App {
     }
 
     fn draw(&mut self, pane: Pane) -> Vec<Request> {
-        let frame = match &self.shown {
-            Shown::Image { info, .. } => Some(ViewerFrame {
-                placement: self.session.viewer().placement(info.display_window),
-                display_window: info.display_window,
-                data_window: info.data_window,
-                scale_factor: self.session.viewer().scale_factor(),
-            }),
-            Shown::Nothing | Shown::Failed { .. } => None,
-        };
+        let frame = self.shown.framed().map(|info| ViewerFrame {
+            placement: self.session.viewer().placement(info.display_window),
+            display_window: info.display_window,
+            data_window: info.data_window,
+            scale_factor: self.session.viewer().scale_factor(),
+        });
         let again = self
             .gpu
             .draw(pane, self.session.graph(), self.session.graph_view(), frame);
@@ -564,61 +572,54 @@ impl App {
         vec![Request::Redraw(Pane::Graph)]
     }
 
-    /// Shows a finished evaluation if the viewer still wants it. Otherwise it is dropped, which
-    /// returns its staging buffer to the worker.
+    /// Shows a finished evaluation if the viewer still wants it, and records how it ended.
+    /// Otherwise it is dropped, which returns its staging buffer to the worker.
     fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
-        let Some((request, _)) = self.wanted().filter(|(_, key)| *key == evaluated.key) else {
+        let Evaluated { key, result } = evaluated;
+        if self.wanted().as_ref() != Some(&key) {
             return Vec::new();
+        }
+        let graph_changed = match &result {
+            Err(ViewerError::Eval(error)) => self.session.record_failure(error.origin()),
+            // What the GPU cannot hold is the viewer's limitation, not the node's failure.
+            Ok(_) | Err(ViewerError::CannotShow(_)) => self.session.record_success(&key),
         };
-        let failed = evaluated.result.is_err();
-        self.shown = match evaluated.result {
+        self.shown = match result {
             Ok(image) => {
                 match image.pixels {
                     Some(staged) => self.gpu.show_image(staged),
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
-                    request: request.clone(),
+                    key,
                     info: image.info,
                 }
             }
             Err(error) => {
                 self.gpu.clear_image();
-                // The caption names the file already.
-                let error = match error {
-                    ViewerError::Eval(EvalError::Read { error, .. }) => error.to_string(),
-                    error => error.to_string(),
-                };
                 Shown::Failed {
-                    request: request.clone(),
-                    error,
+                    key,
+                    error: error.to_string(),
                 }
             }
         };
         let mut requests = vec![Request::Redraw(Pane::Viewer)];
-        if self.session.record_read(request, failed) {
+        if graph_changed {
             requests.push(Request::Redraw(Pane::Graph));
         }
         requests
     }
 
-    /// What the viewer's slot leads to as a Reader's file, and its key.
-    fn wanted(&self) -> Option<(LoadRequest, ResultKey)> {
-        let Viewed::Node(request) = self.session.viewed() else {
-            return None;
-        };
-        let key = result_key(
-            self.session.document(),
-            self.session.reloads(),
-            request.node,
-        )?;
-        Some((request, key))
+    /// The key of the node the viewer's slot marks.
+    fn wanted(&self) -> Option<ResultKey> {
+        let node = self.session.viewed()?;
+        result_key(self.session.document(), self.session.reloads(), node)
     }
 
-    /// Keeps the viewer on what its slot leads to: asks the worker for it, shows nothing if the
-    /// slot leads nowhere, and describes the result.
+    /// Keeps the viewer on what its slot marks: asks the worker for it, shows nothing if the slot
+    /// marks nothing, and describes the result.
     fn follow_viewer(&mut self, requests: &mut Vec<Request>) {
-        let wanted = self.wanted().map(|(_, key)| key);
+        let wanted = self.wanted();
         if wanted.is_none() && !matches!(self.shown, Shown::Nothing) {
             self.shown = Shown::Nothing;
             self.gpu.clear_image();
@@ -638,57 +639,52 @@ impl App {
         }
     }
 
+    /// Names the viewed node from the document as it stands, then says what is shown of it and
+    /// what upstream of it is not connected. Called once the wanted key has been sent.
     fn caption(&self) -> String {
         let slot = self.session.viewer().slot().digit();
-        let request = match self.session.viewed() {
+        let document = self.session.document();
+        let Some(viewed) = self.session.viewed() else {
             // The next step, for an artist who has not found the menus yet.
-            Viewed::Unmarked if self.session.document().nodes().next().is_none() => {
-                return format!(
+            return if document.nodes().next().is_none() {
+                format!(
                     "Slot {slot}: nothing marked. Read files with R, then mark one with Ctrl+{slot}"
-                );
-            }
-            Viewed::Unmarked => {
-                return format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node");
-            }
-            Viewed::NoInput { node, input } => {
-                let declared = self.session.document().node(node).and_then(|node| {
-                    (node.kind.inputs().iter()).find(|declared| declared.name == input)
-                });
-                let label = declared.map_or(input, |declared| declared.label);
-                return format!("Slot {slot} · Exposure · {label} is not connected");
-            }
-            Viewed::NotImplemented(_) => {
-                return format!("Slot {slot} · Exposure · not computed yet");
-            }
-            Viewed::Node(request) => request,
+                )
+            } else {
+                format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node")
+            };
         };
-        let name = file_name(&request.path);
+        let node = document.node(viewed).expect("marks name existing nodes");
+        let current = self.sent.is_some() && self.shown.key() == self.sent.as_ref();
+        let mut details = Vec::new();
         match &self.shown {
-            Shown::Image {
-                request: shown,
-                info,
-            } if *shown == request => {
+            Shown::Image { info, .. } if current => {
                 let window = info.display_window;
-                let mut caption = format!(
-                    "Slot {slot} · {name} · {} × {}",
-                    window.width, window.height
-                );
-                for warning in &info.warnings {
-                    caption.push_str("; ");
-                    caption.push_str(&warning.to_string());
+                if !is_empty(window) {
+                    details.push(format!("{} × {}", window.width, window.height));
                 }
-                caption
+                details.extend(info.warnings.iter().map(ToString::to_string));
             }
-            Shown::Failed {
-                request: shown,
-                error,
-            } if *shown == request => format!("Slot {slot} · {name} · {error}"),
-            Shown::Image { request: shown, .. } if shown.node != request.node => format!(
-                "Slot {slot} · {name} · reading… (showing {} until then)",
-                file_name(&shown.path)
-            ),
-            _ => format!("Slot {slot} · {name} · reading…"),
+            Shown::Failed { error, .. } if current => details.push(error.clone()),
+            // The previous image stays until then.
+            _ => details.push("updating…".to_owned()),
         }
+        for (id, input) in unconnected_inputs(document, viewed) {
+            details.push(if id == viewed {
+                format!("{} is not connected", input.label)
+            } else {
+                let upstream = document.node(id).expect("inputs name existing nodes");
+                format!(
+                    "{} of {} is not connected",
+                    input.label,
+                    node_name(upstream)
+                )
+            });
+        }
+        if details.is_empty() {
+            details.push("empty".to_owned());
+        }
+        format!("Slot {slot} · {} · {}", node_name(node), details.join("; "))
     }
 }
 
@@ -700,11 +696,20 @@ fn redraw_if(pane: Pane, needed: bool) -> Vec<Request> {
     }
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
+/// A Reader's file name, or the node's kind.
+fn node_name(node: &Node) -> String {
+    match &node.kind {
+        NodeKind::Reader { path } => path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned(),
+        NodeKind::Exposure { .. } => "Exposure".to_owned(),
+    }
+}
+
+fn is_empty(window: Window) -> bool {
+    window.width == 0 || window.height == 0
 }
 
 #[cfg(test)]

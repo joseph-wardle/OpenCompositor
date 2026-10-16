@@ -144,11 +144,6 @@ impl Node {
         self.inputs.get(name).copied()
     }
 
-    /// The first input, in declaration order, that takes no image.
-    pub fn unconnected_input(&self) -> Option<&'static NodeInput> {
-        (self.kind.inputs().iter()).find(|input| !self.inputs.contains_key(input.name))
-    }
-
     /// Each connected input with the node it takes its image from, by input name.
     pub fn inputs(&self) -> impl Iterator<Item = (&'static str, NodeId)> {
         self.inputs.iter().map(|(&name, &source)| (name, source))
@@ -173,6 +168,32 @@ impl Node {
         self.authored.remove(parameter.name);
         Ok(())
     }
+}
+
+/// Every input that takes no image on the node and upstream of it: the node's own first, each in
+/// declaration order, and each upstream node once, without recursion. Empty if the document has
+/// no such node.
+///
+/// An unconnected input gives the empty image, so this, not the image, says what is incomplete.
+pub fn unconnected_inputs(document: &Document, node: NodeId) -> Vec<(NodeId, &'static NodeInput)> {
+    let mut unconnected = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut pending = vec![node];
+    while let Some(id) = pending.pop() {
+        let Some(current) = document.node(id).filter(|_| visited.insert(id)) else {
+            continue;
+        };
+        let mut sources = Vec::new();
+        for input in current.kind.inputs() {
+            match current.input(input.name) {
+                Some(source) => sources.push(source),
+                None => unconnected.push((id, input)),
+            }
+        }
+        // Reversed, so that the first input's chain is visited first.
+        pending.extend(sources.into_iter().rev());
+    }
+    unconnected
 }
 
 /// Everything undo restores, and nothing else. Decoded images, GPU resources, Qt objects, the ID
