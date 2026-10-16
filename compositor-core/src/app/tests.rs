@@ -607,3 +607,27 @@ fn a_viewed_exposure_names_its_missing_input_then_says_it_is_not_computed() {
     assert_eq!(app.caption, "Slot 2 · Exposure · not computed yet");
     assert_eq!(app.reading, None);
 }
+
+#[test]
+fn an_exposure_node_is_created_where_the_pointer_is_over_the_graph() {
+    let (mut app, _deliveries) = app();
+    let pointer = PhysicalPoint { x: 300.0, y: 50.0 };
+    app.dispatch(input(Pane::Graph, Input::PointerEntered));
+    app.dispatch(input(
+        Pane::Graph,
+        Input::PointerMoved { position: pointer },
+    ));
+
+    let requests = app.dispatch(Event::Command(Command::CreateExposure));
+
+    assert!(requests.contains(&Request::Redraw(Pane::Graph)));
+    let document = app.session().document();
+    let &[id] = document.selection() else {
+        panic!("one node selected")
+    };
+    let node = document.node(id).unwrap();
+    assert!(matches!(node.kind, NodeKind::Exposure { .. }));
+    // The graph origin is at the centre, 200 × 150 physical pixels, and a unit is 2 pixels.
+    assert_eq!(node.position, Point { x: 50.0, y: -50.0 });
+    assert_eq!(app.session().undo_label(), Some("Create Exposure"));
+}

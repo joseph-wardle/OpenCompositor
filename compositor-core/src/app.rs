@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{NodeId, Slot};
+use crate::document::{ExposureVersion, NodeId, NodeKind, Slot};
 use crate::gpu::{FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
 use crate::loader::{LoadRequest, Loaded, Loader, is_empty};
@@ -95,6 +95,8 @@ pub enum Request {
 pub enum Command {
     /// A Reader for each file chosen, placed where the pointer is over the graph.
     ReadFiles,
+    /// An Exposure node where the pointer is over the graph, selected alone.
+    CreateExposure,
     /// A new file for the one selected Reader.
     ChangeReaderFile,
     /// Reads the selected Readers' files again when they are next viewed, at once if they are.
@@ -478,6 +480,14 @@ impl App {
             Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders {
                 at: self.graph_point_at_pointer(),
             })],
+            Command::CreateExposure => {
+                let kind = NodeKind::Exposure {
+                    version: ExposureVersion::CURRENT,
+                };
+                self.session
+                    .create_node(kind, self.graph_point_at_pointer());
+                vec![Request::Redraw(Pane::Graph)]
+            }
             Command::ChangeReaderFile => match self.session.document().selection() {
                 &[id] => vec![Request::ChooseFiles(FileIntent::SetReaderPath(id))],
                 _ => vec![Request::ShowStatus(
