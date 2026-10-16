@@ -110,7 +110,7 @@ pub mod ffi {
         fn is_exposed(self: &Pane) -> bool;
     }
 
-    // Receives the loader's results on the GUI thread. It lives as long as the event loop, unlike a
+    // Receives the evaluator's results on the GUI thread. It lives as long as the event loop, unlike a
     // pane, which closes with its dock.
     extern "RustQt" {
         #[qobject]
@@ -195,7 +195,7 @@ pub mod ffi {
         /// Shows the text in the status bar until another status replaces it.
         unsafe fn show_error(window: *mut QMainWindow, text: &QString);
         /// Runs a modal file dialog. Its nested event loop delivers paints, resizes, timers and
-        /// the loader's results, but no input to the panes.
+        /// the evaluator's results, but no input to the panes.
         unsafe fn choose_files(
             window: *mut QMainWindow,
             title: &QString,

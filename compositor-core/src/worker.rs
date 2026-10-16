@@ -1,49 +1,47 @@
-//! Reading image files off the GUI thread, and staging their pixels for the GPU.
+//! Evaluating the viewed image off the GUI thread, and staging its pixels for the GPU.
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use half::f16;
 
 use crate::document::NodeId;
+use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, ResultKey};
 use crate::image::ImageInfo;
-use crate::read::{ReadError, read_image};
 
 /// The staging buffer's first size, a DCI 4K image, and its least.
 const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
 
-/// Loads in a row that fit in half the staging buffer before it shrinks to fit them.
-const LOADS_BEFORE_SHRINKING: u32 = 3;
+/// Images in a row that fit in half the staging buffer before it shrinks to fit them.
+const IMAGES_BEFORE_SHRINKING: u32 = 3;
 
-/// A node's file to read, as of its last reload. The worker reads the path, never the document.
-///
-/// The request is also the result's key: the viewer shows a result only while its request is the
-/// one it wants.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadRequest {
-    pub node: NodeId,
-    pub path: PathBuf,
-    /// How many times the node's file had been reloaded, so that a reload reads it again.
-    pub reload: u64,
+/// What the viewer asks the worker for: the image of the node its slot marks, as that node's key
+/// stood when asked. The app numbers its requests in the order it sends them.
+#[derive(Clone, Debug)]
+pub(crate) struct Wanted {
+    pub(crate) node: NodeId,
+    pub(crate) key: ResultKey,
+    pub(crate) number: u64,
 }
 
+/// A finished evaluation of what the worker was asked for, which may have been superseded since.
 #[derive(Debug)]
-pub struct Loaded {
-    pub request: LoadRequest,
-    pub result: Result<Decoded, LoadError>,
+pub struct Evaluated {
+    pub(crate) wanted: Wanted,
+    pub(crate) result: Result<ViewerImage, ViewerError>,
 }
 
-/// An image the worker read: its description, and its pixels staged for the GPU.
+/// An image as the viewer receives it: its description, and its pixels staged for the GPU. Its
+/// planes stay with the evaluator.
 #[derive(Debug)]
-pub struct Decoded {
+pub struct ViewerImage {
     pub info: ImageInfo,
     /// `None` before the GPU exists, as headless, or if the data window is empty.
     pub(crate) pixels: Option<Staged>,
 }
 
-/// An image's pixels, RGBA f16 rows bottom first in the loader's staging buffer, and the texture
+/// An image's pixels, RGBA f16 rows bottom first in the worker's staging buffer, and the texture
 /// for them.
 ///
 /// The GUI thread copies the rows into the texture with its own queue. Dropping this returns the
@@ -61,7 +59,7 @@ impl Staged {
     }
 }
 
-/// The loader's staging buffer, returned to its mailbox when dropped, by whichever thread holds
+/// The worker's staging buffer, returned to its mailbox when dropped, by whichever thread holds
 /// it, so that neither a skipped result nor a panic loses it.
 #[derive(Debug)]
 struct Staging {
@@ -75,7 +73,7 @@ impl Drop for Staging {
             return;
         };
         let mut state = self.mailbox.lock();
-        // A buffer returned after the loader stopped would be dropped with the mailbox, which
+        // A buffer returned after the worker stopped would be dropped with the mailbox, which
         // may be on the worker's thread.
         if !state.stopping {
             state.staging = Some((buffer, false));
@@ -84,39 +82,45 @@ impl Drop for Staging {
     }
 }
 
+/// Why the viewer has no image for a key.
 #[derive(Debug)]
-pub enum LoadError {
-    Read(ReadError),
-    /// Read, but the GPU cannot hold it.
+pub enum ViewerError {
+    Eval(EvalError),
+    /// Evaluated, but the GPU cannot hold it.
     CannotShow(String),
 }
 
-impl fmt::Display for LoadError {
+impl fmt::Display for ViewerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LoadError::Read(error) => error.fmt(f),
-            LoadError::CannotShow(reason) => write!(f, "cannot show it: {reason}"),
+            ViewerError::Eval(error) => error.fmt(f),
+            ViewerError::CannotShow(reason) => write!(f, "cannot show it: {reason}"),
         }
     }
 }
 
-impl std::error::Error for LoadError {
+impl std::error::Error for ViewerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            LoadError::Read(error) => Some(error),
-            LoadError::CannotShow(_) => None,
+            ViewerError::Eval(error) => Some(error),
+            ViewerError::CannotShow(_) => None,
         }
     }
 }
 
-/// One worker reading one file at a time. A request replaces any request it has not started, so
-/// after a burst of requests it reads at most the one in progress and the last. It skips the rest
-/// of a read that a newer request supersedes, once after decoding and again after staging.
+/// One worker evaluating one key at a time with its own [`Evaluator`]. A request replaces any
+/// request it has not started, so after a burst of requests it evaluates at most the one in
+/// progress and the last.
+///
+/// A newer request for the same node lets the evaluation in progress finish and be delivered, so
+/// that an edit faster than evaluation still shows its results as they finish. A newer request
+/// for another node, or for nothing, stops it between nodes, before staging and while waiting for
+/// the staging buffer, and skips its delivery after staging.
 ///
 /// The worker never writes to a texture or submits to the queue: `Queue::write_texture` copies
 /// under a queue-wide lock that the GUI thread's submit then waits for.
 #[derive(Debug)]
-pub struct Loader {
+pub struct Worker {
     mailbox: Arc<Mailbox>,
 }
 
@@ -131,51 +135,68 @@ struct Mailbox {
 /// thread after the driver has begun tearing itself down.
 #[derive(Debug, Default)]
 struct MailboxState {
-    request: Option<LoadRequest>,
+    /// A request the worker has not started: what the viewer wants, or `None` for nothing,
+    /// which releases everything retained.
+    request: Option<Option<Wanted>>,
+    /// The request the worker started last.
+    started: Option<Wanted>,
     stopping: bool,
-    /// The GPU's device, from `connect` until the loader drops.
+    /// The GPU's device, from `connect` until the worker drops.
     device: Option<wgpu::Device>,
     /// The staging buffer while it waits for the worker, and whether it is mapped.
     staging: Option<(wgpu::Buffer, bool)>,
-    /// Whether the worker is staging or delivering a read, and so may hold GPU objects.
+    /// Whether the worker is staging or delivering a result, and so may hold GPU objects.
     finishing: bool,
 }
 
-impl Loader {
+impl Worker {
     /// Starts the worker. It passes each result to `deliver` on its own thread.
-    pub fn start(deliver: impl Fn(Loaded) + Send + 'static) -> Loader {
+    pub fn start(deliver: impl Fn(Evaluated) + Send + 'static) -> Worker {
         let mailbox = Arc::new(Mailbox::default());
         let worker = Arc::clone(&mailbox);
         std::thread::Builder::new()
-            .name("loader".to_owned())
+            .name("evaluator".to_owned())
+            .stack_size(DEEP_STACK)
             .spawn(move || {
+                let mut evaluator = Evaluator::new();
                 let mut sizing = StagingSizing::default();
                 while let Some(request) = worker.next() {
-                    read(&worker, request, &deliver, &mut sizing);
+                    match request {
+                        Some(wanted) => {
+                            evaluate(&worker, &mut evaluator, wanted, &deliver, &mut sizing);
+                        }
+                        None => evaluator.release_all(),
+                    }
                 }
             })
-            .expect("the loader thread starts");
-        Loader { mailbox }
+            .expect("the evaluator thread starts");
+        Worker { mailbox }
     }
 
-    pub fn request(&self, request: LoadRequest) {
-        self.mailbox.lock().request = Some(request);
+    /// Asks for a node's image, or with `None` for nothing, releasing everything retained.
+    pub(crate) fn request(&self, wanted: Option<Wanted>) {
+        self.mailbox.lock().request = Some(wanted);
         self.mailbox.changed.notify_all();
     }
 
-    /// Lets the worker stage pixels for `device`. Until then it reads images without them.
+    /// Lets the worker stage pixels for `device`, and delivers the last request again, under its
+    /// number, now with its pixels. Until then it evaluates images without them.
     pub(crate) fn connect(&self, device: wgpu::Device) {
-        // Mapped at creation, the buffer is zeroed here rather than during the first read.
+        // Mapped at creation, the buffer is zeroed here rather than during the first evaluation.
         let (width, height) = FIRST_STAGING_SIZE;
         let staging = staging_buffer(&device, staging_size(width, height));
         let mut state = self.mailbox.lock();
         state.staging = Some((staging, true));
         state.device = Some(device);
+        if state.request.is_none() && state.started.is_some() {
+            state.request = Some(state.started.clone());
+        }
+        self.mailbox.changed.notify_all();
     }
 }
 
-impl Drop for Loader {
-    /// Stops the worker, waiting while it stages or delivers a read but not while it decodes
+impl Drop for Worker {
+    /// Stops the worker, waiting while it stages or delivers a result but not while it evaluates
     /// one, and drops the device and the staging buffer on this thread. Nothing is delivered
     /// after this returns.
     fn drop(&mut self) {
@@ -203,14 +224,26 @@ impl Mailbox {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Waits for a request, or `None` once the loader is stopping.
-    fn next(&self) -> Option<LoadRequest> {
-        self.wait_for(|state| state.request.take())
+    /// Waits for a request, or `None` once the worker is stopping.
+    fn next(&self) -> Option<Option<Wanted>> {
+        self.wait_for(|state| {
+            let request = state.request.take()?;
+            state.started.clone_from(&request);
+            Some(request)
+        })
     }
 
-    /// Waits for the staging buffer to come back, or `None` once the loader is stopping.
+    /// Waits for the staging buffer to come back, or `None` once the started request is
+    /// superseded or the worker is stopping.
     fn take_staging(&self) -> Option<(wgpu::Buffer, bool)> {
-        self.wait_for(|state| state.staging.take())
+        let taken = self.wait_for(|state| {
+            if state.superseded() {
+                Some(None)
+            } else {
+                state.staging.take().map(Some)
+            }
+        });
+        taken.flatten()
     }
 
     fn wait_for<T>(&self, mut take: impl FnMut(&mut MailboxState) -> Option<T>) -> Option<T> {
@@ -229,16 +262,14 @@ impl Mailbox {
         }
     }
 
-    /// Whether a newer request is waiting, or the loader is stopping.
     fn superseded(&self) -> bool {
-        let state = self.lock();
-        state.stopping || state.request.is_some()
+        self.lock().superseded()
     }
 
-    /// Begins staging and delivering a read, unless it is superseded.
+    /// Begins staging and delivering a result, unless it is superseded.
     fn start_finishing(self: &Arc<Mailbox>) -> Option<Finishing<'_>> {
         let mut state = self.lock();
-        if state.stopping || state.request.is_some() {
+        if state.superseded() {
             return None;
         }
         state.finishing = true;
@@ -249,7 +280,17 @@ impl Mailbox {
     }
 }
 
-/// The worker's staging and delivery of a read. The loader's drop waits for it to end.
+impl MailboxState {
+    /// Whether a newer request for another node, or for nothing, is waiting, or the worker is
+    /// stopping. A newer request for the same node waits for the started one to be delivered.
+    fn superseded(&self) -> bool {
+        let node = |wanted: &Option<Wanted>| wanted.as_ref().map(|wanted| wanted.node);
+        self.stopping
+            || (self.request.as_ref()).is_some_and(|newer| node(newer) != node(&self.started))
+    }
+}
+
+/// The worker's staging and delivery of a result. The worker's drop waits for it to end.
 struct Finishing<'a> {
     mailbox: &'a Arc<Mailbox>,
     device: Option<wgpu::Device>,
@@ -263,43 +304,57 @@ impl Drop for Finishing<'_> {
     }
 }
 
-/// Reads the request's file on the worker's thread, then stages and delivers it.
-fn read(
+/// Evaluates the wanted key on the worker's thread, then stages and delivers its image, unless it
+/// is superseded first.
+fn evaluate(
     mailbox: &Arc<Mailbox>,
-    request: LoadRequest,
-    deliver: &impl Fn(Loaded),
+    evaluator: &mut Evaluator,
+    wanted: Wanted,
+    deliver: &impl Fn(Evaluated),
     sizing: &mut StagingSizing,
 ) {
-    // A panic on this thread would end the worker and every later read with it; the panic hook
-    // has already reported it. The EXR reader contains its decoding threads' panics itself. A
-    // failed allocation aborts the process regardless.
-    let read = std::panic::catch_unwind(AssertUnwindSafe(|| read_image(&request.path)))
-        .unwrap_or_else(|_| Err(ReadError::Decode("the reader panicked".to_owned())));
+    let evaluated = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        evaluator.evaluate(&wanted.key, || mailbox.superseded())
+    }));
+    let result = match evaluated {
+        Ok(None) => return,
+        Ok(Some(result)) => result,
+        // An operation's panic is already its node's failure, so this one is the evaluator's
+        // own, and its bookkeeping cannot be trusted: it starts again with nothing retained,
+        // rather than the worker ending and every later evaluation with it. The panic hook has
+        // already reported it.
+        Err(_) => {
+            *evaluator = Evaluator::new();
+            Err(EvalError::Panicked {
+                origin: wanted.key.clone(),
+            })
+        }
+    };
     let Some(finishing) = mailbox.start_finishing() else {
         return;
     };
-    let result = match read {
+    let result = match result {
         Ok(image) => {
             let (info, planes) = image.into_parts();
             match stage(&finishing, &info, planes, sizing) {
-                Ok(pixels) => Ok(Decoded { info, pixels }),
-                Err(reason) => Err(LoadError::CannotShow(reason)),
+                Ok(pixels) => Ok(ViewerImage { info, pixels }),
+                Err(reason) => Err(ViewerError::CannotShow(reason)),
             }
         }
-        Err(error) => Err(LoadError::Read(error)),
+        Err(error) => Err(ViewerError::Eval(error)),
     };
     // The result's GPU objects, if any, go before the finishing ends.
     if mailbox.superseded() {
         drop(result);
     } else {
-        deliver(Loaded { request, result });
+        deliver(Evaluated { wanted, result });
     }
     drop(finishing);
 }
 
 /// Converts the planes into the staging buffer and makes their texture. `Ok(None)` without a GPU
-/// or pixels, or if the loader stopped while waiting for the buffer, which the check for a
-/// superseded read after this catches.
+/// or pixels, or if the request was superseded or the worker stopped while waiting for the buffer,
+/// which the check for a superseded result after this catches.
 fn stage(
     finishing: &Finishing,
     info: &ImageInfo,
@@ -391,12 +446,12 @@ fn stage(
 }
 
 /// When the worker replaces its staging buffer. It grows to fit any larger image, and shrinks
-/// only after several loads in a row would fit in half of it, so that one large image does not
+/// only after several images in a row would fit in half of it, so that one large image does not
 /// hold its memory for the rest of the session, and alternating large and small images does not
 /// make a buffer for each.
 #[derive(Debug, Default)]
 struct StagingSizing {
-    loads_fitting_half: u32,
+    images_fitting_half: u32,
 }
 
 impl StagingSizing {
@@ -406,12 +461,12 @@ impl StagingSizing {
         let (first_width, first_height) = FIRST_STAGING_SIZE;
         let fitted = needed.max(staging_size(first_width, first_height));
         if current / 2 > fitted {
-            self.loads_fitting_half += 1;
+            self.images_fitting_half += 1;
         } else {
-            self.loads_fitting_half = 0;
+            self.images_fitting_half = 0;
         }
-        if current < needed || self.loads_fitting_half == LOADS_BEFORE_SHRINKING {
-            self.loads_fitting_half = 0;
+        if current < needed || self.images_fitting_half == IMAGES_BEFORE_SHRINKING {
+            self.images_fitting_half = 0;
             Some(fitted)
         } else {
             None

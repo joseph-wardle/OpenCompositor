@@ -8,8 +8,8 @@ use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
 
 use crate::app::Pane;
 use crate::image::Window;
-use crate::loader::Staged;
 use crate::viewer::Placement;
+use crate::worker::Staged;
 
 /// Behind everything a pane draws.
 const BACKGROUND: wgpu::Color = wgpu::Color {
@@ -80,7 +80,7 @@ pub struct FrameCheck {
 
 #[derive(Debug, Default)]
 struct FrameChecks {
-    /// Counted from the queue, which can report finished work on the loader's thread.
+    /// Counted from the queue, which can report finished work on the evaluator's thread.
     finished: [Arc<AtomicU64>; Pane::COUNT],
     centres: [Option<[u8; 4]>; Pane::COUNT],
 }
@@ -136,12 +136,8 @@ impl Gpu {
         self.surfaces[pane.index()].is_some()
     }
 
-    pub(crate) fn has_device(&self) -> bool {
-        self.device.is_some()
-    }
-
     /// Makes the pane's surface, and the device if there is none yet, which it returns so that
-    /// the loader can stage images for it. On failure the pane draws nothing and no new device is
+    /// the worker can stage images for it. On failure the pane draws nothing and no new device is
     /// kept; the error says why.
     pub(crate) fn attach(
         &mut self,
@@ -183,7 +179,7 @@ impl Gpu {
     /// Copies a staged image into its texture and shows it in the viewer from the next frame.
     ///
     /// The copy is submitted at once rather than with the viewer's next frame, which may never
-    /// come while the viewer is closed, so that the staging buffer goes back to the loader.
+    /// come while the viewer is closed, so that the staging buffer goes back to the worker.
     pub(crate) fn show_image(&mut self, staged: Staged) {
         let Some(device) = &mut self.device else {
             return;
@@ -645,20 +641,6 @@ pub(crate) fn noop_device(limits: Option<wgpu::Limits>) -> wgpu::Device {
 
 #[cfg(test)]
 impl Gpu {
-    /// A GPU with a [`noop_device`] and no surfaces, and the device for the loader.
-    pub(crate) fn noop() -> (Gpu, wgpu::Device) {
-        let (adapter, device, queue) = noop_parts(None);
-        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let connected = device.clone();
-        let gpu = Gpu {
-            surfaces: Default::default(),
-            device: Some(Device::for_format(adapter, device, queue, format)),
-            instance: None,
-            checks: None,
-        };
-        (gpu, connected)
-    }
-
     /// A GPU whose instance has no backends, so that every surface fails to attach.
     pub(crate) fn without_backends() -> Gpu {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();

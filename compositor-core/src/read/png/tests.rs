@@ -227,7 +227,7 @@ fn every_colour_type_expands_to_rgba() {
     let image = read_bytes(&rgba16).unwrap();
     let alpha = 32768.0 / 65535.0;
     assert_eq!(rgba(&image, 0, 0), [alpha, 0.0, 0.0, alpha]);
-    let Source::Png(source) = image.source() else {
+    let Some(Source::Png(source)) = image.source() else {
         panic!("a PNG source")
     };
     assert_eq!(
@@ -354,7 +354,7 @@ fn an_srgb_chunk_overrides_gamma_and_primaries() {
     let image = read_bytes(&bytes).unwrap();
 
     assert_eq!(image.warnings(), []);
-    let Source::Png(source) = image.source() else {
+    let Some(Source::Png(source)) = image.source() else {
         panic!("a PNG source")
     };
     assert!(source.srgb && source.gamma == Some(1.0) && source.chromaticities.is_some());

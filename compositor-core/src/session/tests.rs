@@ -9,6 +9,7 @@ use open_ng::{
 
 use super::*;
 use crate::document::ExposureVersion;
+use crate::evaluate::result_key;
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
 
@@ -43,7 +44,7 @@ fn assert_presented(session: &Session) {
     for (id, node) in document.nodes() {
         assert_eq!(
             graph.node(id.into()),
-            Some(&record(document, &session.loads, id, node)),
+            Some(&record(document, &session.failures.nodes, id, node)),
             "{id:?}"
         );
     }
@@ -328,7 +329,7 @@ fn an_exposure_node_is_created_selected_and_undoable() {
 }
 
 #[test]
-fn an_exposure_node_views_its_missing_input_and_has_no_reader_path() {
+fn an_exposure_node_has_no_reader_path() {
     let mut session = Session::new();
     let changes = session.create_node(
         NodeKind::Exposure {
@@ -339,22 +340,77 @@ fn an_exposure_node_views_its_missing_input_and_has_no_reader_path() {
     let id = *changes.nodes.first().expect("one node created");
     session.set_mark(slot(1), Some(id)).unwrap();
 
-    assert_eq!(
-        session.viewed(),
-        Viewed::NoInput {
-            node: id,
-            input: "source"
-        }
-    );
+    assert_eq!(session.viewed(), Some(id));
     assert_eq!(
         session.set_reader_path(id, "a.exr".into()),
         Err(EditError::WrongKind(id))
     );
     assert_eq!(session.undo_label(), Some("Mark"));
+}
 
+#[test]
+fn reloading_a_reader_reloads_every_reader_of_its_file() {
+    let mut session = Session::new();
+    let other = create(&mut session, "b.exr", ORIGIN);
+    let twin = create(&mut session, "a.exr", ORIGIN);
+    let selected = create(&mut session, "a.exr", ORIGIN);
+    assert_eq!(session.document().selection(), [selected]);
+    let key = |session: &Session, id| result_key(session.document(), session.reloads(), id);
+    let before = [selected, twin, other].map(|id| key(&session, id));
+    session.record_failure(before[1].as_ref().unwrap());
+    assert!(session.failures.nodes.contains(&twin));
+
+    assert!(session.reload_selected());
+
+    let after = [selected, twin, other].map(|id| key(&session, id));
+    assert_ne!(after[0], before[0]);
+    assert_eq!(after[0], after[1]);
+    assert_eq!(after[2], before[2]);
+    assert!(session.failures.nodes.is_empty());
+    assert_presented(&session);
+
+    create_exposure(&mut session, ORIGIN);
+    assert!(!session.reload_selected());
+}
+
+#[test]
+fn a_node_shows_a_failure_while_its_current_key_failed() {
+    let mut session = Session::new();
     let reader = create(&mut session, "a.exr", ORIGIN);
-    session.connect(id, "source", reader).unwrap();
-    assert_eq!(session.viewed(), Viewed::NotImplemented(id));
+    let twin = create(&mut session, "a.exr", ORIGIN);
+    let exposure = create_exposure(&mut session, ORIGIN);
+    session.connect(exposure, "source", reader).unwrap();
+    let key =
+        |session: &Session, id| result_key(session.document(), session.reloads(), id).unwrap();
+    let failing = |session: &Session| session.failures.nodes.iter().copied().collect::<Vec<_>>();
+
+    // At the Reader, and at its twin, whose key is equal; not at the Exposure that took it.
+    assert!(session.record_failure(&key(&session, reader)));
+    assert_eq!(failing(&session), [reader, twin]);
+    assert_presented(&session);
+
+    // An edit downstream leaves the Reader's key, and its failure, as they were.
+    session.begin_edit(exposure, "Stops").unwrap();
+    session.set_value("stops", Value::Float(1.0)).unwrap();
+    session.finish_edit();
+    assert_eq!(failing(&session), [reader, twin]);
+
+    // Deleted, a node shows nothing; restored, its key and its failure come back.
+    session.delete_nodes(&[twin]).unwrap();
+    assert_eq!(failing(&session), [reader]);
+    session.undo();
+    assert_eq!(failing(&session), [reader, twin]);
+    assert_presented(&session);
+
+    // Evaluating anything downstream of the key successfully clears it.
+    assert!(session.record_success(&key(&session, exposure)));
+    assert!(failing(&session).is_empty());
+    assert_presented(&session);
+
+    // A failure downstream clears the keys inside it, which were evaluated.
+    session.record_failure(&key(&session, reader));
+    session.record_failure(&key(&session, exposure));
+    assert_eq!(failing(&session), [exposure]);
 }
 
 fn create_exposure(session: &mut Session, at: Point) -> NodeId {
@@ -676,7 +732,7 @@ fn deleting_is_one_step_that_undo_restores_whole() {
     assert_eq!(source_of(&session, exposure), None);
     assert_eq!(session.document().mark(slot(1)), None);
     assert_eq!(session.document().selection(), [exposure]);
-    assert_eq!(session.viewed(), Viewed::Unmarked);
+    assert_eq!(session.viewed(), None);
     assert_presented(&session);
 
     session.undo();

@@ -65,7 +65,8 @@ pub struct Image {
     /// In `Channel::ALL`'s order.
     planes: [Arc<[f32]>; 4],
     pixel_aspect: f32,
-    source: Source,
+    /// `None` for an image no file was read for: the empty image, and what operations make of it.
+    source: Option<Source>,
     warnings: Vec<Warning>,
 }
 
@@ -89,9 +90,50 @@ impl Image {
             data_window,
             planes,
             pixel_aspect,
-            source,
+            source: Some(source),
             warnings,
         }
+    }
+
+    /// No pixels and no frame: what an unconnected input takes.
+    pub(crate) fn empty() -> Image {
+        let window = Window {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        let plane: Arc<[f32]> = Arc::new([]);
+        Image {
+            display_window: window,
+            data_window: window,
+            planes: [(); 4].map(|()| plane.clone()),
+            pixel_aspect: 1.0,
+            source: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// This image with other values over the same data window, in `Channel::ALL`'s order.
+    pub(crate) fn with_planes(&self, planes: [Arc<[f32]>; 4]) -> Image {
+        let area = self.data_window.width as usize * self.data_window.height as usize;
+        assert!(
+            planes.iter().all(|plane| plane.len() == area),
+            "one value per data window pixel"
+        );
+        Image {
+            display_window: self.display_window,
+            data_window: self.data_window,
+            planes,
+            pixel_aspect: self.pixel_aspect,
+            source: self.source.clone(),
+            warnings: self.warnings.clone(),
+        }
+    }
+
+    /// Every channel's plane, in `Channel::ALL`'s order.
+    pub(crate) fn planes(&self) -> &[Arc<[f32]>; 4] {
+        &self.planes
     }
 
     pub fn display_window(&self) -> Window {
@@ -124,8 +166,9 @@ impl Image {
         self.pixel_aspect
     }
 
-    pub fn source(&self) -> &Source {
-        &self.source
+    /// The file the image's pixels came from, through any operations.
+    pub fn source(&self) -> Option<&Source> {
+        self.source.as_ref()
     }
 
     /// What the artist should know about how the file was interpreted.

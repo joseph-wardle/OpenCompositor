@@ -141,3 +141,22 @@ fn deleting_nodes_clears_what_named_them() {
     assert_eq!(after.marks[1], None);
     assert_eq!(after.marks[2], Some(NodeId(3)));
 }
+
+#[test]
+fn unconnected_inputs_are_found_up_the_chain() {
+    // 3 takes 2, which takes nothing; 1 takes the Reader and is not upstream of 3.
+    let document = document_of(3)
+        .assign_inputs(&[connect(3, 2), connect(1, 0)])
+        .unwrap();
+    let names = |id: u64| -> Vec<(u64, &str)> {
+        (unconnected_inputs(&document, NodeId(id)).into_iter())
+            .map(|(node, input)| (node.0, input.name))
+            .collect()
+    };
+
+    assert_eq!(names(3), [(2, "source")]);
+    assert_eq!(names(2), [(2, "source")]);
+    assert_eq!(names(1), []);
+    assert_eq!(names(0), []);
+    assert_eq!(names(9), []);
+}

@@ -1,15 +1,16 @@
-//! The interactive compositor: a session, the GPU that draws its panes, and the loader, changed
-//! only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
+//! The interactive compositor: a session, the GPU that draws its panes, and the evaluator's
+//! worker, changed only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{ExposureVersion, NodeId, NodeKind, Slot};
+use crate::document::{ExposureVersion, Node, NodeId, NodeKind, Slot, unconnected_inputs};
+use crate::evaluate::{ResultKey, result_key};
 use crate::gpu::{FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
-use crate::loader::{LoadRequest, Loaded, Loader, is_empty};
-use crate::session::{Session, Viewed};
+use crate::session::Session;
+use crate::worker::{Evaluated, ViewerError, Wanted, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,8 +70,8 @@ pub enum Event {
         intent: FileIntent,
         paths: Vec<PathBuf>,
     },
-    /// A read finished on the loader's thread.
-    Loaded(Loaded),
+    /// An evaluation finished on the evaluator's thread.
+    Evaluated(Evaluated),
 }
 
 /// What the shell does for [`App::dispatch`], after it returns.
@@ -99,7 +100,8 @@ pub enum Command {
     CreateExposure,
     /// A new file for the one selected Reader.
     ChangeReaderFile,
-    /// Reads the selected Readers' files again when they are next viewed, at once if they are.
+    /// Reads the selected Readers' files again, for every Reader of them, when they are next
+    /// viewed, at once if they are.
     Reload,
     Undo,
     Redo,
@@ -190,32 +192,35 @@ pub enum Input {
 enum Shown {
     Nothing,
     Image {
-        request: LoadRequest,
+        wanted: Wanted,
         info: ImageInfo,
-        /// Read while there was no GPU to stage its pixels for, so the viewer draws only its
-        /// outline.
-        unstaged: bool,
     },
     /// An empty frame, never an older image.
     Failed {
-        request: LoadRequest,
+        wanted: Wanted,
         error: String,
     },
 }
 
 impl Shown {
-    fn request(&self) -> Option<&LoadRequest> {
+    /// The request whose result is shown.
+    fn wanted(&self) -> Option<&Wanted> {
         match self {
             Shown::Nothing => None,
-            Shown::Image { request, .. } | Shown::Failed { request, .. } => Some(request),
+            Shown::Image { wanted, .. } | Shown::Failed { wanted, .. } => Some(wanted),
+        }
+    }
+
+    /// The image the viewer frames: none for an empty display window, which has no size to fit.
+    fn framed(&self) -> Option<&ImageInfo> {
+        match self {
+            Shown::Image { info, .. } if !is_empty(info.display_window) => Some(info),
+            Shown::Image { .. } | Shown::Nothing | Shown::Failed { .. } => None,
         }
     }
 
     fn display_window(&self) -> Option<Window> {
-        match self {
-            Shown::Image { info, .. } => Some(info.display_window),
-            Shown::Nothing | Shown::Failed { .. } => None,
-        }
+        self.framed().map(|info| info.display_window)
     }
 }
 
@@ -224,30 +229,33 @@ pub struct App {
     session: Session,
     gpu: Gpu,
     /// Nothing is delivered once the app has dropped.
-    loader: Loader,
+    worker: Worker,
+    /// What the worker was last asked for.
+    sent: Option<Wanted>,
+    /// How many requests the worker was sent, which numbers them.
+    requests_sent: u64,
     /// The pane under the pointer, which receives keys whichever pane has the keyboard.
     hovered: Option<Pane>,
     /// The pointer's last position over the graph pane.
     graph_pointer: Option<PhysicalPoint>,
     shown: Shown,
-    /// The read in progress for the viewer.
-    reading: Option<LoadRequest>,
     /// The viewer's caption as last requested.
     caption: String,
 }
 
 impl App {
-    /// `deliver` receives each finished read on the loader's thread, and must hand it to the GUI
-    /// thread as an [`Event::Loaded`].
-    pub fn new(deliver: impl Fn(Loaded) + Send + 'static) -> App {
+    /// `deliver` receives each finished evaluation on the evaluator's thread, and must hand it to
+    /// the GUI thread as an [`Event::Evaluated`].
+    pub fn new(deliver: impl Fn(Evaluated) + Send + 'static) -> App {
         App {
             session: Session::new(),
             gpu: Gpu::new(),
-            loader: Loader::start(deliver),
+            worker: Worker::start(deliver),
+            sent: None,
+            requests_sent: 0,
             hovered: None,
             graph_pointer: None,
             shown: Shown::Nothing,
-            reading: None,
             caption: String::new(),
         }
     }
@@ -282,7 +290,7 @@ impl App {
                 match self.gpu.attach(pane, window, size) {
                     Ok(device) => {
                         if let Some(device) = device {
-                            self.loader.connect(device);
+                            self.worker.connect(device);
                         }
                     }
                     Err(error) => return vec![Request::ShowError(error)],
@@ -314,22 +322,19 @@ impl App {
                 Vec::new()
             }
             Event::FilesChosen { intent, paths } => self.files_chosen(intent, paths),
-            Event::Loaded(loaded) => self.loaded(loaded),
+            Event::Evaluated(evaluated) => self.evaluated(evaluated),
         };
         self.follow_viewer(&mut requests);
         requests
     }
 
     fn draw(&mut self, pane: Pane) -> Vec<Request> {
-        let frame = match &self.shown {
-            Shown::Image { info, .. } => Some(ViewerFrame {
-                placement: self.session.viewer().placement(info.display_window),
-                display_window: info.display_window,
-                data_window: info.data_window,
-                scale_factor: self.session.viewer().scale_factor(),
-            }),
-            Shown::Nothing | Shown::Failed { .. } => None,
-        };
+        let frame = self.shown.framed().map(|info| ViewerFrame {
+            placement: self.session.viewer().placement(info.display_window),
+            display_window: info.display_window,
+            data_window: info.data_window,
+            scale_factor: self.session.viewer().scale_factor(),
+        });
         let again = self
             .gpu
             .draw(pane, self.session.graph(), self.session.graph_view(), frame);
@@ -571,66 +576,80 @@ impl App {
         vec![Request::Redraw(Pane::Graph)]
     }
 
-    /// Shows a finished read if the viewer still wants it. Otherwise it is dropped, which returns
-    /// its staging buffer to the loader.
-    fn loaded(&mut self, loaded: Loaded) -> Vec<Request> {
-        let Some(read) = self.reading.take_if(|reading| *reading == loaded.request) else {
+    /// Shows a finished evaluation of the node the viewer marks, even one an edit has superseded
+    /// since, so that an edit faster than evaluation keeps the viewer updating. It is not shown if
+    /// the image shown came from a later request, and how it ended is recorded only if it is
+    /// shown or failed. A failure is shown only while its key is still wanted, so that an edit in
+    /// progress never blanks the viewer. What is not shown is dropped, which returns its staging
+    /// buffer to the worker.
+    fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
+        let Evaluated { wanted, result } = evaluated;
+        // Not only later: connecting the GPU delivers the request shown again, with its pixels.
+        let not_older = (self.shown.wanted()).is_none_or(|shown| wanted.number >= shown.number);
+        if self.session.viewed() != Some(wanted.node) || !not_older {
             return Vec::new();
+        }
+        let current = self.wanted().is_some_and(|(_, key)| key == wanted.key);
+        let graph_changed = match &result {
+            Err(ViewerError::Eval(error)) => self.session.record_failure(error.origin()),
+            // What the GPU cannot hold is the viewer's limitation, not the node's failure.
+            Ok(_) | Err(ViewerError::CannotShow(_)) => self.session.record_success(&wanted.key),
         };
-        let Loaded { request, result } = loaded;
-        let failed = result.is_err();
+        if result.is_err() && !current {
+            return redraw_if(Pane::Graph, graph_changed);
+        }
         self.shown = match result {
-            Ok(decoded) => {
-                let unstaged = decoded.pixels.is_none() && !is_empty(&decoded.info);
-                match decoded.pixels {
+            Ok(image) => {
+                match image.pixels {
                     Some(staged) => self.gpu.show_image(staged),
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
-                    request,
-                    info: decoded.info,
-                    unstaged,
+                    wanted,
+                    info: image.info,
                 }
             }
             Err(error) => {
                 self.gpu.clear_image();
                 Shown::Failed {
-                    request,
+                    wanted,
                     error: error.to_string(),
                 }
             }
         };
         let mut requests = vec![Request::Redraw(Pane::Viewer)];
-        if self.session.record_read(read, failed) {
+        if graph_changed {
             requests.push(Request::Redraw(Pane::Graph));
         }
         requests
     }
 
-    /// Keeps the viewer on what its slot leads to: reads it unless it is shown or being read,
-    /// shows nothing if the slot leads nowhere, and describes the result.
+    /// The node the viewer's slot marks, and its key.
+    fn wanted(&self) -> Option<(NodeId, ResultKey)> {
+        let node = self.session.viewed()?;
+        let key = result_key(self.session.document(), self.session.reloads(), node)?;
+        Some((node, key))
+    }
+
+    /// Keeps the viewer on what its slot marks: asks the worker for it, shows nothing if the slot
+    /// marks nothing, and describes the result.
     fn follow_viewer(&mut self, requests: &mut Vec<Request>) {
-        let wanted = match self.session.viewed() {
-            Viewed::Node(request) => Some(request),
-            Viewed::Unmarked | Viewed::NoInput { .. } | Viewed::NotImplemented(_) => None,
-        };
+        let wanted = self.wanted();
         if wanted.is_none() && !matches!(self.shown, Shown::Nothing) {
             self.shown = Shown::Nothing;
             self.gpu.clear_image();
             requests.push(Request::Redraw(Pane::Viewer));
         }
-        // An image read without a GPU is read again once there is one, including a read that
-        // finished just before the GPU arrived.
-        let shown = match &self.shown {
-            Shown::Image { unstaged: true, .. } if self.gpu.has_device() => None,
-            shown => shown.request(),
-        };
-        let read = wanted.filter(|wanted| Some(wanted) != shown);
-        if read != self.reading {
-            if let Some(request) = &read {
-                self.loader.request(request.clone());
-            }
-            self.reading = read;
+        // Compared with what was sent, not with what is shown: a key already shown is sent again
+        // so that the worker releases what the last request retained, and stops working on it.
+        // Nothing is sent too, which releases everything.
+        let sent = (self.sent.as_ref()).map(|sent| (sent.node, &sent.key));
+        if wanted.as_ref().map(|(node, key)| (*node, key)) != sent {
+            self.requests_sent += 1;
+            let number = self.requests_sent;
+            let wanted = wanted.map(|(node, key)| Wanted { node, key, number });
+            self.worker.request(wanted.clone());
+            self.sent = wanted;
         }
         let caption = self.caption();
         if caption != self.caption {
@@ -639,64 +658,55 @@ impl App {
         }
     }
 
+    /// Names the viewed node from the document as it stands, then says what is shown of it and
+    /// what upstream of it is not connected. Called once the wanted key has been sent.
     fn caption(&self) -> String {
         let slot = self.session.viewer().slot().digit();
-        let request = match self.session.viewed() {
+        let document = self.session.document();
+        let Some(viewed) = self.session.viewed() else {
             // The next step, for an artist who has not found the menus yet.
-            Viewed::Unmarked if self.session.document().nodes().next().is_none() => {
-                return format!(
+            return if document.nodes().next().is_none() {
+                format!(
                     "Slot {slot}: nothing marked. Read files with R, then mark one with Ctrl+{slot}"
-                );
-            }
-            Viewed::Unmarked => {
-                return format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node");
-            }
-            Viewed::NoInput { node, input } => {
-                let declared = self.session.document().node(node).and_then(|node| {
-                    (node.kind.inputs().iter()).find(|declared| declared.name == input)
-                });
-                let label = declared.map_or(input, |declared| declared.label);
-                return format!("Slot {slot} · Exposure · {label} is not connected");
-            }
-            Viewed::NotImplemented(_) => {
-                return format!("Slot {slot} · Exposure · not computed yet");
-            }
-            Viewed::Node(request) => request,
-        };
-        let name = file_name(&request.path);
-        if self.reading.as_ref() == Some(&request) {
-            return match &self.shown {
-                Shown::Image { request: shown, .. } if shown.node != request.node => format!(
-                    "Slot {slot} · {name} · reading… (showing {} until then)",
-                    file_name(&shown.path)
-                ),
-                _ => format!("Slot {slot} · {name} · reading…"),
+                )
+            } else {
+                format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node")
             };
-        }
+        };
+        let node = document.node(viewed).expect("marks name existing nodes");
+        let current = match (&self.sent, self.shown.wanted()) {
+            (Some(sent), Some(shown)) => shown.key == sent.key,
+            _ => false,
+        };
+        let mut details = Vec::new();
         match &self.shown {
-            Shown::Image {
-                request: shown,
-                info,
-                ..
-            } if *shown == request => {
+            Shown::Image { info, .. } if current => {
                 let window = info.display_window;
-                let mut caption = format!(
-                    "Slot {slot} · {name} · {} × {}",
-                    window.width, window.height
-                );
-                for warning in &info.warnings {
-                    caption.push_str("; ");
-                    caption.push_str(&warning.to_string());
+                if !is_empty(window) {
+                    details.push(format!("{} × {}", window.width, window.height));
                 }
-                caption
+                details.extend(info.warnings.iter().map(ToString::to_string));
             }
-            Shown::Failed {
-                request: shown,
-                error,
-            } if *shown == request => format!("Slot {slot} · {name} · {error}"),
-            // Nothing is being read once loading stops.
-            _ => format!("Slot {slot} · {name}"),
+            Shown::Failed { error, .. } if current => details.push(error.clone()),
+            // The previous image stays until then.
+            _ => details.push("updating…".to_owned()),
         }
+        for (id, input) in unconnected_inputs(document, viewed) {
+            details.push(if id == viewed {
+                format!("{} is not connected", input.label)
+            } else {
+                let upstream = document.node(id).expect("inputs name existing nodes");
+                format!(
+                    "{} of {} is not connected",
+                    input.label,
+                    node_name(upstream)
+                )
+            });
+        }
+        if details.is_empty() {
+            details.push("empty".to_owned());
+        }
+        format!("Slot {slot} · {} · {}", node_name(node), details.join("; "))
     }
 }
 
@@ -708,11 +718,20 @@ fn redraw_if(pane: Pane, needed: bool) -> Vec<Request> {
     }
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
+/// A Reader's file name, or the node's kind.
+fn node_name(node: &Node) -> String {
+    match &node.kind {
+        NodeKind::Reader { path } => path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned(),
+        NodeKind::Exposure { .. } => "Exposure".to_owned(),
+    }
+}
+
+fn is_empty(window: Window) -> bool {
+    window.width == 0 || window.height == 0
 }
 
 #[cfg(test)]

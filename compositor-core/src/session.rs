@@ -1,6 +1,6 @@
 //! One open document with its history, its presentation in OpenNG, and the viewer's state.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 use crate::document::{
     Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, Slot,
 };
-use crate::loader::LoadRequest;
+use crate::evaluate::{Reloads, ResultKey, result_keys};
 use crate::parameter::{Value, ValueError};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
@@ -81,52 +81,18 @@ impl std::error::Error for EditError {
     }
 }
 
-/// What the viewer's slot leads to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Viewed {
-    Unmarked,
-    /// The slot marks a node with an input that takes no image.
-    NoInput {
-        node: NodeId,
-        input: &'static str,
-    },
-    /// The slot marks a node that nothing computes yet.
-    NotImplemented(NodeId),
-    Node(LoadRequest),
-}
-
-/// What the session knows of reading nodes' files. Unsaved and not undoable.
+/// Evaluations that failed, by the key of the node each failed at. A node is shown failed while
+/// its current key is one of them, so evaluating that key again successfully clears it, a deleted
+/// node never shows it and equal nodes show it alike. Unsaved and not undoable.
 #[derive(Debug, Default)]
-pub(crate) struct Loads {
-    /// Each node's reloads; a node never reloaded is absent.
-    reloads: HashMap<NodeId, u64>,
-    /// Each node's last failed read.
-    failed: HashMap<NodeId, LoadRequest>,
+struct Failures {
+    keys: Vec<ResultKey>,
+    /// The nodes the graph shows failed.
+    nodes: BTreeSet<NodeId>,
 }
 
-impl Loads {
-    /// What reading a Reader's file means now.
-    fn request(&self, id: NodeId, path: &Path) -> LoadRequest {
-        LoadRequest {
-            node: id,
-            path: path.to_owned(),
-            reload: self.reloads.get(&id).copied().unwrap_or(0),
-        }
-    }
-
-    /// Whether reading the node's file failed, and it would read the same file again.
-    pub(crate) fn failed(&self, document: &Document, id: NodeId) -> bool {
-        let Some(NodeKind::Reader { path }) = document.node(id).map(|node| &node.kind) else {
-            return false;
-        };
-        self.failed
-            .get(&id)
-            .is_some_and(|failed| *failed == self.request(id, path))
-    }
-}
-
-/// A document with its undo history, its OpenNG graph and the view of it, the viewer, and what
-/// is known of reading each node's file.
+/// A document with its undo history, its OpenNG graph and the view of it, the viewer, how many
+/// times each file has been reloaded, and which evaluations failed.
 ///
 /// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
 /// before returning the [`Changes`] it made. An edit that changes nothing records no step.
@@ -146,7 +112,9 @@ pub struct Session {
     graph: Graph,
     graph_view: View,
     viewer: Viewer,
-    loads: Loads,
+    /// Unsaved and not undoable.
+    reloads: Reloads,
+    failures: Failures,
 }
 
 impl Default for Session {
@@ -172,7 +140,8 @@ impl Session {
                 scale_factor: 1.0,
             }),
             viewer: Viewer::new(),
-            loads: Loads::default(),
+            reloads: Reloads::default(),
+            failures: Failures::default(),
         }
     }
 
@@ -196,46 +165,56 @@ impl Session {
         &mut self.viewer
     }
 
-    /// What the viewer's slot leads to.
-    pub fn viewed(&self) -> Viewed {
-        match self.document.mark(self.viewer.slot()) {
-            None => Viewed::Unmarked,
-            Some(id) => {
-                let node = self.document.node(id).expect("marks name existing nodes");
-                if let Some(input) = node.unconnected_input() {
-                    return Viewed::NoInput {
-                        node: id,
-                        input: input.name,
-                    };
-                }
-                match &node.kind {
-                    NodeKind::Reader { path } => Viewed::Node(self.loads.request(id, path)),
-                    NodeKind::Exposure { .. } => Viewed::NotImplemented(id),
-                }
-            }
-        }
+    /// The node the viewer's slot marks.
+    pub fn viewed(&self) -> Option<NodeId> {
+        self.document.mark(self.viewer.slot())
     }
 
-    /// Records how a read of a node's file ended. Returns whether the graph changed.
-    pub(crate) fn record_read(&mut self, request: LoadRequest, failed: bool) -> bool {
-        let node = request.node;
-        if failed {
-            self.loads.failed.insert(node, request);
-        } else {
-            self.loads.failed.remove(&node);
-        }
-        self.present_statuses([node])
+    /// Records that a key was evaluated, which clears the failures of it and of every key
+    /// inside it. Returns whether the graph changed.
+    pub(crate) fn record_success(&mut self, key: &ResultKey) -> bool {
+        let inside = key.with_upstream();
+        self.failures
+            .keys
+            .retain(|failed| !inside.contains(&failed));
+        self.present_failures()
     }
 
-    /// Makes each selected node read its file again the next time it is viewed. Returns whether
-    /// any was selected.
+    /// Records a failure at the key of the node it happened at, if that is still some node's
+    /// key: a failure superseded by an edit would otherwise stay recorded with nothing to clear
+    /// it. Every key inside that one was evaluated, which clears their failures. Returns whether
+    /// the graph changed.
+    pub(crate) fn record_failure(&mut self, origin: &ResultKey) -> bool {
+        let inside = origin.with_upstream();
+        self.failures
+            .keys
+            .retain(|failed| !inside.contains(&failed));
+        let keys = result_keys(&self.document, &self.reloads);
+        if keys.values().any(|key| key == origin) {
+            self.failures.keys.push(origin.clone());
+        }
+        self.present_failures()
+    }
+
+    /// How many times each file has been reloaded.
+    pub fn reloads(&self) -> &Reloads {
+        &self.reloads
+    }
+
+    /// Makes every Reader of each selected Reader's file read it again the next time it is
+    /// viewed. Returns whether any Reader was selected.
     pub fn reload_selected(&mut self) -> bool {
-        let selected: Vec<NodeId> = self.document.selection().to_vec();
-        for &id in &selected {
-            *self.loads.reloads.entry(id).or_default() += 1;
+        let paths: BTreeSet<Arc<Path>> = (self.document.selection().iter())
+            .filter_map(|&id| match &self.document.node(id)?.kind {
+                NodeKind::Reader { path } => Some(path.clone()),
+                NodeKind::Exposure { .. } => None,
+            })
+            .collect();
+        for path in &paths {
+            self.reloads.reload(path.clone());
         }
-        self.present_statuses(selected.iter().copied());
-        !selected.is_empty()
+        self.present_failures();
+        !paths.is_empty()
     }
 
     /// Centres the node a slot marks in the graph view. Returns whether the slot marks one.
@@ -577,20 +556,44 @@ impl Session {
 
     /// Updates the graph, then the view, which cannot notice a change to the graph on its own.
     /// Returns whether the graph changed.
+    ///
+    /// An edit changes the keys of every node downstream of what it changes, so whether each node
+    /// shows a failure is decided again for all of them.
     fn present(&mut self, changes: &Changes) -> bool {
-        let changed = present(&mut self.graph, &self.document, &self.loads, changes);
+        let failing = self.failing_nodes();
+        let mut nodes = changes.nodes.clone();
+        nodes.extend(failing.symmetric_difference(&self.failures.nodes));
+        self.failures.nodes = failing;
+        let changes = Changes {
+            nodes,
+            selection: changes.selection,
+        };
+        let changed = present(
+            &mut self.graph,
+            &self.document,
+            &self.failures.nodes,
+            &changes,
+        );
         let document = &self.document;
         self.graph_view
             .refresh(&self.graph, |edit| judge(document, edit));
         changed
     }
 
-    /// Presents nodes whose failure to read may have changed. Returns whether any did.
-    fn present_statuses(&mut self, nodes: impl IntoIterator<Item = NodeId>) -> bool {
-        self.present(&Changes {
-            nodes: nodes.into_iter().collect::<BTreeSet<_>>(),
-            selection: false,
-        })
+    /// Presents nodes whose failure may have changed. Returns whether any did.
+    fn present_failures(&mut self) -> bool {
+        self.present(&Changes::default())
+    }
+
+    /// The nodes whose current key failed.
+    fn failing_nodes(&self) -> BTreeSet<NodeId> {
+        if self.failures.keys.is_empty() {
+            return BTreeSet::new();
+        }
+        (result_keys(&self.document, &self.reloads).into_iter())
+            .filter(|(_, key)| self.failures.keys.contains(key))
+            .map(|(id, _)| id)
+            .collect()
     }
 }
 

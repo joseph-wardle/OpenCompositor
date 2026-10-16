@@ -1,6 +1,6 @@
 //! How the document appears in OpenNG, and what OpenNG's connection edits mean to it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use open_ng::{
     Color, Connection, ConnectionEdit, Direction, Graph, NodeRecord, Pin, PinId, PinRef, Row,
@@ -8,7 +8,6 @@ use open_ng::{
 };
 
 use crate::document::{Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind};
-use crate::session::Loads;
 
 /// Every node's one output. An input's pin is its declaration index plus one, so pins are
 /// derived from the node's version and never stored: a version that reorders or removes inputs
@@ -34,12 +33,12 @@ const FAILED_COLOR: Color = Color {
 /// elides titles itself.
 const MAX_NAME_CHARS: usize = 32;
 
-/// Brings the graph in line with the document and load statuses, for the nodes and selection
-/// `changes` names only. Returns whether the graph changed.
+/// Brings the graph in line with the document and the nodes shown failed, for the nodes and
+/// selection `changes` names only. Returns whether the graph changed.
 pub(crate) fn present(
     graph: &mut Graph,
     document: &Document,
-    loads: &Loads,
+    failing: &BTreeSet<NodeId>,
     changes: &Changes,
 ) -> bool {
     let mut changed = false;
@@ -53,12 +52,12 @@ pub(crate) fn present(
             (None, None) => {}
             (Some(node), None) => {
                 graph
-                    .add_node(id.into(), record(document, loads, id, node))
+                    .add_node(id.into(), record(document, failing, id, node))
                     .expect("the node is not shown");
                 changed = true;
             }
             (Some(node), Some(shown)) => {
-                let record = record(document, loads, id, node);
+                let record = record(document, failing, id, node);
                 // Updating a record lays the node out again; moving it does not.
                 if record.title == shown.title
                     && record.color == shown.color
@@ -111,7 +110,12 @@ pub(crate) fn present(
     changed || !moved.is_empty() || changes.selection
 }
 
-pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node) -> NodeRecord {
+pub(crate) fn record(
+    document: &Document,
+    failing: &BTreeSet<NodeId>,
+    id: NodeId,
+    node: &Node,
+) -> NodeRecord {
     let (mut title, color) = match &node.kind {
         NodeKind::Reader { path } => {
             let name = path.file_name().unwrap_or(path.as_os_str());
@@ -119,8 +123,8 @@ pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node
         }
         NodeKind::Exposure { .. } => ("Exposure".to_owned(), EXPOSURE_COLOR),
     };
-    // Slot numbers go in the title, and a failed read in the colour, until OpenNG has badges.
-    // Nothing shows a read in progress: the title would widen the node while it lasted, and the
+    // Slot numbers go in the title, and a failure in the colour, until OpenNG has badges.
+    // Nothing shows an evaluation in progress: the title would widen the node while it lasted, and the
     // viewer's caption says it.
     let slots: Vec<_> = document
         .slots_marking(id)
@@ -132,7 +136,7 @@ pub(crate) fn record(document: &Document, loads: &Loads, id: NodeId, node: &Node
     NodeRecord {
         position: node.position,
         title,
-        color: if loads.failed(document, id) {
+        color: if failing.contains(&id) {
             FAILED_COLOR
         } else {
             color
