@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use half::f16;
 
+use crate::document::NodeId;
 use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, ResultKey};
 use crate::image::ImageInfo;
 
@@ -15,11 +16,20 @@ const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
 /// Images in a row that fit in half the staging buffer before it shrinks to fit them.
 const IMAGES_BEFORE_SHRINKING: u32 = 3;
 
-/// A finished evaluation of the key the worker was asked for.
+/// What the viewer asks the worker for: the image of the node its slot marks, as that node's key
+/// stood when asked. The app numbers its requests in the order it sends them.
+#[derive(Clone, Debug)]
+pub(crate) struct Wanted {
+    pub(crate) node: NodeId,
+    pub(crate) key: ResultKey,
+    pub(crate) number: u64,
+}
+
+/// A finished evaluation of what the worker was asked for, which may have been superseded since.
 #[derive(Debug)]
 pub struct Evaluated {
-    pub key: ResultKey,
-    pub result: Result<ViewerImage, ViewerError>,
+    pub(crate) wanted: Wanted,
+    pub(crate) result: Result<ViewerImage, ViewerError>,
 }
 
 /// An image as the viewer receives it: its description, and its pixels staged for the GPU. Its
@@ -100,8 +110,12 @@ impl std::error::Error for ViewerError {
 
 /// One worker evaluating one key at a time with its own [`Evaluator`]. A request replaces any
 /// request it has not started, so after a burst of requests it evaluates at most the one in
-/// progress and the last. A newer request stops an evaluation between nodes, before staging and
-/// while waiting for the staging buffer, and skips its delivery after staging.
+/// progress and the last.
+///
+/// A newer request for the same node lets the evaluation in progress finish and be delivered, so
+/// that an edit faster than evaluation still shows its results as they finish. A newer request
+/// for another node, or for nothing, stops it between nodes, before staging and while waiting for
+/// the staging buffer, and skips its delivery after staging.
 ///
 /// The worker never writes to a texture or submits to the queue: `Queue::write_texture` copies
 /// under a queue-wide lock that the GUI thread's submit then waits for.
@@ -121,11 +135,11 @@ struct Mailbox {
 /// thread after the driver has begun tearing itself down.
 #[derive(Debug, Default)]
 struct MailboxState {
-    /// A request the worker has not started: the key the viewer wants, or `None` for nothing,
+    /// A request the worker has not started: what the viewer wants, or `None` for nothing,
     /// which releases everything retained.
-    request: Option<Option<ResultKey>>,
+    request: Option<Option<Wanted>>,
     /// The request the worker started last.
-    started: Option<ResultKey>,
+    started: Option<Wanted>,
     stopping: bool,
     /// The GPU's device, from `connect` until the worker drops.
     device: Option<wgpu::Device>,
@@ -148,7 +162,9 @@ impl Worker {
                 let mut sizing = StagingSizing::default();
                 while let Some(request) = worker.next() {
                     match request {
-                        Some(key) => evaluate(&worker, &mut evaluator, key, &deliver, &mut sizing),
+                        Some(wanted) => {
+                            evaluate(&worker, &mut evaluator, wanted, &deliver, &mut sizing);
+                        }
                         None => evaluator.release_all(),
                     }
                 }
@@ -157,14 +173,14 @@ impl Worker {
         Worker { mailbox }
     }
 
-    /// Asks for the key's image, or with `None` for nothing, releasing everything retained.
-    pub fn request(&self, key: Option<ResultKey>) {
-        self.mailbox.lock().request = Some(key);
+    /// Asks for a node's image, or with `None` for nothing, releasing everything retained.
+    pub(crate) fn request(&self, wanted: Option<Wanted>) {
+        self.mailbox.lock().request = Some(wanted);
         self.mailbox.changed.notify_all();
     }
 
-    /// Lets the worker stage pixels for `device`, and delivers the last key requested again, now
-    /// with its pixels. Until then it evaluates images without them.
+    /// Lets the worker stage pixels for `device`, and delivers the last request again, under its
+    /// number, now with its pixels. Until then it evaluates images without them.
     pub(crate) fn connect(&self, device: wgpu::Device) {
         // Mapped at creation, the buffer is zeroed here rather than during the first evaluation.
         let (width, height) = FIRST_STAGING_SIZE;
@@ -209,7 +225,7 @@ impl Mailbox {
     }
 
     /// Waits for a request, or `None` once the worker is stopping.
-    fn next(&self) -> Option<Option<ResultKey>> {
+    fn next(&self) -> Option<Option<Wanted>> {
         self.wait_for(|state| {
             let request = state.request.take()?;
             state.started.clone_from(&request);
@@ -217,12 +233,15 @@ impl Mailbox {
         })
     }
 
-    /// Waits for the staging buffer to come back, or `None` once a newer request arrives or the
-    /// worker is stopping.
+    /// Waits for the staging buffer to come back, or `None` once the started request is
+    /// superseded or the worker is stopping.
     fn take_staging(&self) -> Option<(wgpu::Buffer, bool)> {
-        let taken = self.wait_for(|state| match state.request {
-            Some(_) => Some(None),
-            None => state.staging.take().map(Some),
+        let taken = self.wait_for(|state| {
+            if state.superseded() {
+                Some(None)
+            } else {
+                state.staging.take().map(Some)
+            }
         });
         taken.flatten()
     }
@@ -243,16 +262,14 @@ impl Mailbox {
         }
     }
 
-    /// Whether a newer request is waiting, or the worker is stopping.
     fn superseded(&self) -> bool {
-        let state = self.lock();
-        state.stopping || state.request.is_some()
+        self.lock().superseded()
     }
 
     /// Begins staging and delivering a result, unless it is superseded.
     fn start_finishing(self: &Arc<Mailbox>) -> Option<Finishing<'_>> {
         let mut state = self.lock();
-        if state.stopping || state.request.is_some() {
+        if state.superseded() {
             return None;
         }
         state.finishing = true;
@@ -260,6 +277,16 @@ impl Mailbox {
             mailbox: self,
             device: state.device.clone(),
         })
+    }
+}
+
+impl MailboxState {
+    /// Whether a newer request for another node, or for nothing, is waiting, or the worker is
+    /// stopping. A newer request for the same node waits for the started one to be delivered.
+    fn superseded(&self) -> bool {
+        let node = |wanted: &Option<Wanted>| wanted.as_ref().map(|wanted| wanted.node);
+        self.stopping
+            || (self.request.as_ref()).is_some_and(|newer| node(newer) != node(&self.started))
     }
 }
 
@@ -277,17 +304,17 @@ impl Drop for Finishing<'_> {
     }
 }
 
-/// Evaluates the key on the worker's thread, then stages and delivers its image, unless a newer
-/// request stops it first.
+/// Evaluates the wanted key on the worker's thread, then stages and delivers its image, unless it
+/// is superseded first.
 fn evaluate(
     mailbox: &Arc<Mailbox>,
     evaluator: &mut Evaluator,
-    key: ResultKey,
+    wanted: Wanted,
     deliver: &impl Fn(Evaluated),
     sizing: &mut StagingSizing,
 ) {
     let evaluated = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        evaluator.evaluate(&key, || mailbox.superseded())
+        evaluator.evaluate(&wanted.key, || mailbox.superseded())
     }));
     let result = match evaluated {
         Ok(None) => return,
@@ -299,7 +326,7 @@ fn evaluate(
         Err(_) => {
             *evaluator = Evaluator::new();
             Err(EvalError::Panicked {
-                origin: key.clone(),
+                origin: wanted.key.clone(),
             })
         }
     };
@@ -320,13 +347,13 @@ fn evaluate(
     if mailbox.superseded() {
         drop(result);
     } else {
-        deliver(Evaluated { key, result });
+        deliver(Evaluated { wanted, result });
     }
     drop(finishing);
 }
 
 /// Converts the planes into the staging buffer and makes their texture. `Ok(None)` without a GPU
-/// or pixels, or if a newer request arrived or the worker stopped while waiting for the buffer,
+/// or pixels, or if the request was superseded or the worker stopped while waiting for the buffer,
 /// which the check for a superseded result after this catches.
 fn stage(
     finishing: &Finishing,

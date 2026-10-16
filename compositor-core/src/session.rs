@@ -180,14 +180,19 @@ impl Session {
         self.present_failures()
     }
 
-    /// Records a failure at the key of the node it happened at. Every key inside that one was
-    /// evaluated, which clears their failures. Returns whether the graph changed.
+    /// Records a failure at the key of the node it happened at, if that is still some node's
+    /// key: a failure superseded by an edit would otherwise stay recorded with nothing to clear
+    /// it. Every key inside that one was evaluated, which clears their failures. Returns whether
+    /// the graph changed.
     pub(crate) fn record_failure(&mut self, origin: &ResultKey) -> bool {
         let inside = origin.with_upstream();
         self.failures
             .keys
             .retain(|failed| !inside.contains(&failed));
-        self.failures.keys.push(origin.clone());
+        let keys = result_keys(&self.document, &self.reloads);
+        if keys.values().any(|key| key == origin) {
+            self.failures.keys.push(origin.clone());
+        }
         self.present_failures()
     }
 

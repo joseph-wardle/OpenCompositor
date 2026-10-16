@@ -10,7 +10,7 @@ use crate::evaluate::{ResultKey, result_key};
 use crate::gpu::{FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
 use crate::session::Session;
-use crate::worker::{Evaluated, ViewerError, Worker};
+use crate::worker::{Evaluated, ViewerError, Wanted, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,21 +192,22 @@ pub enum Input {
 enum Shown {
     Nothing,
     Image {
-        key: ResultKey,
+        wanted: Wanted,
         info: ImageInfo,
     },
     /// An empty frame, never an older image.
     Failed {
-        key: ResultKey,
+        wanted: Wanted,
         error: String,
     },
 }
 
 impl Shown {
-    fn key(&self) -> Option<&ResultKey> {
+    /// The request whose result is shown.
+    fn wanted(&self) -> Option<&Wanted> {
         match self {
             Shown::Nothing => None,
-            Shown::Image { key, .. } | Shown::Failed { key, .. } => Some(key),
+            Shown::Image { wanted, .. } | Shown::Failed { wanted, .. } => Some(wanted),
         }
     }
 
@@ -230,7 +231,9 @@ pub struct App {
     /// Nothing is delivered once the app has dropped.
     worker: Worker,
     /// What the worker was last asked for.
-    sent: Option<ResultKey>,
+    sent: Option<Wanted>,
+    /// How many requests the worker was sent, which numbers them.
+    requests_sent: u64,
     /// The pane under the pointer, which receives keys whichever pane has the keyboard.
     hovered: Option<Pane>,
     /// The pointer's last position over the graph pane.
@@ -249,6 +252,7 @@ impl App {
             gpu: Gpu::new(),
             worker: Worker::start(deliver),
             sent: None,
+            requests_sent: 0,
             hovered: None,
             graph_pointer: None,
             shown: Shown::Nothing,
@@ -572,18 +576,28 @@ impl App {
         vec![Request::Redraw(Pane::Graph)]
     }
 
-    /// Shows a finished evaluation if the viewer still wants it, and records how it ended.
-    /// Otherwise it is dropped, which returns its staging buffer to the worker.
+    /// Shows a finished evaluation of the node the viewer marks, even one an edit has superseded
+    /// since, so that an edit faster than evaluation keeps the viewer updating. It is not shown if
+    /// the image shown came from a later request, and how it ended is recorded only if it is
+    /// shown or failed. A failure is shown only while its key is still wanted, so that an edit in
+    /// progress never blanks the viewer. What is not shown is dropped, which returns its staging
+    /// buffer to the worker.
     fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
-        let Evaluated { key, result } = evaluated;
-        if self.wanted().as_ref() != Some(&key) {
+        let Evaluated { wanted, result } = evaluated;
+        // Not only later: connecting the GPU delivers the request shown again, with its pixels.
+        let not_older = (self.shown.wanted()).is_none_or(|shown| wanted.number >= shown.number);
+        if self.session.viewed() != Some(wanted.node) || !not_older {
             return Vec::new();
         }
+        let current = self.wanted().is_some_and(|(_, key)| key == wanted.key);
         let graph_changed = match &result {
             Err(ViewerError::Eval(error)) => self.session.record_failure(error.origin()),
             // What the GPU cannot hold is the viewer's limitation, not the node's failure.
-            Ok(_) | Err(ViewerError::CannotShow(_)) => self.session.record_success(&key),
+            Ok(_) | Err(ViewerError::CannotShow(_)) => self.session.record_success(&wanted.key),
         };
+        if result.is_err() && !current {
+            return redraw_if(Pane::Graph, graph_changed);
+        }
         self.shown = match result {
             Ok(image) => {
                 match image.pixels {
@@ -591,14 +605,14 @@ impl App {
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
-                    key,
+                    wanted,
                     info: image.info,
                 }
             }
             Err(error) => {
                 self.gpu.clear_image();
                 Shown::Failed {
-                    key,
+                    wanted,
                     error: error.to_string(),
                 }
             }
@@ -610,10 +624,11 @@ impl App {
         requests
     }
 
-    /// The key of the node the viewer's slot marks.
-    fn wanted(&self) -> Option<ResultKey> {
+    /// The node the viewer's slot marks, and its key.
+    fn wanted(&self) -> Option<(NodeId, ResultKey)> {
         let node = self.session.viewed()?;
-        result_key(self.session.document(), self.session.reloads(), node)
+        let key = result_key(self.session.document(), self.session.reloads(), node)?;
+        Some((node, key))
     }
 
     /// Keeps the viewer on what its slot marks: asks the worker for it, shows nothing if the slot
@@ -628,7 +643,11 @@ impl App {
         // Compared with what was sent, not with what is shown: a key already shown is sent again
         // so that the worker releases what the last request retained, and stops working on it.
         // Nothing is sent too, which releases everything.
-        if wanted != self.sent {
+        let sent = (self.sent.as_ref()).map(|sent| (sent.node, &sent.key));
+        if wanted.as_ref().map(|(node, key)| (*node, key)) != sent {
+            self.requests_sent += 1;
+            let number = self.requests_sent;
+            let wanted = wanted.map(|(node, key)| Wanted { node, key, number });
             self.worker.request(wanted.clone());
             self.sent = wanted;
         }
@@ -655,7 +674,10 @@ impl App {
             };
         };
         let node = document.node(viewed).expect("marks name existing nodes");
-        let current = self.sent.is_some() && self.shown.key() == self.sent.as_ref();
+        let current = match (&self.sent, self.shown.wanted()) {
+            (Some(sent), Some(shown)) => shown.key == sent.key,
+            _ => false,
+        };
         let mut details = Vec::new();
         match &self.shown {
             Shown::Image { info, .. } if current => {

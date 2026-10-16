@@ -75,13 +75,13 @@ fn slot_key(digit: u8, modifiers: Modifiers) -> Event {
     }
 }
 
-/// The key the worker was last asked for.
-fn sent(app: &App) -> ResultKey {
+/// What the worker was last asked for.
+fn sent(app: &App) -> Wanted {
     app.sent.clone().expect("a key was sent")
 }
 
 /// A finished evaluation of a `width` × `height` image whose pixels the GPU never received.
-fn read(key: &ResultKey, width: u32, height: u32) -> Event {
+fn read(wanted: &Wanted, width: u32, height: u32) -> Event {
     let window = Window {
         x: 0,
         y: 0,
@@ -89,7 +89,7 @@ fn read(key: &ResultKey, width: u32, height: u32) -> Event {
         height,
     };
     Event::Evaluated(Evaluated {
-        key: key.clone(),
+        wanted: wanted.clone(),
         result: Ok(ViewerImage {
             info: ImageInfo {
                 display_window: window,
@@ -365,7 +365,7 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     );
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.key, sent(&app));
+    assert_eq!(evaluated.wanted.key, sent(&app).key);
     app.dispatch(Event::Evaluated(evaluated));
 
     // Failed: the error under the viewer, and the node coloured unlike others.
@@ -396,7 +396,7 @@ fn shift_and_a_digit_frames_the_node_the_slot_marks() {
 }
 
 #[test]
-fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
+fn a_result_for_a_node_no_longer_viewed_is_not_shown() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
@@ -404,7 +404,7 @@ fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
     create(&mut app, "/nonexistent/b.exr");
     app.dispatch(slot_key(2, CTRL));
     let second = sent(&app);
-    assert_ne!(second, first);
+    assert_ne!(second.key, first.key);
 
     // The first read finishes after the viewer moved on.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
@@ -415,14 +415,68 @@ fn a_result_reaches_the_viewer_only_while_it_is_still_wanted() {
 
     // Back to slot 1, which is read again, showing slot 2's image until then.
     app.dispatch(slot_key(1, NONE));
-    assert_eq!(sent(&app), first);
+    assert_eq!(sent(&app).key, first.key);
     assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
     assert!(matches!(app.shown, Shown::Image { .. }));
     // Back to slot 2, which is shown already and asked for again, so that the worker lets slot
     // 1's read go.
     app.dispatch(slot_key(2, NONE));
-    assert_eq!(sent(&app), second);
+    assert_eq!(sent(&app).key, second.key);
     assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
+}
+
+#[test]
+fn an_edit_faster_than_evaluation_shows_each_later_result_as_it_finishes() {
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let first = sent(&app);
+    app.dispatch(Event::Command(Command::Reload));
+    let second = sent(&app);
+    app.dispatch(Event::Command(Command::Reload));
+    let third = sent(&app);
+
+    // Superseded, but later than anything shown.
+    app.dispatch(read(&second, 8, 2));
+    assert!(matches!(&app.shown, Shown::Image { info, .. } if info.data_window.width == 8));
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    // Earlier than what is shown.
+    assert_eq!(app.dispatch(read(&first, 4, 4)), []);
+    assert!(matches!(&app.shown, Shown::Image { info, .. } if info.data_window.width == 8));
+
+    app.dispatch(read(&third, 5, 1));
+    assert_eq!(app.caption, "Slot 1 · a.exr · 5 × 1");
+}
+
+#[test]
+fn a_superseded_failure_leaves_the_viewer_and_the_node_as_they_are() {
+    let (mut app, _deliveries) = app();
+    let id = create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(read(&sent(&app), 4, 4));
+    let color = |app: &App| app.session().graph().node(id.into()).unwrap().color;
+    let unfailed = color(&app);
+    app.dispatch(Event::Command(Command::Reload));
+    let superseded = sent(&app);
+    app.dispatch(Event::Command(Command::Reload));
+    let failed = |wanted: Wanted| {
+        Event::Evaluated(Evaluated {
+            result: Err(ViewerError::Eval(EvalError::Read {
+                origin: wanted.key.clone(),
+                error: ReadError::UnknownFormat,
+            })),
+            wanted,
+        })
+    };
+
+    app.dispatch(failed(superseded));
+
+    assert!(matches!(app.shown, Shown::Image { .. }));
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert_eq!(color(&app), unfailed);
+    app.dispatch(failed(sent(&app)));
+    assert!(matches!(app.shown, Shown::Failed { .. }));
+    assert_ne!(color(&app), unfailed);
 }
 
 #[test]
@@ -463,11 +517,11 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
 
     app.dispatch(Event::Command(Command::Reload));
     let reload = sent(&app);
-    assert_ne!(reload, before);
+    assert_ne!(reload.key, before.key);
     app.dispatch(Event::Evaluated(Evaluated {
-        key: reload.clone(),
+        wanted: reload.clone(),
         result: Err(ViewerError::Eval(EvalError::Read {
-            origin: reload,
+            origin: reload.key,
             error: ReadError::UnknownFormat,
         })),
     }));
@@ -557,7 +611,7 @@ fn delete_in_the_graph_deletes_the_selection_and_the_viewer_lets_go() {
     assert_eq!(app.session().document().node(id), None);
     assert!(app.session().document().node(kept).is_some());
     assert_eq!(app.session().undo_label(), Some("Delete"));
-    assert_eq!(app.sent, None);
+    assert!(app.sent.is_none());
     assert_eq!(
         app.caption,
         "Slot 1: nothing marked. Ctrl+1 marks the selected node"
@@ -606,7 +660,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
         result_key(session.document(), session.reloads(), id).unwrap()
     };
     let requests = app.dispatch(Event::Evaluated(Evaluated {
-        key: sent(&app),
+        wanted: sent(&app),
         result: Err(ViewerError::Eval(EvalError::Read {
             origin: key(&app, reader),
             error: ReadError::UnknownFormat,

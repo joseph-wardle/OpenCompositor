@@ -20,6 +20,15 @@ fn key(path: impl Into<PathBuf>) -> ResultKey {
     result_key(session.document(), session.reloads(), id).unwrap()
 }
 
+/// A request for the node with the key, as the worker cares only about which node it is.
+fn on(node: u64, key: ResultKey) -> Wanted {
+    Wanted {
+        node: NodeId(node),
+        key,
+        number: 0,
+    }
+}
+
 fn missing(name: &str) -> ResultKey {
     key(format!("/nonexistent/{name}.exr"))
 }
@@ -73,14 +82,14 @@ fn a_request_replaces_any_the_worker_has_not_started() {
     let released = Mutex::new(released);
     // Each delivery waits for the test, holding the worker as a long evaluation would.
     let worker = Worker::start(move |evaluated| {
-        delivered.send(evaluated.key).unwrap();
+        delivered.send(evaluated.wanted.key).unwrap();
         released.lock().unwrap().recv().unwrap();
     });
 
-    worker.request(Some(missing("first")));
+    worker.request(Some(on(1, missing("first"))));
     assert_eq!(deliveries.recv().unwrap(), missing("first"));
-    worker.request(Some(missing("second")));
-    worker.request(Some(missing("third")));
+    worker.request(Some(on(1, missing("second"))));
+    worker.request(Some(on(1, missing("third"))));
     release.send(()).unwrap();
     assert_eq!(deliveries.recv().unwrap(), missing("third"));
     release.send(()).unwrap();
@@ -111,7 +120,7 @@ fn dropping_the_worker_waits_for_the_delivery_in_progress() {
         started.send(()).unwrap();
         released.lock().unwrap().recv().unwrap();
     });
-    worker.request(Some(missing("missing")));
+    worker.request(Some(on(1, missing("missing"))));
     delivering.recv().unwrap();
 
     let drop_returned = drop_elsewhere(worker);
@@ -137,7 +146,7 @@ fn dropping_the_worker_does_not_wait_for_an_evaluation() {
     let made = std::process::Command::new("mkfifo").arg(&pipe).status();
     assert!(made.unwrap().success());
     let (worker, deliveries) = worker();
-    worker.request(Some(key(&pipe)));
+    worker.request(Some(on(1, key(&pipe))));
     // Opening for writing without blocking fails until the worker has the pipe open for
     // reading; once it succeeds, the worker waits on the read for as long as this end is open.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -173,10 +182,10 @@ fn dropping_the_worker_does_not_wait_for_an_evaluation() {
 fn a_failure_is_delivered_with_its_key() {
     let (worker, deliveries) = worker();
 
-    worker.request(Some(missing("missing")));
+    worker.request(Some(on(1, missing("missing"))));
     let evaluated = receive(&deliveries);
 
-    assert_eq!(evaluated.key, missing("missing"));
+    assert_eq!(evaluated.wanted.key, missing("missing"));
     assert!(matches!(
         evaluated.result,
         Err(ViewerError::Eval(EvalError::Read {
@@ -193,7 +202,7 @@ fn without_a_gpu_an_image_is_evaluated_but_not_staged() {
     write_png(&path, 3, 2);
     let (worker, deliveries) = worker();
 
-    worker.request(Some(key(&path)));
+    worker.request(Some(on(1, key(&path))));
 
     let image = receive(&deliveries).result.unwrap();
     assert_eq!(image.info.data_window.width, 3);
@@ -206,13 +215,13 @@ fn connecting_a_gpu_delivers_the_last_key_again_with_its_pixels() {
     let path = directory.join("white.png");
     write_png(&path, 3, 2);
     let (worker, deliveries) = worker();
-    worker.request(Some(key(&path)));
+    worker.request(Some(on(1, key(&path))));
     assert!(receive(&deliveries).result.unwrap().pixels.is_none());
 
     worker.connect(noop_device(None));
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.key, key(&path));
+    assert_eq!(evaluated.wanted.key, key(&path));
     assert!(evaluated.result.unwrap().pixels.is_some());
 }
 
@@ -223,17 +232,17 @@ fn asking_for_nothing_releases_everything() {
     write_png(&path, 3, 2);
     let (worker, deliveries) = worker();
     let width = |evaluated: Evaluated| evaluated.result.unwrap().info.data_window.width;
-    worker.request(Some(key(&path)));
+    worker.request(Some(on(1, key(&path))));
     assert_eq!(width(receive(&deliveries)), 3);
 
     // Retained, a replaced file is not read again.
     write_png(&path, 5, 1);
-    worker.request(Some(key(&path)));
+    worker.request(Some(on(1, key(&path))));
     assert_eq!(width(receive(&deliveries)), 3);
 
     worker.request(None);
     wait_until_started(&worker);
-    worker.request(Some(key(&path)));
+    worker.request(Some(on(1, key(&path))));
     assert_eq!(width(receive(&deliveries)), 5);
 }
 
@@ -250,7 +259,7 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     let (worker, deliveries) = worker();
     worker.connect(noop_device(None));
 
-    worker.request(Some(key(&small)));
+    worker.request(Some(on(1, key(&small))));
     let first = receive(&deliveries).result.unwrap().pixels.unwrap();
     assert_eq!(first.bytes_per_row, 256);
     assert_eq!(
@@ -264,7 +273,7 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     let buffer = first.buffer().clone();
 
     // Held by the GUI, the buffer is not the worker's to write.
-    worker.request(Some(key(&other)));
+    worker.request(Some(on(1, key(&other))));
     assert!(
         deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
         "staged while the buffer was held"
@@ -274,7 +283,7 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     assert_eq!(second.buffer(), &buffer);
     drop(second);
 
-    worker.request(Some(key(&tall)));
+    worker.request(Some(on(1, key(&tall))));
     let third = receive(&deliveries).result.unwrap().pixels.unwrap();
     assert_ne!(third.buffer(), &buffer);
     assert!(third.buffer().size() > buffer.size());
@@ -283,11 +292,11 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
 
     // Under half the grown buffer, which goes back to the first size after enough such loads.
     for _ in 1..IMAGES_BEFORE_SHRINKING {
-        worker.request(Some(key(&small)));
+        worker.request(Some(on(1, key(&small))));
         let kept = receive(&deliveries).result.unwrap().pixels.unwrap();
         assert_eq!(kept.buffer(), &grown);
     }
-    worker.request(Some(key(&small)));
+    worker.request(Some(on(1, key(&small))));
     let shrunk = receive(&deliveries).result.unwrap().pixels.unwrap();
     assert_eq!(shrunk.buffer().size(), buffer.size());
 }
@@ -331,25 +340,14 @@ fn an_image_larger_than_the_gpu_allows_is_read_but_cannot_be_shown() {
         ..wgpu::Limits::downlevel_defaults()
     })));
 
-    worker.request(Some(key(&path)));
+    worker.request(Some(on(1, key(&path))));
 
     let error = receive(&deliveries).result.unwrap_err();
     assert!(matches!(error, ViewerError::CannotShow(_)), "{error}");
 }
 
-#[test]
-fn a_newer_request_ends_the_wait_for_the_staging_buffer() {
-    let directory = directory("staging-wait");
-    let [first, second] = ["first.png", "second.png"].map(|name| directory.join(name));
-    write_png(&first, 3, 2);
-    write_png(&second, 3, 2);
-    let (worker, deliveries) = worker();
-    worker.connect(noop_device(None));
-    worker.request(Some(key(&first)));
-    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
-
-    worker.request(Some(key(&second)));
-    // Started and finishing, so staging or waiting for the buffer the test holds.
+/// Waits until the worker has started the last request and is staging or delivering it.
+fn wait_until_finishing(worker: &Worker) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let state = worker.mailbox.lock();
@@ -360,17 +358,59 @@ fn a_newer_request_ends_the_wait_for_the_staging_buffer() {
         assert!(Instant::now() < deadline, "the worker never began staging");
         std::thread::yield_now();
     }
+}
+
+#[test]
+fn a_newer_request_for_another_node_ends_the_wait_for_the_staging_buffer() {
+    let directory = directory("staging-wait");
+    let [first, second] = ["first.png", "second.png"].map(|name| directory.join(name));
+    write_png(&first, 3, 2);
+    write_png(&second, 3, 2);
+    let (worker, deliveries) = worker();
+    worker.connect(noop_device(None));
+    worker.request(Some(on(1, key(&first))));
+    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+
+    worker.request(Some(on(1, key(&second))));
+    wait_until_finishing(&worker);
     // A failure needs no buffer, so it arrives while the buffer is still held.
-    worker.request(Some(missing("missing")));
+    worker.request(Some(on(2, missing("missing"))));
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.key, missing("missing"));
+    assert_eq!(evaluated.wanted.key, missing("missing"));
     assert!(evaluated.result.is_err());
     drop(held);
     assert!(
         deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
         "the abandoned image was delivered"
     );
+}
+
+#[test]
+fn a_newer_request_for_the_same_node_lets_the_started_one_be_delivered() {
+    let directory = directory("same-node");
+    let [first, second, third] =
+        ["first.png", "second.png", "third.png"].map(|name| directory.join(name));
+    for path in [&first, &second, &third] {
+        write_png(path, 3, 2);
+    }
+    let (worker, deliveries) = worker();
+    worker.connect(noop_device(None));
+    worker.request(Some(on(1, key(&first))));
+    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+
+    // Waiting for the buffer the test holds when the edit goes on.
+    worker.request(Some(on(1, key(&second))));
+    wait_until_finishing(&worker);
+    worker.request(Some(on(1, key(&third))));
+    drop(held);
+
+    let staged = |evaluated: Evaluated| {
+        assert!(evaluated.result.unwrap().pixels.is_some());
+        evaluated.wanted.key
+    };
+    assert_eq!(staged(receive(&deliveries)), key(&second));
+    assert_eq!(staged(receive(&deliveries)), key(&third));
 }
 
 #[test]
