@@ -145,7 +145,7 @@ pub enum Request {
     /// Describe under the viewer what it shows, or why it shows nothing.
     ShowViewerCaption(String),
     /// Show the text in the status bar's permanent GPU label, or hide the label with `None`.
-    /// It changes only when the panes stop or start drawing.
+    /// It changes when the panes stop or start drawing, and when a GPU error is counted.
     ShowGpuLabel(Option<String>),
     /// Dispatch [`Event::RetryDeviceCreation`] with the attempt after the delay. An attempt not
     /// the last one requested is ignored, so dispatching every one is safe.
@@ -330,6 +330,8 @@ pub struct App {
     shown: Shown,
     /// The viewer's caption as last requested.
     caption: String,
+    /// The status bar's GPU label as last requested.
+    gpu_label: Option<String>,
 }
 
 impl App {
@@ -350,6 +352,7 @@ impl App {
             graph_pointer: None,
             shown: Shown::Nothing,
             caption: String::new(),
+            gpu_label: None,
         }
     }
 
@@ -377,6 +380,12 @@ impl App {
     /// up to a limit, after which drawing continues.
     pub fn gpu_errors(&self) -> u64 {
         self.gpu.errors()
+    }
+
+    /// Destroys the GPU device for the shell's lifecycle check. Its loss then arrives as a
+    /// driver's would, as [`Notice::DeviceLost`].
+    pub fn destroy_device(&mut self) {
+        self.gpu.destroy_device();
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
@@ -438,7 +447,25 @@ impl App {
             },
         };
         self.follow_viewer(&mut requests);
+        let gpu_label = self.gpu_label();
+        if gpu_label != self.gpu_label {
+            self.gpu_label.clone_from(&gpu_label);
+            requests.push(Request::ShowGpuLabel(gpu_label));
+        }
         requests
+    }
+
+    /// Whether the panes cannot draw, and how many GPU errors there were, which the status bar
+    /// shows for as long as either holds.
+    fn gpu_label(&self) -> Option<String> {
+        let unavailable = matches!(self.drawing, Drawing::Unavailable { .. });
+        let label = match (unavailable, self.gpu.errors()) {
+            (false, 0) => return None,
+            (true, 0) => GPU_UNAVAILABLE.to_owned(),
+            (false, errors) => gpu_errors(errors),
+            (true, errors) => format!("{GPU_UNAVAILABLE}. {}", gpu_errors(errors)),
+        };
+        Some(label)
     }
 
     /// Retires the lost device, which stops the panes drawing, and requests the first attempt to
@@ -455,10 +482,7 @@ impl App {
             } if recovered.at.elapsed() < LONGEST_RETRY => after_failure(recovered.delay),
             Drawing::Ready { .. } | Drawing::Unavailable { .. } => FIRST_RETRY,
         };
-        vec![
-            Request::ShowGpuLabel(Some(GPU_UNAVAILABLE.to_owned())),
-            self.request_attempt(delay),
-        ]
+        vec![self.request_attempt(delay)]
     }
 
     /// Makes a device for every pane with a native window, which the worker then stages for. On
@@ -477,14 +501,12 @@ impl App {
                     self.drawing = Drawing::Ready {
                         recovered: Some(Recovered { at, delay }),
                     };
-                    requests.push(Request::ShowGpuLabel(None));
                 }
                 requests
             }
             Err(error) => match self.drawing {
                 Drawing::Ready { .. } => vec![
                     Request::ShowError(error),
-                    Request::ShowGpuLabel(Some(GPU_UNAVAILABLE.to_owned())),
                     self.request_attempt(RETRY_AFTER_FAILURE),
                 ],
                 Drawing::Unavailable { delay, .. } => {
@@ -889,6 +911,12 @@ impl App {
 }
 
 const GPU_UNAVAILABLE: &str = "GPU unavailable: the panes draw again once it recovers";
+
+/// Names the session's GPU errors, which are bugs, for the status bar.
+fn gpu_errors(errors: u64) -> String {
+    let noun = if errors == 1 { "error" } else { "errors" };
+    format!("{errors} GPU {noun}, logged on standard error")
+}
 
 /// The wait after a failed attempt that waited `delay`.
 fn after_failure(delay: Duration) -> Duration {

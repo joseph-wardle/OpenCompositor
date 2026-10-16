@@ -92,10 +92,12 @@ pub(crate) struct NewDevice {
     pub(crate) pane_errors: Vec<String>,
 }
 
-/// What the frames a pane drew prove, for the shell's lifecycle check: that the GPU finished
-/// them, and what the last one put at the pane's centre.
+/// What the frames a pane drew on the current device prove, for the shell's lifecycle check:
+/// that the GPU finished them, and what the last one put at the pane's centre.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameCheck {
+    /// The device's generation, which advances with each attempt to make a device.
+    pub generation: u64,
     /// How many of the pane's frames the GPU has finished.
     pub finished: u64,
     /// The centre pixel of the pane's last finished frame, as sRGB-encoded RGBA, if its surface
@@ -105,6 +107,8 @@ pub struct FrameCheck {
 
 #[derive(Debug, Default)]
 struct FrameChecks {
+    /// The device the frames were drawn on. Every new device starts the counts again.
+    generation: u64,
     /// Counted from the queue, which can report finished work on the evaluator's thread.
     finished: [Arc<AtomicU64>; Pane::COUNT],
     centres: [Option<[u8; 4]>; Pane::COUNT],
@@ -170,6 +174,7 @@ impl Gpu {
     pub(crate) fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
         let checks = self.checks.as_ref()?;
         Some(FrameCheck {
+            generation: checks.generation,
             finished: checks.finished[pane.index()].load(Ordering::Relaxed),
             centre: checks.centres[pane.index()],
         })
@@ -260,6 +265,13 @@ impl Gpu {
             pane_errors,
         };
         self.device = Some(device);
+        if let Some(checks) = &mut self.checks {
+            // New counters, so that the old device's late callbacks count nothing.
+            *checks = FrameChecks {
+                generation: new.generation,
+                ..Default::default()
+            };
+        }
         Ok(new)
     }
 
@@ -271,6 +283,18 @@ impl Gpu {
         }
         self.device = None;
         true
+    }
+
+    /// Destroys the device for the shell's lifecycle check, which then notices its loss as it
+    /// would a driver's.
+    pub(crate) fn destroy_device(&mut self) {
+        let Some(device) = &self.device else {
+            return;
+        };
+        device.device.destroy();
+        // `destroy` loses the device only at a later poll, and work on it until then would be
+        // counted as errors.
+        let _ = wait_for_device(&device.device);
     }
 
     /// Copies a staged image into its texture and shows it in the viewer from the next frame.
@@ -919,6 +943,17 @@ impl Gpu {
         gpu.device = Some(Device::for_format(adapter, device, queue, format));
         gpu
     }
+
+    /// Makes an invalid buffer on the device, an uncaptured error.
+    pub(crate) fn make_invalid_buffer(&self) {
+        let device = &self.device.as_ref().expect("a device").device;
+        let _buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("no usage"),
+            size: 4,
+            usage: wgpu::BufferUsages::empty(),
+            mapped_at_creation: false,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -964,10 +999,7 @@ mod tests {
         let mut gpu = Gpu::with_noop_device(waker);
 
         assert!(!gpu.retire_lost_device(0));
-        let device = &gpu.device.as_ref().expect("kept").device;
-        device.destroy();
-        // `destroy` calls the lost callback in the next poll that finds the queue empty.
-        let _ = wait_for_device(device);
+        gpu.destroy_device();
         let Ok(Notice::DeviceLost(generation)) = notices.try_recv() else {
             panic!("the lost callback sent no notice");
         };

@@ -571,9 +571,27 @@ fn a_device_lost_soon_after_recovering_waits_longer_than_the_attempt_that_made_i
 
         let requests = app.dispatch(Event::DeviceLost(1));
 
-        assert!(shows_gpu_label(&requests));
         assert_eq!(retry(&requests).1, delay);
     }
+}
+
+#[test]
+fn the_gpu_label_shows_while_the_panes_cannot_draw_and_names_each_new_error_count() {
+    let (mut app, _deliveries) = app();
+    app.gpu = Gpu::with_noop_device(Waker::channel().0);
+    let label = |text: &str| Request::ShowGpuLabel(Some(text.to_owned()));
+
+    app.gpu.make_invalid_buffer();
+    let requests = app.dispatch(Event::FocusLost(Pane::Viewer));
+    assert_eq!(requests, [label("1 GPU error, logged on standard error")]);
+    assert_eq!(app.dispatch(Event::FocusLost(Pane::Viewer)), []);
+    app.gpu.make_invalid_buffer();
+    let requests = app.dispatch(Event::FocusLost(Pane::Viewer));
+    assert_eq!(requests, [label("2 GPU errors, logged on standard error")]);
+
+    let requests = app.dispatch(Event::DeviceLost(1));
+    let expected = format!("{GPU_UNAVAILABLE}. 2 GPU errors, logged on standard error");
+    assert!(requests.contains(&label(&expected)), "{requests:?}");
 }
 
 #[test]
