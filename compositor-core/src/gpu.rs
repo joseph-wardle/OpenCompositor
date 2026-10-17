@@ -1001,8 +1001,12 @@ impl NativeWindow {
     }
 }
 
+/// The noop adapter, a device and its queue. A device whose queue has dropped cannot make a
+/// command encoder.
 #[cfg(test)]
-fn noop_parts(limits: Option<wgpu::Limits>) -> (wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+pub(crate) fn noop_parts(
+    limits: Option<wgpu::Limits>,
+) -> (wgpu::Adapter, wgpu::Device, wgpu::Queue) {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::NOOP;
     descriptor.backend_options.noop = wgpu::NoopBackendOptions {

@@ -42,6 +42,13 @@ const SIGN: u32 = 1 << 31;
 #[cfg(not(target_arch = "spirv"))]
 pub const SPIRV: &[u8] = include_bytes!("../kernels.spv");
 
+/// Exposure's entry point in [`SPIRV`]: rust-gpu names each one by its path in this crate.
+pub const EXPOSURE_ENTRY: &str = "gpu::exposure";
+
+/// The entry points' workgroup is this many invocations on each side; their `threads` must say
+/// the same, since the host dispatches `ceil(width / WORKGROUP)` by `ceil(height / WORKGROUP)`.
+pub const WORKGROUP: u32 = 16;
+
 /// How far apart two results are, in representable values: the distance every per-operation
 /// bound is stated in.
 ///
@@ -103,7 +110,7 @@ pub mod gpu {
     /// Exposure over one R32Float plane. Dispatched once per distinct colour plane, with the
     /// grid rounded up to whole 16 by 16 workgroups; invocations past the edge return, since
     /// an image store outside the texture is discarded only under robust image access.
-    #[spirv(compute(threads(16, 16)))]
+    #[spirv(compute(threads(16, 16)))] // WORKGROUP
     pub fn exposure(
         #[spirv(global_invocation_id)] id: UVec3,
         #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &ExposureParams,
