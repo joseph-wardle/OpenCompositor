@@ -16,7 +16,9 @@ use std::time::Instant;
 
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
-use opencompositor_core::{App, Command, Event, FileIntent, FrameCheck, Pane, Request, Slot};
+use opencompositor_core::{
+    App, Command, Event, FileIntent, FrameCheck, Notice, Pane, Request, Slot,
+};
 
 use crate::qt::ffi;
 
@@ -81,7 +83,7 @@ fn main() {
     let waker_thread = unsafe { &*waker }.qt_thread();
     let mut app = App::new(move |notice| {
         // Fails only once the waker is deleted at exit, when nothing is left to tell.
-        let _ = waker_thread.queue(move |_| dispatch(Event::from(notice)));
+        let _ = waker_thread.queue(move |_| receive(notice));
     });
     if lifecycle_check.is_some() {
         app.check_frames();
@@ -297,6 +299,17 @@ pub fn perform(request: Request) {
             let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
             ffi::single_shot(milliseconds, retry_device_creation, attempt as usize);
         }
+    }
+}
+
+/// Dispatches a notice from another thread. Retiring a lost device blocks the GUI thread, so
+/// the lifecycle check reports how long.
+fn receive(notice: Notice) {
+    let lost = matches!(notice, Notice::DeviceLost(_));
+    let started = Instant::now();
+    dispatch(Event::from(notice));
+    if lost {
+        lifecycle::retirement_took(started.elapsed());
     }
 }
 

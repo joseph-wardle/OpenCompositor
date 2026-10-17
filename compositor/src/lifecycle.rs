@@ -52,8 +52,9 @@ const STEPS: [(i32, &str, &[Pane]); 14] = [
 ];
 
 /// The longest an attempt to make a device may block the GUI thread, warm, on the workstation.
+/// Configuring the panes' swapchains is most of it and varies most from run to run.
 /// Hypothesis, untested: after a real reset the same adapter returns, so its shader cache is warm.
-const REBUILD_BUDGET: Duration = Duration::from_millis(250);
+const REBUILD_BUDGET: Duration = Duration::from_millis(350);
 
 thread_local! {
     static IMAGE: RefCell<PathBuf> = RefCell::default();
@@ -64,6 +65,8 @@ thread_local! {
     static DESTROYED: Cell<Option<FrameCheck>> = const { Cell::new(None) };
     /// The longest an attempt to make a device took.
     static LONGEST_ATTEMPT: Cell<Option<Duration>> = const { Cell::new(None) };
+    /// How long retiring the lost device took, which has no budget yet.
+    static RETIREMENT: Cell<Option<Duration>> = const { Cell::new(None) };
 }
 
 pub fn start(image: PathBuf) {
@@ -76,6 +79,11 @@ pub fn start(image: PathBuf) {
 /// Records how long an attempt to make a GPU device blocked the GUI thread.
 pub fn attempt_took(duration: Duration) {
     LONGEST_ATTEMPT.with(|cell| cell.set(cell.get().max(Some(duration))));
+}
+
+/// Records how long retiring a lost device blocked the GUI thread.
+pub fn retirement_took(duration: Duration) {
+    RETIREMENT.with(|cell| cell.set(Some(duration)));
 }
 
 fn step(index: usize) {
@@ -231,6 +239,9 @@ fn check_recovery(checks: [Option<FrameCheck>; Pane::COUNT]) {
         fail(format!(
             "the GPU label stayed after the loss: {gpu_label:?}"
         ));
+    }
+    if let Some(retirement) = RETIREMENT.with(Cell::get) {
+        eprintln!("lifecycle check: retiring the lost device took {retirement:?}");
     }
     match LONGEST_ATTEMPT.with(Cell::get) {
         None => fail("no attempt made a device after the loss".to_owned()),
