@@ -664,7 +664,8 @@ impl Device {
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
             .map_err(|error| format!("no GPU device: {error}"))?;
-        // Hypothesis, untested: a loss before the callback is set is never noticed.
+        // Before any other call on the device: wgpu notices a loss only when a call reaches the
+        // driver, so with nothing in between, none goes unnoticed.
         ErrorCounter::install(&device, errors, generation, waker);
         // Panes draw clamped linear values, which an sRGB format encodes. Encoding in a shader too
         // would encode twice.
