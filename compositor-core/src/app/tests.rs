@@ -24,8 +24,10 @@ const SHIFT: Modifiers = Modifiers {
 /// An app whose worker hands its results to the test, with a 400 × 300 graph pane at scale 2.
 fn app() -> (App, Receiver<Evaluated>) {
     let (delivered, deliveries) = mpsc::channel();
-    let mut app = App::new(move |evaluated| {
-        let _ = delivered.send(evaluated);
+    let mut app = App::new(move |notice| {
+        if let Notice::Evaluated(evaluated) = notice {
+            let _ = delivered.send(evaluated);
+        }
     });
     let size = PaneSize {
         width: 400,
@@ -290,7 +292,7 @@ fn pane_keys_go_to_the_pane_under_the_pointer() {
 }
 
 #[test]
-fn a_pane_asks_for_a_surface_when_exposed_without_one() {
+fn a_pane_asks_for_a_surface_when_exposed_without_a_native_window() {
     let (mut app, _deliveries) = app();
 
     assert_eq!(
@@ -479,8 +481,24 @@ fn a_superseded_failure_leaves_the_viewer_and_the_node_as_they_are() {
     assert_ne!(color(&app), unfailed);
 }
 
+/// The attempt and delay of the one retry the requests ask for.
+fn retry(requests: &[Request]) -> (u64, Duration) {
+    let retries: Vec<_> = (requests.iter())
+        .filter_map(|request| match request {
+            &Request::RetryDeviceCreation { attempt, after } => Some((attempt, after)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retries.len(), 1, "{requests:?}");
+    retries[0]
+}
+
+fn shows_gpu_label(requests: &[Request]) -> bool {
+    (requests.iter()).any(|request| matches!(request, Request::ShowGpuLabel(Some(_))))
+}
+
 #[test]
-fn a_surface_that_fails_to_attach_shows_an_error_that_stays() {
+fn a_failed_first_device_shows_why_and_retries_less_often_each_time() {
     let (mut app, _deliveries) = app();
     app.gpu = Gpu::without_backends();
     let size = PaneSize {
@@ -496,14 +514,126 @@ fn a_surface_that_fails_to_attach_shows_an_error_that_stays() {
     });
 
     assert!(
-        matches!(requests.as_slice(), [Request::ShowError(error)] if error.contains("Viewer")),
+        (requests.iter()).any(
+            |request| matches!(request, Request::ShowError(error) if error.contains("Viewer"))
+        ),
         "{requests:?}"
     );
-    assert!(!app.has_surface(Pane::Viewer));
-    assert_eq!(
-        app.dispatch(Event::Exposed(Pane::Viewer)),
-        [Request::AttachSurface(Pane::Viewer)]
-    );
+    assert!(shows_gpu_label(&requests));
+    let (mut attempt, after) = retry(&requests);
+    assert_eq!(after, Duration::from_secs(1));
+    // Exposing the pane does not try again.
+    assert_eq!(app.dispatch(Event::Exposed(Pane::Viewer)), []);
+    let mut delays = Vec::new();
+    for _ in 0..6 {
+        let requests = app.dispatch(Event::RetryDeviceCreation(attempt));
+        // The status bar keeps the first failure, and the label stays.
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let (next, after) = retry(&requests);
+        delays.push(after.as_secs());
+        attempt = next;
+    }
+    assert_eq!(delays, [2, 4, 8, 16, 30, 30]);
+}
+
+#[test]
+fn a_pane_opened_while_the_gpu_is_unavailable_is_tried_without_waiting_out_the_backoff() {
+    let (mut app, _deliveries) = app();
+    app.gpu = Gpu::without_backends();
+    let size = PaneSize {
+        width: 400,
+        height: 300,
+        scale_factor: 1.0,
+    };
+    let created = |pane| Event::SurfaceCreated {
+        pane,
+        window: NativeWindow::none(),
+        size,
+    };
+    let (mut attempt, _) = retry(&app.dispatch(created(Pane::Viewer)));
+    app.dispatch(Event::SurfaceDestroyed(Pane::Viewer));
+    for _ in 0..3 {
+        (attempt, _) = retry(&app.dispatch(Event::RetryDeviceCreation(attempt)));
+    }
+
+    let (next, after) = retry(&app.dispatch(created(Pane::Graph)));
+
+    assert_eq!(after, FIRST_RETRY);
+    assert_eq!(app.dispatch(Event::RetryDeviceCreation(attempt)), []);
+    retry(&app.dispatch(Event::RetryDeviceCreation(next)));
+}
+
+#[test]
+fn a_stale_attempt_is_ignored_so_attempts_never_overlap() {
+    let (mut app, _deliveries) = app();
+    app.gpu = Gpu::with_noop_device(Waker::channel().0);
+    let (attempt, _) = retry(&app.dispatch(Event::DeviceLost(1)));
+    let (next, _) = retry(&app.dispatch(Event::RetryDeviceCreation(attempt)));
+
+    assert_eq!(app.dispatch(Event::RetryDeviceCreation(attempt)), []);
+    retry(&app.dispatch(Event::RetryDeviceCreation(next)));
+}
+
+#[test]
+fn a_device_lost_soon_after_recovering_waits_longer_than_the_attempt_that_made_it() {
+    let (mut app, _deliveries) = app();
+    let ago = |seconds| {
+        Instant::now()
+            .checked_sub(Duration::from_secs(seconds))
+            .unwrap()
+    };
+    let cases = [
+        (None, FIRST_RETRY),
+        (Some(ago(10)), Duration::from_secs(4)),
+        (Some(ago(31)), FIRST_RETRY),
+    ];
+    for (recovered_at, delay) in cases {
+        app.gpu = Gpu::with_noop_device(Waker::channel().0);
+        app.drawing = Drawing::Ready {
+            recovered: recovered_at.map(|at| Recovered {
+                at,
+                delay: Duration::from_secs(2),
+            }),
+        };
+
+        let requests = app.dispatch(Event::DeviceLost(1));
+
+        assert_eq!(retry(&requests).1, delay);
+    }
+}
+
+#[test]
+fn the_gpu_label_shows_while_the_panes_cannot_draw_and_names_each_new_error_count() {
+    let (mut app, _deliveries) = app();
+    app.gpu = Gpu::with_noop_device(Waker::channel().0);
+    let label = |text: &str| Request::ShowGpuLabel(Some(text.to_owned()));
+
+    app.gpu.make_invalid_buffer();
+    let requests = app.dispatch(Event::FocusLost(Pane::Viewer));
+    assert_eq!(requests, [label("1 GPU error, logged on standard error")]);
+    assert_eq!(app.dispatch(Event::FocusLost(Pane::Viewer)), []);
+    app.gpu.make_invalid_buffer();
+    let requests = app.dispatch(Event::FocusLost(Pane::Viewer));
+    assert_eq!(requests, [label("2 GPU errors, logged on standard error")]);
+
+    let requests = app.dispatch(Event::DeviceLost(1));
+    let expected = format!("{GPU_UNAVAILABLE}. 2 GPU errors, logged on standard error");
+    assert!(requests.contains(&label(&expected)), "{requests:?}");
+    assert_eq!(app.gpu.take_errors(), 2);
+}
+
+#[test]
+fn closing_during_recovery_notices_no_loss() {
+    let (mut app, _deliveries) = app();
+    let (waker, notices) = Waker::channel();
+    app.gpu = Gpu::with_noop_device(waker);
+    create(&mut app, "missing.png");
+    app.dispatch(slot_key(1, CTRL));
+    retry(&app.dispatch(Event::DeviceLost(1)));
+
+    drop(app);
+
+    assert!(notices.try_recv().is_err());
 }
 
 #[test]

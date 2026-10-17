@@ -80,7 +80,7 @@ void set_caption(QLabel *label, const QString &text) {
     label->setText(text);
     label->setToolTip(text);
 }
-QString caption(QLabel *label) { return label->text(); }
+QString label_text(QLabel *label) { return label->text(); }
 void tabify(QMainWindow *window, QDockWidget *first, QDockWidget *second) {
     window->tabifyDockWidget(first, second);
 }
@@ -90,6 +90,16 @@ void show_status(QMainWindow *window, const QString &text) {
 }
 void show_error(QMainWindow *window, const QString &text) {
     window->statusBar()->showMessage(text);
+}
+QLabel *new_permanent_status(QMainWindow *window) {
+    auto *label = new QLabel;
+    label->hide();
+    window->statusBar()->addPermanentWidget(label);
+    return label;
+}
+void set_permanent_status(QLabel *label, const QString &text) {
+    label->setText(text);
+    label->setVisible(!text.isEmpty());
 }
 QStringList choose_files(QMainWindow *window, const QString &title, bool several) {
     if (several) return QFileDialog::getOpenFileNames(window, title);

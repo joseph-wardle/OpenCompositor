@@ -1,12 +1,14 @@
 //! The GPU: one device for every pane, and a surface for each pane while it has a native window.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use open_ng::{Graph, Renderer, View, ViewBuffers, Viewport};
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
 
-use crate::app::Pane;
+use crate::app::{Notice, Pane, Waker};
 use crate::image::Window;
 use crate::viewer::Placement;
 use crate::worker::Staged;
@@ -19,8 +21,8 @@ const BACKGROUND: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-/// A pane's native window, from which its surface is made.
-#[derive(Debug)]
+/// A pane's native window, from which its surface on each device is made.
+#[derive(Clone, Copy, Debug)]
 pub struct NativeWindow {
     display: RawDisplayHandle,
     window: RawWindowHandle,
@@ -29,8 +31,9 @@ pub struct NativeWindow {
 impl NativeWindow {
     /// # Safety
     ///
-    /// The handles must stay valid until the pane's surface is dropped: when the shell dispatches
-    /// [`Event::SurfaceDestroyed`](crate::Event::SurfaceDestroyed) for the pane, or the app drops.
+    /// The handles must stay valid until the shell dispatches
+    /// [`Event::SurfaceDestroyed`](crate::Event::SurfaceDestroyed) for the pane, or the app drops:
+    /// until then the pane's surface may be made from them again, for a new device.
     pub unsafe fn new(display: RawDisplayHandle, window: RawWindowHandle) -> NativeWindow {
         NativeWindow { display, window }
     }
@@ -58,19 +61,44 @@ impl PaneSize {
 
 #[derive(Debug)]
 pub(crate) struct Gpu {
-    // Fields drop in order: the surfaces go before the device that draws to them.
-    surfaces: [Option<wgpu::Surface<'static>>; Pane::COUNT],
+    // Fields drop in order: the device and the surfaces it holds go first.
     device: Option<Device>,
+    /// Kept while the pane has a native window, so that every device made can draw to it.
+    windows: [Option<PaneWindow>; Pane::COUNT],
     /// Made with the first surface, so that headless use needs no GPU backend.
     instance: Option<wgpu::Instance>,
     /// Only in the lifecycle check.
     checks: Option<FrameChecks>,
+    /// Uncaptured errors on every device of the session.
+    errors: Arc<AtomicU64>,
+    /// Counts the attempts to make a device, telling each device's notices and staged images
+    /// apart.
+    device_generation: u64,
+    /// Tells the GUI thread that a device was lost.
+    waker: Waker,
 }
 
-/// What the frames a pane drew prove, for the shell's lifecycle check: that the GPU finished
-/// them, and what the last one put at the pane's centre.
+#[derive(Debug)]
+struct PaneWindow {
+    window: NativeWindow,
+    size: PaneSize,
+}
+
+/// A device made for the panes, for the worker to stage images for.
+#[derive(Debug)]
+pub(crate) struct NewDevice {
+    pub(crate) device: wgpu::Device,
+    pub(crate) generation: u64,
+    /// Why panes with a native window cannot draw on it.
+    pub(crate) pane_errors: Vec<String>,
+}
+
+/// What the frames a pane drew on the current device prove, for the shell's lifecycle check:
+/// that the GPU finished them, and what the last one put at the pane's centre.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameCheck {
+    /// The device's generation, which advances with each attempt to make a device.
+    pub generation: u64,
     /// How many of the pane's frames the GPU has finished.
     pub finished: u64,
     /// The centre pixel of the pane's last finished frame, as sRGB-encoded RGBA, if its surface
@@ -80,6 +108,8 @@ pub struct FrameCheck {
 
 #[derive(Debug, Default)]
 struct FrameChecks {
+    /// The device the frames were drawn on. Every new device starts the counts again.
+    generation: u64,
     /// Counted from the queue, which can report finished work on the evaluator's thread.
     finished: [Arc<AtomicU64>; Pane::COUNT],
     centres: [Option<[u8; 4]>; Pane::COUNT],
@@ -95,31 +125,49 @@ pub(crate) struct ViewerFrame {
     pub(crate) scale_factor: f32,
 }
 
-/// Everything made once there is a surface to choose an adapter for.
+/// Everything made once there is a surface to choose an adapter for, which goes with the device.
 #[derive(Debug)]
 struct Device {
+    // Fields drop in order: the surfaces go before the device that draws to them.
+    /// A pane's surface, while it has a native window and its surface is configured. Surfaces
+    /// are never carried to another device: wgpu 30 reconfiguring a surface releases the old
+    /// swapchain's fences and semaphores with the new device, which Vulkan does not allow.
+    surfaces: [Option<PaneSurface>; Pane::COUNT],
     graph_buffers: ViewBuffers,
     renderer: Renderer,
     viewer: ViewerRenderer,
-    configs: [Option<wgpu::SurfaceConfiguration>; Pane::COUNT],
     format: wgpu::TextureFormat,
     queue: wgpu::Queue,
     device: wgpu::Device,
     adapter: wgpu::Adapter,
 }
 
+#[derive(Debug)]
+struct PaneSurface {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+}
+
 impl Gpu {
-    pub(crate) fn new() -> Gpu {
+    pub(crate) fn new(waker: Waker) -> Gpu {
         Gpu {
-            surfaces: Default::default(),
             device: None,
+            windows: Default::default(),
             instance: None,
             checks: None,
+            errors: Arc::default(),
+            device_generation: 0,
+            waker,
         }
     }
 
+    /// How many GPU errors no error scope captured this session: each is a bug.
+    pub(crate) fn errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
+    }
+
     /// Records what every frame from now on proves, waiting for the GPU after each. Surfaces
-    /// attached from now on are made readable where they allow it.
+    /// made from now on are made readable where they allow it.
     pub(crate) fn check_frames(&mut self) {
         self.checks.get_or_insert_default();
     }
@@ -127,28 +175,50 @@ impl Gpu {
     pub(crate) fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
         let checks = self.checks.as_ref()?;
         Some(FrameCheck {
+            generation: checks.generation,
             finished: checks.finished[pane.index()].load(Ordering::Relaxed),
             centre: checks.centres[pane.index()],
         })
     }
 
-    pub(crate) fn has_surface(&self, pane: Pane) -> bool {
-        self.surfaces[pane.index()].is_some()
+    pub(crate) fn has_device(&self) -> bool {
+        self.device.is_some()
     }
 
-    /// Makes the pane's surface, and the device if there is none yet, which it returns so that
-    /// the worker can stage images for it. On failure the pane draws nothing and no new device is
-    /// kept; the error says why.
+    /// Whether the pane has a configured surface to draw to.
+    pub(crate) fn has_surface(&self, pane: Pane) -> bool {
+        (self.device.as_ref()).is_some_and(|device| device.surfaces[pane.index()].is_some())
+    }
+
+    pub(crate) fn has_window(&self, pane: Pane) -> bool {
+        self.windows[pane.index()].is_some()
+    }
+
+    /// Keeps the pane's native window, for every device made from now on, and makes its surface
+    /// on the device if there is one. On failure the pane draws nothing; the error says why.
     pub(crate) fn attach(
         &mut self,
         pane: Pane,
         window: NativeWindow,
         size: PaneSize,
-    ) -> Result<Option<wgpu::Device>, String> {
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: Some(window.display),
-            raw_window_handle: window.window,
+    ) -> Result<(), String> {
+        self.windows[pane.index()] = Some(PaneWindow { window, size });
+        let Some(device) = &mut self.device else {
+            return Ok(());
         };
+        let instance = self.instance.as_ref().expect("made before the device");
+        let surface = make_surface(instance, pane, window)?;
+        device.surfaces[pane.index()] =
+            Some(device.configure(pane, surface, size, self.checks.is_some())?);
+        Ok(())
+    }
+
+    /// Makes a device with a surface on it for each pane with a native window: the one way a
+    /// device is made, first and after a loss. A pane whose surface fails does not stop the
+    /// others, and gives up its window, so that it attaches again when next exposed; with no
+    /// surface the attempt fails and no device is kept. Each attempt is a new generation.
+    pub(crate) fn make_device(&mut self) -> Result<NewDevice, String> {
+        self.device_generation += 1;
         let instance = self.instance.get_or_insert_with(|| {
             let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
             // The shell is tested on Vulkan only; WGPU_BACKEND chooses another.
@@ -157,33 +227,94 @@ impl Gpu {
             }
             wgpu::Instance::new(descriptor)
         });
-        // SAFETY: `NativeWindow::new`'s contract keeps the handles valid until `detach`.
-        let surface = unsafe { instance.create_surface_unsafe(target) }
-            .map_err(|error| format!("no surface for the {pane:?} pane: {error}"))?;
-        let new_device = match &self.device {
-            Some(_) => None,
-            None => Some(Device::new(instance, &surface)?),
+        let mut pane_errors = Vec::new();
+        let surfaces = Pane::ALL.map(|pane| {
+            let window = self.windows[pane.index()].as_ref()?;
+            make_surface(instance, pane, window.window)
+                .map_err(|error| pane_errors.push(error))
+                .ok()
+        });
+        let Some(first) = surfaces.iter().flatten().next() else {
+            return Err(if pane_errors.is_empty() {
+                "no pane has a native window".to_owned()
+            } else {
+                pane_errors.join("; ")
+            });
         };
-        let device = new_device
-            .as_ref()
-            .or(self.device.as_ref())
-            .expect("one exists");
-        let config = configure(device, pane, &surface, size, self.checks.is_some())?;
-        let created = new_device.map(|new| self.device.insert(new).device.clone());
-        let device = self.device.as_mut().expect("kept above if new");
-        device.configs[pane.index()] = Some(config);
-        self.surfaces[pane.index()] = Some(surface);
-        Ok(created)
+        let mut device = Device::new(
+            instance,
+            first,
+            &self.errors,
+            self.device_generation,
+            &self.waker,
+        )?;
+        for (pane, surface) in Pane::ALL.into_iter().zip(surfaces) {
+            let (Some(surface), Some(window)) = (surface, &self.windows[pane.index()]) else {
+                continue;
+            };
+            match device.configure(pane, surface, window.size, self.checks.is_some()) {
+                Ok(configured) => device.surfaces[pane.index()] = Some(configured),
+                Err(error) => pane_errors.push(error),
+            }
+        }
+        if device.surfaces.iter().all(Option::is_none) {
+            return Err(pane_errors.join("; "));
+        }
+        for (window, surface) in self.windows.iter_mut().zip(&device.surfaces) {
+            if surface.is_none() {
+                *window = None;
+            }
+        }
+        let new = NewDevice {
+            device: device.device.clone(),
+            generation: self.device_generation,
+            pane_errors,
+        };
+        self.device = Some(device);
+        if let Some(checks) = &mut self.checks {
+            // New counters, so that the old device's late callbacks count nothing.
+            *checks = FrameChecks {
+                generation: new.generation,
+                ..Default::default()
+            };
+        }
+        Ok(new)
+    }
+
+    /// Drops the device of the generation, with its surfaces and everything made on it, unless
+    /// a notice of its loss came after it was replaced. Returns whether it was dropped.
+    pub(crate) fn retire_lost_device(&mut self, generation: u64) -> bool {
+        if generation != self.device_generation || self.device.is_none() {
+            return false;
+        }
+        self.device = None;
+        true
+    }
+
+    /// Destroys the device for the shell's lifecycle check, which then notices its loss as it
+    /// would a driver's.
+    pub(crate) fn destroy_device(&mut self) {
+        let Some(device) = &self.device else {
+            return;
+        };
+        device.device.destroy();
+        // `destroy` loses the device only at a later poll, and work on it until then would be
+        // counted as errors.
+        let _ = wait_for_device(&device.device, None);
     }
 
     /// Copies a staged image into its texture and shows it in the viewer from the next frame.
     ///
     /// The copy is submitted at once rather than with the viewer's next frame, which may never
     /// come while the viewer is closed, so that the staging buffer goes back to the worker.
+    /// An image staged for an earlier device is dropped.
     pub(crate) fn show_image(&mut self, staged: Staged) {
         let Some(device) = &mut self.device else {
             return;
         };
+        if staged.device_generation() != self.device_generation {
+            return;
+        }
         let mut encoder = device.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
@@ -216,24 +347,27 @@ impl Gpu {
         }
     }
 
-    /// Drops the pane's surface, if it has one, before its native window goes.
+    /// Drops the pane's surface, if it has one, and its native window, before the window goes.
     pub(crate) fn detach(&mut self, pane: Pane) {
-        self.surfaces[pane.index()] = None;
+        self.windows[pane.index()] = None;
         if let Some(device) = &mut self.device {
-            device.configs[pane.index()] = None;
+            device.surfaces[pane.index()] = None;
         }
     }
 
     pub(crate) fn resize(&mut self, pane: Pane, size: PaneSize) {
-        let (Some(surface), Some(device)) = (&self.surfaces[pane.index()], &mut self.device) else {
+        if let Some(window) = &mut self.windows[pane.index()] {
+            window.size = size;
+        }
+        let Some(device) = &mut self.device else {
             return;
         };
-        let Some(config) = &mut device.configs[pane.index()] else {
+        let Some(target) = &mut device.surfaces[pane.index()] else {
             return;
         };
-        config.width = size.width.max(1);
-        config.height = size.height.max(1);
-        surface.configure(&device.device, config);
+        target.config.width = size.width.max(1);
+        target.config.height = size.height.max(1);
+        target.surface.configure(&device.device, &target.config);
     }
 
     /// Draws one frame of the pane: the graph, or the viewer's frame if it shows an image.
@@ -248,12 +382,12 @@ impl Gpu {
         view: &View,
         viewer_frame: Option<ViewerFrame>,
     ) -> bool {
-        let (Some(surface), Some(device)) = (&self.surfaces[pane.index()], &mut self.device) else {
+        let Some(device) = &mut self.device else {
             return false;
         };
-        let config = device.configs[pane.index()]
-            .as_ref()
-            .expect("a surface has a configuration");
+        let Some(PaneSurface { surface, config }) = &device.surfaces[pane.index()] else {
+            return false;
+        };
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -369,11 +503,7 @@ impl FrameChecks {
         if let Some(buffer) = &readback {
             buffer.map_async(wgpu::MapMode::Read, .., |_| {});
         }
-        let wait = wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        };
-        if device.device.poll(wait).is_err() {
+        if wait_for_device(&device.device, None).is_err() {
             return;
         }
         let Some(view) = readback
@@ -390,49 +520,138 @@ impl FrameChecks {
     }
 }
 
-/// Configures a pane's surface for the device.
-fn configure(
-    device: &Device,
+/// Waits until the device has finished its submitted work, or for at most `timeout`, and runs the
+/// callbacks it made ready. Returns whether the work finished.
+pub(crate) fn wait_for_device(
+    device: &wgpu::Device,
+    timeout: Option<Duration>,
+) -> Result<bool, String> {
+    let wait = wgpu::PollType::Wait {
+        submission_index: None,
+        timeout,
+    };
+    // wgpu 30 panics rather than returning an error when the driver reports the device lost
+    // during a poll, because `WaitIdleError::Device` has no `PollError`. The panic is raised after
+    // wgpu has released its locks, so catching it leaves wgpu usable. Hypothesis, untested since
+    // it needs a real reset: Vulkan's waits return `DEVICE_LOST` promptly after one, rather than
+    // holding the frame checks here. The worker bounds its waits, so it does not rely on this.
+    match std::panic::catch_unwind(AssertUnwindSafe(|| device.poll(wait))) {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(wgpu::PollError::Timeout)) => Ok(false),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("the GPU device was lost".to_owned()),
+    }
+}
+
+/// Makes a surface for the pane's native window.
+fn make_surface(
+    instance: &wgpu::Instance,
     pane: Pane,
-    surface: &wgpu::Surface,
-    size: PaneSize,
-    readable: bool,
-) -> Result<wgpu::SurfaceConfiguration, String> {
-    if !device.adapter.is_surface_supported(surface) {
+    window: NativeWindow,
+) -> Result<wgpu::Surface<'static>, String> {
+    let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+        raw_display_handle: Some(window.display),
+        raw_window_handle: window.window,
+    };
+    // SAFETY: `NativeWindow::new`'s contract keeps the handles valid until `detach`, which drops
+    // the window and any surface made from it.
+    unsafe { instance.create_surface_unsafe(target) }
+        .map_err(|error| format!("no surface for the {pane:?} pane: {error}"))
+}
+
+/// The adapter that WGPU_ADAPTER_NAME names, or else wgpu's choice for the surface, which
+/// WGPU_POWER_PREF steers. A CPU renderer is refused unless named: lavapipe can be installed
+/// beside a GPU's driver, and recovering onto it would leave the session slow for good.
+fn choose_adapter(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Result<wgpu::Adapter, String> {
+    // Not `wgpu::util::initialize_adapter_from_env`, which panics when no adapter has the name,
+    // as while a reset GPU has not come back.
+    if let Ok(name) = std::env::var("WGPU_ADAPTER_NAME") {
+        let name = name.to_lowercase();
+        return pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .into_iter()
+            .find(|adapter| {
+                adapter.is_surface_supported(surface)
+                    && adapter.get_info().name.to_lowercase().contains(&name)
+            })
+            .ok_or_else(|| format!("no GPU adapter named {name:?} can draw to the panes"));
+    }
+    let options = wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::from_env().unwrap_or_default(),
+        compatible_surface: Some(surface),
+        ..Default::default()
+    };
+    let adapter = pollster::block_on(instance.request_adapter(&options))
+        .map_err(|error| format!("no GPU adapter: {error}"))?;
+    let info = adapter.get_info();
+    if info.device_type == wgpu::DeviceType::Cpu {
         return Err(format!(
-            "the adapter cannot draw to the {pane:?} pane's surface"
+            "the only GPU adapter, {}, renders on the CPU; WGPU_ADAPTER_NAME can select it",
+            info.name
         ));
     }
-    let mut config = surface
-        .get_default_config(&device.adapter, size.width.max(1), size.height.max(1))
-        .ok_or_else(|| format!("the {pane:?} pane's surface has no configuration"))?;
-    config.format = device.format;
-    // Mailbox replaces a waiting frame instead of blocking for the display, so a draw waits
-    // only when the pane redraws faster than its screen refreshes, which the shell prevents.
-    // Fifo, which every surface supports, is the fallback. The default is the driver's first
-    // mode, which may be Immediate, which tears.
-    let capabilities = surface.get_capabilities(&device.adapter);
-    if readable && capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
-        config.usage |= wgpu::TextureUsages::COPY_SRC;
+    Ok(adapter)
+}
+
+/// Errors logged in full; later ones are only counted, so a bug repeated every frame does not
+/// flood the log.
+const LOGGED_ERRORS: u64 = 20;
+
+/// Counts the errors on one device that no error scope captured, until the device is lost: work
+/// on a lost device fails without being a bug. Its loss is noticed with its generation.
+#[derive(Debug)]
+struct ErrorCounter {
+    counted: Arc<AtomicU64>,
+    lost: AtomicBool,
+}
+
+impl ErrorCounter {
+    /// Replaces wgpu's default handler, which panics, so that a bug in one frame does not end the
+    /// session. The handler and the lost callback run inside wgpu's calls, on any thread, so they
+    /// only count, log and wake the GUI thread.
+    ///
+    /// A real loss calls the lost callback at once, in the call that failed; `destroy` calls it
+    /// only at a later poll. Nothing polls while the panes are idle or hidden: a loss then is
+    /// noticed at the next use of the GPU, and until then nothing visible depends on it.
+    fn install(device: &wgpu::Device, counted: &Arc<AtomicU64>, generation: u64, waker: &Waker) {
+        let counter = Arc::new(ErrorCounter {
+            counted: Arc::clone(counted),
+            lost: AtomicBool::new(false),
+        });
+        let handler = Arc::clone(&counter);
+        device.on_uncaptured_error(Arc::new(move |error| handler.count(&error)));
+        let waker = waker.clone();
+        device.set_device_lost_callback(move |_, _| {
+            counter.lost.store(true, Ordering::Relaxed);
+            waker.wake(Notice::DeviceLost(generation));
+        });
     }
-    let modes = capabilities.present_modes;
-    config.present_mode = if modes.contains(&wgpu::PresentMode::Mailbox) {
-        wgpu::PresentMode::Mailbox
-    } else {
-        wgpu::PresentMode::Fifo
-    };
-    surface.configure(&device.device, &config);
-    Ok(config)
+
+    fn count(&self, error: &wgpu::Error) {
+        if self.lost.load(Ordering::Relaxed) {
+            return;
+        }
+        let number = self.counted.fetch_add(1, Ordering::Relaxed) + 1;
+        if number <= LOGGED_ERRORS {
+            eprintln!("GPU error {number}: {error}");
+        }
+        if number == LOGGED_ERRORS {
+            eprintln!("later GPU errors are counted, not logged");
+        }
+    }
 }
 
 impl Device {
-    fn new(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>) -> Result<Device, String> {
-        // WGPU_ADAPTER_NAME and WGPU_POWER_PREF choose the adapter.
-        let adapter = pollster::block_on(wgpu::util::initialize_adapter_from_env_or_default(
-            instance,
-            Some(surface),
-        ))
-        .map_err(|error| format!("no GPU adapter: {error}"))?;
+    fn new(
+        instance: &wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        errors: &Arc<AtomicU64>,
+        generation: u64,
+        waker: &Waker,
+    ) -> Result<Device, String> {
+        let adapter = choose_adapter(instance, surface)?;
         // Images take the largest textures and staging buffers the adapter allows.
         let supported = adapter.limits();
         let descriptor = wgpu::DeviceDescriptor {
@@ -445,6 +664,9 @@ impl Device {
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
             .map_err(|error| format!("no GPU device: {error}"))?;
+        // Before any other call on the device: wgpu notices a loss only when a call reaches the
+        // driver, so with nothing in between, none goes unnoticed.
+        ErrorCounter::install(&device, errors, generation, waker);
         // Panes draw clamped linear values, which an sRGB format encodes. Encoding in a shader too
         // would encode twice.
         let formats = surface.get_capabilities(&adapter).formats;
@@ -454,6 +676,54 @@ impl Device {
             .find(wgpu::TextureFormat::is_srgb)
             .ok_or("the surface offers no sRGB format")?;
         Ok(Device::for_format(adapter, device, queue, format))
+    }
+
+    /// Configures the pane's surface at its size. Its errors are the pane's, not bugs, so they
+    /// are captured rather than counted.
+    fn configure(
+        &self,
+        pane: Pane,
+        surface: wgpu::Surface<'static>,
+        size: PaneSize,
+        readable: bool,
+    ) -> Result<PaneSurface, String> {
+        if !self.adapter.is_surface_supported(&surface) {
+            return Err(format!(
+                "the adapter cannot draw to the {pane:?} pane's surface"
+            ));
+        }
+        let capabilities = surface.get_capabilities(&self.adapter);
+        if !capabilities.formats.contains(&self.format) {
+            return Err(format!(
+                "the {pane:?} pane's surface cannot show {:?}",
+                self.format
+            ));
+        }
+        let mut config = surface
+            .get_default_config(&self.adapter, size.width.max(1), size.height.max(1))
+            .ok_or_else(|| format!("the {pane:?} pane's surface has no configuration"))?;
+        config.format = self.format;
+        if readable && capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+        // Mailbox replaces a waiting frame instead of blocking for the display, so a draw waits
+        // only when the pane redraws faster than its screen refreshes, which the shell prevents.
+        // Fifo, which every surface supports, is the fallback. The default is the driver's first
+        // mode, which may be Immediate, which tears.
+        let modes = capabilities.present_modes;
+        config.present_mode = if modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        surface.configure(&self.device, &config);
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            return Err(format!(
+                "the {pane:?} pane's surface cannot be configured: {error}"
+            ));
+        }
+        Ok(PaneSurface { surface, config })
     }
 
     /// The renderers for panes of the format.
@@ -470,7 +740,7 @@ impl Device {
             graph_buffers,
             renderer,
             viewer,
-            configs: Default::default(),
+            surfaces: Default::default(),
             format,
             queue,
             device,
@@ -632,11 +902,36 @@ impl ViewerRenderer {
     }
 }
 
+/// Production counts uncaptured errors instead of panicking, so a test that left one would
+/// otherwise pass.
+#[cfg(test)]
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            assert_eq!(self.errors(), 0, "the GPU reported uncaptured errors");
+        }
+    }
+}
+
 /// A device that keeps buffers in memory and draws nothing, with the limits given or the most
 /// permissive, for tests that need wgpu objects but no GPU.
 #[cfg(test)]
 pub(crate) fn noop_device(limits: Option<wgpu::Limits>) -> wgpu::Device {
     noop_parts(limits).1
+}
+
+/// Two noop devices from one adapter. Objects of devices from separate instances can compare
+/// equal, since each instance numbers its objects from the same start.
+#[cfg(test)]
+pub(crate) fn noop_device_pair() -> [wgpu::Device; 2] {
+    let (adapter, first, _) = noop_parts(None);
+    let descriptor = wgpu::DeviceDescriptor {
+        required_limits: adapter.limits(),
+        ..Default::default()
+    };
+    let (second, _) = pollster::block_on(adapter.request_device(&descriptor))
+        .expect("the noop adapter has a second device");
+    [first, second]
 }
 
 #[cfg(test)]
@@ -645,10 +940,52 @@ impl Gpu {
     pub(crate) fn without_backends() -> Gpu {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::empty();
-        Gpu {
-            instance: Some(wgpu::Instance::new(descriptor)),
-            ..Gpu::new()
-        }
+        let mut gpu = Gpu::new(Waker::channel().0);
+        gpu.instance = Some(wgpu::Instance::new(descriptor));
+        gpu
+    }
+
+    /// A GPU with a noop device of generation 1 that draws no pane, and the viewer's native
+    /// window, kept for the next device. Every later attempt fails: the noop backend makes
+    /// surfaces it cannot draw to, so no adapter suits them.
+    pub(crate) fn with_noop_device(waker: Waker) -> Gpu {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop.enable = true;
+        let mut gpu = Gpu::new(waker);
+        gpu.instance = Some(wgpu::Instance::new(descriptor));
+        gpu.device_generation = 1;
+        let window = PaneWindow {
+            window: NativeWindow::none(),
+            size: PaneSize {
+                width: 400,
+                height: 300,
+                scale_factor: 1.0,
+            },
+        };
+        gpu.windows[Pane::Viewer.index()] = Some(window);
+        let (adapter, device, queue) = noop_parts(None);
+        ErrorCounter::install(&device, &gpu.errors, 1, &gpu.waker);
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        gpu.device = Some(Device::for_format(adapter, device, queue, format));
+        gpu
+    }
+
+    /// The uncaptured errors counted so far, which a test that makes them on purpose takes so
+    /// that dropping the GPU does not fail it.
+    pub(crate) fn take_errors(&self) -> u64 {
+        self.errors.swap(0, Ordering::Relaxed)
+    }
+
+    /// Makes an invalid buffer on the device, an uncaptured error.
+    pub(crate) fn make_invalid_buffer(&self) {
+        let device = &self.device.as_ref().expect("a device").device;
+        let _buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("no usage"),
+            size: 4,
+            usage: wgpu::BufferUsages::empty(),
+            mapped_at_creation: false,
+        });
     }
 }
 
@@ -688,6 +1025,42 @@ fn noop_parts(limits: Option<wgpu::Limits>) -> (wgpu::Adapter, wgpu::Device, wgp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_loss_notice_keeps_the_device_and_its_own_notice_retires_it() {
+        let (waker, notices) = Waker::channel();
+        let mut gpu = Gpu::with_noop_device(waker);
+
+        assert!(!gpu.retire_lost_device(0));
+        gpu.destroy_device();
+        let Ok(Notice::DeviceLost(generation)) = notices.try_recv() else {
+            panic!("the lost callback sent no notice");
+        };
+
+        assert!(gpu.retire_lost_device(generation));
+        assert!(gpu.device.is_none());
+        assert!(!gpu.retire_lost_device(generation));
+        assert_eq!(gpu.errors(), 0);
+    }
+
+    #[test]
+    fn a_failed_attempt_keeps_no_device_but_the_window_and_the_next_is_a_new_generation() {
+        let mut gpu = Gpu::with_noop_device(Waker::channel().0);
+        assert!(gpu.retire_lost_device(1));
+
+        for generation in [2, 3] {
+            let error = gpu
+                .make_device()
+                .expect_err("no adapter can draw to the surface");
+            assert!(error.contains("adapter"), "{error}");
+            assert_eq!(gpu.device_generation, generation);
+        }
+        assert!(!gpu.has_device());
+        assert!(gpu.has_window(Pane::Viewer));
+        gpu.detach(Pane::Viewer);
+        assert!(!gpu.has_window(Pane::Viewer));
+        assert!(gpu.make_device().is_err());
+    }
 
     #[test]
     fn the_viewers_shader_and_pipelines_validate() {

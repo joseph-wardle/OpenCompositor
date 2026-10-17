@@ -12,10 +12,13 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Instant;
 
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
-use opencompositor_core::{App, Command, Event, FileIntent, FrameCheck, Pane, Request, Slot};
+use opencompositor_core::{
+    App, Command, Event, FileIntent, FrameCheck, Notice, Pane, Request, Slot,
+};
 
 use crate::qt::ffi;
 
@@ -49,6 +52,8 @@ pub struct Widgets {
     pub panes: [*mut qt::Pane; Pane::COUNT],
     /// Under the viewer.
     pub caption: *mut ffi::QLabel,
+    /// At the status bar's right, while the GPU is unavailable or has reported errors.
+    pub gpu_label: *mut ffi::QLabel,
     pub undo: *mut ffi::QAction,
     pub redo: *mut ffi::QAction,
 }
@@ -76,10 +81,9 @@ fn main() {
     let waker = ffi::new_waker();
     // SAFETY: the waker is live. Its thread handle outlives it: queueing fails once it is deleted.
     let waker_thread = unsafe { &*waker }.qt_thread();
-    let mut app = App::new(move |evaluated| {
-        waker_thread
-            .queue(move |_| dispatch(Event::Evaluated(evaluated)))
-            .expect("the waker outlives the app, whose worker delivers nothing once dropped");
+    let mut app = App::new(move |notice| {
+        // Fails only once the waker is deleted at exit, when nothing is left to tell.
+        let _ = waker_thread.queue(move |_| receive(notice));
     });
     if lifecycle_check.is_some() {
         app.check_frames();
@@ -173,12 +177,15 @@ fn main() {
         ffi::container(panes[Pane::Graph.index()], graph_dock);
         ffi::container_with_caption(panes[Pane::Viewer.index()], viewer_dock)
     };
+    // SAFETY: the window is live; it owns the label.
+    let gpu_label = unsafe { ffi::new_permanent_status(window_ptr) };
     WIDGETS.with(|cell| {
         cell.set(Widgets {
             window: window_ptr,
             docks,
             panes,
             caption,
+            gpu_label,
             undo,
             redo,
         })
@@ -283,7 +290,35 @@ pub fn perform(request: Request) {
         Request::ShowViewerCaption(text) => unsafe {
             ffi::set_caption(widgets.caption, &QString::from(&text))
         },
+        // SAFETY: the window owns the label, and lives as long as it.
+        Request::ShowGpuLabel(text) => unsafe {
+            let text = QString::from(text.as_deref().unwrap_or_default());
+            ffi::set_permanent_status(widgets.gpu_label, &text)
+        },
+        Request::RetryDeviceCreation { attempt, after } => {
+            let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
+            ffi::single_shot(milliseconds, retry_device_creation, attempt as usize);
+        }
     }
+}
+
+/// Dispatches a notice from another thread. Retiring a lost device blocks the GUI thread, so
+/// the lifecycle check reports how long.
+fn receive(notice: Notice) {
+    let lost = matches!(notice, Notice::DeviceLost(_));
+    let started = Instant::now();
+    dispatch(Event::from(notice));
+    if lost {
+        lifecycle::retirement_took(started.elapsed());
+    }
+}
+
+/// Every attempt is dispatched; the app ignores all but the last. One whose timer fires after
+/// the app has dropped dispatches to nothing.
+fn retry_device_creation(attempt: usize) {
+    let started = Instant::now();
+    dispatch(Event::RetryDeviceCreation(attempt as u64));
+    lifecycle::attempt_took(started.elapsed());
 }
 
 fn path(name: &QString) -> PathBuf {
@@ -303,6 +338,20 @@ pub fn has_surface(pane: Pane) -> bool {
 /// What the pane's frames have proved, in the lifecycle check.
 pub fn frame_check(pane: Pane) -> Option<FrameCheck> {
     APP.with(|cell| cell.borrow().as_ref()?.frame_check(pane))
+}
+
+/// Destroys the GPU device, in the lifecycle check.
+pub fn destroy_device() {
+    APP.with(|cell| {
+        if let Some(app) = cell.borrow_mut().as_mut() {
+            app.destroy_device();
+        }
+    });
+}
+
+/// How many GPU errors this session went uncaptured.
+pub fn gpu_errors() -> u64 {
+    APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))
 }
 
 pub fn widgets() -> Widgets {

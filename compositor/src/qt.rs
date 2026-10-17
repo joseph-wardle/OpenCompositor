@@ -184,7 +184,7 @@ pub mod ffi {
         unsafe fn container_with_caption(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QLabel;
         /// Sets the caption's text, and its tooltip for when the text is clipped.
         unsafe fn set_caption(label: *mut QLabel, text: &QString);
-        unsafe fn caption(label: *mut QLabel) -> QString;
+        unsafe fn label_text(label: *mut QLabel) -> QString;
         unsafe fn tabify(
             window: *mut QMainWindow,
             first: *mut QDockWidget,
@@ -194,6 +194,10 @@ pub mod ffi {
         unsafe fn show_status(window: *mut QMainWindow, text: &QString);
         /// Shows the text in the status bar until another status replaces it.
         unsafe fn show_error(window: *mut QMainWindow, text: &QString);
+        /// A hidden label at the status bar's right, which owns it, beside any status shown.
+        unsafe fn new_permanent_status(window: *mut QMainWindow) -> *mut QLabel;
+        /// Shows the text in the label, or hides it when the text is empty.
+        unsafe fn set_permanent_status(label: *mut QLabel, text: &QString);
         /// Runs a modal file dialog. Its nested event loop delivers paints, resizes, timers and
         /// the evaluator's results, but no input to the panes.
         unsafe fn choose_files(

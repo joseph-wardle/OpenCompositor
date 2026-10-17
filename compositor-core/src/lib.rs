@@ -14,7 +14,7 @@ mod session;
 mod viewer;
 mod worker;
 
-pub use app::{App, Command, Event, FileIntent, Input, Key, Pane, Request};
+pub use app::{App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
 pub use document::{
     Assignment, Changes, ConnectionError, Document, ExposureVersion, Node, NodeId, NodeInput,
     NodeKind, Slot, unconnected_inputs,
