@@ -37,6 +37,11 @@ pub fn flush(v: f32) -> f32 {
 
 const SIGN: u32 = 1 << 31;
 
+/// The GPU entry points, as the builder in `shaders/` compiled them for Vulkan 1.2. Rebuild it
+/// whenever the `gpu` module or a function it calls changes; CI rebuilds and compares.
+#[cfg(not(target_arch = "spirv"))]
+pub const SPIRV: &[u8] = include_bytes!("../kernels.spv");
+
 /// How far apart two results are, in representable values: the distance every per-operation
 /// bound is stated in.
 ///
