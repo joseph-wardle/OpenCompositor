@@ -401,8 +401,16 @@ impl App {
                     return vec![Request::ShowError(error)];
                 }
                 let mut requests = Vec::new();
-                if matches!(self.drawing, Drawing::Ready { .. }) && !self.gpu.has_device() {
-                    requests = self.make_device();
+                match self.drawing {
+                    Drawing::Ready { .. } if !self.gpu.has_device() => {
+                        requests = self.make_device();
+                    }
+                    Drawing::Ready { .. } => {}
+                    // The new window may be what the last attempt lacked, so the next one does
+                    // not wait out the backoff.
+                    Drawing::Unavailable { .. } => {
+                        requests.push(self.request_attempt(FIRST_RETRY));
+                    }
                 }
                 self.resize(pane, size);
                 requests.extend(self.draw(pane));

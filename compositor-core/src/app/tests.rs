@@ -537,6 +537,33 @@ fn a_failed_first_device_shows_why_and_retries_less_often_each_time() {
 }
 
 #[test]
+fn a_pane_opened_while_the_gpu_is_unavailable_is_tried_without_waiting_out_the_backoff() {
+    let (mut app, _deliveries) = app();
+    app.gpu = Gpu::without_backends();
+    let size = PaneSize {
+        width: 400,
+        height: 300,
+        scale_factor: 1.0,
+    };
+    let created = |pane| Event::SurfaceCreated {
+        pane,
+        window: NativeWindow::none(),
+        size,
+    };
+    let (mut attempt, _) = retry(&app.dispatch(created(Pane::Viewer)));
+    app.dispatch(Event::SurfaceDestroyed(Pane::Viewer));
+    for _ in 0..3 {
+        (attempt, _) = retry(&app.dispatch(Event::RetryDeviceCreation(attempt)));
+    }
+
+    let (next, after) = retry(&app.dispatch(created(Pane::Graph)));
+
+    assert_eq!(after, FIRST_RETRY);
+    assert_eq!(app.dispatch(Event::RetryDeviceCreation(attempt)), []);
+    retry(&app.dispatch(Event::RetryDeviceCreation(next)));
+}
+
+#[test]
 fn a_stale_attempt_is_ignored_so_attempts_never_overlap() {
     let (mut app, _deliveries) = app();
     app.gpu = Gpu::with_noop_device(Waker::channel().0);
