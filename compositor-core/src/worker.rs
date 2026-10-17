@@ -3,6 +3,7 @@
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::Duration;
 
 use half::f16;
 
@@ -16,6 +17,10 @@ const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
 
 /// Images in a row that fit in half the staging buffer before it shrinks to fit them.
 const IMAGES_BEFORE_SHRINKING: u32 = 3;
+
+/// The longest the worker waits on the GPU before checking that it still wants the device, so
+/// that a wait that never ends cannot hold the worker's drop, and with it the GUI thread.
+const LONGEST_GPU_WAIT: Duration = Duration::from_millis(100);
 
 /// What the viewer asks the worker for: the image of the node its slot marks, as that node's key
 /// stood when asked. The app numbers its requests in the order it sends them.
@@ -374,6 +379,13 @@ impl Finishing<'_> {
             .as_ref()
             .is_some_and(|&(_, began)| current != Some(began))
     }
+
+    /// Whether the worker is stopping or another device, or none, has been connected since this
+    /// began, so that waiting on this one's GPU is pointless.
+    fn abandoned(&self) -> bool {
+        let stopping = self.mailbox.lock().stopping;
+        stopping || self.device_replaced()
+    }
 }
 
 impl Drop for Finishing<'_> {
@@ -475,7 +487,7 @@ fn stage(
         Some(buffer) => match sizing.replacement(buffer.size(), size) {
             None if mapped => buffer,
             None => {
-                map(device, &buffer).map_err(|error| {
+                map(finishing, device, &buffer).map_err(|error| {
                     format!("the GPU could not map its staging buffer: {error}")
                 })?;
                 buffer
@@ -610,16 +622,20 @@ fn allocate<T>(device: &wgpu::Device, what: &str, make: impl FnOnce() -> T) -> R
     }
 }
 
-/// Maps the buffer for writing once the GPU has finished copying out of it.
-fn map(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<(), String> {
+/// Maps the buffer for writing once the GPU has finished copying out of it, unless the staging is
+/// abandoned first.
+fn map(finishing: &Finishing, device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
     buffer.map_async(wgpu::MapMode::Write, .., move |result| {
         let _ = sender.send(result);
     });
     loop {
-        wait_for_device(device)?;
+        wait_for_device(device, Some(LONGEST_GPU_WAIT))?;
         if let Ok(result) = receiver.try_recv() {
             return result.map_err(|error| error.to_string());
+        }
+        if finishing.abandoned() {
+            return Err("the worker stopped waiting for the GPU".to_owned());
         }
     }
 }

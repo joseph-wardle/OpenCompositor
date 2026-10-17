@@ -3,6 +3,7 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use open_ng::{Graph, Renderer, View, ViewBuffers, Viewport};
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
@@ -294,7 +295,7 @@ impl Gpu {
         device.device.destroy();
         // `destroy` loses the device only at a later poll, and work on it until then would be
         // counted as errors.
-        let _ = wait_for_device(&device.device);
+        let _ = wait_for_device(&device.device, None);
     }
 
     /// Copies a staged image into its texture and shows it in the viewer from the next frame.
@@ -497,7 +498,7 @@ impl FrameChecks {
         if let Some(buffer) = &readback {
             buffer.map_async(wgpu::MapMode::Read, .., |_| {});
         }
-        if wait_for_device(&device.device).is_err() {
+        if wait_for_device(&device.device, None).is_err() {
             return;
         }
         let Some(view) = readback
@@ -514,19 +515,24 @@ impl FrameChecks {
     }
 }
 
-/// Waits until the device has finished its submitted work and run the callbacks it made ready.
-pub(crate) fn wait_for_device(device: &wgpu::Device) -> Result<(), String> {
+/// Waits until the device has finished its submitted work, or for at most `timeout`, and runs the
+/// callbacks it made ready. Returns whether the work finished.
+pub(crate) fn wait_for_device(
+    device: &wgpu::Device,
+    timeout: Option<Duration>,
+) -> Result<bool, String> {
     let wait = wgpu::PollType::Wait {
         submission_index: None,
-        timeout: None,
+        timeout,
     };
     // wgpu 30 panics rather than returning an error when the driver reports the device lost
     // during a poll, because `WaitIdleError::Device` has no `PollError`. The panic is raised after
     // wgpu has released its locks, so catching it leaves wgpu usable. Hypothesis, untested since
     // it needs a real reset: Vulkan's waits return `DEVICE_LOST` promptly after one, rather than
-    // holding the worker and the frame checks here.
+    // holding the frame checks here. The worker bounds its waits, so it does not rely on this.
     match std::panic::catch_unwind(AssertUnwindSafe(|| device.poll(wait))) {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(wgpu::PollError::Timeout)) => Ok(false),
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err("the GPU device was lost".to_owned()),
     }
