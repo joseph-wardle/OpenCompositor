@@ -31,4 +31,4 @@ pub use parameter::{
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Session};
 pub use viewer::{Placement, Viewer};
-pub use worker::{Evaluated, ViewerError, ViewerImage};
+pub use worker::{Evaluated, StagingTiming, Timing, ViewerError, ViewerImage};

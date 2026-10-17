@@ -3,7 +3,7 @@
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use half::f16;
 
@@ -36,6 +36,51 @@ pub(crate) struct Wanted {
 pub struct Evaluated {
     pub(crate) wanted: Wanted,
     pub(crate) result: Result<ViewerImage, ViewerError>,
+    pub timing: Timing,
+}
+
+impl Evaluated {
+    /// The number of the request this answers.
+    pub fn request(&self) -> u64 {
+        self.wanted.number
+    }
+}
+
+/// When a result passed each stage of the worker, for the shell's drag check.
+#[derive(Clone, Copy, Debug)]
+pub struct Timing {
+    /// The worker took the request.
+    pub started: Instant,
+    /// The evaluator returned the image or its failure.
+    pub evaluated: Instant,
+    pub staging: StagingTiming,
+    /// The result left for the GUI thread.
+    pub delivered: Instant,
+}
+
+/// When a result passed each stage of staging; all `None` with no pixels to stage.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StagingTiming {
+    /// The staging buffer was taken, mapped for writing.
+    pub mapped: Option<Instant>,
+    /// The pixels were converted into it.
+    pub converted: Option<Instant>,
+    /// It was unmapped and the texture made.
+    pub staged: Option<Instant>,
+}
+
+#[cfg(test)]
+impl Timing {
+    /// Every stage passed now, for results tests make without a worker.
+    pub(crate) fn now() -> Timing {
+        let now = Instant::now();
+        Timing {
+            started: now,
+            evaluated: now,
+            staging: StagingTiming::default(),
+            delivered: now,
+        }
+    }
 }
 
 /// An image as the viewer receives it: its description, and its pixels staged for the GPU. Its
@@ -398,9 +443,11 @@ fn evaluate(
     deliver: &impl Fn(Evaluated),
     sizing: &mut StagingSizing,
 ) {
+    let started = Instant::now();
     let evaluated = std::panic::catch_unwind(AssertUnwindSafe(|| {
         evaluator.evaluate(&wanted.key, || mailbox.superseded())
     }));
+    let evaluated_at = Instant::now();
     let result = match evaluated {
         Ok(None) => return,
         Ok(Some(result)) => result,
@@ -418,10 +465,11 @@ fn evaluate(
     let Some(finishing) = mailbox.start_finishing() else {
         return;
     };
+    let mut staging = StagingTiming::default();
     let result = match result {
         Ok(image) => {
             let (info, planes) = image.into_parts();
-            match stage(&finishing, &info, planes, sizing) {
+            match stage(&finishing, &info, planes, sizing, &mut staging) {
                 Ok(pixels) => Ok(ViewerImage { info, pixels }),
                 Err(reason) => Err(ViewerError::CannotShow(reason)),
             }
@@ -434,7 +482,17 @@ fn evaluate(
     if mailbox.superseded() || finishing.device_replaced() {
         drop(result);
     } else {
-        deliver(Evaluated { wanted, result });
+        let timing = Timing {
+            started,
+            evaluated: evaluated_at,
+            staging,
+            delivered: Instant::now(),
+        };
+        deliver(Evaluated {
+            wanted,
+            result,
+            timing,
+        });
     }
     drop(finishing);
 }
@@ -447,6 +505,7 @@ fn stage(
     info: &ImageInfo,
     planes: [Arc<[f32]>; 4],
     sizing: &mut StagingSizing,
+    timing: &mut StagingTiming,
 ) -> Result<Option<Staged>, String> {
     let Some((device, device_generation)) = &finishing.device else {
         return Ok(None);
@@ -492,6 +551,7 @@ fn stage(
         },
         None => staging_buffer(device, sizing.first(size))?,
     };
+    timing.mapped = Some(Instant::now());
     let bytes_per_row = row_bytes(window.width);
     {
         let mut view = buffer
@@ -511,6 +571,7 @@ fn stage(
             bytes_per_row as usize / 2,
         );
     }
+    timing.converted = Some(Instant::now());
     drop(planes);
     buffer.unmap();
     staging.buffer = Some(buffer);
@@ -530,6 +591,7 @@ fn stage(
             view_formats: &[],
         })
     })?;
+    timing.staged = Some(Instant::now());
     Ok(Some(Staged {
         texture,
         bytes_per_row,

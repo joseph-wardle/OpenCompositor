@@ -68,7 +68,8 @@ fn request_update(pane: Pane) {
     crate::with_pane_window(pane, |window| window.request_update());
 }
 
-fn refresh_period(window: &qt::Pane) -> Duration {
+/// The refresh period of the pane's screen.
+pub fn refresh_period(window: &qt::Pane) -> Duration {
     // SAFETY: Qt keeps a window's screen alive while it is the window's screen, moving its windows
     // to another screen before deleting it.
     let rate = unsafe { window.screen().as_ref() }.map_or(0.0, ffi::QScreen::refresh_rate);

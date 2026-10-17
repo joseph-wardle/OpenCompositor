@@ -6,7 +6,7 @@ use super::*;
 use crate::document::NodeKind;
 use crate::evaluate::EvalError;
 use crate::read::ReadError;
-use crate::worker::ViewerImage;
+use crate::worker::{Timing, ViewerImage};
 
 const NONE: Modifiers = Modifiers {
     shift: false,
@@ -91,6 +91,7 @@ fn read(wanted: &Wanted, width: u32, height: u32) -> Event {
         height,
     };
     Event::Evaluated(Evaluated {
+        timing: Timing::now(),
         wanted: wanted.clone(),
         result: Ok(ViewerImage {
             info: ImageInfo {
@@ -463,6 +464,7 @@ fn a_superseded_failure_leaves_the_viewer_and_the_node_as_they_are() {
     app.dispatch(Event::Command(Command::Reload));
     let failed = |wanted: Wanted| {
         Event::Evaluated(Evaluated {
+            timing: Timing::now(),
             result: Err(ViewerError::Eval(EvalError::Read {
                 origin: wanted.key.clone(),
                 error: ReadError::UnknownFormat,
@@ -649,6 +651,7 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     let reload = sent(&app);
     assert_ne!(reload.key, before.key);
     app.dispatch(Event::Evaluated(Evaluated {
+        timing: Timing::now(),
         wanted: reload.clone(),
         result: Err(ViewerError::Eval(EvalError::Read {
             origin: reload.key,
@@ -790,6 +793,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
         result_key(session.document(), session.reloads(), id).unwrap()
     };
     let requests = app.dispatch(Event::Evaluated(Evaluated {
+        timing: Timing::now(),
         wanted: sent(&app),
         result: Err(ViewerError::Eval(EvalError::Read {
             origin: key(&app, reader),

@@ -1,6 +1,7 @@
 //! OpenCompositor's Qt shell. Qt owns the windows, docks, dialogs and event loop; the core's
 //! [`App`] owns everything else. Everything here runs on Qt's GUI thread.
 
+mod drag;
 mod keys;
 mod lifecycle;
 mod pace;
@@ -17,7 +18,7 @@ use std::time::Instant;
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
 use opencompositor_core::{
-    App, Command, Event, FileIntent, FrameCheck, Notice, Pane, Request, Slot,
+    App, Command, Event, FileIntent, FrameCheck, Notice, Pane, Request, Session, Slot,
 };
 
 use crate::qt::ffi;
@@ -58,12 +59,19 @@ pub struct Widgets {
     pub redo: *mut ffi::QAction,
 }
 
+/// A scripted check of the shell, from the command line.
+enum Check {
+    Lifecycle(PathBuf),
+    Drag(PathBuf),
+}
+
 fn main() {
-    let lifecycle_check = match &std::env::args_os().skip(1).collect::<Vec<_>>()[..] {
+    let check = match &std::env::args_os().skip(1).collect::<Vec<_>>()[..] {
         [] => None,
-        [flag, image] if flag == "--lifecycle-check" => Some(PathBuf::from(image)),
+        [flag, image] if flag == "--lifecycle-check" => Some(Check::Lifecycle(image.into())),
+        [flag, image] if flag == "--drag-check" => Some(Check::Drag(image.into())),
         _ => {
-            eprintln!("usage: opencompositor [--lifecycle-check IMAGE]");
+            eprintln!("usage: opencompositor [--lifecycle-check IMAGE | --drag-check IMAGE]");
             std::process::exit(2);
         }
     };
@@ -85,7 +93,7 @@ fn main() {
         // Fails only once the waker is deleted at exit, when nothing is left to tell.
         let _ = waker_thread.queue(move |_| receive(notice));
     });
-    if lifecycle_check.is_some() {
+    if matches!(check, Some(Check::Lifecycle(_))) {
         app.check_frames();
     }
     APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -194,8 +202,10 @@ fn main() {
     show_undo_labels([None, None]);
     keys::start();
     window.pin_mut().show();
-    if let Some(image) = lifecycle_check {
-        lifecycle::start(image);
+    match check {
+        Some(Check::Lifecycle(image)) => lifecycle::start(image),
+        Some(Check::Drag(image)) => drag::start(image),
+        None => {}
     }
     let status = ffi::exec();
 
@@ -211,6 +221,7 @@ fn main() {
 
 /// Hands an event to the app, then does what it asks.
 pub fn dispatch(event: Event) {
+    let draws_viewer = matches!(event, Event::Draw(Pane::Viewer));
     let handled = APP.with(|cell| {
         let mut app = cell.borrow_mut();
         let app = app.as_mut()?;
@@ -221,9 +232,21 @@ pub fn dispatch(event: Event) {
     let Some((requests, labels)) = handled else {
         return;
     };
+    // A draw asks to be drawn again only when it submitted no frame.
+    if draws_viewer && !requests.contains(&Request::Redraw(Pane::Viewer)) {
+        drag::viewer_frame_submitted();
+    }
     // Before the requests, which may dispatch again and show newer labels.
     show_undo_labels(labels);
     for request in requests {
+        perform(request);
+    }
+}
+
+/// Edits the session for the drag check, then does what the app asks.
+pub fn edit(edit: impl FnOnce(&mut Session)) {
+    let requests = APP.with(|cell| cell.borrow_mut().as_mut().map(|app| app.edit(edit)));
+    for request in requests.into_iter().flatten() {
         perform(request);
     }
 }
@@ -303,13 +326,20 @@ pub fn perform(request: Request) {
 }
 
 /// Dispatches a notice from another thread. Retiring a lost device blocks the GUI thread, so
-/// the lifecycle check reports how long.
+/// the lifecycle check reports how long; the drag check records each result's arrival.
 fn receive(notice: Notice) {
     let lost = matches!(notice, Notice::DeviceLost(_));
+    let evaluated = match &notice {
+        Notice::Evaluated(evaluated) => Some((evaluated.request(), evaluated.timing)),
+        Notice::DeviceLost(_) => None,
+    };
     let started = Instant::now();
     dispatch(Event::from(notice));
     if lost {
         lifecycle::retirement_took(started.elapsed());
+    }
+    if let Some((request, timing)) = evaluated {
+        drag::delivered(request, timing, started);
     }
 }
 
@@ -352,6 +382,16 @@ pub fn destroy_device() {
 /// How many GPU errors this session went uncaptured.
 pub fn gpu_errors() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))
+}
+
+/// The number of the request last sent to the worker, in the drag check.
+pub fn last_request() -> u64 {
+    APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.last_request()))
+}
+
+/// The number of the request whose image the viewer shows, in the drag check.
+pub fn shown_request() -> Option<u64> {
+    APP.with(|cell| cell.borrow().as_ref()?.shown_request())
 }
 
 pub fn widgets() -> Widgets {
