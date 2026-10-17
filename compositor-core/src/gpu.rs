@@ -901,6 +901,17 @@ impl ViewerRenderer {
     }
 }
 
+/// Production counts uncaptured errors instead of panicking, so a test that left one would
+/// otherwise pass.
+#[cfg(test)]
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            assert_eq!(self.errors(), 0, "the GPU reported uncaptured errors");
+        }
+    }
+}
+
 /// A device that keeps buffers in memory and draws nothing, with the limits given or the most
 /// permissive, for tests that need wgpu objects but no GPU.
 #[cfg(test)]
@@ -928,10 +939,9 @@ impl Gpu {
     pub(crate) fn without_backends() -> Gpu {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::empty();
-        Gpu {
-            instance: Some(wgpu::Instance::new(descriptor)),
-            ..Gpu::new(Waker::channel().0)
-        }
+        let mut gpu = Gpu::new(Waker::channel().0);
+        gpu.instance = Some(wgpu::Instance::new(descriptor));
+        gpu
     }
 
     /// A GPU with a noop device of generation 1 that draws no pane, and the viewer's native
@@ -941,11 +951,9 @@ impl Gpu {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::NOOP;
         descriptor.backend_options.noop.enable = true;
-        let mut gpu = Gpu {
-            instance: Some(wgpu::Instance::new(descriptor)),
-            device_generation: 1,
-            ..Gpu::new(waker)
-        };
+        let mut gpu = Gpu::new(waker);
+        gpu.instance = Some(wgpu::Instance::new(descriptor));
+        gpu.device_generation = 1;
         let window = PaneWindow {
             window: NativeWindow::none(),
             size: PaneSize {
@@ -960,6 +968,12 @@ impl Gpu {
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
         gpu.device = Some(Device::for_format(adapter, device, queue, format));
         gpu
+    }
+
+    /// The uncaptured errors counted so far, which a test that makes them on purpose takes so
+    /// that dropping the GPU does not fail it.
+    pub(crate) fn take_errors(&self) -> u64 {
+        self.errors.swap(0, Ordering::Relaxed)
     }
 
     /// Makes an invalid buffer on the device, an uncaptured error.

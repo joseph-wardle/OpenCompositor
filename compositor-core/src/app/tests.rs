@@ -619,6 +619,7 @@ fn the_gpu_label_shows_while_the_panes_cannot_draw_and_names_each_new_error_coun
     let requests = app.dispatch(Event::DeviceLost(1));
     let expected = format!("{GPU_UNAVAILABLE}. 2 GPU errors, logged on standard error");
     assert!(requests.contains(&label(&expected)), "{requests:?}");
+    assert_eq!(app.gpu.take_errors(), 2);
 }
 
 #[test]
