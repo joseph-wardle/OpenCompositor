@@ -215,8 +215,8 @@ impl Gpu {
 
     /// Makes a device with a surface on it for each pane with a native window: the one way a
     /// device is made, first and after a loss. A pane whose surface fails does not stop the
-    /// others, but with none the attempt fails and no device is kept. Each attempt is a new
-    /// generation.
+    /// others, and gives up its window, so that it attaches again when next exposed; with no
+    /// surface the attempt fails and no device is kept. Each attempt is a new generation.
     pub(crate) fn make_device(&mut self) -> Result<NewDevice, String> {
         self.device_generation += 1;
         let instance = self.instance.get_or_insert_with(|| {
@@ -259,6 +259,11 @@ impl Gpu {
         }
         if device.surfaces.iter().all(Option::is_none) {
             return Err(pane_errors.join("; "));
+        }
+        for (window, surface) in self.windows.iter_mut().zip(&device.surfaces) {
+            if surface.is_none() {
+                *window = None;
+            }
         }
         let new = NewDevice {
             device: device.device.clone(),
