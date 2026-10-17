@@ -1,0 +1,19 @@
+[package]
+name = "opencompositor-kernels"
+version = "0.0.0"
+description = "OpenCompositor's per-pixel kernel functions, one source for the CPU shells and the GPU entry points."
+edition.workspace = true
+license.workspace = true
+repository = "https://github.com/joseph-wardle/OpenCompositor"
+publish = false
+
+# A plain library. spirv-builder adds the `dylib` crate type itself when it compiles this crate
+# to SPIR-V, and the module was byte-identical with and without one here, so ordinary builds
+# need not produce a shared object.
+
+[target.'cfg(target_arch = "spirv")'.dependencies]
+# Pinned exactly: its version must match the codegen backend the shader builder installs.
+spirv-std = "=0.11.0"
+
+[lints]
+workspace = true

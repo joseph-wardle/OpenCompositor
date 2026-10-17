@@ -12,14 +12,15 @@ exr = "1.74.2"
 half = "2.7.1"
 imbl = "7.0.2"
 open-ng = { path = "../open-ng", version = "0.4.1" }
+opencompositor-kernels = { path = "../compositor-kernels" }
 png = "0.18.1"
 pollster = "1.0.1"
-# Backends are the shell's choice; headless tests need none.
-wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
+# Backends are the shell's choice. `spirv` reads the kernels' module through naga's validation.
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "spirv"] }
 
 [dev-dependencies]
-# The loader's staging, tested without a GPU.
-wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "noop"] }
+# The loader's staging is tested without a GPU; the kernels on a real Vulkan adapter.
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "spirv", "noop", "vulkan"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # O_NONBLOCK, to open a named pipe for writing without waiting for a reader.

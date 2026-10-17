@@ -7,6 +7,9 @@ mod document;
 mod evaluate;
 mod gpu;
 mod image;
+// Used by the worker once it evaluates on the GPU; until then only the tests dispatch.
+#[cfg_attr(not(test), expect(dead_code))]
+mod kernels;
 mod parameter;
 mod presentation;
 mod read;
@@ -31,4 +34,4 @@ pub use parameter::{
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Session};
 pub use viewer::{Placement, Viewer};
-pub use worker::{Evaluated, ViewerError, ViewerImage};
+pub use worker::{Evaluated, StagingTiming, Timing, ViewerError, ViewerImage};

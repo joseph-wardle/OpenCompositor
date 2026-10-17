@@ -485,13 +485,18 @@ fn compute(key: &ResultKey, inputs: &[&Image]) -> Result<Image, EvalError> {
     })
 }
 
-/// Multiplies R, G and B by two to the power of `stops` and shares A. A plain loop until the
-/// kernel crate replaces it.
+/// Multiplies R, G and B by two to the power of `stops` and shares A. A plain loop over the
+/// shared function, which is Exposure's definition for both devices.
 fn exposure(image: &Image, stops: f64) -> Image {
     // Exact for whole stops, and far inside f32's range at the limits.
     let gain = stops.exp2() as f32;
     let [r, g, b, a] = image.planes();
-    let scaled = |plane: &Arc<[f32]>| -> Arc<[f32]> { plane.iter().map(|v| v * gain).collect() };
+    let scaled = |plane: &Arc<[f32]>| -> Arc<[f32]> {
+        plane
+            .iter()
+            .map(|&v| opencompositor_kernels::exposure(v, gain))
+            .collect()
+    };
     // A grey image's colour planes are one plane, and stay one.
     let red = scaled(r);
     let green = if Arc::ptr_eq(g, r) {

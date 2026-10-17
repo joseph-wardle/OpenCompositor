@@ -33,6 +33,10 @@ impl Pane {
 
 /// Something that happened in the shell.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a result is dispatched once and never stored, where a box would allocate per result"
+)]
 pub enum Event {
     /// The pane became visible and must be drawn. A pane without a native window asks for one.
     Exposed(Pane),
@@ -387,6 +391,28 @@ impl App {
     /// driver's would, as [`Notice::DeviceLost`].
     pub fn destroy_device(&mut self) {
         self.gpu.destroy_device();
+    }
+
+    /// Edits the session for the shell's drag check, which has no parameter panel to drive yet,
+    /// then keeps the viewer following it as `dispatch` does.
+    pub fn edit(&mut self, edit: impl FnOnce(&mut Session)) -> Vec<Request> {
+        edit(&mut self.session);
+        let mut requests = vec![Request::Redraw(Pane::Graph)];
+        self.follow_viewer(&mut requests);
+        requests
+    }
+
+    /// The number of the request last sent to the worker; 0 before the first.
+    pub fn last_request(&self) -> u64 {
+        self.requests_sent
+    }
+
+    /// The number of the request whose image the viewer shows.
+    pub fn shown_request(&self) -> Option<u64> {
+        match &self.shown {
+            Shown::Image { wanted, .. } => Some(wanted.number),
+            Shown::Nothing | Shown::Failed { .. } => None,
+        }
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
@@ -792,7 +818,7 @@ impl App {
     /// progress never blanks the viewer. What is not shown is dropped, which returns its staging
     /// buffer to the worker.
     fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
-        let Evaluated { wanted, result } = evaluated;
+        let Evaluated { wanted, result, .. } = evaluated;
         // Not only later: connecting the GPU delivers the request shown again, with its pixels.
         let not_older = (self.shown.wanted()).is_none_or(|shown| wanted.number >= shown.number);
         if self.session.viewed() != Some(wanted.node) || !not_older {
