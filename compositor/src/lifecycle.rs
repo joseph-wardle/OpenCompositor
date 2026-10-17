@@ -61,8 +61,8 @@ thread_local! {
     static FAILURES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     /// What each pane's frames proved when the last step began.
     static CHECKED: Cell<[Option<FrameCheck>; Pane::COUNT]> = const { Cell::new([None; Pane::COUNT]) };
-    /// What the viewer's frames proved on the device the check destroyed.
-    static DESTROYED: Cell<Option<FrameCheck>> = const { Cell::new(None) };
+    /// What each pane's frames proved on the device the check destroyed.
+    static DESTROYED: Cell<Option<[Option<FrameCheck>; Pane::COUNT]>> = const { Cell::new(None) };
     /// The longest an attempt to make a device took.
     static LONGEST_ATTEMPT: Cell<Option<Duration>> = const { Cell::new(None) };
     /// How long retiring the lost device took, which has no budget yet.
@@ -166,7 +166,7 @@ fn step(index: usize) {
             ffi::close_modal_dialog();
         }
         12 => {
-            DESTROYED.with(|cell| cell.set(checks[Pane::Viewer.index()]));
+            DESTROYED.with(|cell| cell.set(Some(checks)));
             crate::destroy_device();
         }
         _ => {
@@ -199,31 +199,40 @@ fn new_frames(before: Option<FrameCheck>, now: Option<FrameCheck>) -> u64 {
     }
 }
 
-/// Checks that a new device replaced the destroyed one: both panes drew on it, the viewer shows
-/// the image as before, the GPU label is gone, and making it kept within the budget.
+/// Checks that a new device replaced the destroyed one: both panes drew on it with the same
+/// centre as before, the viewer's not black, the GPU label is gone, and making it kept within the
+/// budget.
 fn check_recovery(checks: [Option<FrameCheck>; Pane::COUNT]) {
     let Some(destroyed) = DESTROYED.with(Cell::get) else {
-        fail("the viewer drew nothing before the device was destroyed".to_owned());
+        fail("the device was not destroyed".to_owned());
         return;
     };
     for pane in Pane::ALL {
-        let generation = checks[pane.index()].map_or(0, |check| check.generation);
-        if generation <= destroyed.generation {
+        let [before, after] = [destroyed, checks].map(|checks| checks[pane.index()]);
+        let Some(before) = before else {
+            fail(format!(
+                "the {pane:?} pane drew nothing before the device was destroyed"
+            ));
+            continue;
+        };
+        if after.map_or(0, |after| after.generation) <= before.generation {
             fail(format!(
                 "the {pane:?} pane drew on no new device after the loss"
             ));
+            continue;
         }
-    }
-    let centre = checks[Pane::Viewer.index()].and_then(|check| check.centre);
-    match (destroyed.centre, centre) {
-        (Some(_), Some([0, 0, 0, 255])) => {
-            fail("the viewer's centre was black on the new device".to_owned())
+        match (before.centre, after.and_then(|after| after.centre)) {
+            (Some(_), Some([0, 0, 0, 255])) if pane == Pane::Viewer => {
+                fail("the viewer's centre was black on the new device".to_owned())
+            }
+            (Some(before), Some(after)) if before != after => fail(format!(
+                "the {pane:?} pane's centre was {before:?} before the loss and {after:?} after"
+            )),
+            (Some(_), None) => fail(format!(
+                "the {pane:?} pane's centre was not read on the new device"
+            )),
+            _ => {}
         }
-        (Some(before), Some(after)) if before != after => fail(format!(
-            "the viewer's centre was {before:?} before the loss and {after:?} after"
-        )),
-        (Some(_), None) => fail("the viewer's centre was not read on the new device".to_owned()),
-        _ => {}
     }
     let widgets = crate::widgets();
     // SAFETY: the caption lives as long as the viewer's dock, and the GPU label as long as the

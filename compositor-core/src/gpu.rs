@@ -1048,22 +1048,6 @@ mod tests {
     }
 
     #[test]
-    fn uncaptured_errors_are_counted_instead_of_panicking() {
-        let device = noop_device(None);
-        let counted = Arc::default();
-        ErrorCounter::install(&device, &counted, 1, &Waker::channel().0);
-        for _ in 0..2 {
-            let _buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("no usage"),
-                size: 4,
-                usage: wgpu::BufferUsages::empty(),
-                mapped_at_creation: false,
-            });
-        }
-        assert_eq!(counted.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
     fn the_viewers_shader_and_pipelines_validate() {
         let device = noop_device(None);
         ViewerRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb);

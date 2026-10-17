@@ -93,10 +93,7 @@ impl Drop for Staging {
             return;
         }
         connection.staging = match buffer {
-            Some(buffer) => StagingSlot::Waiting {
-                buffer,
-                mapped: false,
-            },
+            Some(buffer) => StagingSlot::Waiting(buffer),
             None => StagingSlot::Empty,
         };
         self.mailbox.changed.notify_all();
@@ -181,8 +178,8 @@ struct Connection {
 enum StagingSlot {
     /// None yet, or the last staging failed: the worker makes one when it next stages.
     Empty,
-    /// Waiting for the worker, mapped for writing or not.
-    Waiting { buffer: wgpu::Buffer, mapped: bool },
+    /// Waiting for the worker, unmapped.
+    Waiting(wgpu::Buffer),
     /// With the worker, or with an image staged in it.
     Out,
 }
@@ -243,8 +240,6 @@ impl Worker {
         }
         drop(state);
         self.mailbox.changed.notify_all();
-        // Hypothesis, untested: a lost device's staging buffer still mapped here keeps its memory,
-        // since wgpu 30 destroys a lost device's buffers without unmapping them.
         drop(replaced);
     }
 }
@@ -287,10 +282,10 @@ impl Mailbox {
         })
     }
 
-    /// Waits for the device's staging buffer to come back and takes it, with whether it is
-    /// mapped, or takes its empty slot to fill. `None` once the started request is superseded,
+    /// Waits for the device's staging buffer to come back and takes it, or takes its empty slot
+    /// to fill. `None` once the started request is superseded,
     /// the device is no longer connected or the worker is stopping.
-    fn take_staging(self: &Arc<Mailbox>, device_generation: u64) -> Option<(Staging, bool)> {
+    fn take_staging(self: &Arc<Mailbox>, device_generation: u64) -> Option<Staging> {
         let taken = self.wait_for(|state| {
             let superseded = state.superseded();
             let connection = match &mut state.connection {
@@ -300,18 +295,16 @@ impl Mailbox {
                 _ => return Some(None),
             };
             match std::mem::replace(&mut connection.staging, StagingSlot::Out) {
-                StagingSlot::Empty => Some(Some((None, false))),
-                StagingSlot::Waiting { buffer, mapped } => Some(Some((Some(buffer), mapped))),
+                StagingSlot::Empty => Some(Some(None)),
+                StagingSlot::Waiting(buffer) => Some(Some(Some(buffer))),
                 StagingSlot::Out => None,
             }
         });
-        let (buffer, mapped) = taken.flatten()?;
-        let staging = Staging {
-            buffer,
+        Some(Staging {
+            buffer: taken.flatten()?,
             device_generation,
             mailbox: Arc::clone(self),
-        };
-        Some((staging, mapped))
+        })
     }
 
     fn wait_for<T>(&self, mut take: impl FnMut(&mut MailboxState) -> Option<T>) -> Option<T> {
@@ -479,13 +472,12 @@ fn stage(
             limits.max_buffer_size
         ));
     }
-    let Some((mut staging, mapped)) = finishing.mailbox.take_staging(*device_generation) else {
+    let Some(mut staging) = finishing.mailbox.take_staging(*device_generation) else {
         return Ok(None);
     };
     // Until the buffer is back in `staging`, a failure drops it, leaving the slot empty.
     let buffer = match staging.buffer.take() {
         Some(buffer) => match sizing.replacement(buffer.size(), size) {
-            None if mapped => buffer,
             None => {
                 map(finishing, device, &buffer).map_err(|error| {
                     format!("the GPU could not map its staging buffer: {error}")

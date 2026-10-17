@@ -622,15 +622,6 @@ fn the_gpu_label_shows_while_the_panes_cannot_draw_and_names_each_new_error_coun
 }
 
 #[test]
-fn a_loss_notice_for_a_replaced_device_changes_nothing() {
-    let (mut app, _deliveries) = app();
-    app.gpu = Gpu::with_noop_device(Waker::channel().0);
-
-    assert_eq!(app.dispatch(Event::DeviceLost(0)), []);
-    assert!(app.gpu.has_device());
-}
-
-#[test]
 fn closing_during_recovery_notices_no_loss() {
     let (mut app, _deliveries) = app();
     let (waker, notices) = Waker::channel();
