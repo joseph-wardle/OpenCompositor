@@ -6,7 +6,7 @@ use open_ng::Point;
 
 use super::*;
 use crate::document::Assignment;
-use crate::image::Channel;
+use crate::image::{Channel, PngColorType, PngSource, Source, Window};
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 
@@ -95,6 +95,38 @@ fn chain(nodes: impl IntoIterator<Item = Node>) -> Document {
 
 fn key(document: &Document, id: u64) -> ResultKey {
     result_key(document, &Reloads::default(), NodeId(id)).unwrap()
+}
+
+/// An image of these planes over `width` × `height`, as a reader would make it.
+fn image(width: u32, height: u32, planes: [Arc<[f32]>; 4]) -> Image {
+    let window = Window {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let source = Source::Png(PngSource {
+        bit_depth: 8,
+        color_type: PngColorType::Rgba,
+        srgb: false,
+        gamma: None,
+        chromaticities: None,
+        icc_profile: false,
+        cicp: None,
+    });
+    Image::new(window, window, planes, 1.0, source, Vec::new())
+}
+
+/// `len` finite values of both signs, from tiny to huge, different for each `seed`.
+fn finite_plane(len: usize, seed: u32) -> Arc<[f32]> {
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
+            (unit - 0.5) * 2f32.powi((state & 0x3f) as i32 - 32)
+        })
+        .collect()
 }
 
 #[test]
@@ -382,8 +414,147 @@ fn a_failure_carries_the_key_of_the_node_it_happened_at() {
 fn a_panicking_operation_fails_its_node() {
     // An Exposure whose key says it is connected, given no image, panics.
     let exposure = key(&chain([reader("a.png"), exposure(None)]), 2);
-    let error = compute(&exposure, &[]).unwrap_err();
+    let evaluator = Evaluator::new();
+    let error = evaluator
+        .compute(&exposure, &[], &mut Vec::new())
+        .unwrap_err();
     assert!(matches!(error, EvalError::Panicked { origin } if origin == exposure));
+}
+
+/// Exposure through the pool's chunking at every width across a SIMD tail and at heights on both
+/// sides of a chunk: every output sample is the shared function's bit for bit, and every one is
+/// written, since the outputs start as NaN and the inputs are finite.
+#[test]
+fn exposure_on_the_pool_writes_every_sample_as_the_shared_function_does() {
+    let evaluator = Evaluator::new();
+    let exposure = key(&chain([reader("a.png"), exposure(Some(1.5))]), 2);
+    let gain = 1.5_f64.exp2() as f32;
+    for height in [1, 7, 8, 9, 17] {
+        for width in 1..=33 {
+            let len = (width * height) as usize;
+            let input = image(
+                width,
+                height,
+                [1, 2, 3, 4].map(|c| finite_plane(len, c * 64 + width)),
+            );
+            let nans = || -> Arc<[f32]> { std::iter::repeat_n(f32::NAN, len).collect() };
+            let mut released = vec![nans(), nans(), nans()];
+
+            let output = evaluator
+                .compute(&exposure, &[&input], &mut released)
+                .unwrap();
+
+            for channel in [Channel::R, Channel::G, Channel::B] {
+                let (src, dst) = (input.plane(channel), output.plane(channel));
+                for (index, (&s, &d)) in src.iter().zip(dst.iter()).enumerate() {
+                    let expected = opencompositor_kernels::exposure(s, gain);
+                    assert_eq!(
+                        d.to_bits(),
+                        expected.to_bits(),
+                        "{width}x{height} {channel:?} at {index}"
+                    );
+                }
+            }
+            assert!(
+                released.is_empty(),
+                "{width}x{height} left a released plane unused"
+            );
+            assert!(Arc::ptr_eq(
+                output.plane(Channel::A),
+                input.plane(Channel::A)
+            ));
+        }
+    }
+}
+
+#[test]
+fn exposure_never_writes_its_input_even_where_alpha_is_a_colour_plane() {
+    // One plane for all four channels, which an in-place write would show through A.
+    let plane = finite_plane(12, 7);
+    let before: Vec<u32> = plane.iter().map(|v| v.to_bits()).collect();
+    let input = image(4, 3, [(); 4].map(|()| plane.clone()));
+    let evaluator = Evaluator::new();
+    let exposure = key(&chain([reader("a.png"), exposure(Some(2.0))]), 2);
+
+    let output = evaluator
+        .compute(&exposure, &[&input], &mut Vec::new())
+        .unwrap();
+
+    assert!(Arc::ptr_eq(output.plane(Channel::A), &plane));
+    assert_eq!(
+        plane.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        before
+    );
+    assert!(!Arc::ptr_eq(output.plane(Channel::R), &plane));
+    assert!(Arc::ptr_eq(
+        output.plane(Channel::R),
+        output.plane(Channel::G)
+    ));
+    assert!(Arc::ptr_eq(
+        output.plane(Channel::R),
+        output.plane(Channel::B)
+    ));
+    assert_eq!(output.value(Channel::R, 1, 2), plane[9] * 4.0);
+}
+
+/// The addresses of the R, G and B planes.
+fn colour_addresses(image: &Image) -> BTreeSet<usize> {
+    [Channel::R, Channel::G, Channel::B]
+        .map(|channel| plane_address(image.plane(channel)))
+        .into()
+}
+
+#[test]
+fn a_request_reuses_the_planes_of_the_results_it_releases() {
+    let path = directory("reuse").join("image.png");
+    write_png(&path, 255);
+    let mut evaluator = Evaluator::new();
+    let [one, two] = exposure_keys(&path, [1.0, 2.0]);
+    let first = colour_addresses(&run(&mut evaluator, &one).unwrap());
+
+    // The first result is now the evaluator's alone, and the second request releases it.
+    let second = run(&mut evaluator, &two).unwrap();
+
+    assert_eq!(colour_addresses(&second), first);
+    assert_eq!(red(&second), 4.0);
+}
+
+#[test]
+fn a_released_plane_held_elsewhere_is_not_reused() {
+    let path = directory("held").join("image.png");
+    write_png(&path, 255);
+    let mut evaluator = Evaluator::new();
+    let [one, two] = exposure_keys(&path, [1.0, 2.0]);
+    let first = run(&mut evaluator, &one).unwrap();
+
+    let second = run(&mut evaluator, &two).unwrap();
+
+    assert!(colour_addresses(&first).is_disjoint(&colour_addresses(&second)));
+    assert_eq!(red(&first) * 2.0, red(&second));
+}
+
+#[test]
+fn the_pool_has_a_thread_per_physical_core_the_process_may_use() {
+    let available = std::thread::available_parallelism().unwrap().get();
+    let threads = pool_threads();
+    assert!((1..=available).contains(&threads));
+    let evaluator = Evaluator::new();
+    assert_eq!(evaluator.pool.threads.current_num_threads(), threads);
+    println!(
+        "evaluator pool: {threads} threads at {:?}",
+        evaluator.pool.level
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cpu_lists_name_ranges_and_single_cpus() {
+    assert_eq!(
+        cpus_in("0-3,16-19,32\n"),
+        Some(vec![0, 1, 2, 3, 16, 17, 18, 19, 32])
+    );
+    assert_eq!(cpus_in(""), Some(Vec::new()));
+    assert_eq!(cpus_in("0-x"), None);
 }
 
 #[test]

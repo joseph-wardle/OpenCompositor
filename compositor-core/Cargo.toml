@@ -15,6 +15,7 @@ open-ng = { path = "../open-ng", version = "0.4.1" }
 opencompositor-kernels = { path = "../compositor-kernels" }
 png = "0.18.1"
 pollster = "1.0.1"
+rayon = "1.12.0"
 # Backends are the shell's choice. `spirv` reads the kernels' module through naga's validation.
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "spirv"] }
 

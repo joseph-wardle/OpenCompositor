@@ -7,8 +7,11 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::document::{Document, ExposureVersion, Node, NodeId, NodeKind};
-use crate::image::Image;
+use crate::image::{Image, zeroed_plane};
+use crate::kernels::cpu::{self, Level};
 use crate::parameter::{Value, resolve};
 use crate::read::{ReadError, read_image};
 
@@ -233,6 +236,9 @@ const RETAINED_BYTES_CAP: u64 = 4 << 30;
 /// A file is read again only once nothing retained depends on its key, so a file replaced on disk
 /// is stale until it is reloaded or its results are released.
 ///
+/// Operations run on the evaluator's own threads, a chunk of rows at a time, and a request's
+/// outputs take the planes of the results it releases before making new ones.
+///
 /// Time is fixed, the whole data window is computed and every channel produced.
 #[derive(Debug)]
 pub struct Evaluator {
@@ -241,6 +247,7 @@ pub struct Evaluator {
     planes: BTreeMap<usize, (u64, u32)>,
     retained_bytes: u64,
     cap: u64,
+    pool: Pool,
 }
 
 #[derive(Debug)]
@@ -274,6 +281,7 @@ impl Evaluator {
             planes: BTreeMap::new(),
             retained_bytes: 0,
             cap,
+            pool: Pool::new(),
         }
     }
 
@@ -287,7 +295,9 @@ impl Evaluator {
         stop: impl Fn() -> bool,
     ) -> Option<Result<Image, EvalError>> {
         let steps = self.plan(key);
-        self.release_except(&steps);
+        // Planes for this request's outputs; whatever it does not take drops with it. Nothing is
+        // kept for the next request, so a change of image size or a `release_all` needs no rule.
+        let mut released = self.release_except(&steps);
         let requested = steps.len() - 1;
         // What the request needs, and how many nodes still to compute take each image.
         let mut needed = vec![false; steps.len()];
@@ -317,7 +327,7 @@ impl Evaluator {
             let inputs: Vec<&Image> = (step.inputs.iter())
                 .map(|&input| images[input].as_ref().expect("inputs come first"))
                 .collect();
-            let image = match compute(&step.key, &inputs) {
+            let image = match self.compute(&step.key, &inputs, &mut released) {
                 Ok(image) => image,
                 Err(error) => return Some(Err(error)),
             };
@@ -390,17 +400,26 @@ impl Evaluator {
         self.retained_bytes = 0;
     }
 
-    /// Releases every retained result the request does not contain.
-    fn release_except(&mut self, steps: &[Step]) {
+    /// Releases every retained result the request does not contain, and returns the released
+    /// planes nothing else holds, for the request's outputs.
+    fn release_except(&mut self, steps: &[Step]) -> Vec<Arc<[f32]>> {
         let requested: BTreeSet<*const Recipe> =
             steps.iter().map(|step| Arc::as_ptr(&step.key.0)).collect();
+        let mut released = Vec::new();
         for retained in std::mem::take(&mut self.retained) {
             if requested.contains(&Arc::as_ptr(&retained.key.0)) {
                 self.retained.push(retained);
-            } else {
-                self.forget_planes(&retained.image);
+                continue;
             }
+            self.forget_planes(&retained.image);
+            let (_, planes) = retained.image.into_parts();
+            // A plane shared by two channels is unheld once at the last of them.
+            let unheld = planes
+                .into_iter()
+                .filter(|plane| Arc::strong_count(plane) == 1 && Arc::weak_count(plane) == 0);
+            released.extend(unheld);
         }
+        released
     }
 
     /// Retains a result if its planes fit under the cap. Returns whether it did.
@@ -456,46 +475,163 @@ fn plane_bytes(plane: &Arc<[f32]>) -> u64 {
     std::mem::size_of_val::<[f32]>(plane) as u64
 }
 
-/// Computes one node's image from the images of its connected inputs, in declaration order.
-fn compute(key: &ResultKey, inputs: &[&Image]) -> Result<Image, EvalError> {
-    let operation = || match &*key.0 {
-        Recipe::Reader { path, .. } => read_image(path).map_err(|error| EvalError::Read {
-            origin: key.clone(),
-            error,
-        }),
-        Recipe::Exposure { stops, source, .. } => {
-            let empty;
-            let source = match source {
-                Some(_) => inputs[0],
-                None => {
-                    empty = Image::empty();
-                    &empty
-                }
-            };
-            Ok(exposure(source, f64::from_bits(*stops)))
-        }
-    };
-    // Operations are pure, so a panic leaves nothing half done, and the node fails instead of
-    // ending the worker. The panic hook has already reported it. A failed allocation aborts the
-    // process regardless.
-    std::panic::catch_unwind(AssertUnwindSafe(operation)).unwrap_or_else(|_| {
-        Err(EvalError::Panicked {
-            origin: key.clone(),
+impl Evaluator {
+    /// Computes one node's image from the images of its connected inputs, in declaration order,
+    /// with its output planes taken from `released` while one of the right length is there.
+    fn compute(
+        &self,
+        key: &ResultKey,
+        inputs: &[&Image],
+        released: &mut Vec<Arc<[f32]>>,
+    ) -> Result<Image, EvalError> {
+        let operation = || match &*key.0 {
+            Recipe::Reader { path, .. } => read_image(path).map_err(|error| EvalError::Read {
+                origin: key.clone(),
+                error,
+            }),
+            Recipe::Exposure { stops, source, .. } => {
+                let empty;
+                let source = match source {
+                    Some(_) => inputs[0],
+                    None => {
+                        empty = Image::empty();
+                        &empty
+                    }
+                };
+                Ok(exposure(
+                    &self.pool,
+                    source,
+                    f64::from_bits(*stops),
+                    released,
+                ))
+            }
+        };
+        // Operations write only their own outputs, so a panic leaves nothing half done, and the
+        // node fails instead of ending the worker. The panic hook has already reported it. A
+        // failed allocation aborts the process regardless.
+        std::panic::catch_unwind(AssertUnwindSafe(operation)).unwrap_or_else(|_| {
+            Err(EvalError::Panicked {
+                origin: key.clone(),
+            })
         })
-    })
+    }
 }
 
-/// Multiplies R, G and B by two to the power of `stops` and shares A. A plain loop over the
-/// shared function, which is Exposure's definition for both devices.
-fn exposure(image: &Image, stops: f64) -> Image {
+/// The threads operations run on and the level their kernels run at. Each evaluator builds its
+/// own when it is built, so a request never waits for threads to start; the global rayon pool is
+/// never used, and no operation threads otherwise. A pool of the machine's physical cores leaves
+/// the GUI thread a core to wake on: hyperthreads added nothing to a memory-bound kernel and made
+/// its wake-ups late.
+#[derive(Debug)]
+struct Pool {
+    threads: rayon::ThreadPool,
+    level: Level,
+}
+
+/// Rows of a plane per chunk the pool hands out. Small chunks balance the threads; even bands,
+/// one per thread, lost to them once the machine had anything else to do.
+const CHUNK_ROWS: usize = 8;
+
+impl Pool {
+    fn new() -> Pool {
+        let threads = rayon::ThreadPoolBuilder::new()
+            .num_threads(pool_threads())
+            .thread_name(|index| format!("kernels {index}"))
+            .build()
+            .expect("the evaluator's threads start");
+        Pool {
+            threads,
+            level: Level::detect(),
+        }
+    }
+
+    /// Runs `kernel` from `src` into `dst`, two planes of `width` columns and one length, a
+    /// chunk of rows at a time over the threads. `kernel` is given the level and a chunk of each.
+    fn run(
+        &self,
+        width: usize,
+        src: &[f32],
+        dst: &mut [f32],
+        kernel: impl Fn(Level, &[f32], &mut [f32]) + Sync,
+    ) {
+        // An empty plane has no chunks, whichever of its sides is zero.
+        let chunk = (CHUNK_ROWS * width).max(1);
+        let level = self.level;
+        self.threads.install(|| {
+            (dst.par_chunks_mut(chunk).zip(src.par_chunks(chunk)))
+                .for_each(|(dst, src)| kernel(level, src, dst));
+        });
+    }
+}
+
+/// How many threads the pool has: the physical cores among the CPUs the process may run on, and
+/// no more than `available_parallelism`, which also honours a cgroup's quota.
+fn pool_threads() -> usize {
+    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+    physical_cores().unwrap_or(available).min(available)
+}
+
+/// The distinct physical cores among the CPUs this process may run on, or `None` where the
+/// system does not say.
+#[cfg(target_os = "linux")]
+fn physical_cores() -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let allowed = (status.lines()).find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+    let mut cores = BTreeSet::new();
+    for cpu in cpus_in(allowed)? {
+        let siblings = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+        cores.insert(std::fs::read_to_string(siblings).ok()?.trim().to_owned());
+    }
+    Some(cores.len()).filter(|&cores| cores > 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn physical_cores() -> Option<usize> {
+    None
+}
+
+/// The CPUs a sysfs or procfs list names, as in `0-3,16-19`.
+#[cfg(target_os = "linux")]
+fn cpus_in(list: &str) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in list
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        match part.split_once('-') {
+            Some((first, last)) => cpus.extend(first.parse::<usize>().ok()?..=last.parse().ok()?),
+            None => cpus.push(part.parse().ok()?),
+        }
+    }
+    Some(cpus)
+}
+
+/// A plane of `len` for an output: one of `released` if any has the length, else a new one.
+/// Touching a new plane costs more than Exposure over it (page faults, then unmapping when it
+/// drops), which is what reusing released planes saves.
+fn output_plane(released: &mut Vec<Arc<[f32]>>, len: usize) -> Arc<[f32]> {
+    match released.iter().position(|plane| plane.len() == len) {
+        Some(index) => released.swap_remove(index),
+        None => zeroed_plane(len),
+    }
+}
+
+/// Multiplies R, G and B by two to the power of `stops` and shares A, each colour plane through
+/// the shared function, Exposure's definition for both devices. Inputs are never written: an
+/// output is a plane from `released` or a new one, and A is the input's.
+fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Arc<[f32]>>) -> Image {
     // Exact for whole stops, and far inside f32's range at the limits.
     let gain = stops.exp2() as f32;
+    let width = image.data_window().width as usize;
     let [r, g, b, a] = image.planes();
-    let scaled = |plane: &Arc<[f32]>| -> Arc<[f32]> {
-        plane
-            .iter()
-            .map(|&v| opencompositor_kernels::exposure(v, gain))
-            .collect()
+    let mut scaled = |plane: &Arc<[f32]>| -> Arc<[f32]> {
+        let mut output = output_plane(released, plane.len());
+        let dst = Arc::get_mut(&mut output).expect("nothing else holds an output plane");
+        pool.run(width, plane, dst, |level, src, dst| {
+            cpu::exposure(level, src, dst, gain);
+        });
+        output
     };
     // A grey image's colour planes are one plane, and stay one.
     let red = scaled(r);

@@ -187,7 +187,7 @@ impl Image {
     }
 }
 
-/// A plane of `len` zeros for a reader to fill before anything else shares it.
+/// A plane of `len` zeros for a reader or an operation to fill before anything else shares it.
 pub(crate) fn zeroed_plane(len: usize) -> Arc<[f32]> {
     // SAFETY: all zero bits are the f32 0.0. Zeroed memory comes from the allocator already
     // cleared, where a safe fill would write every value once more before the reader does.
