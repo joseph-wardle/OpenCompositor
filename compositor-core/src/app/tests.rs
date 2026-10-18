@@ -5,6 +5,7 @@ use std::time::Duration;
 use super::*;
 use crate::document::NodeKind;
 use crate::evaluate::EvalError;
+use crate::parameter::Value;
 use crate::read::ReadError;
 use crate::worker::{Timing, ViewerImage};
 
@@ -845,4 +846,27 @@ fn a_viewer_draw_without_a_surface_presents_nothing() {
 
     assert_eq!(app.dispatch(Event::Draw(Pane::Viewer)), []);
     assert_eq!(app.presented_request(), None);
+}
+
+#[test]
+fn the_viewer_follows_value_edits_and_their_undo() {
+    let (mut app, _deliveries) = app();
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    let exposure = create_exposure(&mut app);
+    app.session.connect(exposure, "source", reader).unwrap();
+    app.dispatch(slot_key(1, CTRL));
+    let before = sent(&app).key;
+
+    app.edit(|session| {
+        session.begin_edit(exposure, "Stops").unwrap();
+        session.set_value("stops", Value::Float(1.0)).unwrap();
+        session.finish_edit();
+    });
+    let edited = sent(&app).key;
+    assert_ne!(edited, before);
+
+    app.dispatch(Event::Command(Command::Undo));
+    assert_eq!(sent(&app).key, before);
+    app.dispatch(Event::Command(Command::Redo));
+    assert_eq!(sent(&app).key, edited);
 }

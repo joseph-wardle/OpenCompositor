@@ -115,6 +115,8 @@ pub struct Session {
     /// Unsaved and not undoable.
     reloads: Reloads,
     failures: Failures,
+    /// Counts changes to the document and the reloads, which every key is made from.
+    version: u64,
 }
 
 impl Default for Session {
@@ -142,6 +144,7 @@ impl Session {
             viewer: Viewer::new(),
             reloads: Reloads::default(),
             failures: Failures::default(),
+            version: 0,
         }
     }
 
@@ -163,6 +166,12 @@ impl Session {
 
     pub(crate) fn viewer_mut(&mut self) -> &mut Viewer {
         &mut self.viewer
+    }
+
+    /// Changes whenever the document or the reloads do, so that a key built at one version is
+    /// current while the version is.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// The node the viewer's slot marks.
@@ -212,6 +221,9 @@ impl Session {
             .collect();
         for path in &paths {
             self.reloads.reload(path.clone());
+        }
+        if !paths.is_empty() {
+            self.version += 1;
         }
         self.present_failures();
         !paths.is_empty()
@@ -515,6 +527,7 @@ impl Session {
     fn restore(&mut self, step: Step) -> (Step, Changes) {
         let changes = self.document.changes_to(&step.document);
         let current = std::mem::replace(&mut self.document, step.document);
+        self.version += 1;
         self.present(&changes);
         let reverse = Step {
             label: step.label,
@@ -534,6 +547,7 @@ impl Session {
         }
         self.finish_edit();
         let before = std::mem::replace(&mut self.document, after);
+        self.version += 1;
         self.undo.push(Step {
             label,
             document: before,
@@ -549,6 +563,7 @@ impl Session {
         let changes = self.document.changes_to(&after);
         if !changes.is_empty() {
             self.document = after;
+            self.version += 1;
             self.present(&changes);
         }
         changes

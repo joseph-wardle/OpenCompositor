@@ -323,6 +323,8 @@ pub struct App {
     worker: Worker,
     /// What the worker was last asked for.
     sent: Option<Wanted>,
+    /// The session's version and the viewed node when the viewer last followed them.
+    followed: Option<(u64, Option<NodeId>)>,
     /// How many requests the worker was sent, which numbers them.
     requests_sent: u64,
     drawing: Drawing,
@@ -352,6 +354,7 @@ impl App {
             gpu: Gpu::new(waker),
             worker: Worker::start(move |evaluated| deliver.wake(Notice::Evaluated(evaluated))),
             sent: None,
+            followed: None,
             requests_sent: 0,
             drawing: Drawing::Ready { recovered: None },
             attempts_requested: 0,
@@ -836,7 +839,8 @@ impl App {
         if self.session.viewed() != Some(wanted.node) || !not_older {
             return Vec::new();
         }
-        let current = self.wanted().is_some_and(|(_, key)| key == wanted.key);
+        // What was sent is current: the viewer follows every change before this runs.
+        let current = (self.sent.as_ref()).is_some_and(|sent| sent.key == wanted.key);
         let graph_changed = match &result {
             Err(ViewerError::Eval(error)) => self.session.record_failure(error.origin()),
             // What the GPU cannot hold is the viewer's limitation, not the node's failure.
@@ -881,6 +885,20 @@ impl App {
     /// Keeps the viewer on what its slot marks: asks the worker for it, shows nothing if the slot
     /// marks nothing, and describes the result.
     fn follow_viewer(&mut self, requests: &mut Vec<Request>) {
+        // Building a key walks the viewed node's whole upstream, so not on every pointer move.
+        let followed = Some((self.session.version(), self.session.viewed()));
+        if followed != self.followed {
+            self.followed = followed;
+            self.send_wanted(requests);
+        }
+        let caption = self.caption();
+        if caption != self.caption {
+            self.caption.clone_from(&caption);
+            requests.push(Request::ShowViewerCaption(caption));
+        }
+    }
+
+    fn send_wanted(&mut self, requests: &mut Vec<Request>) {
         let wanted = self.wanted();
         if wanted.is_none() && !matches!(self.shown, Shown::Nothing) {
             self.shown = Shown::Nothing;
@@ -897,11 +915,6 @@ impl App {
             let wanted = wanted.map(|(node, key)| Wanted { node, key, number });
             self.worker.request(wanted.clone());
             self.sent = wanted;
-        }
-        let caption = self.caption();
-        if caption != self.caption {
-            self.caption.clone_from(&caption);
-            requests.push(Request::ShowViewerCaption(caption));
         }
     }
 
