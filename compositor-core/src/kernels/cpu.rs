@@ -7,11 +7,15 @@
 
 use opencompositor_kernels as kernels;
 
-/// The x86-64 feature level the kernels run at. Made by [`Level::detect`], which checks every
-/// feature a level's wrapper enables; the tests make the others only after checking it. Other
-/// architectures have only [`Level::Baseline`], the plain build.
+/// The x86-64 feature level the kernels run at. Only [`Level::detect`] makes one, after checking
+/// every feature its wrapper enables, so holding a level proves this machine supports it. Other
+/// architectures have only the baseline, the plain build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Level {
+pub struct Level(Kind);
+
+// Private so that no caller can name a level the machine lacks: the kernels' safety rests on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
     /// The build's own target: SSE2 on x86-64, four lanes of f32.
     Baseline,
     /// x86-64-v3, AVX2 and FMA: eight lanes.
@@ -42,13 +46,13 @@ impl Level {
                 && is_x86_feature_detected!("avx512dq")
                 && is_x86_feature_detected!("avx512vl");
             if v4 {
-                return Level::V4;
+                return Level(Kind::V4);
             }
             if v3 {
-                return Level::V3;
+                return Level(Kind::V3);
             }
         }
-        Level::Baseline
+        Level(Kind::Baseline)
     }
 }
 
@@ -56,15 +60,15 @@ impl Level {
 /// becomes [`kernels::exposure`] of the sample at the same index in `src`.
 pub fn exposure(level: Level, src: &[f32], dst: &mut [f32], gain: f32) {
     assert_eq!(src.len(), dst.len(), "Exposure's slices differ in length");
-    match level {
-        Level::Baseline => exposure_baseline(src, dst, gain),
+    match level.0 {
+        Kind::Baseline => exposure_baseline(src, dst, gain),
         #[cfg(target_arch = "x86_64")]
         // SAFETY: `level` came from `Level::detect` on this machine, which found every feature
         // the wrapper enables.
-        Level::V3 => unsafe { exposure_v3(src, dst, gain) },
+        Kind::V3 => unsafe { exposure_v3(src, dst, gain) },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as above.
-        Level::V4 => unsafe { exposure_v4(src, dst, gain) },
+        Kind::V4 => unsafe { exposure_v4(src, dst, gain) },
     }
 }
 
@@ -164,19 +168,19 @@ mod tests {
 
     #[test]
     fn baseline_matches_the_kernel_crate() {
-        exposure_matches_the_kernel_crate(Level::Baseline);
+        exposure_matches_the_kernel_crate(Level(Kind::Baseline));
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn v3_matches_the_kernel_crate() {
-        exposure_matches_the_kernel_crate(Level::V3);
+        exposure_matches_the_kernel_crate(Level(Kind::V3));
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn v4_matches_the_kernel_crate() {
-        exposure_matches_the_kernel_crate(Level::V4);
+        exposure_matches_the_kernel_crate(Level(Kind::V4));
     }
 
     #[test]
