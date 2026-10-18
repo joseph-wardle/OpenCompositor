@@ -8,7 +8,7 @@ mod pace;
 mod pane;
 mod qt;
 
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{OnceCell, RefCell};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
@@ -37,12 +37,7 @@ thread_local! {
     /// Each pane's connection to Qt Wayland's `surfaceRoleDestroyed`.
     static SURFACE_WATCHES: RefCell<[Option<QMetaObjectConnectionGuard>; Pane::COUNT]> =
         RefCell::new(Default::default());
-    /// What the Undo and Redo items name, once set.
-    static UNDO_LABELS: Cell<Option<UndoLabels>> = const { Cell::new(None) };
 }
-
-/// What undo and then redo would undo and redo, if anything.
-type UndoLabels = [Option<&'static str>; 2];
 
 /// The Qt objects the shell acts on. Docks are hidden when closed, not deleted, so all of them
 /// live until the main window is destroyed after the event loop.
@@ -222,39 +217,35 @@ fn main() {
 /// Hands an event to the app, then does what it asks.
 pub fn dispatch(event: Event) {
     let draws_viewer = matches!(event, Event::Draw(Pane::Viewer));
-    let handled = APP.with(|cell| {
-        let mut app = cell.borrow_mut();
-        let app = app.as_mut()?;
-        let requests = app.dispatch(event);
-        let session = app.session();
-        Some((requests, [session.undo_label(), session.redo_label()]))
-    });
-    let Some((requests, labels)) = handled else {
+    let Some(requests) = APP.with(|cell| cell.borrow_mut().as_mut().map(|app| app.dispatch(event)))
+    else {
         return;
     };
     if draws_viewer {
         drag::viewer_frame_drawn();
     }
-    // Before the requests, which may dispatch again and show newer labels.
-    show_undo_labels(labels);
     for request in requests {
         perform(request);
     }
 }
 
-/// Edits the session for the drag check, then does what the app asks.
-pub fn edit(edit: impl FnOnce(&mut Session)) {
-    let requests = APP.with(|cell| cell.borrow_mut().as_mut().map(|app| app.edit(edit)));
-    for request in requests.into_iter().flatten() {
+/// Edits the session for the drag check, then does what the app asks. Returns the number of the
+/// request whose result shows the edited session.
+pub fn edit(edit: impl FnOnce(&mut Session)) -> u64 {
+    let (requests, request) = APP.with(|cell| {
+        let mut app = cell.borrow_mut();
+        app.as_mut()
+            .expect("the drag check edits while the app runs")
+            .edit(edit)
+    });
+    for request in requests {
         perform(request);
     }
+    request
 }
 
 /// Names in the Edit menu what undo and redo would do, and disables either when there is nothing.
-fn show_undo_labels(labels: UndoLabels) {
-    if UNDO_LABELS.replace(Some(labels)) == Some(labels) {
-        return;
-    }
+fn show_undo_labels(labels: [Option<&str>; 2]) {
     let widgets = widgets();
     for ((action, verb), label) in [(widgets.undo, "&Undo"), (widgets.redo, "&Redo")]
         .into_iter()
@@ -312,6 +303,7 @@ pub fn perform(request: Request) {
         Request::ShowViewerCaption(text) => unsafe {
             ffi::set_caption(widgets.caption, &QString::from(&text))
         },
+        Request::ShowUndoLabels { undo, redo } => show_undo_labels([undo, redo]),
         // SAFETY: the window owns the label, and lives as long as it.
         Request::ShowGpuLabel(text) => unsafe {
             let text = QString::from(text.as_deref().unwrap_or_default());
@@ -381,11 +373,6 @@ pub fn destroy_device() {
 /// How many GPU errors this session went uncaptured.
 pub fn gpu_errors() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))
-}
-
-/// The number of the request last sent to the worker, in the drag check.
-pub fn last_request() -> u64 {
-    APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.last_request()))
 }
 
 /// The number of the request whose image the viewer last presented, in the drag check.

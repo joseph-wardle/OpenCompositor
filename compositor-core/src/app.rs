@@ -148,6 +148,12 @@ pub enum Request {
     ShowError(String),
     /// Describe under the viewer what it shows, or why it shows nothing.
     ShowViewerCaption(String),
+    /// Name in the Edit menu what undo and redo would undo and redo, and disable either with
+    /// `None`. Both start disabled.
+    ShowUndoLabels {
+        undo: Option<&'static str>,
+        redo: Option<&'static str>,
+    },
     /// Show the text in the status bar's permanent GPU label, or hide the label with `None`.
     /// It changes when the panes stop or start drawing, and when a GPU error is counted.
     ShowGpuLabel(Option<String>),
@@ -339,6 +345,8 @@ pub struct App {
     presented: Option<u64>,
     /// The viewer's caption as last requested.
     caption: String,
+    /// The Edit menu's undo and redo labels as last requested.
+    undo_labels: [Option<&'static str>; 2],
     /// The status bar's GPU label as last requested.
     gpu_label: Option<String>,
 }
@@ -363,6 +371,7 @@ impl App {
             shown: Shown::Nothing,
             presented: None,
             caption: String::new(),
+            undo_labels: [None, None],
             gpu_label: None,
         }
     }
@@ -371,55 +380,17 @@ impl App {
         &self.session
     }
 
-    pub fn has_surface(&self, pane: Pane) -> bool {
-        self.gpu.has_surface(pane)
-    }
-
-    /// Has every frame from now on record what it proves, for the shell's lifecycle check. Each
-    /// frame then waits for the GPU. Call it before the first surface is attached, so that every
-    /// surface is made readable where it allows.
-    pub fn check_frames(&mut self) {
-        self.gpu.check_frames();
-    }
-
-    /// What the pane's frames have proved since [`App::check_frames`]; `None` before it.
-    pub fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
-        self.gpu.frame_check(pane)
-    }
-
-    /// How many GPU errors this session went uncaptured. Each is a bug, logged on standard error
-    /// up to a limit, after which drawing continues.
-    pub fn gpu_errors(&self) -> u64 {
-        self.gpu.errors()
-    }
-
-    /// Destroys the GPU device for the shell's lifecycle check. Its loss then arrives as a
-    /// driver's would, as [`Notice::DeviceLost`].
-    pub fn destroy_device(&mut self) {
-        self.gpu.destroy_device();
-    }
-
-    /// Edits the session for the shell's drag check, which has no parameter panel to drive yet,
-    /// then keeps the viewer following it as `dispatch` does.
-    pub fn edit(&mut self, edit: impl FnOnce(&mut Session)) -> Vec<Request> {
+    /// Edits the session as a parameter panel will, which the shell's drag check stands in for,
+    /// then follows the change as [`App::dispatch`] does. Returns the requests, and the number of
+    /// the request whose result shows the edited session.
+    pub fn edit(&mut self, edit: impl FnOnce(&mut Session)) -> (Vec<Request>, u64) {
         edit(&mut self.session);
-        let mut requests = vec![Request::Redraw(Pane::Graph)];
-        self.follow_viewer(&mut requests);
-        requests
-    }
-
-    /// The number of the request last sent to the worker; 0 before the first.
-    pub fn last_request(&self) -> u64 {
-        self.requests_sent
-    }
-
-    /// The number of the request whose image the viewer's last presented frame showed.
-    pub fn presented_request(&self) -> Option<u64> {
-        self.presented
+        let requests = self.after_change(vec![Request::Redraw(Pane::Graph)]);
+        (requests, self.requests_sent)
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
-        let mut requests = match event {
+        let requests = match event {
             // Not while the pane has no surface: after a loss, only the retry makes a device.
             Event::Exposed(pane) if !self.gpu.has_window(pane) => {
                 vec![Request::AttachSurface(pane)]
@@ -484,11 +455,24 @@ impl App {
                 _ => Vec::new(),
             },
         };
+        self.after_change(requests)
+    }
+
+    /// Follows whatever the event or edit changed: the viewer, then the labels the shell shows.
+    fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
         self.follow_viewer(&mut requests);
+        // The labels go first, since performing another request may dispatch again and show
+        // newer ones.
+        let undo_labels = [self.session.undo_label(), self.session.redo_label()];
+        if undo_labels != self.undo_labels {
+            self.undo_labels = undo_labels;
+            let [undo, redo] = undo_labels;
+            requests.insert(0, Request::ShowUndoLabels { undo, redo });
+        }
         let gpu_label = self.gpu_label();
         if gpu_label != self.gpu_label {
             self.gpu_label.clone_from(&gpu_label);
-            requests.push(Request::ShowGpuLabel(gpu_label));
+            requests.insert(0, Request::ShowGpuLabel(gpu_label));
         }
         requests
     }
@@ -967,6 +951,44 @@ impl App {
             details.push("empty".to_owned());
         }
         format!("Slot {slot} · {} · {}", node_name(node), details.join("; "))
+    }
+}
+
+/// What the shell's checks read and do, which the app itself has no use for.
+#[doc(hidden)]
+impl App {
+    pub fn has_surface(&self, pane: Pane) -> bool {
+        self.gpu.has_surface(pane)
+    }
+
+    /// Has every frame from now on record what it proves, for the lifecycle check. Each frame
+    /// then waits for the GPU. Call it before the first surface is attached, so that every
+    /// surface is made readable where it allows.
+    pub fn check_frames(&mut self) {
+        self.gpu.check_frames();
+    }
+
+    /// What the pane's frames have proved since [`App::check_frames`]; `None` before it.
+    pub fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
+        self.gpu.frame_check(pane)
+    }
+
+    /// How many GPU errors this session went uncaptured. Each is a bug, logged on standard error
+    /// up to a limit, after which drawing continues.
+    pub fn gpu_errors(&self) -> u64 {
+        self.gpu.errors()
+    }
+
+    /// Destroys the GPU device for the lifecycle check. Its loss then arrives as a driver's
+    /// would, as [`Notice::DeviceLost`].
+    pub fn destroy_device(&mut self) {
+        self.gpu.destroy_device();
+    }
+
+    /// The number of the request whose image the viewer's last presented frame showed, for the
+    /// drag check.
+    pub fn presented_request(&self) -> Option<u64> {
+        self.presented
     }
 }
 

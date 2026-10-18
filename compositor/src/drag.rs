@@ -178,12 +178,11 @@ fn begin() {
 fn step(index: usize) {
     let stops = STOPS.start() + (STOPS.end() - STOPS.start()) * (index + 1) as f64 / EDITS as f64;
     let at = Instant::now();
-    crate::edit(|session| {
+    let request = crate::edit(|session| {
         session
             .set_value("stops", Value::Float(stops))
             .expect("Stops takes the value");
     });
-    let request = crate::last_request();
     let period = with(|check| {
         check.edits.push(Edit {
             request,

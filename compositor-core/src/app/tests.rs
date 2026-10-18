@@ -141,6 +141,10 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
     assert_eq!(
         requests,
         [
+            Request::ShowUndoLabels {
+                undo: Some("Create Reader"),
+                redo: None
+            },
             Request::Redraw(Pane::Graph),
             Request::ShowViewerCaption(
                 "Slot 1: nothing marked. Ctrl+1 marks the selected node".to_owned()
@@ -869,4 +873,28 @@ fn the_viewer_follows_value_edits_and_their_undo() {
     assert_eq!(sent(&app).key, before);
     app.dispatch(Event::Command(Command::Redo));
     assert_eq!(sent(&app).key, edited);
+}
+
+#[test]
+fn an_edit_names_itself_as_what_undo_would_undo() {
+    let (mut app, _deliveries) = app();
+    let exposure = create_exposure(&mut app);
+
+    let (requests, _) = app.edit(|session| {
+        session.begin_edit(exposure, "Stops").unwrap();
+        session.set_value("stops", Value::Float(1.0)).unwrap();
+        session.finish_edit();
+    });
+
+    let labels = Request::ShowUndoLabels {
+        undo: Some("Stops"),
+        redo: None,
+    };
+    assert!(requests.contains(&labels), "{requests:?}");
+    let requests = app.dispatch(Event::Command(Command::Undo));
+    let labels = Request::ShowUndoLabels {
+        undo: Some("Create Exposure"),
+        redo: Some("Stops"),
+    };
+    assert!(requests.contains(&labels), "{requests:?}");
 }
