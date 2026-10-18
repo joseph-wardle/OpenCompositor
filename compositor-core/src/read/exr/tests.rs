@@ -204,6 +204,36 @@ fn every_sample_type_reads_as_f32_and_other_channels_are_skipped() {
 }
 
 #[test]
+fn an_f32_subnormal_reads_as_signed_zero() {
+    // The smallest subnormal, a negative one, the smallest normal, and a half's smallest
+    // subnormal, which is a normal f32.
+    let area = SIZE.0 * SIZE.1;
+    let f32s = |value: f32| FlatSamples::F32(vec![value; area]);
+    let channels = vec![
+        AnyChannel::new("R", f32s(f32::from_bits(1))),
+        AnyChannel::new("G", f32s(-f32::MIN_POSITIVE / 2.0)),
+        AnyChannel::new("B", f32s(f32::MIN_POSITIVE)),
+        AnyChannel::new("A", FlatSamples::F16(vec![half::f16::from_bits(1); area])),
+    ];
+    let layer = Layer::new(
+        SIZE,
+        LayerAttributes::default(),
+        Encoding::FAST_LOSSLESS,
+        AnyChannels::sort(channels.into_iter().collect()),
+    );
+    let bytes = write(display(0, 0, SIZE.0, SIZE.1), vec![layer]);
+
+    let image = read_bytes(&bytes).unwrap();
+
+    let [r, g, b, a] = rgba(&image, 1, 1);
+    assert_eq!(r.to_bits(), 0.0f32.to_bits());
+    assert_eq!(g.to_bits(), (-0.0f32).to_bits());
+    assert_eq!(b, f32::MIN_POSITIVE);
+    assert_eq!(a, half::f16::from_bits(1).to_f32());
+    assert!(a.is_normal());
+}
+
+#[test]
 fn a_tiled_zip_file_from_openexr_reads_exactly() {
     // A 16 × 8 data window at (-7, -5) counted down in a 10 × 10 display window, red each pixel's
     // x and green its row, written by OpenEXR 3.5 as one 64 × 64 ZIP tile, so the expected

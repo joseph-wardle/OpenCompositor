@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ::png::{
     BitDepth, ColorType, Decoder, DecodingError, ScaledFloat, SourceChromaticities, Transformations,
 };
+use opencompositor_kernels::flush;
 
 use super::{ReadError, Refusal, check_size};
 use crate::image::{
@@ -279,7 +280,10 @@ fn premultiplied_linear(
                 _ => (code(0), code(1), code(2), code(3)),
             };
             let a = f32::from(a) / f32::from(max);
-            [r_row[x], g_row[x], b_row[x]] = [r, g, b].map(|code| linear[usize::from(code)] * a);
+            // A tiny gamma can decode a code below the normal range, and alpha can take a normal
+            // value there.
+            [r_row[x], g_row[x], b_row[x]] =
+                [r, g, b].map(|code| flush(linear[usize::from(code)] * a));
             a_row[x] = a;
         }
         let planes = colour.iter_mut().chain([&mut alpha]);

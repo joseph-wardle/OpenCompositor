@@ -57,7 +57,8 @@ impl Channel {
 ///
 /// Every channel is a plane: the data window's values, bottom row first, shared between images
 /// that leave it unchanged. Every image has R, G, B and A; a file without alpha reads as opaque.
-/// Colour is always premultiplied by A.
+/// Colour is always premultiplied by A. No plane holds a subnormal: a reader or an operation
+/// flushes one to signed zero as it writes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Image {
     display_window: Window,
@@ -80,11 +81,7 @@ impl Image {
         source: Source,
         warnings: Vec<Warning>,
     ) -> Image {
-        let area = data_window.width as usize * data_window.height as usize;
-        assert!(
-            planes.iter().all(|plane| plane.len() == area),
-            "one value per data window pixel"
-        );
+        check_planes(&planes, data_window);
         Image {
             display_window,
             data_window,
@@ -116,11 +113,7 @@ impl Image {
 
     /// This image with other values over the same data window, in `Channel::ALL`'s order.
     pub(crate) fn with_planes(&self, planes: [Arc<[f32]>; 4]) -> Image {
-        let area = self.data_window.width as usize * self.data_window.height as usize;
-        assert!(
-            planes.iter().all(|plane| plane.len() == area),
-            "one value per data window pixel"
-        );
+        check_planes(&planes, self.data_window);
         Image {
             display_window: self.display_window,
             data_window: self.data_window,
@@ -185,6 +178,24 @@ impl Image {
         };
         (info, self.planes)
     }
+}
+
+/// What every plane of an image meets: one value per data window pixel, and no subnormal. The
+/// second is checked only in debug builds, as it reads every plane. A subnormal input is what a
+/// GPU in flush-to-zero mode zeroes and the CPU would scale to a normal result, so whatever fills
+/// a plane flushes as it writes rather than leaving it to the consumer.
+fn check_planes(planes: &[Arc<[f32]>; 4], data_window: Window) {
+    let area = data_window.width as usize * data_window.height as usize;
+    assert!(
+        planes.iter().all(|plane| plane.len() == area),
+        "one value per data window pixel"
+    );
+    debug_assert!(
+        planes
+            .iter()
+            .all(|plane| plane.iter().all(|value| !value.is_subnormal())),
+        "no plane holds a subnormal"
+    );
 }
 
 /// A plane of `len` zeros for a reader or an operation to fill before anything else shares it.
@@ -420,3 +431,6 @@ impl fmt::Display for Warning {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

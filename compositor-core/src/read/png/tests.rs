@@ -287,6 +287,44 @@ fn transfer_curves_and_narrow_range_are_honoured() {
 }
 
 #[test]
+fn colour_decoded_below_the_normal_range_reads_as_zero() {
+    // At 16 bits under a gamma of 0.00001, code 65470 decodes to a subnormal, 65480 to a normal
+    // value that a barely covering alpha takes below the range, and 65490 to a normal value that
+    // alpha keeps there.
+    let gamma = ScaledFloat::new(0.00001);
+    let a = 1.0 / 65535.0;
+    let decoding = Decoding {
+        transfer: Transfer::Power(1.0 / gamma.into_value()),
+        narrow_range: false,
+    };
+    assert!(decoding.decode(65470, u16::MAX).is_subnormal());
+    assert!((decoding.decode(65480, u16::MAX) * a).is_subnormal());
+    assert!((decoding.decode(65490, u16::MAX) * a).is_normal());
+    let codes: [u16; 12] = [
+        65470, 65470, 65470, 65535, // a subnormal, opaque
+        65480, 65480, 65480, 1, // a normal value, barely covered
+        65490, 65490, 65490, 65535, // a normal value, opaque
+    ];
+    let data: Vec<u8> = codes.iter().flat_map(|code| code.to_be_bytes()).collect();
+    let bytes = png(
+        ColorType::Rgba,
+        BitDepth::Sixteen,
+        3,
+        &data,
+        |info| info.source_gamma = Some(gamma),
+        &[],
+    );
+
+    let image = read_bytes(&bytes).unwrap();
+
+    assert_eq!(rgba(&image, 0, 0), [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(rgba(&image, 1, 0), [0.0, 0.0, 0.0, a]);
+    let [red, .., alpha] = rgba(&image, 2, 0);
+    assert!(red.is_normal() && red > 0.0);
+    assert_eq!(alpha, 1.0);
+}
+
+#[test]
 fn primaries_and_icc_profiles_load_with_warnings() {
     let p3 = |info: &mut Info<'static>| info.source_chromaticities = Some(p3());
     assert!(matches!(

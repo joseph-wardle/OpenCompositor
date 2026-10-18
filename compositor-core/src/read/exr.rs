@@ -16,6 +16,7 @@ use ::exr::meta::header::Header;
 use ::exr::meta::{BlockDescription, MetaData};
 use half::f16;
 use half::slice::HalfFloatSliceExt;
+use opencompositor_kernels::flush;
 
 use super::{ReadError, Refusal, check_size, window};
 use crate::image::{
@@ -178,6 +179,8 @@ fn read_planes(
             for &(plane, before, sample_type) in &sources {
                 let samples = &bytes[before * block_width..];
                 let target = &mut out[plane][start..start + block_width];
+                // Only an F32 sample can be subnormal: every f16 is a normal f32 or zero, and a
+                // U32 is a whole number.
                 match sample_type {
                     attribute::SampleType::F16 => {
                         let (samples, _) = samples.as_chunks();
@@ -192,7 +195,7 @@ fn read_planes(
                     attribute::SampleType::F32 => {
                         let (samples, _) = samples.as_chunks();
                         for (value, &sample) in target.iter_mut().zip(samples) {
-                            *value = f32::from_ne_bytes(sample);
+                            *value = flush(f32::from_ne_bytes(sample));
                         }
                     }
                     attribute::SampleType::U32 => {
