@@ -372,34 +372,31 @@ impl Gpu {
 
     /// Draws one frame of the pane: the graph, or the viewer's frame if it shows an image.
     /// This can wait for the display while the pane has frames it has not shown.
-    ///
-    /// Returns whether to draw again: the surface was out of date and has been reconfigured, or
-    /// the display took too long to free a frame, which would otherwise lose this draw.
     pub(crate) fn draw(
         &mut self,
         pane: Pane,
         graph: &Graph,
         view: &View,
         viewer_frame: Option<ViewerFrame>,
-    ) -> bool {
+    ) -> Drawn {
         let Some(device) = &mut self.device else {
-            return false;
+            return Drawn::Skipped;
         };
         let Some(PaneSurface { surface, config }) = &device.surfaces[pane.index()] else {
-            return false;
+            return Drawn::Skipped;
         };
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 surface.configure(&device.device, config);
-                return true;
+                return Drawn::Again;
             }
-            wgpu::CurrentSurfaceTexture::Timeout => return true,
+            wgpu::CurrentSurfaceTexture::Timeout => return Drawn::Again,
             // The pane is hidden; it is drawn again when exposed.
-            wgpu::CurrentSurfaceTexture::Occluded => return false,
+            wgpu::CurrentSurfaceTexture::Occluded => return Drawn::Skipped,
             // Only under an error scope or handler, which this code does not install.
-            wgpu::CurrentSurfaceTexture::Validation => return false,
+            wgpu::CurrentSurfaceTexture::Validation => return Drawn::Skipped,
         };
         match pane {
             Pane::Graph => device.renderer.prepare(
@@ -451,8 +448,21 @@ impl Gpu {
             checks.record(pane, device, readback);
         }
         device.queue.present(frame);
-        false
+        Drawn::Presented
     }
+}
+
+/// What [`Gpu::draw`] did with the pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Drawn {
+    /// A frame was submitted and presented.
+    Presented,
+    /// Nothing was drawn and nothing needs to be until the pane changes: there is no device or
+    /// surface, or the pane is hidden.
+    Skipped,
+    /// Nothing was drawn, but it should be again: the surface was out of date and has been
+    /// reconfigured, or the display took too long to free a frame.
+    Again,
 }
 
 /// Copies the texture's centre pixel into a new buffer that can be mapped.

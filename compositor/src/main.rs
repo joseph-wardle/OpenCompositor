@@ -232,9 +232,8 @@ pub fn dispatch(event: Event) {
     let Some((requests, labels)) = handled else {
         return;
     };
-    // A draw asks to be drawn again only when it submitted no frame.
-    if draws_viewer && !requests.contains(&Request::Redraw(Pane::Viewer)) {
-        drag::viewer_frame_submitted();
+    if draws_viewer {
+        drag::viewer_frame_drawn();
     }
     // Before the requests, which may dispatch again and show newer labels.
     show_undo_labels(labels);
@@ -389,9 +388,9 @@ pub fn last_request() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.last_request()))
 }
 
-/// The number of the request whose image the viewer shows, in the drag check.
-pub fn shown_request() -> Option<u64> {
-    APP.with(|cell| cell.borrow().as_ref()?.shown_request())
+/// The number of the request whose image the viewer last presented, in the drag check.
+pub fn presented_request() -> Option<u64> {
+    APP.with(|cell| cell.borrow().as_ref()?.presented_request())
 }
 
 pub fn widgets() -> Widgets {

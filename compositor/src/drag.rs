@@ -79,10 +79,11 @@ pub fn delivered(request: u64, timing: Timing, at: Instant) {
     with_edit(request, |edit| edit.delivered = Some((at, timing)));
 }
 
-/// Records that the viewer submitted a frame: the first for every edit the shown result answers,
-/// which is each edit it is from or supersedes, if the drag check is running.
-pub fn viewer_frame_submitted() {
-    let Some(shown) = crate::shown_request() else {
+/// Records the viewer's last presented frame as the first for every edit its result answers,
+/// which is each edit it is from or supersedes, if the drag check is running. A draw that
+/// presented nothing leaves the last frame, whose edits are already recorded.
+pub fn viewer_frame_drawn() {
+    let Some(shown) = crate::presented_request() else {
         return;
     };
     let now = Instant::now();
@@ -146,7 +147,7 @@ fn created(changes: Changes) -> NodeId {
 }
 
 fn wait_for_image(tries: usize) {
-    if crate::shown_request().is_some() {
+    if crate::presented_request().is_some() {
         begin();
     } else if POLL * tries as u32 >= LONGEST_WAIT {
         report(vec![format!(

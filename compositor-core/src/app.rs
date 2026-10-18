@@ -10,7 +10,7 @@ use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{ExposureVersion, Node, NodeId, NodeKind, Slot, unconnected_inputs};
 use crate::evaluate::{ResultKey, result_key};
-use crate::gpu::{FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
+use crate::gpu::{Drawn, FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
 use crate::session::Session;
 use crate::worker::{Evaluated, ViewerError, Wanted, Worker};
@@ -333,6 +333,8 @@ pub struct App {
     /// The pointer's last position over the graph pane.
     graph_pointer: Option<PhysicalPoint>,
     shown: Shown,
+    /// The request whose image the viewer's last presented frame showed.
+    presented: Option<u64>,
     /// The viewer's caption as last requested.
     caption: String,
     /// The status bar's GPU label as last requested.
@@ -356,6 +358,7 @@ impl App {
             hovered: None,
             graph_pointer: None,
             shown: Shown::Nothing,
+            presented: None,
             caption: String::new(),
             gpu_label: None,
         }
@@ -407,12 +410,9 @@ impl App {
         self.requests_sent
     }
 
-    /// The number of the request whose image the viewer shows.
-    pub fn shown_request(&self) -> Option<u64> {
-        match &self.shown {
-            Shown::Image { wanted, .. } => Some(wanted.number),
-            Shown::Nothing | Shown::Failed { .. } => None,
-        }
+    /// The number of the request whose image the viewer's last presented frame showed.
+    pub fn presented_request(&self) -> Option<u64> {
+        self.presented
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
@@ -570,10 +570,22 @@ impl App {
             data_window: info.data_window,
             scale_factor: self.session.viewer().scale_factor(),
         });
-        let again = self
+        match self
             .gpu
-            .draw(pane, self.session.graph(), self.session.graph_view(), frame);
-        redraw_if(pane, again)
+            .draw(pane, self.session.graph(), self.session.graph_view(), frame)
+        {
+            Drawn::Presented => {
+                if pane == Pane::Viewer {
+                    self.presented = match &self.shown {
+                        Shown::Image { wanted, .. } => Some(wanted.number),
+                        Shown::Nothing | Shown::Failed { .. } => None,
+                    };
+                }
+                Vec::new()
+            }
+            Drawn::Skipped => Vec::new(),
+            Drawn::Again => vec![Request::Redraw(pane)],
+        }
     }
 
     fn resize(&mut self, pane: Pane, size: PaneSize) {

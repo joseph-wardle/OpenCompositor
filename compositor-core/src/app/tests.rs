@@ -834,3 +834,15 @@ fn an_exposure_node_is_created_where_the_pointer_is_over_the_graph() {
     assert_eq!(node.position, Point { x: 50.0, y: -50.0 });
     assert_eq!(app.session().undo_label(), Some("Create Exposure"));
 }
+
+#[test]
+fn a_viewer_draw_without_a_surface_presents_nothing() {
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(read(&sent(&app), 4, 4));
+    assert!(matches!(app.shown, Shown::Image { .. }));
+
+    assert_eq!(app.dispatch(Event::Draw(Pane::Viewer)), []);
+    assert_eq!(app.presented_request(), None);
+}
