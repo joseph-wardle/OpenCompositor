@@ -1,9 +1,11 @@
 //! `--drag-check IMAGE`: drags Exposure's Stops on a Reader → Exposure chain of IMAGE, one edit
 //! per refresh of the viewer's screen, and reports how the viewer kept up. The worker evaluates the
-//! latest request and discards the rest, so no one number says it: the check reports how many
-//! edits reached a frame, the latency from each such edit to the first frame that sampled its
-//! result, the final edit's latency, the stages of the worker's path, and the process's resident
-//! memory. It exits 0 if the latencies' p95 met the budget and 1 otherwise.
+//! latest request and discards the rest, so an edit's latency ends at the first viewer frame
+//! submitted that samples a result from its request or a later one: a superseded edit is answered
+//! by the frame showing a newer value, as the artist sees it. The check reports the latencies over
+//! every edit, the final edit's own, how many edits' own values were shown, the stages of the
+//! worker's path for the edits whose result it delivered, and the process's resident memory. It
+//! exits 0 if the latencies' p95 and the final edit's met the budget and 1 otherwise.
 //!
 //! Run it in a release build on the workstation, and twice, since the first run's shader and
 //! file caches are cold. A frame counts when the GUI thread submits it, not when the display
@@ -25,8 +27,8 @@ use crate::qt::ffi;
 const EDITS: usize = 200;
 const STOPS: RangeInclusive<f64> = -3.0..=3.0;
 
-/// The p95 from an edit to the frame that first sampled its result, in a CPU session on the
-/// workstation: the kernel branch's gate.
+/// What the latencies' p95 and the final edit's latency must meet in a CPU session on the
+/// workstation.
 const BUDGET: Duration = Duration::from_millis(50);
 
 /// How often the check looks for the image before the drag and for the final edit's frame after,
@@ -49,8 +51,10 @@ struct Edit {
     /// When its result arrived on the GUI thread, with the worker's record; `None` if the worker
     /// discarded it.
     delivered: Option<(Instant, Timing)>,
-    /// When the first viewer frame sampling its result was submitted.
+    /// When the first viewer frame sampling its result, or a later one, was submitted.
     framed: Option<Instant>,
+    /// Whether a frame sampled its own result.
+    shown: bool,
 }
 
 thread_local! {
@@ -75,14 +79,22 @@ pub fn delivered(request: u64, timing: Timing, at: Instant) {
     with_edit(request, |edit| edit.delivered = Some((at, timing)));
 }
 
-/// Records that the viewer submitted a frame, the first for the result it shows if the drag
-/// check is running and an edit asked for it.
+/// Records that the viewer submitted a frame: the first for every edit the shown result answers,
+/// which is each edit it is from or supersedes, if the drag check is running.
 pub fn viewer_frame_submitted() {
     let Some(shown) = crate::shown_request() else {
         return;
     };
-    with_edit(shown, |edit| {
-        edit.framed.get_or_insert_with(Instant::now);
+    let now = Instant::now();
+    CHECK.with(|cell| {
+        let mut check = cell.borrow_mut();
+        let Some(check) = check.as_mut() else {
+            return;
+        };
+        for edit in check.edits.iter_mut().filter(|edit| edit.request <= shown) {
+            edit.framed.get_or_insert(now);
+            edit.shown |= edit.request == shown;
+        }
     });
 }
 
@@ -177,6 +189,7 @@ fn step(index: usize) {
             at,
             delivered: None,
             framed: None,
+            shown: false,
         });
         check.period
     });
@@ -214,10 +227,12 @@ fn report(mut failures: Vec<String>) {
         .with(|cell| cell.borrow_mut().take())
         .expect("the check has started");
     let edits = &check.edits;
-    let framed: Vec<&Edit> = edits.iter().filter(|edit| edit.framed.is_some()).collect();
-    let latency = |edit: &Edit| edit.framed.expect("framed") - edit.at;
-    let mut latencies: Vec<Duration> = framed.iter().map(|edit| latency(edit)).collect();
+    let latency = |edit: &Edit| Some(edit.framed? - edit.at);
+    // Every edit once the final one is framed, since that frame answers them all.
+    let mut latencies: Vec<Duration> = edits.iter().filter_map(latency).collect();
     latencies.sort();
+    let final_latency = edits.last().and_then(latency);
+    let shown = edits.iter().filter(|edit| edit.shown).count();
     let mut spacing: Vec<Duration> = edits
         .windows(2)
         .map(|pair| pair[1].at - pair[0].at)
@@ -234,16 +249,13 @@ fn report(mut failures: Vec<String>) {
         );
     }
     eprintln!(
-        "drag check: {} of {} edits reached a frame; edit → frame p50 {:.1?}, p95 {:.1?}, max {:.1?}; the final edit {}",
-        framed.len(),
-        edits.len(),
+        "drag check: edit → frame p50 {:.1?}, p95 {:.1?}, max {:.1?}; the final edit {}; {} of {} edits' own values were shown",
         percentile(&latencies, 0.5),
         percentile(&latencies, 0.95),
         percentile(&latencies, 1.0),
-        match edits.last() {
-            Some(edit) if edit.framed.is_some() => format!("{:.1?}", latency(edit)),
-            _ => "never".to_owned(),
-        }
+        final_latency.map_or_else(|| "never".to_owned(), |latency| format!("{latency:.1?}")),
+        shown,
+        edits.len(),
     );
     type Stage = (
         &'static str,
@@ -270,32 +282,42 @@ fn report(mut failures: Vec<String>) {
         }),
         ("frame", |edit, _, received| Some(edit.framed? - received)),
     ];
+    let delivered: Vec<(&Edit, Instant, Timing)> = edits
+        .iter()
+        .filter_map(|edit| {
+            let (received, timing) = edit.delivered?;
+            Some((edit, received, timing))
+        })
+        .collect();
     let medians: Vec<String> = stages
         .iter()
         .map(|(name, stage)| {
-            let mut values: Vec<Duration> = framed
+            let mut values: Vec<Duration> = delivered
                 .iter()
-                .filter_map(|edit| {
-                    let (received, timing) = edit.delivered?;
-                    stage(edit, &timing, received)
-                })
+                .filter_map(|(edit, received, timing)| stage(edit, timing, *received))
                 .collect();
             values.sort();
             format!("{name} {:.1?}", percentile(&values, 0.5))
         })
         .collect();
     eprintln!(
-        "drag check: stage medians of the edits that reached a frame: {}",
+        "drag check: stage medians of the {} edits whose result was delivered: {}",
+        delivered.len(),
         medians.join(", ")
     );
     eprintln!("drag check: resident memory {}", resident_memory());
-    if latencies.is_empty() {
-        failures.push("no edit reached a frame".to_owned());
-    } else if percentile(&latencies, 0.95) > BUDGET {
-        failures.push(format!(
-            "edit → frame p95 {:.1?}, over the {BUDGET:?} budget",
-            percentile(&latencies, 0.95)
-        ));
+    if let Some(final_latency) = final_latency {
+        let p95 = percentile(&latencies, 0.95);
+        if p95 > BUDGET {
+            failures.push(format!(
+                "edit → frame p95 {p95:.1?}, over the {BUDGET:?} budget"
+            ));
+        }
+        if final_latency > BUDGET {
+            failures.push(format!(
+                "the final edit {final_latency:.1?}, over the {BUDGET:?} budget"
+            ));
+        }
     }
     for failure in &failures {
         eprintln!("drag check failed: {failure}");
