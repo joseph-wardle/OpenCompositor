@@ -11,7 +11,7 @@ use opencompositor_kernels as kernels;
 /// feature a level's wrapper enables; the tests make the others only after checking it. Other
 /// architectures have only [`Level::Baseline`], the plain build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Level {
+pub enum Level {
     /// The build's own target: SSE2 on x86-64, four lanes of f32.
     Baseline,
     /// x86-64-v3, AVX2 and FMA: eight lanes.
@@ -54,7 +54,7 @@ impl Level {
 
 /// Exposure by `gain` from `src` into `dst`, two slices of one length: each sample of `dst`
 /// becomes [`kernels::exposure`] of the sample at the same index in `src`.
-pub(crate) fn exposure(level: Level, src: &[f32], dst: &mut [f32], gain: f32) {
+pub fn exposure(level: Level, src: &[f32], dst: &mut [f32], gain: f32) {
     assert_eq!(src.len(), dst.len(), "Exposure's slices differ in length");
     match level {
         Level::Baseline => exposure_baseline(src, dst, gain),

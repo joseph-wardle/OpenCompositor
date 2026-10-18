@@ -432,5 +432,6 @@ impl fmt::Display for Warning {
     }
 }
 
-#[cfg(test)]
+// The constructors' subnormal check is a debug assertion, so the tests are debug-only too.
+#[cfg(all(test, debug_assertions))]
 mod tests;

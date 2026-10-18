@@ -27,14 +27,12 @@ fn plane(values: [f32; 2]) -> [Arc<[f32]>; 4] {
 }
 
 // Debug builds check what every producer keeps by flushing as it writes.
-#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "no plane holds a subnormal")]
 fn a_new_image_refuses_a_plane_holding_a_subnormal() {
     image(plane([0.0, f32::from_bits(1)]));
 }
 
-#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "no plane holds a subnormal")]
 fn with_planes_refuses_a_plane_holding_a_subnormal() {

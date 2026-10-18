@@ -19,6 +19,10 @@ rayon = "1.12.0"
 # Backends are the shell's choice. `spirv` reads the kernels' module through naga's validation.
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "spirv"] }
 
+[[bench]]
+name = "kernels"
+harness = false
+
 [dev-dependencies]
 # The loader's staging is tested without a GPU; the kernels on a real Vulkan adapter.
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "spirv", "noop", "vulkan"] }

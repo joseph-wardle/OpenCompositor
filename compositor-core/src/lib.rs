@@ -17,6 +17,14 @@ mod session;
 mod viewer;
 mod worker;
 
+/// What `benches/kernels.rs` measures. The benchmark is a crate of its own, so this is the one
+/// place the pool and the CPU kernels are reachable from outside; nothing else is public here.
+#[doc(hidden)]
+pub mod bench {
+    pub use crate::evaluate::Pool;
+    pub use crate::kernels::cpu::{Level, exposure};
+}
+
 pub use app::{App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
 pub use document::{
     Assignment, Changes, ConnectionError, Document, ExposureVersion, Node, NodeId, NodeInput,

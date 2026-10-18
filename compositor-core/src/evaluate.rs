@@ -523,7 +523,7 @@ impl Evaluator {
 /// the GUI thread a core to wake on: hyperthreads added nothing to a memory-bound kernel and made
 /// its wake-ups late.
 #[derive(Debug)]
-struct Pool {
+pub struct Pool {
     threads: rayon::ThreadPool,
     level: Level,
 }
@@ -532,8 +532,14 @@ struct Pool {
 /// one per thread, lost to them once the machine had anything else to do.
 const CHUNK_ROWS: usize = 8;
 
+impl Default for Pool {
+    fn default() -> Pool {
+        Pool::new()
+    }
+}
+
 impl Pool {
-    fn new() -> Pool {
+    pub fn new() -> Pool {
         let threads = rayon::ThreadPoolBuilder::new()
             .num_threads(pool_threads())
             .thread_name(|index| format!("kernels {index}"))
@@ -545,9 +551,19 @@ impl Pool {
         }
     }
 
+    /// How many threads run kernels.
+    pub fn threads(&self) -> usize {
+        self.threads.current_num_threads()
+    }
+
+    /// The level the kernels run at.
+    pub fn level(&self) -> Level {
+        self.level
+    }
+
     /// Runs `kernel` from `src` into `dst`, two planes of `width` columns and one length, a
     /// chunk of rows at a time over the threads. `kernel` is given the level and a chunk of each.
-    fn run(
+    pub fn run(
         &self,
         width: usize,
         src: &[f32],
