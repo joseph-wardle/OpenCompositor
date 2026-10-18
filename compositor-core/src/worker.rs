@@ -321,9 +321,11 @@ impl Mailbox {
     /// Waits for a request, or `None` once the worker is stopping.
     fn next(&self) -> Option<Option<Wanted>> {
         self.wait_for(|state| {
-            let request = state.request.take()?;
+            let Some(request) = state.request.take() else {
+                return Take::Wait;
+            };
             state.started.clone_from(&request);
-            Some(request)
+            Take::Taken(request)
         })
     }
 
@@ -331,35 +333,39 @@ impl Mailbox {
     /// to fill. `None` once the started request is superseded,
     /// the device is no longer connected or the worker is stopping.
     fn take_staging(self: &Arc<Mailbox>, device_generation: u64) -> Option<Staging> {
-        let taken = self.wait_for(|state| {
+        let buffer = self.wait_for(|state| {
             let superseded = state.superseded();
             let connection = match &mut state.connection {
                 Some(connection) if connection.generation == device_generation && !superseded => {
                     connection
                 }
-                _ => return Some(None),
+                _ => return Take::GiveUp,
             };
             match std::mem::replace(&mut connection.staging, StagingSlot::Out) {
-                StagingSlot::Empty => Some(Some(None)),
-                StagingSlot::Waiting(buffer) => Some(Some(Some(buffer))),
-                StagingSlot::Out => None,
+                StagingSlot::Empty => Take::Taken(None),
+                StagingSlot::Waiting(buffer) => Take::Taken(Some(buffer)),
+                StagingSlot::Out => Take::Wait,
             }
-        });
+        })?;
         Some(Staging {
-            buffer: taken.flatten()?,
+            buffer,
             device_generation,
             mailbox: Arc::clone(self),
         })
     }
 
-    fn wait_for<T>(&self, mut take: impl FnMut(&mut MailboxState) -> Option<T>) -> Option<T> {
+    /// Calls `take` each time the state changes until it takes something or gives up. `None`
+    /// once it gives up or the worker is stopping.
+    fn wait_for<T>(&self, mut take: impl FnMut(&mut MailboxState) -> Take<T>) -> Option<T> {
         let mut state = self.lock();
         loop {
             if state.stopping {
                 return None;
             }
-            if let Some(taken) = take(&mut state) {
-                return Some(taken);
+            match take(&mut state) {
+                Take::Taken(taken) => return Some(taken),
+                Take::GiveUp => return None,
+                Take::Wait => {}
             }
             state = self
                 .changed
@@ -386,6 +392,14 @@ impl Mailbox {
             device,
         })
     }
+}
+
+/// What [`Mailbox::wait_for`]'s `take` found in the state.
+enum Take<T> {
+    Taken(T),
+    /// Not yet: wait for the state to change.
+    Wait,
+    GiveUp,
 }
 
 impl MailboxState {
