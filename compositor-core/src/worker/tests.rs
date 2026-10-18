@@ -511,13 +511,47 @@ fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels(
 }
 
 #[test]
+fn every_row_is_staged_where_its_row_number_says() {
+    // More rows than one chunk of the pool's, and a count no chunk divides.
+    let (width, height) = (3, 21);
+    let plane = |channel: usize| -> Vec<f32> {
+        (0..width * height)
+            .map(|i| (i * 4 + channel) as f32)
+            .collect()
+    };
+    let planes = [plane(0), plane(1), plane(2), plane(3)];
+    let halves_per_row = row_bytes(width as u32) as usize / 2;
+    let mut out = vec![f16::NAN; halves_per_row * height];
+
+    convert_rows(
+        &Pool::new(),
+        planes.each_ref().map(|plane| &plane[..]),
+        width,
+        &mut out,
+        halves_per_row,
+    );
+
+    for row in 0..height {
+        let staged = &out[row * halves_per_row..][..width * 4];
+        let expected = (row * width * 4..(row + 1) * width * 4).map(|i| f16::from_f32(i as f32));
+        assert!(staged.iter().copied().eq(expected), "row {row}");
+    }
+}
+
+#[test]
 fn staged_rows_are_interleaved_half_floats_padded_to_the_copy_alignment() {
     // Two rows of one pixel each; the second has a NaN and a value beyond f16's range.
     let planes = [[0.5, f32::NAN], [1.0, 1e6], [-2.0, 0.0], [0.25, 1.0]];
     let padding = f16::from_f32(7.0);
     let mut out = vec![padding; 2 * 128];
 
-    convert_rows(planes.each_ref().map(|plane| &plane[..]), 1, &mut out, 128);
+    convert_rows(
+        &Pool::new(),
+        planes.each_ref().map(|plane| &plane[..]),
+        1,
+        &mut out,
+        128,
+    );
 
     let row = |index: usize| out[index * 128..index * 128 + 4].to_vec();
     assert_eq!(row(0), [0.5, 1.0, -2.0, 0.25].map(f16::from_f32));
@@ -539,6 +573,7 @@ fn a_file_is_staged_bottom_row_first() {
     let mut out = vec![f16::ZERO; halves_per_row * window.height as usize];
 
     convert_rows(
+        &Pool::new(),
         planes.each_ref().map(|plane| &plane[..]),
         width,
         &mut out,

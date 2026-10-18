@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use half::f16;
 
 use crate::document::NodeId;
-use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, ResultKey};
+use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, Pool, ResultKey};
 use crate::gpu::wait_for_device;
 use crate::image::ImageInfo;
 
@@ -483,7 +483,8 @@ fn evaluate(
     let result = match result {
         Ok(image) => {
             let (info, planes) = image.into_parts();
-            match stage(&finishing, &info, planes, sizing, &mut staging) {
+            let pool = evaluator.pool();
+            match stage(&finishing, &info, planes, pool, sizing, &mut staging) {
                 Ok(pixels) => Ok(ViewerImage { info, pixels }),
                 Err(reason) => Err(ViewerError::CannotShow(reason)),
             }
@@ -518,6 +519,7 @@ fn stage(
     finishing: &Finishing,
     info: &ImageInfo,
     planes: [Arc<[f32]>; 4],
+    pool: &Pool,
     sizing: &mut StagingSizing,
     timing: &mut StagingTiming,
 ) -> Result<Option<Staged>, String> {
@@ -579,6 +581,7 @@ fn stage(
         // be write-combining, so the conversion only writes to it.
         let out = unsafe { std::slice::from_raw_parts_mut(start.as_ptr(), halves) };
         convert_rows(
+            pool,
             planes.each_ref().map(|plane| &plane[..]),
             window.width as usize,
             out,
@@ -710,21 +713,29 @@ fn map(finishing: &Finishing, device: &wgpu::Device, buffer: &wgpu::Buffer) -> R
 
 /// Interleaves planes of rows `width` pixels long, in `Channel::ALL`'s order, into RGBA f16 rows
 /// `halves_per_row` apart in `out`, in the planes' row order.
-fn convert_rows(planes: [&[f32]; 4], width: usize, out: &mut [f16], halves_per_row: usize) {
-    // A row is interleaved where it stays in cache, then converted in one call, which only writes
-    // to `out` and uses the CPU's f16 instructions where it has them.
-    let mut interleaved = vec![[0.0; 4]; width];
-    let rows = out.chunks_mut(halves_per_row);
-    for (start, target) in (0..planes[0].len()).step_by(width).zip(rows) {
-        let [r, g, b, a] = planes.map(|plane| &plane[start..start + width]);
-        for (x, pixel) in interleaved.iter_mut().enumerate() {
-            *pixel = [r[x], g[x], b[x], a[x]];
+fn convert_rows(
+    pool: &Pool,
+    planes: [&[f32]; 4],
+    width: usize,
+    out: &mut [f16],
+    halves_per_row: usize,
+) {
+    pool.fill_rows(out, halves_per_row, |first_row, rows| {
+        // A row is interleaved where it stays in cache, then converted in one call, which only
+        // writes to `out` and uses the CPU's f16 instructions where it has them.
+        let mut interleaved = vec![[0.0; 4]; width];
+        for (row, target) in (first_row..).zip(rows.chunks_mut(halves_per_row)) {
+            let start = row * width;
+            let [r, g, b, a] = planes.map(|plane| &plane[start..start + width]);
+            for (x, pixel) in interleaved.iter_mut().enumerate() {
+                *pixel = [r[x], g[x], b[x], a[x]];
+            }
+            half::slice::HalfFloatSliceExt::convert_from_f32_slice(
+                &mut target[..width * 4],
+                interleaved.as_flattened(),
+            );
         }
-        half::slice::HalfFloatSliceExt::convert_from_f32_slice(
-            &mut target[..width * 4],
-            interleaved.as_flattened(),
-        );
-    }
+    });
 }
 
 #[cfg(test)]

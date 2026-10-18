@@ -289,6 +289,10 @@ impl Evaluator {
     ///
     /// `stop` is asked before each node is computed; nothing stops during an operation. Nodes
     /// completed before stopping stay retained until the next request.
+    pub(crate) fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
     pub fn evaluate(
         &mut self,
         key: &ResultKey,
@@ -517,7 +521,8 @@ impl Evaluator {
     }
 }
 
-/// The threads operations run on and the level their kernels run at. Each evaluator builds its
+/// The threads operations and the viewer's conversion of their results run on, and the level the
+/// kernels run at. Each evaluator builds its
 /// own when it is built, so a request never waits for threads to start; the global rayon pool is
 /// never used, and no operation threads otherwise. A pool of the machine's physical cores leaves
 /// the GUI thread a core to wake on: hyperthreads added nothing to a memory-bound kernel and made
@@ -576,6 +581,21 @@ impl Pool {
         self.threads.install(|| {
             (dst.par_chunks_mut(chunk).zip(src.par_chunks(chunk)))
                 .for_each(|(dst, src)| kernel(level, src, dst));
+        });
+    }
+
+    /// Runs `fill` over `out`, rows of `row_len` elements, a chunk of rows at a time over the
+    /// threads. `fill` is given the index of the chunk's first row and the chunk.
+    pub(crate) fn fill_rows<T: Send>(
+        &self,
+        out: &mut [T],
+        row_len: usize,
+        fill: impl Fn(usize, &mut [T]) + Sync,
+    ) {
+        let chunk = (CHUNK_ROWS * row_len).max(1);
+        self.threads.install(|| {
+            (out.par_chunks_mut(chunk).enumerate())
+                .for_each(|(index, rows)| fill(index * CHUNK_ROWS, rows));
         });
     }
 }
