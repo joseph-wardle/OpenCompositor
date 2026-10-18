@@ -1,5 +1,6 @@
-//! The GPU kernels: one compute pipeline per operation over the entry points the kernel crate
-//! compiled to SPIR-V, dispatched over the evaluator's per-plane R32Float textures.
+//! The kernels as compositor-core runs them: the CPU shells in [`cpu`], and here the GPU
+//! pipelines, one per operation over the entry points the kernel crate compiled to SPIR-V,
+//! dispatched over the evaluator's per-plane R32Float textures.
 //!
 //! A dispatch records into the caller's encoder and never submits, so one submission can carry
 //! an evaluation's dispatches and copies together. Nothing here uploads or reads back: the tests
@@ -8,6 +9,8 @@
 use std::fmt;
 
 use opencompositor_kernels::{EXPOSURE_ENTRY, ExposureParams, SPIRV, WORKGROUP};
+
+pub(crate) mod cpu;
 
 /// The format of every plane texture.
 pub(crate) const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;

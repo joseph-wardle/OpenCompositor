@@ -7,7 +7,7 @@ mod document;
 mod evaluate;
 mod gpu;
 mod image;
-// Used by the worker once it evaluates on the GPU; until then only the tests dispatch.
+// Used by the evaluator and the worker once they dispatch; until then only the tests do.
 #[cfg_attr(not(test), expect(dead_code))]
 mod kernels;
 mod parameter;
