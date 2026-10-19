@@ -326,8 +326,6 @@ fn releasing_everything_reads_again() {
     evaluator.release_all();
 
     assert!(evaluator.retained.is_empty());
-    assert!(evaluator.planes.is_empty());
-    assert_eq!(evaluator.retained_bytes, 0);
     write_png(&path, 0);
     assert_eq!(red(&run(&mut evaluator, &exposed).unwrap()), 0.0);
 }
@@ -363,7 +361,7 @@ fn the_cap_keeps_readers_first_and_never_a_result_without_its_inputs() {
     let mut evaluator = Evaluator::with_cap(image_bytes);
     let before = red(&run(&mut evaluator, &one).unwrap());
     assert_eq!(evaluator.retained.len(), 1);
-    assert_eq!(evaluator.retained_bytes, image_bytes);
+    assert_eq!(evaluator.retained_bytes(), image_bytes);
     write_png(&path, 0);
     assert_eq!(red(&run(&mut evaluator, &two).unwrap()), before * 2.0);
 
@@ -372,26 +370,22 @@ fn the_cap_keeps_readers_first_and_never_a_result_without_its_inputs() {
     let mut evaluator = Evaluator::with_cap(image_bytes - 1);
     run(&mut evaluator, &one).unwrap();
     assert!(evaluator.retained.is_empty());
-    assert_eq!(evaluator.retained_bytes, 0);
     write_png(&path, 0);
     assert_eq!(red(&run(&mut evaluator, &two).unwrap()), 0.0);
 }
 
 #[test]
-fn released_planes_are_no_longer_counted() {
+fn a_plane_shared_with_an_input_is_counted_once() {
     let path = directory("counting").join("image.png");
     write_png(&path, 255);
-    let mut evaluator = Evaluator::new();
     let [exposed, _] = exposure_keys(&path, [1.0, 1.0]);
 
+    // The Exposure shares the read's alpha, so seven planes hold both.
+    let mut evaluator = Evaluator::with_cap(7 * 2 * 4);
     run(&mut evaluator, &exposed).unwrap();
-    // The Exposure shares the read's alpha.
-    assert_eq!(evaluator.retained_bytes, 7 * 2 * 4);
-    assert_eq!(evaluator.planes.len(), 7);
 
-    run(&mut evaluator, &key(&chain([exposure(None)]), 1)).unwrap();
-    assert_eq!(evaluator.retained.len(), 1);
-    assert_eq!(evaluator.retained_bytes, 0);
+    assert_eq!(evaluator.retained.len(), 2);
+    assert_eq!(evaluator.retained_bytes(), 7 * 2 * 4);
 }
 
 #[test]

@@ -243,9 +243,6 @@ const RETAINED_BYTES_CAP: u64 = 4 << 30;
 #[derive(Debug)]
 pub struct Evaluator {
     retained: Vec<Retained>,
-    /// Each retained plane once, by address: its bytes and how many retained planes are it.
-    planes: BTreeMap<usize, (u64, u32)>,
-    retained_bytes: u64,
     cap: u64,
     pool: Pool,
 }
@@ -278,8 +275,6 @@ impl Evaluator {
     pub(crate) fn with_cap(cap: u64) -> Evaluator {
         Evaluator {
             retained: Vec::new(),
-            planes: BTreeMap::new(),
-            retained_bytes: 0,
             cap,
             pool: Pool::new(),
         }
@@ -302,6 +297,7 @@ impl Evaluator {
         // Planes for this request's outputs; whatever it does not take drops with it. Nothing is
         // kept for the next request, so a change of image size or a `release_all` needs no rule.
         let mut released = self.release_except(&steps);
+        let mut retained_bytes = self.retained_bytes();
         let requested = steps.len() - 1;
         // What the request needs, and how many nodes still to compute take each image.
         let mut needed = vec![false; steps.len()];
@@ -337,8 +333,23 @@ impl Evaluator {
             };
             // Keeping a result only with its inputs means no retained result outlives what it was
             // computed from, and that Readers are the last refused.
-            if step.inputs.iter().all(|&input| kept[input]) && self.keep(&step.key, &image) {
-                kept[index] = true;
+            if step.inputs.iter().all(|&input| kept[input]) {
+                // A result's planes are new or its inputs', which are counted already.
+                let held: Vec<usize> = (inputs.iter())
+                    .flat_map(|input| input.planes())
+                    .map(plane_address)
+                    .collect();
+                let own =
+                    (image.planes().iter()).filter(|plane| !held.contains(&plane_address(plane)));
+                let added = distinct_bytes(own);
+                if retained_bytes + added <= self.cap {
+                    retained_bytes += added;
+                    self.retained.push(Retained {
+                        key: step.key.clone(),
+                        image: image.clone(),
+                    });
+                    kept[index] = true;
+                }
             }
             for &input in &step.inputs {
                 uses[input] -= 1;
@@ -400,8 +411,6 @@ impl Evaluator {
     /// Releases every retained result, as when the viewer wants nothing.
     pub fn release_all(&mut self) {
         self.retained.clear();
-        self.planes.clear();
-        self.retained_bytes = 0;
     }
 
     /// Releases every retained result the request does not contain, and returns the released
@@ -415,7 +424,6 @@ impl Evaluator {
                 self.retained.push(retained);
                 continue;
             }
-            self.forget_planes(&retained.image);
             let (_, planes) = retained.image.into_parts();
             // A plane shared by two channels is unheld once at the last of them.
             let unheld = planes
@@ -426,47 +434,14 @@ impl Evaluator {
         released
     }
 
-    /// Retains a result if its planes fit under the cap. Returns whether it did.
-    fn keep(&mut self, key: &ResultKey, image: &Image) -> bool {
-        let mut added = 0;
-        let mut seen = Vec::new();
-        for plane in image.planes() {
-            let address = plane_address(plane);
-            if !self.planes.contains_key(&address) && !seen.contains(&address) {
-                seen.push(address);
-                added += plane_bytes(plane);
-            }
-        }
-        if self.retained_bytes + added > self.cap {
-            return false;
-        }
-        for plane in image.planes() {
-            let (_, holders) = (self.planes)
-                .entry(plane_address(plane))
-                .or_insert((plane_bytes(plane), 0));
-            *holders += 1;
-        }
-        self.retained_bytes += added;
-        self.retained.push(Retained {
-            key: key.clone(),
-            image: image.clone(),
-        });
-        true
-    }
-
-    fn forget_planes(&mut self, image: &Image) {
-        for plane in image.planes() {
-            let address = plane_address(plane);
-            let (bytes, holders) = self
-                .planes
-                .get_mut(&address)
-                .expect("retained planes are counted");
-            *holders -= 1;
-            if *holders == 0 {
-                self.retained_bytes -= *bytes;
-                self.planes.remove(&address);
-            }
-        }
+    /// The bytes of the retained planes, each counted once however many channels and results
+    /// share it.
+    fn retained_bytes(&self) -> u64 {
+        distinct_bytes(
+            self.retained
+                .iter()
+                .flat_map(|retained| retained.image.planes()),
+        )
     }
 }
 
@@ -475,8 +450,13 @@ fn plane_address(plane: &Arc<[f32]>) -> usize {
     Arc::as_ptr(plane).cast::<f32>().addr()
 }
 
-fn plane_bytes(plane: &Arc<[f32]>) -> u64 {
-    std::mem::size_of_val::<[f32]>(plane) as u64
+/// The bytes of the planes, each counted once however often it appears.
+fn distinct_bytes<'a>(planes: impl Iterator<Item = &'a Arc<[f32]>>) -> u64 {
+    let mut counted = BTreeSet::new();
+    planes
+        .filter(|plane| counted.insert(plane_address(plane)))
+        .map(|plane| std::mem::size_of_val::<[f32]>(plane) as u64)
+        .sum()
 }
 
 impl Evaluator {
