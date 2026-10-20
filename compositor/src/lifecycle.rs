@@ -4,7 +4,11 @@
 //!
 //! It exits 0 if every step ran; each pane a step made draw had a surface and a frame the GPU
 //! finished by the next step; the image was shown while a dialog was open, in the caption and, where
-//! the surface can be read back, at the viewer's centre; after the device was destroyed, a new one
+//! the surface can be read back, at the viewer's centre; Tab over the graph opened the creation
+//! menu, and Escape closed it with no step; Exposure chosen in it was inserted after the Reader as
+//! one step, leaving the Reader marked; an edit from a script moved the panel's slider without an
+//! edit of its own; the panel survived its dock floated, closed and reopened; Reader chosen in the
+//! menu and its dialog cancelled created nothing; after the device was destroyed, a new one
 //! drew both panes, with the same centre and caption, within the rebuild's budget; both panes had a
 //! surface at the end; and the GPU reported no uncaptured error. It exits 1 if a check failed, and
 //! otherwise as a crash or protocol error does. Frames are checked as rendered, not as presented:
@@ -19,14 +23,19 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 
+use cxx_qt_lib::QString;
 use open_ng::{Modifiers, Point};
-use opencompositor_core::{Event, FileIntent, FrameCheck, Key, Pane, Request, Slot};
+use opencompositor_core::{
+    Anchor, Event, FileIntent, FrameCheck, Input, Key, NodeId, NodeKind, Pane, Request, Session,
+    Slot, Value,
+};
 
+use crate::keys::qt_key;
 use crate::qt::ffi;
 
 /// Each step, when it runs in milliseconds from the start, and the panes it makes draw: each of
 /// those has a surface and has finished a new frame by the next step.
-const STEPS: [(i32, &str, &[Pane]); 14] = [
+const STEPS: [(i32, &str, &[Pane]); 23] = [
     (1000, "resize the window", &[Pane::Graph, Pane::Viewer]),
     (2000, "float the viewer", &[Pane::Viewer]),
     (3000, "dock the viewer again", &[Pane::Viewer]),
@@ -43,12 +52,25 @@ const STEPS: [(i32, &str, &[Pane]); 14] = [
         &[Pane::Viewer],
     ),
     (15_000, "close the dialog", &[]),
+    (16_000, "press Tab over the graph", &[]),
+    (16_500, "press Escape in the creation menu", &[]),
     (
-        16_000,
+        17_000,
+        "choose Exposure in the creation menu",
+        &[Pane::Graph],
+    ),
+    (17_500, "edit Stops from a script", &[]),
+    (18_000, "float the parameter panel", &[]),
+    (18_500, "close the parameter panel", &[]),
+    (19_000, "reopen the parameter panel", &[]),
+    (19_500, "choose Reader in the creation menu", &[]),
+    (20_500, "cancel the Reader's dialog", &[]),
+    (
+        21_000,
         "destroy the GPU device",
         &[Pane::Graph, Pane::Viewer],
     ),
-    (17_000, "quit", &[]),
+    (22_000, "quit", &[]),
 ];
 
 /// The longest an attempt to make a device may block the GUI thread, warm, on the workstation.
@@ -67,6 +89,8 @@ thread_local! {
     static LONGEST_ATTEMPT: Cell<Option<Duration>> = const { Cell::new(None) };
     /// How long retiring the lost device took, which has no budget yet.
     static RETIREMENT: Cell<Option<Duration>> = const { Cell::new(None) };
+    /// Where Stops' slider was after the scripted edit.
+    static STOPS_TICK: Cell<Option<i32>> = const { Cell::new(None) };
 }
 
 pub fn start(image: PathBuf) {
@@ -133,7 +157,7 @@ fn step(index: usize) {
             let at = Point::default();
             let image = IMAGE.with(|cell| cell.borrow().clone());
             crate::dispatch(Event::FilesChosen {
-                intent: FileIntent::CreateReaders { at },
+                intent: FileIntent::CreateReaders(Anchor { at, current: None }),
                 paths: vec![image],
             });
             crate::dispatch(Event::KeyPressed {
@@ -144,7 +168,10 @@ fn step(index: usize) {
                 },
             });
             // Returns once the next step closes the dialog.
-            crate::perform(Request::ChooseFiles(FileIntent::CreateReaders { at }));
+            crate::perform(Request::ChooseFiles(FileIntent::CreateReaders(Anchor {
+                at,
+                current: None,
+            })));
         }
         11 => {
             // SAFETY: the caption lives as long as the viewer's dock, as for `with_dock`.
@@ -165,7 +192,54 @@ fn step(index: usize) {
             }
             ffi::close_modal_dialog();
         }
-        12 => {
+        12 => press_tab_over_the_graph(),
+        13 => {
+            if !ffi::popup_open() {
+                fail("Tab over the graph opened no menu".to_owned());
+            }
+            press_key(qt_key::ESCAPE, "");
+        }
+        14 => {
+            if ffi::popup_open() {
+                fail("Escape left the creation menu open".to_owned());
+            }
+            check_undo_label("Mark", "after the menu was dismissed");
+            choose_in_menu("exp");
+        }
+        15 => {
+            check_undo_label("Create Exposure", "after Exposure was chosen");
+            let exposure = check_inserted_exposure();
+            if let Some(exposure) = exposure {
+                edit_stops(exposure);
+            }
+        }
+        16 => with_panel_dock(|dock| dock.set_floating(true)),
+        17 => {
+            with_panel_dock(|dock| dock.close());
+        }
+        18 => with_panel_dock(|dock| dock.show()),
+        19 => {
+            let tick = stops_slider().map(|slider| slider.value());
+            if tick.is_none() || tick != STOPS_TICK.with(Cell::get) {
+                fail(format!(
+                    "the panel showed Stops' slider at {tick:?} after its dock was reopened"
+                ));
+            }
+            with_panel_dock(|mut dock| {
+                dock.as_mut().set_floating(false);
+            });
+            // Returns once the next step cancels the dialog.
+            choose_in_menu("read");
+        }
+        20 => ffi::close_modal_dialog(),
+        21 => {
+            check_undo_label("Stops", "after the Reader's dialog was cancelled");
+            let nodes = crate::read_session(|session| session.document().nodes().count());
+            if nodes != 2 {
+                fail(format!(
+                    "{nodes} nodes after the Reader's dialog was cancelled, not 2"
+                ));
+            }
             DESTROYED.with(|cell| cell.set(Some(checks)));
             crate::destroy_device();
         }
@@ -187,6 +261,92 @@ fn step(index: usize) {
             ffi::exit(i32::from(!failures.is_empty()));
         }
     }
+}
+
+fn press_tab_over_the_graph() {
+    crate::dispatch(Event::Input {
+        pane: Pane::Graph,
+        input: Input::PointerEntered,
+    });
+    press_key(qt_key::TAB, "");
+}
+
+/// Opens the creation menu, types the text and presses Enter. The type is created once the event
+/// loop runs.
+fn choose_in_menu(text: &str) {
+    press_tab_over_the_graph();
+    for character in text.chars() {
+        let key = character.to_ascii_uppercase() as i32;
+        press_key(key, &character.to_string());
+    }
+    press_key(qt_key::RETURN, "");
+}
+
+fn press_key(key: i32, text: &str) {
+    // SAFETY: the window lives until it is destroyed after the event loop.
+    unsafe { ffi::press_key(crate::widgets().window, key, &QString::from(text)) };
+}
+
+fn check_undo_label(expected: &str, when: &str) {
+    let label = crate::read_session(Session::undo_label);
+    if label != Some(expected) {
+        fail(format!("the step to undo was {label:?} {when}"));
+    }
+}
+
+/// Checks that one Exposure is selected, inserted after the Reader slot 1 still marks, and
+/// returns it.
+fn check_inserted_exposure() -> Option<NodeId> {
+    let slot = Slot::new(1).expect("1 is a slot");
+    let (selection, source, marked) = crate::read_session(|session| {
+        let document = session.document();
+        let &[exposure] = document.selection() else {
+            return (document.selection().to_vec(), None, None);
+        };
+        let source = (document.node(exposure))
+            .filter(|node| matches!(node.kind, NodeKind::Exposure { .. }))
+            .and_then(|node| node.input("source"));
+        (vec![exposure], source, document.mark(slot))
+    });
+    match (selection.as_slice(), source) {
+        (&[exposure], Some(source)) if marked == Some(source) => Some(exposure),
+        _ => {
+            fail(format!(
+                "after Exposure was chosen, {selection:?} was selected, taking {source:?}, and \
+                 slot 1 marked {marked:?}"
+            ));
+            None
+        }
+    }
+}
+
+/// Sets Stops as a script does, and checks that the panel's slider followed without an edit.
+fn edit_stops(exposure: NodeId) {
+    let before = stops_slider().map(|slider| slider.value());
+    let edited = crate::edit(|session| {
+        let edited = session.set_value(exposure, "stops", Value::Float(2.0));
+        (edited, session.version())
+    });
+    let version = crate::read_session(Session::version);
+    let after = stops_slider().map(|slider| slider.value());
+    STOPS_TICK.with(|cell| cell.set(after));
+    match edited {
+        (Err(error), _) => fail(format!("the scripted edit failed: {error}")),
+        (Ok(_), edited) if edited != version => {
+            fail("refreshing the panel after a scripted edit edited the document".to_owned())
+        }
+        _ if before.is_none() || after <= before => fail(format!(
+            "the panel's Stops slider went from {before:?} to {after:?} for 2 stops"
+        )),
+        _ => check_undo_label("Stops", "after the scripted edit"),
+    }
+}
+
+/// Stops' slider in the panel, which lives until the panel next rebuilds its rows.
+fn stops_slider() -> Option<&'static ffi::QSlider> {
+    // SAFETY: the panel lives as long as its dock; the slider until a rebuild, which the checks
+    // that read it do not cause.
+    unsafe { ffi::panel_slider(crate::widgets().panel, &QString::from("stops")).as_ref() }
 }
 
 /// Frames finished between the checks, counting all of a new device's.
@@ -262,6 +422,15 @@ fn check_recovery(checks: [Option<FrameCheck>; Pane::COUNT]) {
                 ));
             }
         }
+    }
+}
+
+/// Calls `use_dock` with the parameter panel's dock. The reference ends with it.
+fn with_panel_dock<R>(use_dock: impl FnOnce(Pin<&mut ffi::QDockWidget>) -> R) -> R {
+    // SAFETY: as for `with_dock`; the window owns the panel's dock.
+    unsafe {
+        let dock = ffi::panel_dock(crate::widgets().panel);
+        use_dock(Pin::new_unchecked(&mut *dock))
     }
 }
 

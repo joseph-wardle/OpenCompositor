@@ -1,6 +1,7 @@
 //! OpenCompositor's Qt shell. Qt owns the windows, docks, dialogs and event loop; the core's
 //! [`App`] owns everything else. Everything here runs on Qt's GUI thread.
 
+mod creation;
 mod drag;
 mod keys;
 mod lifecycle;
@@ -47,6 +48,7 @@ pub struct Widgets {
     pub docks: [*mut ffi::QDockWidget; Pane::COUNT],
     pub panes: [*mut qt::Pane; Pane::COUNT],
     pub panel: *mut ffi::ParameterPanel,
+    pub creation_menu: *mut ffi::CreationMenu,
     /// Under the viewer.
     pub caption: *mut ffi::QLabel,
     /// At the status bar's right, while the GPU is unavailable or has reported errors.
@@ -118,7 +120,7 @@ fn main() {
     add(
         file_menu,
         "&Change the Reader's File…",
-        "Shift+R",
+        "",
         Command::ChangeReaderFile,
     );
     add(
@@ -129,7 +131,8 @@ fn main() {
     );
     let undo = add(edit_menu, "&Undo", "Ctrl+Z", Command::Undo);
     let redo = add(edit_menu, "&Redo", "Ctrl+Shift+Z", Command::Redo);
-    add(node_menu, "&Exposure", "E", Command::CreateExposure);
+    // SAFETY: the node menu is live; it owns the note.
+    unsafe { ffi::add_note(node_menu, &QString::from("Create a Node\tTab")) };
     // The key filter takes the digit row by position and H for the pane under the pointer, so
     // these items only name their keys, after a tab, rather than binding shortcuts.
     let slot_menus = [
@@ -199,6 +202,8 @@ fn main() {
         ffi::container(panes[Pane::Graph.index()], graph_dock);
         ffi::container_with_caption(panes[Pane::Viewer.index()], viewer_dock)
     };
+    // SAFETY: the window is live; it owns the menu.
+    let creation_menu = unsafe { ffi::new_creation_menu(window_ptr, creation::chosen) };
     // SAFETY: the window is live; it owns the label.
     let gpu_label = unsafe { ffi::new_permanent_status(window_ptr) };
     WIDGETS.with(|cell| {
@@ -207,6 +212,7 @@ fn main() {
             docks,
             panes,
             panel,
+            creation_menu,
             caption,
             gpu_label,
             undo,
@@ -305,7 +311,7 @@ pub fn perform(request: Request) {
         }
         Request::ChooseFiles(intent) => {
             let title = match intent {
-                FileIntent::CreateReaders { .. } => "Read Files",
+                FileIntent::CreateReaders(_) => "Read Files",
                 FileIntent::SetFile { .. } => "Choose a File",
             };
             let several = intent.allows_several();
@@ -328,6 +334,7 @@ pub fn perform(request: Request) {
             ffi::set_caption(widgets.caption, &QString::from(&text))
         },
         Request::ShowUndoLabels { undo, redo } => show_undo_labels([undo, redo]),
+        Request::ShowCreationMenu(anchor) => creation::show(anchor),
         Request::ShowPanel(shown) => panel::show(shown),
         // SAFETY: the window owns the label, and lives as long as it.
         Request::ShowGpuLabel(text) => unsafe {

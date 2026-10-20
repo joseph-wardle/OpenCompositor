@@ -135,7 +135,7 @@ fn poll_in(tries: usize) -> i32 {
 fn setup(_: usize) {
     let image = with(|check| check.image.clone());
     let exposure = crate::edit(|session| {
-        let reader = created(session.create_readers(vec![image], Point::default()));
+        let reader = created(session.create_readers(vec![image], Point::default(), None));
         let node = created(
             (session.create_node("exposure", Point::default(), Some(reader)))
                 .expect("Exposure is a node type and the Reader exists"),
@@ -274,7 +274,8 @@ fn check_steps() -> Vec<String> {
     let moved = state().0;
     // SAFETY: as in `begin`.
     unsafe {
-        ffi::press_escape(slider);
+        let window = crate::widgets().window;
+        ffi::press_key(window, crate::keys::qt_key::ESCAPE, &QString::default());
         ffi::drag_slider(slider, MOUSE_BUTTON_RELEASE, middle);
     }
     let cancelled = state();

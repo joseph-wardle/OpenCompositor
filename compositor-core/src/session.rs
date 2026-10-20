@@ -273,9 +273,20 @@ impl Session {
         self.redo.last().map(|step| step.label)
     }
 
-    /// Creates a Reader for each path, stacked downwards from `at`, and selects them all. A
-    /// Reader of an empty path has no file.
-    pub fn create_readers(&mut self, paths: Vec<PathBuf>, at: Point) -> Changes {
+    /// Creates a Reader for each path, stacked downwards, and selects them all. A Reader of an
+    /// empty path has no file.
+    ///
+    /// The stack starts beside the current node, as [`create_node`](Session::create_node) places
+    /// a type without inputs, or at `at` without one, or if it no longer exists.
+    pub fn create_readers(
+        &mut self,
+        paths: Vec<PathBuf>,
+        at: Point,
+        current: Option<NodeId>,
+    ) -> Changes {
+        let at = current
+            .and_then(|current| self.beside(current))
+            .unwrap_or(at);
         let mut document = self.document.clone();
         let mut created = Vec::with_capacity(paths.len());
         for (row, path) in paths.into_iter().enumerate() {
@@ -325,9 +336,9 @@ impl Session {
             if self.document.node(current).is_none() {
                 return Err(EditError::MissingNode(current));
             }
-            let outline = (self.graph.node_rect(current.into()))
-                .expect("the graph presents every node the document has");
             if let Some(input) = node_type.kind.inputs().first() {
+                let outline = (self.graph.node_rect(current.into()))
+                    .expect("the graph presents every node the document has");
                 position = Point {
                     x: outline.min.x,
                     y: outline.max.y + PLACEMENT_GAP,
@@ -349,10 +360,8 @@ impl Session {
                     source: Some(current),
                 });
             } else {
-                position = Point {
-                    x: outline.max.x + PLACEMENT_GAP,
-                    y: outline.min.y,
-                };
+                position =
+                    (self.beside(current)).expect("the graph presents every node the document has");
             }
         }
         let mut document = self.document.clone();
@@ -363,6 +372,15 @@ impl Session {
         document.selection = [id].into();
         self.next_id += 1;
         Ok(self.commit(node_type.step, document))
+    }
+
+    /// Where a node goes beside another, unconnected: `None` if that one does not exist.
+    fn beside(&self, node: NodeId) -> Option<Point> {
+        let outline = self.graph.node_rect(node.into())?;
+        Some(Point {
+            x: outline.max.x + PLACEMENT_GAP,
+            y: outline.min.y,
+        })
     }
 
     /// Marks a node in a slot, replacing what the slot marked, or clears the slot.

@@ -3,15 +3,18 @@
 
 #include <QtCore/QFile>
 #include <QtCore/QTimer>
+#include <QtGui/QCursor>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QInputMethodQueryEvent>
 #include <QtGui/QKeyEvent>
 #include <QtGui/QPlatformSurfaceEvent>
+#include <QtGui/QScreen>
 #include <QtGui/QWheelEvent>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QGridLayout>
 #include <QtWidgets/QLineEdit>
+#include <QtWidgets/QListWidget>
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QProxyStyle>
 #include <QtWidgets/QPushButton>
@@ -20,6 +23,7 @@
 #include <QtWidgets/QStyleOptionSlider>
 #include <QtWidgets/QToolButton>
 #include <QtWidgets/QVBoxLayout>
+#include <algorithm>
 #include <functional>
 
 namespace shim {
@@ -364,6 +368,9 @@ ParameterPanel *new_parameter_panel(QMainWindow *window, QMenu *menu, QDockWidge
     return panel;
 }
 void show_panel(ParameterPanel *panel, const PanelData &data) { panel->show_panel(data); }
+QDockWidget *panel_dock(ParameterPanel *panel) {
+    return static_cast<QDockWidget *>(panel->parentWidget());
+}
 QSlider *panel_slider(ParameterPanel *panel, const QString &name) { return panel->slider(name); }
 int slider_span(QSlider *slider) { return static_cast<ParameterSlider *>(slider)->span(); }
 void drag_slider(QSlider *slider, int type, int pixel) {
@@ -374,14 +381,111 @@ void drag_slider(QSlider *slider, int type, int pixel) {
                       Qt::NoModifier);
     QCoreApplication::sendEvent(slider, &event);
 }
-void press_escape(QSlider *widget) {
-    // To the window, as the platform delivers keys, so that the key filter sees it first.
-    QWindow *window = widget->window()->windowHandle();
+void press_key(QMainWindow *window, int key, const QString &text) {
+    // To the window, as the platform delivers keys, so that the key filter sees it first. Qt
+    // sends a popup's keys to the popup whichever window receives them.
     for (auto type : {QEvent::KeyPress, QEvent::KeyRelease}) {
-        QKeyEvent event(type, Qt::Key_Escape, Qt::NoModifier);
-        QCoreApplication::sendEvent(window, &event);
+        QKeyEvent event(type, key, Qt::NoModifier, text);
+        QCoreApplication::sendEvent(window->windowHandle(), &event);
     }
 }
+bool popup_open() { return QApplication::activePopupWidget(); }
+
+CreationMenu::CreationMenu(rust::Fn<void(size_t)> chosen, QWidget *parent)
+    : QFrame(parent, Qt::Popup), chosen(chosen) {
+    setFrameShape(QFrame::StyledPanel);
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(2, 2, 2, 2);
+    layout->setSpacing(2);
+    field = new QLineEdit;
+    field->setPlaceholderText(QStringLiteral("Create a node"));
+    field->installEventFilter(this);
+    list = new QListWidget;
+    list->setFocusPolicy(Qt::NoFocus);
+    list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    layout->addWidget(field);
+    layout->addWidget(list);
+    connect(field, &QLineEdit::textChanged, this, &CreationMenu::filter);
+    connect(field, &QLineEdit::returnPressed, this, [this] { choose(list->currentItem()); });
+    connect(list, &QListWidget::itemClicked, this, &CreationMenu::choose);
+}
+
+void CreationMenu::open(const QStringList &labels) {
+    list->clear();
+    for (qsizetype i = 0; i < labels.size(); ++i) {
+        auto *item = new QListWidgetItem(labels[i], list);
+        item->setData(Qt::UserRole, QVariant::fromValue(size_t(i)));
+    }
+    field->clear();
+    filter(QString());
+    int rows = std::min<int>(labels.size(), 12);
+    list->setFixedHeight(rows * list->sizeHintForRow(0) + 2 * list->frameWidth());
+    setFixedWidth(220);
+    adjustSize();
+    // Within the screen, as a menu opens.
+    QPoint at = QCursor::pos();
+    if (QScreen *screen = QGuiApplication::screenAt(at)) {
+        QRect available = screen->availableGeometry();
+        at.setX(std::clamp(at.x(), available.left(), available.right() - width()));
+        at.setY(std::clamp(at.y(), available.top(), available.bottom() - height()));
+    }
+    move(at);
+    show();
+    field->setFocus();
+}
+
+bool CreationMenu::eventFilter(QObject *watched, QEvent *event) {
+    if (watched == field && event->type() == QEvent::KeyPress) {
+        switch (static_cast<QKeyEvent *>(event)->key()) {
+        case Qt::Key_Up:
+            step_current(-1);
+            return true;
+        case Qt::Key_Down:
+            step_current(1);
+            return true;
+        case Qt::Key_Escape:
+            close();
+            return true;
+        default:
+            break;
+        }
+    }
+    return QFrame::eventFilter(watched, event);
+}
+
+void CreationMenu::filter(const QString &text) {
+    QListWidgetItem *first = nullptr;
+    for (int i = 0; i < list->count(); ++i) {
+        QListWidgetItem *item = list->item(i);
+        bool shown = item->text().contains(text, Qt::CaseInsensitive);
+        item->setHidden(!shown);
+        if (shown && !first) first = item;
+    }
+    list->setCurrentItem(first);
+}
+
+void CreationMenu::step_current(int step) {
+    for (int row = list->currentRow() + step; row >= 0 && row < list->count(); row += step) {
+        if (!list->item(row)->isHidden()) {
+            list->setCurrentRow(row);
+            return;
+        }
+    }
+}
+
+void CreationMenu::choose(QListWidgetItem *item) {
+    if (!item || item->isHidden()) return;
+    size_t index = item->data(Qt::UserRole).value<size_t>();
+    close();
+    // From the event loop: a Reader's file dialog runs a nested loop, which should not run inside
+    // the key or click that closed the menu.
+    QTimer::singleShot(0, this, [this, index] { chosen(index); });
+}
+
+CreationMenu *new_creation_menu(QMainWindow *window, rust::Fn<void(size_t)> chosen) {
+    return new CreationMenu(chosen, window);
+}
+void open_creation_menu(CreationMenu *menu, const QStringList &labels) { menu->open(labels); }
 
 void set_caption(QLabel *label, const QString &text) {
     label->setText(text);

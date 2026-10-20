@@ -13,13 +13,15 @@ const KEY_RELEASE: i32 = 7;
 const APPLICATION_DEACTIVATE: i32 = 122;
 
 /// `Qt::Key` values.
-mod qt_key {
+pub mod qt_key {
     pub const SPACE: i32 = 0x20;
     pub const G: i32 = 0x47;
     pub const H: i32 = 0x48;
     pub const Y: i32 = 0x59;
     pub const ESCAPE: i32 = 0x0100_0000;
+    pub const TAB: i32 = 0x0100_0001;
     pub const BACKSPACE: i32 = 0x0100_0003;
+    pub const RETURN: i32 = 0x0100_0004;
     pub const DELETE: i32 = 0x0100_0007;
 }
 
@@ -73,6 +75,7 @@ fn key(fields: &ffi::InputFields) -> Option<Key> {
     Some(match fields.key {
         qt_key::SPACE => Key::Space,
         qt_key::ESCAPE => Key::Escape,
+        qt_key::TAB => Key::Tab,
         qt_key::G => Key::G,
         qt_key::H => Key::H,
         qt_key::Y => Key::Y,

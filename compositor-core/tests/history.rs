@@ -63,7 +63,7 @@ fn session_of(readers: usize, path_length: usize) -> Session {
     let paths = (0..readers)
         .map(|index| PathBuf::from(format!("{index:0>path_length$}.exr")))
         .collect();
-    session.create_readers(paths, Point { x: 0.0, y: 0.0 });
+    session.create_readers(paths, Point { x: 0.0, y: 0.0 }, None);
     session
 }
 

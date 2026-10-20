@@ -28,7 +28,7 @@ pub mod bench {
     pub use crate::kernels::cpu::{Level, exposure};
 }
 
-pub use app::{App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
+pub use app::{Anchor, App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
 pub use document::{
     Assignment, Changes, ConnectionError, Document, ExposureVersion, Missing, Node, NodeId,
     NodeInput, NodeKind, NodeType, ReaderVersion, Slot, missing, node_types,

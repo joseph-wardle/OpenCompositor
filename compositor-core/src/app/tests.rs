@@ -59,9 +59,10 @@ fn file(app: &App, id: NodeId) -> Option<Arc<Path>> {
 /// Creates a Reader for the path, selected, and returns it.
 fn create(app: &mut App, path: &str) -> NodeId {
     app.dispatch(Event::FilesChosen {
-        intent: FileIntent::CreateReaders {
+        intent: FileIntent::CreateReaders(Anchor {
             at: Point::default(),
-        },
+            current: None,
+        }),
         paths: vec![PathBuf::from(path)],
     });
     app.session().document().selection()[0]
@@ -133,7 +134,7 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
 
     // The graph origin is at the centre, 200 × 150 physical pixels, and a unit is 2 pixels.
     let at = Point { x: 50.0, y: -50.0 };
-    let intent = FileIntent::CreateReaders { at };
+    let intent = FileIntent::CreateReaders(Anchor { at, current: None });
     assert_eq!(requests, [Request::ChooseFiles(intent)]);
 
     let paths = vec![
@@ -185,16 +186,20 @@ fn files_go_to_the_middle_of_the_graph_when_the_pointer_is_elsewhere() {
     let at = Point { x: 0.0, y: 0.0 };
     assert_eq!(
         requests,
-        [Request::ChooseFiles(FileIntent::CreateReaders { at })]
+        [Request::ChooseFiles(FileIntent::CreateReaders(Anchor {
+            at,
+            current: None
+        }))]
     );
 }
 
 #[test]
 fn a_cancelled_dialog_changes_nothing() {
     let (mut app, _deliveries) = app();
-    let intent = FileIntent::CreateReaders {
+    let intent = FileIntent::CreateReaders(Anchor {
         at: Point::default(),
-    };
+        current: None,
+    });
 
     let requests = app.dispatch(Event::FilesChosen {
         intent,
@@ -208,9 +213,10 @@ fn a_cancelled_dialog_changes_nothing() {
 #[test]
 fn changing_the_selected_readers_file_fails_if_it_went_while_the_dialog_was_open() {
     let (mut app, _deliveries) = app();
-    let create = FileIntent::CreateReaders {
+    let create = FileIntent::CreateReaders(Anchor {
         at: Point::default(),
-    };
+        current: None,
+    });
     let paths = vec![PathBuf::from("/nonexistent/a.exr")];
     app.dispatch(Event::FilesChosen {
         intent: create,
@@ -268,9 +274,10 @@ fn undo_and_redo_redraw_the_graph_only_when_they_change_it() {
     assert_eq!(app.dispatch(Event::Command(Command::Undo)), []);
 
     app.dispatch(Event::FilesChosen {
-        intent: FileIntent::CreateReaders {
+        intent: FileIntent::CreateReaders(Anchor {
             at: Point::default(),
-        },
+            current: None,
+        }),
         paths: vec![PathBuf::from("/nonexistent/a.exr")],
     });
     let redraws = |requests: Vec<Request>| requests.contains(&Request::Redraw(Pane::Graph));
@@ -284,9 +291,10 @@ fn undo_and_redo_redraw_the_graph_only_when_they_change_it() {
 fn pane_keys_go_to_the_pane_under_the_pointer() {
     let (mut app, _deliveries) = app();
     app.dispatch(Event::FilesChosen {
-        intent: FileIntent::CreateReaders {
+        intent: FileIntent::CreateReaders(Anchor {
             at: Point { x: 500.0, y: 500.0 },
-        },
+            current: None,
+        }),
         paths: vec![PathBuf::from("/nonexistent/a.exr")],
     });
     let frame = || Event::KeyPressed {
@@ -325,9 +333,10 @@ fn only_the_graph_losing_the_keyboard_cancels_its_gesture() {
     let drag = |focus_lost: Pane| {
         let (mut app, _deliveries) = app();
         app.dispatch(Event::FilesChosen {
-            intent: FileIntent::CreateReaders {
+            intent: FileIntent::CreateReaders(Anchor {
                 at: Point::default(),
-            },
+                current: None,
+            }),
             paths: vec![PathBuf::from("/nonexistent/a.exr")],
         });
         let id = app.session().document().selection()[0];
@@ -846,17 +855,62 @@ fn a_viewed_reader_without_a_file_says_so_where_it_is() {
     assert_eq!(app.caption, "Slot 2 · Exposure · File of Reader is not set");
 }
 
+/// Presses Tab over the graph and chooses the type in the menu it opens.
+fn choose_in_menu(app: &mut App, type_name: &'static str) -> Vec<Request> {
+    app.dispatch(input(Pane::Graph, Input::PointerEntered));
+    let requests = app.dispatch(Event::KeyPressed {
+        key: Key::Tab,
+        modifiers: NONE,
+    });
+    let &[Request::ShowCreationMenu(anchor)] = requests.as_slice() else {
+        panic!("Tab over the graph opens the menu: {requests:?}")
+    };
+    app.dispatch(Event::NodeTypeChosen { type_name, anchor })
+}
+
 #[test]
-fn an_exposure_node_is_created_where_the_pointer_is_over_the_graph() {
+fn tab_opens_the_menu_with_where_the_pointer_was_and_the_current_node() {
     let (mut app, _deliveries) = app();
     let pointer = PhysicalPoint { x: 300.0, y: 50.0 };
+    app.dispatch(input(Pane::Viewer, Input::PointerEntered));
+    let tab = || Event::KeyPressed {
+        key: Key::Tab,
+        modifiers: NONE,
+    };
+    assert_eq!(app.dispatch(tab()), []);
+
     app.dispatch(input(Pane::Graph, Input::PointerEntered));
     app.dispatch(input(
         Pane::Graph,
         Input::PointerMoved { position: pointer },
     ));
+    // The graph origin is at the centre, 200 × 150 physical pixels, and a unit is 2 pixels.
+    let at = Point { x: 50.0, y: -50.0 };
+    assert_eq!(
+        app.dispatch(tab()),
+        [Request::ShowCreationMenu(Anchor { at, current: None })]
+    );
 
-    let requests = app.dispatch(Event::Command(Command::CreateExposure));
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    assert_eq!(
+        app.dispatch(tab()),
+        [Request::ShowCreationMenu(Anchor {
+            at,
+            current: Some(reader)
+        })]
+    );
+}
+
+#[test]
+fn a_type_chosen_without_a_current_node_goes_where_the_pointer_was() {
+    let (mut app, _deliveries) = app();
+    let at = Point { x: 50.0, y: -50.0 };
+    let anchor = Anchor { at, current: None };
+
+    let requests = app.dispatch(Event::NodeTypeChosen {
+        type_name: "exposure",
+        anchor,
+    });
 
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
     let document = app.session().document();
@@ -865,9 +919,48 @@ fn an_exposure_node_is_created_where_the_pointer_is_over_the_graph() {
     };
     let node = document.node(id).unwrap();
     assert!(matches!(node.kind, NodeKind::Exposure { .. }));
-    // The graph origin is at the centre, 200 × 150 physical pixels, and a unit is 2 pixels.
-    assert_eq!(node.position, Point { x: 50.0, y: -50.0 });
+    assert_eq!(node.position, at);
     assert_eq!(app.session().undo_label(), Some("Create Exposure"));
+}
+
+#[test]
+fn a_reader_chosen_in_the_menu_asks_for_its_files_and_goes_beside_the_current_node() {
+    let (mut app, _deliveries) = app();
+    let exposure = create_exposure(&mut app);
+    let requests = choose_in_menu(&mut app, "reader");
+    let &[Request::ChooseFiles(intent)] = requests.as_slice() else {
+        panic!("the dialog comes first: {requests:?}")
+    };
+    assert_eq!(
+        intent,
+        FileIntent::CreateReaders(Anchor {
+            at: Point::default(),
+            current: Some(exposure)
+        })
+    );
+
+    // Cancelling creates nothing.
+    app.dispatch(Event::FilesChosen {
+        intent,
+        paths: Vec::new(),
+    });
+    assert_eq!(app.session().document().nodes().count(), 1);
+    assert_eq!(app.session().undo_label(), Some("Create Exposure"));
+
+    app.dispatch(Event::FilesChosen {
+        intent,
+        paths: vec!["/nonexistent/a.exr".into(), "/nonexistent/b.exr".into()],
+    });
+    let document = app.session().document();
+    let &[first, _] = document.selection() else {
+        panic!("both Readers selected")
+    };
+    let outline = app.session().graph().node_rect(exposure.into()).unwrap();
+    assert!(document.node(first).unwrap().position.x > outline.max.x);
+    assert_eq!(document.node(first).unwrap().position.y, outline.min.y);
+    assert_eq!(app.session().undo_label(), Some("Create Reader"));
+    app.dispatch(Event::Command(Command::Undo));
+    assert_eq!(app.session().document().nodes().count(), 1);
 }
 
 #[test]
@@ -953,7 +1046,7 @@ fn the_panel_follows_the_current_node_and_whether_its_values_were_set() {
         (reader, "a.exr", "Reader", false)
     );
 
-    let requests = app.dispatch(Event::Command(Command::CreateExposure));
+    let requests = choose_in_menu(&mut app, "exposure");
     let exposure = app.session().document().selection()[0];
     assert_eq!(app.panel.as_ref().unwrap().node, exposure);
     let default = (Some(Value::Float(0.0)), ValueState::Absent);
@@ -1002,7 +1095,7 @@ fn a_pinned_panel_stays_on_its_node_until_unpinned_or_the_node_is_deleted() {
     let panel = shown_panel(&requests).flatten().unwrap();
     assert_eq!((panel.node, panel.pinned), (reader, true));
 
-    let requests = app.dispatch(Event::Command(Command::CreateExposure));
+    let requests = choose_in_menu(&mut app, "exposure");
     assert_eq!(shown_panel(&requests), None);
     let exposure = app.session().document().selection()[0];
 

@@ -26,6 +26,8 @@ pub mod ffi {
         include!(<QtWidgets/QSlider>);
         #[allow(missing_debug_implementations)]
         type QSlider;
+
+        fn value(self: &QSlider) -> i32;
     }
 
     unsafe extern "C++Qt" {
@@ -206,6 +208,8 @@ pub mod ffi {
 
         #[allow(missing_debug_implementations)]
         type ParameterPanel;
+        #[allow(missing_debug_implementations)]
+        type CreationMenu;
 
         fn new_application();
         fn exec() -> i32;
@@ -257,6 +261,8 @@ pub mod ffi {
             send: fn(PanelGesture),
         ) -> *mut ParameterPanel;
         unsafe fn show_panel(panel: *mut ParameterPanel, data: &PanelData);
+        /// The dock the panel is in, for the lifecycle check.
+        unsafe fn panel_dock(panel: *mut ParameterPanel) -> *mut QDockWidget;
         /// The named row's slider, or null, for the drag check.
         unsafe fn panel_slider(panel: *mut ParameterPanel, name: &QString) -> *mut QSlider;
         /// How many pixels a drag along the panel slider's groove covers.
@@ -264,8 +270,18 @@ pub mod ffi {
         /// Sends the panel slider a left-button mouse event of the `QEvent::Type`, where the
         /// handle sits `pixel` along its span.
         unsafe fn drag_slider(slider: *mut QSlider, kind: i32, pixel: i32);
-        /// Presses and releases Escape in the widget's window, as the platform does.
-        unsafe fn press_escape(widget: *mut QSlider);
+        /// Presses and releases the `Qt::Key` typing `text` in the window, as the platform does,
+        /// for the checks.
+        unsafe fn press_key(window: *mut QMainWindow, key: i32, text: &QString);
+        /// Whether a popup, such as a menu, has the keyboard and pointer.
+        fn popup_open() -> bool;
+        /// The node creation menu, which the window owns. It sends the index of the label chosen
+        /// to `chosen`.
+        unsafe fn new_creation_menu(
+            window: *mut QMainWindow,
+            chosen: fn(usize),
+        ) -> *mut CreationMenu;
+        unsafe fn open_creation_menu(menu: *mut CreationMenu, labels: &QStringList);
         /// Sets the caption's text, and its tooltip for when the text is clipped.
         unsafe fn set_caption(label: *mut QLabel, text: &QString);
         unsafe fn label_text(label: *mut QLabel) -> QString;

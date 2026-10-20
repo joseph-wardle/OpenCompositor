@@ -1,5 +1,6 @@
 // What cxx cannot bind: one-liners for constructors, statics, templates and casts, and the
-// parameter panel, a plain Qt class that Rust fills and that sends its gestures back.
+// parameter panel and creation menu, plain Qt classes that Rust fills and that send its gestures
+// back.
 #pragma once
 #include <QtCore/QByteArray>
 #include <QtCore/QEvent>
@@ -7,6 +8,7 @@
 #include <QtCore/QStringList>
 #include <QtGui/QAction>
 #include <QtWidgets/QDockWidget>
+#include <QtWidgets/QFrame>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QMenu>
@@ -25,6 +27,8 @@ struct PanelRow;
 struct PanelGesture;
 enum class PanelGestureKind : uint8_t;
 class QLineEdit;
+class QListWidget;
+class QListWidgetItem;
 class QScrollArea;
 class QToolButton;
 
@@ -74,6 +78,28 @@ class ParameterPanel : public QWidget {
     std::vector<Row> rows;
 };
 
+// The node creation menu: a field over the types, which typing filters. Choosing a type sends
+// its index among the labels it was opened with; closing it any other way sends nothing.
+class CreationMenu : public QFrame {
+  public:
+    CreationMenu(rust::Fn<void(size_t)> chosen, QWidget *parent);
+    // Opens at the pointer with the labels, the first current.
+    void open(const QStringList &labels);
+
+  protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
+  private:
+    void filter(const QString &text);
+    // Makes the next shown item `step` away current, if there is one.
+    void step_current(int step);
+    void choose(QListWidgetItem *item);
+
+    rust::Fn<void(size_t)> chosen;
+    QLineEdit *field;
+    QListWidget *list;
+};
+
 void new_application();
 int exec();
 void exit(int code);
@@ -96,10 +122,14 @@ QLabel *container_with_caption(Pane *pane, QDockWidget *dock);
 ParameterPanel *new_parameter_panel(QMainWindow *window, QMenu *menu, QDockWidget *viewer,
                                     QDockWidget *graph, rust::Fn<void(PanelGesture)> send);
 void show_panel(ParameterPanel *panel, const PanelData &data);
+QDockWidget *panel_dock(ParameterPanel *panel);
 QSlider *panel_slider(ParameterPanel *panel, const QString &name);
 int slider_span(QSlider *slider);
 void drag_slider(QSlider *slider, int type, int pixel);
-void press_escape(QSlider *widget);
+void press_key(QMainWindow *window, int key, const QString &text);
+bool popup_open();
+CreationMenu *new_creation_menu(QMainWindow *window, rust::Fn<void(size_t)> chosen);
+void open_creation_menu(CreationMenu *menu, const QStringList &labels);
 void set_caption(QLabel *label, const QString &text);
 QString label_text(QLabel *label);
 void tabify(QMainWindow *window, QDockWidget *first, QDockWidget *second);

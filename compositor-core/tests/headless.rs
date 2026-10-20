@@ -29,7 +29,7 @@ fn write_png(path: &Path, code: u8) {
 }
 
 fn reader(session: &mut Session, path: PathBuf) -> NodeId {
-    let changes = session.create_readers(vec![path], Point { x: 0.0, y: 0.0 });
+    let changes = session.create_readers(vec![path], Point { x: 0.0, y: 0.0 }, None);
     *changes.nodes.first().unwrap()
 }
 

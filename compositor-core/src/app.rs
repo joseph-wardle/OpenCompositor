@@ -71,6 +71,12 @@ pub enum Event {
     /// A key released anywhere in the window, so that no key is left held.
     KeyReleased(Key),
     Command(Command),
+    /// The type chosen in the menu a [`Request::ShowCreationMenu`] opened, by its name in
+    /// [`node_types`](crate::node_types). A Reader asks for its files first.
+    NodeTypeChosen {
+        type_name: &'static str,
+        anchor: Anchor,
+    },
     /// The pane's gesture can no longer expect its button's release, as when the pane lost the
     /// keyboard to another pane or a dialog, or the window lost it to another application.
     FocusLost(Pane),
@@ -156,6 +162,9 @@ pub enum Request {
         undo: Option<&'static str>,
         redo: Option<&'static str>,
     },
+    /// Open the node creation menu at the pointer, then dispatch [`Event::NodeTypeChosen`] with
+    /// the anchor if a type is chosen.
+    ShowCreationMenu(Anchor),
     /// Show the node's parameters in the parameter panel, or that no node is selected with
     /// `None`. The panel starts empty.
     ShowPanel(Option<Panel>),
@@ -170,10 +179,9 @@ pub enum Request {
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// A Reader for each file chosen, placed where the pointer is over the graph.
+    /// A Reader for each file chosen, placed where the pointer is over the graph, or beside the
+    /// current node.
     ReadFiles,
-    /// An Exposure node where the pointer is over the graph, selected alone.
-    CreateExposure,
     /// A new file for the one selected Reader.
     ChangeReaderFile,
     /// Keeps the parameter panel on the node it shows, whatever is selected, until unpinned or
@@ -208,6 +216,8 @@ pub enum Key {
     Y,
     /// Delete or Backspace: deletes the selected nodes while the pointer is over the graph.
     Delete,
+    /// Opens the node creation menu while the pointer is over the graph.
+    Tab,
     /// A key of the digit row, by its position rather than the character it types, so that
     /// layouts that type digits with Shift, as AZERTY does, use the same keys. Alone it views
     /// the slot, with Ctrl it marks the selected node there, with Shift it frames that node.
@@ -222,7 +232,7 @@ impl Key {
             Key::G => open_ng::Key::G,
             Key::H => open_ng::Key::H,
             Key::Y => open_ng::Key::Y,
-            Key::Delete | Key::Slot(_) => return None,
+            Key::Delete | Key::Tab | Key::Slot(_) => return None,
         })
     }
 }
@@ -231,8 +241,8 @@ impl Key {
 /// it is open, so the choice is checked again when it arrives.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FileIntent {
-    /// A Reader for each file, stacked downwards from a graph point.
-    CreateReaders { at: Point },
+    /// A Reader for each file, stacked downwards from the anchor.
+    CreateReaders(Anchor),
     /// The first file chosen for a node's file parameter.
     SetFile {
         node: NodeId,
@@ -242,8 +252,18 @@ pub enum FileIntent {
 
 impl FileIntent {
     pub fn allows_several(self) -> bool {
-        matches!(self, FileIntent::CreateReaders { .. })
+        matches!(self, FileIntent::CreateReaders(_))
     }
+}
+
+/// Where a new node goes, as it was when the artist asked for it, so that a menu or dialog taking
+/// the keyboard and pointer in between changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Anchor {
+    /// The pointer over the graph, or the middle of the graph view if it was elsewhere.
+    pub at: Point,
+    /// The node a new node is inserted after or placed beside: the last selected.
+    pub current: Option<NodeId>,
 }
 
 /// Pointer input to a pane, in physical pixels from its top-left.
@@ -435,6 +455,7 @@ impl App {
             Event::KeyPressed { key, modifiers } => self.key_pressed(key, modifiers),
             Event::KeyReleased(key) => self.key_released(key),
             Event::Command(command) => self.command(command),
+            Event::NodeTypeChosen { type_name, anchor } => self.node_type_chosen(type_name, anchor),
             // Another pane's focus loss can arrive after a press has given the graph the
             // keyboard, so it must not cancel the gesture that press began.
             Event::FocusLost(Pane::Graph) => {
@@ -709,6 +730,9 @@ impl App {
         }
         match (self.hovered, key.in_graph()) {
             (Some(Pane::Graph), _) if key == Key::Delete => self.delete_selected(),
+            (Some(Pane::Graph), _) if key == Key::Tab => {
+                vec![Request::ShowCreationMenu(self.anchor())]
+            }
             (Some(Pane::Graph), Some(key)) => redraw_if(
                 Pane::Graph,
                 self.session.graph_input(InputEvent::KeyPressed(key)),
@@ -768,15 +792,9 @@ impl App {
 
     fn command(&mut self, command: Command) -> Vec<Request> {
         match command {
-            Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders {
-                at: self.graph_point_at_pointer(),
-            })],
-            Command::CreateExposure => {
-                (self.session)
-                    .create_node("exposure", self.graph_point_at_pointer(), None)
-                    .expect("Exposure is a node type");
-                vec![Request::Redraw(Pane::Graph)]
-            }
+            Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders(
+                self.anchor(),
+            ))],
             Command::ChangeReaderFile => match self.session.document().selection() {
                 &[node] => vec![Request::ChooseFiles(FileIntent::SetFile {
                     node,
@@ -845,15 +863,31 @@ impl App {
         }
     }
 
-    /// Where the pointer is over the graph, or the middle of the graph view if it is elsewhere.
-    fn graph_point_at_pointer(&self) -> Point {
+    fn anchor(&self) -> Anchor {
         let view = self.session.graph_view();
         let viewport = view.viewport();
         let pointer = self.graph_pointer.unwrap_or(PhysicalPoint {
             x: viewport.width as f32 / 2.0,
             y: viewport.height as f32 / 2.0,
         });
-        view.to_graph(pointer)
+        Anchor {
+            at: view.to_graph(pointer),
+            current: self.session.document().selection().last().copied(),
+        }
+    }
+
+    fn node_type_chosen(&mut self, type_name: &'static str, anchor: Anchor) -> Vec<Request> {
+        // A Reader without a file is no use to the artist, so the dialog comes first, and
+        // cancelling it creates nothing.
+        if type_name == "reader" {
+            return vec![Request::ChooseFiles(FileIntent::CreateReaders(anchor))];
+        }
+        match (self.session).create_node(type_name, anchor.at, anchor.current) {
+            Ok(_) => vec![Request::Redraw(Pane::Graph)],
+            Err(error) => vec![Request::ShowStatus(format!(
+                "Cannot create the node: {error}"
+            ))],
+        }
     }
 
     fn files_chosen(&mut self, intent: FileIntent, paths: Vec<PathBuf>) -> Vec<Request> {
@@ -861,8 +895,8 @@ impl App {
             return Vec::new();
         };
         match intent {
-            FileIntent::CreateReaders { at } => {
-                self.session.create_readers(paths, at);
+            FileIntent::CreateReaders(Anchor { at, current }) => {
+                self.session.create_readers(paths, at, current);
             }
             FileIntent::SetFile { node, parameter } => {
                 let file = Value::File(first.into());

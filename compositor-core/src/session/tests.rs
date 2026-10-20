@@ -20,7 +20,7 @@ fn paths(names: &[&str]) -> Vec<PathBuf> {
 }
 
 fn create(session: &mut Session, name: &str, at: Point) -> NodeId {
-    let changes = session.create_readers(paths(&[name]), at);
+    let changes = session.create_readers(paths(&[name]), at, None);
     *changes.nodes.first().expect("one node created")
 }
 
@@ -177,7 +177,7 @@ fn undo_skips_clicks_that_only_select() {
 #[test]
 fn the_graph_matches_the_document_after_every_step() {
     let mut session = Session::new();
-    let readers = session.create_readers(paths(&["a.exr", "b.png", "c.exr"]), ORIGIN);
+    let readers = session.create_readers(paths(&["a.exr", "b.png", "c.exr"]), ORIGIN, None);
     assert_presented(&session);
     let [a, b, c] = [0, 1, 2].map(|i| *readers.nodes.iter().nth(i).unwrap());
     assert_eq!(session.document().selection(), [a, b, c]);
@@ -230,7 +230,7 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
     type Edit<'a> = (&'a str, &'a dyn Fn(&mut Session));
     let edits: [Edit; 9] = [
         ("an empty create", &|s| {
-            unchanged(s.create_readers(Vec::new(), ORIGIN));
+            unchanged(s.create_readers(Vec::new(), ORIGIN, None));
         }),
         ("the same file", &|s| {
             unchanged(set_file(s, reader, "a.exr").unwrap());
@@ -420,6 +420,40 @@ fn a_node_without_inputs_is_created_beside_the_current_node_unconnected() {
     assert_eq!(session.document().selection(), [id]);
     assert_eq!(session.undo_label(), Some("Create Reader"));
     assert_presented(&session);
+}
+
+#[test]
+fn readers_stack_beside_the_current_node_or_at_the_point_once_it_is_gone() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+    let outline = session.graph().node_rect(exposure.into()).unwrap();
+    let at = Point { x: 500.0, y: 500.0 };
+
+    let changes = session.create_readers(paths(&["a.exr", "b.exr"]), at, Some(exposure));
+
+    let beside = Point {
+        x: outline.max.x + PLACEMENT_GAP,
+        y: outline.min.y,
+    };
+    let positions = changes
+        .nodes
+        .iter()
+        .map(|&id| session.document().node(id).unwrap().position);
+    assert_eq!(
+        positions.collect::<Vec<_>>(),
+        [
+            beside,
+            Point {
+                y: beside.y + READER_SPACING,
+                ..beside
+            }
+        ]
+    );
+
+    session.delete_nodes(&[exposure]).unwrap();
+    let changes = session.create_readers(paths(&["c.exr"]), at, Some(exposure));
+    let id = *changes.nodes.first().unwrap();
+    assert_eq!(session.document().node(id).unwrap().position, at);
 }
 
 #[test]
