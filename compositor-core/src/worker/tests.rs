@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -8,6 +7,7 @@ use open_ng::Point;
 
 use super::*;
 use crate::evaluate::result_key;
+use crate::fixtures::{self, directory};
 use crate::gpu::{noop_device, noop_device_pair};
 use crate::read::{ReadError, read_image};
 use crate::session::Session;
@@ -33,25 +33,10 @@ fn missing(name: &str) -> ResultKey {
     key(format!("/nonexistent/{name}.exr"))
 }
 
-/// A directory of this test's own, emptied first.
-fn directory(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir()
-        .join(format!("opencompositor-worker-{}", std::process::id()))
-        .join(name);
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).unwrap();
-    directory
-}
-
 /// A white, opaque PNG.
 fn write_png(path: &Path, width: u32, height: u32) {
-    let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    let mut writer = encoder.write_header().unwrap();
-    writer
-        .write_image_data(&vec![255; width as usize * height as usize * 4])
-        .unwrap();
-    writer.finish().unwrap();
+    let white = vec![255; width as usize * height as usize * 4];
+    fixtures::write_png(path, width, height, png::ColorType::Rgba, &white);
 }
 
 fn worker() -> (Worker, Receiver<Evaluated>) {
@@ -287,18 +272,7 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     let third = receive(&deliveries).result.unwrap().pixels.unwrap();
     assert_ne!(third.buffer(), &buffer);
     assert!(third.buffer().size() > buffer.size());
-    let grown = third.buffer().clone();
-    drop(third);
-
-    // Under half the grown buffer, which goes back to the first size after enough such loads.
-    for _ in 1..IMAGES_BEFORE_SHRINKING {
-        worker.request(Some(on(1, key(&small))));
-        let kept = receive(&deliveries).result.unwrap().pixels.unwrap();
-        assert_eq!(kept.buffer(), &grown);
-    }
-    worker.request(Some(on(1, key(&small))));
-    let shrunk = receive(&deliveries).result.unwrap().pixels.unwrap();
-    assert_eq!(shrunk.buffer().size(), buffer.size());
+    // When it shrinks again is `StagingSizing`'s to test.
 }
 
 #[test]

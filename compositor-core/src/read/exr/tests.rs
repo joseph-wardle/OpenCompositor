@@ -602,6 +602,8 @@ fn dwa_chunks_declaring_more_than_their_block_holds_are_refused() {
     }
 }
 
+// Only where overflow is checked does the decoder panic, so only there does this test prove it.
+#[cfg(debug_assertions)]
 #[test]
 fn a_chunk_whose_decoder_panics_fails_the_read() {
     let mut bytes = one_chunk(Compression::B44, Blocks::ScanLines);
@@ -612,10 +614,8 @@ fn a_chunk_whose_decoder_panics_fails_the_read() {
 
     let read = read_bytes(&bytes);
 
-    if cfg!(debug_assertions) {
-        assert!(
-            matches!(&read, Err(ReadError::Decode(reason)) if reason == "the decoder panicked"),
-            "{read:?}"
-        );
-    }
+    assert!(
+        matches!(&read, Err(ReadError::Decode(reason)) if reason == "the decoder panicked"),
+        "{read:?}"
+    );
 }

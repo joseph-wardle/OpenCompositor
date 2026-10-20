@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 use open_ng::{Point, Response};
-use opencompositor_core::{ExposureVersion, NodeKind, Session, Value};
+use opencompositor_core::{ExposureVersion, NodeId, NodeKind, Session, Value};
 
 struct Counting;
 
@@ -67,25 +67,52 @@ fn session_of(readers: usize, path_length: usize) -> Session {
     session
 }
 
-/// What a single-node step may retain in a document of 10,000 nodes: the node and its values,
-/// with a map path that deepens only logarithmically as documents grow.
-const STEP_BUDGET: isize = 2048;
+/// A step retains its node and the map's path to it. The path deepens logarithmically, so a
+/// document a hundred times larger may retain at most this many times more.
+const LARGER_DOCUMENT_FACTOR: isize = 3;
+
+/// What a single-node step may retain at most, against a payload cloned with its node.
+const STEP_CEILING: isize = 16 * 1024;
+
+/// What `edit` retains in a document of 100 Readers and in one of 10,000, each with an Exposure
+/// connected to its first Reader. It must grow with the map's depth, not the document's size.
+fn assert_retains_its_node_and_map_path(what: &str, edit: impl Fn(&mut Session, Edited)) {
+    let [small, large] = [100, 10_000].map(|readers| {
+        let mut session = session_of(readers, 16);
+        let changes = session.create_node(
+            NodeKind::Exposure {
+                version: ExposureVersion::CURRENT,
+            },
+            Point { x: 0.0, y: 0.0 },
+        );
+        let exposure = *changes.nodes.first().expect("one node created");
+        let readers: Vec<_> = (session.document().nodes())
+            .map(|(id, _)| id)
+            .take(2)
+            .collect();
+        let [first, second] = readers[..] else {
+            panic!("two Readers")
+        };
+        session.connect(exposure, "source", first).unwrap();
+        retained_by(|| edit(&mut session, Edited { exposure, second }))
+    });
+    assert!(
+        large <= LARGER_DOCUMENT_FACTOR * small,
+        "{what} retained {small} bytes at 100 nodes but {large} at 10,000"
+    );
+    assert!(large <= STEP_CEILING, "{what} retained {large} bytes");
+}
+
+/// The nodes an edit in `assert_retains_its_node_and_map_path` may use.
+struct Edited {
+    exposure: NodeId,
+    second: NodeId,
+}
 
 #[test]
 fn a_value_edit_retains_its_node_and_map_path_alone() {
-    let mut session = session_of(10_000, 16);
-    let changes = session.create_node(
-        NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        },
-        Point { x: 0.0, y: 0.0 },
-    );
-    let exposure = *changes.nodes.first().expect("one node created");
-    let reader = session.document().nodes().next().expect("a Reader").0;
-    session.connect(exposure, "source", reader).unwrap();
-
-    let retained = retained_by(|| {
-        session.begin_edit(exposure, "Set Stops").unwrap();
+    assert_retains_its_node_and_map_path("a drag", |session, edited| {
+        session.begin_edit(edited.exposure, "Set Stops").unwrap();
         for stops in 1..=100 {
             session
                 .set_value("stops", Value::Float(stops as f64 / 10.0))
@@ -93,7 +120,15 @@ fn a_value_edit_retains_its_node_and_map_path_alone() {
         }
         session.finish_edit();
     });
-    assert!(retained <= STEP_BUDGET, "a drag retained {retained} bytes");
+}
+
+#[test]
+fn connecting_retains_its_node_and_map_path_alone() {
+    assert_retains_its_node_and_map_path("a connection", |session, edited| {
+        session
+            .connect(edited.exposure, "source", edited.second)
+            .unwrap();
+    });
 }
 
 #[test]
@@ -110,38 +145,8 @@ fn moving_a_reader_retains_no_copy_of_its_path() {
     });
     assert_eq!(retained[0], retained[1], "a longer path retained more");
     assert!(
-        retained[0] <= STEP_BUDGET,
+        retained[0] <= STEP_CEILING,
         "a move retained {} bytes",
         retained[0]
-    );
-}
-
-#[test]
-fn connecting_retains_its_node_and_map_path_alone() {
-    let mut session = session_of(10_000, 16);
-    let changes = session.create_node(
-        NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        },
-        Point { x: 0.0, y: 0.0 },
-    );
-    let exposure = *changes.nodes.first().expect("one node created");
-    let readers: Vec<_> = session
-        .document()
-        .nodes()
-        .map(|(id, _)| id)
-        .take(2)
-        .collect();
-    let [first, second] = readers[..] else {
-        panic!("two Readers")
-    };
-    session.connect(exposure, "source", first).unwrap();
-
-    let retained = retained_by(|| {
-        session.connect(exposure, "source", second).unwrap();
-    });
-    assert!(
-        retained <= STEP_BUDGET,
-        "a connection retained {retained} bytes"
     );
 }

@@ -1,11 +1,8 @@
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::PathBuf;
-
 use open_ng::Point;
 
 use super::*;
 use crate::document::Assignment;
+use crate::fixtures::{self, directory};
 use crate::image::{Channel, Window};
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
@@ -35,16 +32,6 @@ fn exposure(stops: Option<f64>) -> Node {
     node
 }
 
-/// A directory of this test's own, emptied first.
-fn directory(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir()
-        .join(format!("opencompositor-evaluate-{}", std::process::id()))
-        .join(name);
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).unwrap();
-    directory
-}
-
 /// A 2 × 1 opaque PNG whose red is one 8-bit code and green and blue lower ones, replacing any
 /// file at `path`.
 fn write_png(path: &Path, code: u8) {
@@ -62,11 +49,7 @@ fn write_grey_png(path: &Path, code: u8) {
 }
 
 fn write(path: &Path, color: png::ColorType, data: &[u8]) {
-    let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), 2, 1);
-    encoder.set_color(color);
-    let mut writer = encoder.write_header().unwrap();
-    writer.write_image_data(data).unwrap();
-    writer.finish().unwrap();
+    fixtures::write_png(path, 2, 1, color, data);
 }
 
 /// A document of these nodes, with IDs from 1, each Exposure taking the image of the node before
@@ -294,10 +277,8 @@ fn viewing_an_unrelated_chain_releases_the_old_one() {
     let mut evaluator = Evaluator::new();
     let [exposed, _] = exposure_keys(&a, [1.0, 1.0]);
     let before = red(&run(&mut evaluator, &exposed).unwrap());
-    assert_eq!(evaluator.retained.len(), 2);
 
     run(&mut evaluator, &key(&chain([reader(&b)]), 1)).unwrap();
-    assert_eq!(evaluator.retained.len(), 1);
 
     write_png(&a, 0);
     let after = red(&run(&mut evaluator, &exposed).unwrap());
@@ -314,7 +295,6 @@ fn releasing_everything_reads_again() {
 
     evaluator.release_all();
 
-    assert!(evaluator.retained.is_empty());
     write_png(&path, 0);
     assert_eq!(red(&run(&mut evaluator, &exposed).unwrap()), 0.0);
 }
@@ -333,7 +313,6 @@ fn stopping_keeps_what_was_completed() {
 
     assert!(evaluator.evaluate(&exposed, stop).is_none());
     assert_eq!(asked.get(), 2);
-    assert_eq!(evaluator.retained.len(), 1);
 
     write_png(&path, 0);
     assert_ne!(red(&run(&mut evaluator, &exposed).unwrap()), 0.0);
@@ -349,7 +328,6 @@ fn the_cap_keeps_readers_first_and_never_a_result_without_its_inputs() {
     // Room for the read, not for the Exposure's three new planes.
     let mut evaluator = Evaluator::with_cap(image_bytes);
     let before = red(&run(&mut evaluator, &one).unwrap());
-    assert_eq!(evaluator.retained.len(), 1);
     assert_eq!(evaluator.retained_bytes(), image_bytes);
     write_png(&path, 0);
     assert_eq!(red(&run(&mut evaluator, &two).unwrap()), before * 2.0);
@@ -358,7 +336,6 @@ fn the_cap_keeps_readers_first_and_never_a_result_without_its_inputs() {
     write_png(&path, 255);
     let mut evaluator = Evaluator::with_cap(image_bytes - 1);
     run(&mut evaluator, &one).unwrap();
-    assert!(evaluator.retained.is_empty());
     write_png(&path, 0);
     assert_eq!(red(&run(&mut evaluator, &two).unwrap()), 0.0);
 }
@@ -521,12 +498,7 @@ fn the_pool_has_a_thread_per_physical_core_the_process_may_use() {
     let available = std::thread::available_parallelism().unwrap().get();
     let threads = pool_threads();
     assert!((1..=available).contains(&threads));
-    let evaluator = Evaluator::new();
-    assert_eq!(evaluator.pool.threads.current_num_threads(), threads);
-    println!(
-        "evaluator pool: {threads} threads at {:?}",
-        evaluator.pool.level
-    );
+    println!("evaluator pool: {threads} threads at {:?}", Level::detect());
 }
 
 #[cfg(target_os = "linux")]

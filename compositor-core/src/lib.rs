@@ -5,6 +5,8 @@
 mod app;
 mod document;
 mod evaluate;
+#[cfg(test)]
+mod fixtures;
 mod gpu;
 mod image;
 // The GPU half is used by the worker once it dispatches; until then only the tests do.

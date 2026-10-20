@@ -96,6 +96,9 @@ impl ExposureParams {
     }
 }
 
+// The bytes the host writes are the struct the shader reads, with no padding.
+const _: () = assert!(size_of::<ExposureParams>() == 12);
+
 /// The GPU entry points, one invocation per texel of one plane.
 #[cfg(target_arch = "spirv")]
 pub mod gpu {
@@ -247,18 +250,5 @@ mod tests {
         assert_eq!(ulp_distance(f32::NAN, -f32::NAN), 0);
         assert_eq!(ulp_distance(f32::NAN, 1.0), u32::MAX);
         assert_eq!(ulp_distance(f32::INFINITY, f32::NAN), u32::MAX);
-    }
-
-    #[test]
-    fn params_bytes_follow_the_fields() {
-        let params = ExposureParams {
-            width: 33,
-            height: 17,
-            gain: 2.0,
-        };
-        let bytes = params.bytes();
-        assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 33);
-        assert_eq!(u32::from_ne_bytes(bytes[4..8].try_into().unwrap()), 17);
-        assert_eq!(f32::from_ne_bytes(bytes[8..12].try_into().unwrap()), 2.0);
     }
 }

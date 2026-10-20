@@ -1077,6 +1077,46 @@ mod tests {
     }
 
     #[test]
+    fn an_image_staged_for_an_earlier_device_is_not_shown() {
+        use std::sync::mpsc;
+
+        use crate::evaluate::result_key;
+        use crate::fixtures;
+        use crate::session::Session;
+        use crate::worker::{Wanted, Worker};
+
+        let mut gpu = Gpu::with_noop_device(Waker::channel().0);
+        let device = gpu.device.as_ref().expect("a device").device.clone();
+        let path = fixtures::directory("staged").join("white.png");
+        fixtures::write_png(&path, 1, 1, png::ColorType::Rgba, &[255; 4]);
+        let mut session = Session::new();
+        let changes = session.create_readers(vec![path], open_ng::Point::default());
+        let node = *changes.nodes.first().expect("one Reader");
+        let key = result_key(session.document(), session.reloads(), node).expect("a key");
+        let (delivered, deliveries) = mpsc::channel();
+        let worker = Worker::start(move |evaluated| delivered.send(evaluated).unwrap());
+        let staged = || {
+            let evaluated = deliveries.recv_timeout(Duration::from_secs(10)).unwrap();
+            evaluated.result.unwrap().pixels.expect("pixels staged")
+        };
+
+        // Staged for the generation before the GPU's own, as after a loss.
+        worker.connect(device.clone(), 0);
+        worker.request(Some(Wanted {
+            node,
+            key,
+            number: 1,
+        }));
+        gpu.show_image(staged());
+        assert!(gpu.device.as_ref().unwrap().viewer.image.is_none());
+
+        // Connecting delivers the last key again, now for the GPU's generation.
+        worker.connect(device, 1);
+        gpu.show_image(staged());
+        assert!(gpu.device.as_ref().unwrap().viewer.image.is_some());
+    }
+
+    #[test]
     fn the_viewers_shader_and_pipelines_validate() {
         let device = noop_device(None);
         ViewerRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb);

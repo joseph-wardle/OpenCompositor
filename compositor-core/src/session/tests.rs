@@ -172,33 +172,6 @@ fn undo_skips_clicks_that_only_select() {
 }
 
 #[test]
-fn redo_survives_selecting_and_edits_that_change_nothing() {
-    let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
-    session.set_mark(slot(2), Some(reader)).unwrap();
-    session.set_reader_path(reader, "b.exr".into()).unwrap();
-    session.undo();
-
-    let deselect = Response {
-        selection: Some(Vec::new()),
-        ..Response::default()
-    };
-    assert!(!session.apply_response(&deselect).is_empty());
-    assert!(session.set_mark(slot(2), Some(reader)).unwrap().is_empty());
-    assert!(
-        session
-            .set_reader_path(reader, "a.exr".into())
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(session.redo_label(), Some("Set Reader Path"));
-
-    assert!(!session.redo().is_empty());
-    assert_eq!(reader_path(&session, reader), Path::new("b.exr"));
-    assert_presented(&session);
-}
-
-#[test]
 fn the_graph_matches_the_document_after_every_step() {
     let mut session = Session::new();
     let readers = session.create_readers(paths(&["a.exr", "b.png", "c.exr"]), ORIGIN);
@@ -239,27 +212,65 @@ fn the_graph_matches_the_document_after_every_step() {
 }
 
 #[test]
-fn an_edit_that_changes_nothing_records_no_step() {
+fn edits_that_change_nothing_record_nothing_and_keep_redo() {
     let mut session = Session::new();
     let reader = create(&mut session, "a.exr", ORIGIN);
+    let connected = create_exposure(&mut session, ORIGIN);
+    let unconnected = create_exposure(&mut session, ORIGIN);
+    session.connect(connected, "source", reader).unwrap();
     session.set_mark(slot(3), Some(reader)).unwrap();
+    session.set_mark(slot(1), Some(connected)).unwrap();
+    session.undo();
     let steps = session.undo.len();
 
-    assert!(session.create_readers(Vec::new(), ORIGIN).is_empty());
-    assert!(
-        session
-            .set_reader_path(reader, "a.exr".into())
-            .unwrap()
-            .is_empty()
-    );
-    assert!(session.set_mark(slot(3), Some(reader)).unwrap().is_empty());
-    let same = Response {
-        positions: vec![(reader.into(), ORIGIN)],
-        selection: Some(vec![reader.into()]),
-        ..Response::default()
-    };
-    assert!(session.apply_response(&same).is_empty());
-    assert_eq!(session.undo.len(), steps);
+    let unchanged = |changes: Changes| assert!(changes.is_empty());
+    type Edit<'a> = (&'a str, &'a dyn Fn(&mut Session));
+    let edits: [Edit; 8] = [
+        ("an empty create", &|s| {
+            unchanged(s.create_readers(Vec::new(), ORIGIN));
+        }),
+        ("the same path", &|s| {
+            unchanged(s.set_reader_path(reader, "a.exr".into()).unwrap());
+        }),
+        ("the same mark", &|s| {
+            unchanged(s.set_mark(slot(3), Some(reader)).unwrap());
+        }),
+        ("the same position", &|s| {
+            unchanged(s.apply_response(&Response {
+                positions: vec![(reader.into(), ORIGIN)],
+                ..Response::default()
+            }));
+        }),
+        ("the same connection", &|s| {
+            unchanged(s.connect(connected, "source", reader).unwrap());
+        }),
+        ("a disconnect of nothing", &|s| {
+            unchanged(s.disconnect(unconnected, "source").unwrap());
+        }),
+        ("a value set then reset", &|s| {
+            s.begin_edit(connected, "Set Stops").unwrap();
+            s.set_value("stops", Value::Float(1.0)).unwrap();
+            s.reset_value("stops").unwrap();
+            s.finish_edit();
+        }),
+        // Selection changes the document, but is not a step.
+        ("a deselection", &|s| {
+            let deselect = Response {
+                selection: Some(Vec::new()),
+                ..Response::default()
+            };
+            assert!(!s.apply_response(&deselect).is_empty());
+        }),
+    ];
+    for (edit, apply) in edits {
+        apply(&mut session);
+        assert_eq!(session.undo.len(), steps, "{edit}");
+        assert_eq!(session.redo_label(), Some("Mark"), "{edit}");
+        assert_presented(&session);
+    }
+
+    assert!(!session.redo().is_empty());
+    assert_eq!(session.document().mark(slot(1)), Some(connected));
 }
 
 #[test]
@@ -566,6 +577,10 @@ fn refused_values_leave_the_edit_and_document_unchanged() {
         session.set_value("stops", Value::Float(1.0)),
         Err(EditError::NoEditInProgress)
     );
+    assert_eq!(
+        session.reset_value("stops"),
+        Err(EditError::NoEditInProgress)
+    );
 
     session.begin_edit(exposure, "Set Stops").unwrap();
     session.set_value("stops", Value::Float(1.0)).unwrap();
@@ -584,25 +599,24 @@ fn refused_values_leave_the_edit_and_document_unchanged() {
 }
 
 #[test]
-fn an_edit_that_changes_nothing_records_nothing_and_keeps_redo() {
+fn a_reader_has_no_values_to_edit() {
     let mut session = Session::new();
-    let exposure = create_exposure(&mut session, ORIGIN);
-    session.set_mark(slot(1), Some(exposure)).unwrap();
-    session.undo();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let before = session.document().clone();
     let steps = session.undo.len();
 
-    session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
-    session.reset_value("stops").unwrap();
+    session.begin_edit(reader, "Set Stops").unwrap();
+    let unknown = Err(EditError::InvalidValue {
+        node: reader,
+        parameter: "stops".to_owned(),
+        error: ValueError::UnknownParameter,
+    });
+    assert_eq!(session.set_value("stops", Value::Float(1.0)), unknown);
+    assert_eq!(session.reset_value("stops"), unknown);
     session.finish_edit();
 
+    assert!(before.changes_to(session.document()).is_empty());
     assert_eq!(session.undo.len(), steps);
-    assert_eq!(session.redo_label(), Some("Mark"));
-
-    session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
-    session.finish_edit();
-    assert_eq!(session.redo_label(), None);
 }
 
 #[test]
@@ -646,67 +660,24 @@ fn replacing_a_wire_is_one_step_and_undo_restores_it() {
 }
 
 #[test]
-fn refused_connections_leave_the_document_and_history_unchanged() {
+fn a_refused_connection_leaves_the_document_and_history_unchanged() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
     let upstream = create_exposure(&mut session, ORIGIN);
     let downstream = create_exposure(&mut session, ORIGIN);
     session.connect(downstream, "source", upstream).unwrap();
-    let gone = create(&mut session, "b.exr", ORIGIN);
+    create(&mut session, "a.exr", ORIGIN);
     session.undo();
     let before = session.document().clone();
     let steps = session.undo.len();
 
-    let refusals = [
-        (upstream, "source", downstream, ConnectionError::Cycle),
-        (
-            upstream,
-            "source",
-            upstream,
-            ConnectionError::SelfConnection,
-        ),
-        (reader, "source", upstream, ConnectionError::UnknownInput),
-        (upstream, "mask", reader, ConnectionError::UnknownInput),
-        (upstream, "source", gone, ConnectionError::MissingNode(gone)),
-    ];
-    for (consumer, input, source, reason) in refusals {
-        assert_eq!(
-            session.connect(consumer, input, source),
-            Err(EditError::Connection(reason))
-        );
-    }
+    // Why each connection is refused is the document's to test.
     assert_eq!(
-        session.disconnect(gone, "source"),
-        Err(EditError::Connection(ConnectionError::MissingNode(gone)))
+        session.connect(upstream, "source", downstream),
+        Err(EditError::Connection(ConnectionError::Cycle))
     );
     assert!(before.changes_to(session.document()).is_empty());
     assert_eq!(session.undo.len(), steps);
     assert_eq!(session.redo_label(), Some("Create Reader"));
-}
-
-#[test]
-fn connections_that_change_nothing_keep_redo() {
-    let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
-    let connected = create_exposure(&mut session, ORIGIN);
-    let unconnected = create_exposure(&mut session, ORIGIN);
-    session.connect(connected, "source", reader).unwrap();
-    session.set_mark(slot(1), Some(connected)).unwrap();
-    session.undo();
-
-    assert!(
-        session
-            .connect(connected, "source", reader)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        session
-            .disconnect(unconnected, "source")
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(session.redo_label(), Some("Mark"));
 }
 
 #[test]
