@@ -318,8 +318,8 @@ impl Session {
     /// Without a current node, the node goes at `at`, unconnected. With one, it is inserted after
     /// it, as Nuke's Tab menu inserts: placed after it in the graph's left-to-right flow, taking it
     /// on its first input and taking over every input that took it. A type without inputs goes
-    /// below it instead, unconnected, as a second stream beside the first.
-    /// Marks stay where they are.
+    /// below it instead, unconnected, as a second stream beside the first. What the inserted node
+    /// feeds moves right if it would sit underneath it. Marks stay where they are.
     pub fn create_node(
         &mut self,
         type_name: &str,
@@ -368,7 +368,34 @@ impl Session {
             .expect("a new node takes over existing wires without a cycle");
         document.selection = [id].into();
         self.next_id += 1;
-        Ok(self.commit(node_type.step, document))
+        let mut changes = self.commit(node_type.step, document);
+        if !assignments.is_empty() {
+            changes.extend(self.make_room_after(id));
+        }
+        Ok(changes)
+    }
+
+    /// Moves everything the node feeds right, keeping its layout, if the node landed on a node it
+    /// feeds, just far enough to clear it. The move joins the step that created the node, which
+    /// must be the last one: its width is known only once the graph presents it.
+    fn make_room_after(&mut self, node: NodeId) -> Changes {
+        let outline = (self.graph.node_rect(node.into()))
+            .expect("the graph presents every node the document has");
+        let overlap = (self.document.nodes())
+            .filter(|(_, consumer)| consumer.inputs().any(|(_, source)| source == node))
+            .filter_map(|(consumer, _)| self.graph.node_rect(consumer.into()))
+            .filter(|consumer| consumer.intersects(&outline))
+            .map(|consumer| outline.max.x + PLACEMENT_GAP - consumer.min.x)
+            .fold(0.0, f32::max);
+        if overlap <= 0.0 {
+            return Changes::default();
+        }
+        let mut document = self.document.clone();
+        for id in self.document.downstream_of(node) {
+            let moved = document.nodes.get_mut(&id).expect("downstream nodes exist");
+            Arc::make_mut(moved).position.x += overlap;
+        }
+        self.swap_in(document)
     }
 
     /// Where a node taking another on its input goes: to its right, as the graph reads left to
@@ -661,8 +688,8 @@ impl Session {
         changes
     }
 
-    /// Swaps in a document without recording a step: a change of selection, or of the edit in
-    /// progress.
+    /// Swaps in a document without recording a step: a change of selection, of the edit in
+    /// progress, or one that joins the step just recorded.
     fn swap_in(&mut self, after: Document) -> Changes {
         let changes = self.document.changes_to(&after);
         if !changes.is_empty() {

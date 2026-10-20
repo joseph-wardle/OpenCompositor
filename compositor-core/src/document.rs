@@ -440,6 +440,20 @@ impl Document {
         false
     }
 
+    /// The nodes `node` feeds, directly or through other nodes.
+    pub(crate) fn downstream_of(&self, node: NodeId) -> BTreeSet<NodeId> {
+        let mut downstream = BTreeSet::new();
+        let mut pending = vec![node];
+        while let Some(source) = pending.pop() {
+            for (id, consumer) in self.nodes() {
+                if consumer.inputs.values().any(|&input| input == source) && downstream.insert(id) {
+                    pending.push(id);
+                }
+            }
+        }
+        downstream
+    }
+
     /// What differs from this document to `after`. Subtrees and nodes the two share are skipped
     /// without comparing them.
     pub(crate) fn changes_to(&self, after: &Document) -> Changes {

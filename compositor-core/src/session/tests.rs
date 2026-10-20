@@ -393,6 +393,47 @@ fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
 }
 
 #[test]
+fn an_inserted_node_pushes_what_it_feeds_right_when_it_lands_on_it() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let outline = session.graph().node_rect(reader.into()).unwrap();
+    let first = create_exposure(
+        &mut session,
+        Point {
+            x: outline.max.x + PLACEMENT_GAP,
+            y: 0.0,
+        },
+    );
+    let second = create_exposure(&mut session, Point { x: 600.0, y: 0.0 });
+    let unrelated = create_exposure(&mut session, Point { x: 600.0, y: 300.0 });
+    session.connect(first, "source", reader).unwrap();
+    session.connect(second, "source", first).unwrap();
+    let before = session.document().clone();
+    let steps = session.undo.len();
+
+    let changes = session.create_node("exposure", ORIGIN, Some(reader));
+
+    let id = *changes.unwrap().nodes.last().unwrap();
+    let inserted = session.graph().node_rect(id.into()).unwrap();
+    let pushed = session.graph().node_rect(first.into()).unwrap();
+    assert_eq!(pushed.min.x, inserted.max.x + PLACEMENT_GAP);
+    let position = |id| session.document().node(id).unwrap().position;
+    let moved = pushed.min.x - before.node(first).unwrap().position.x;
+    assert_eq!(position(second).x, 600.0 + moved);
+    assert_eq!(position(unrelated).x, 600.0);
+    assert_eq!(position(reader), ORIGIN);
+    assert_eq!(session.undo.len(), steps + 1);
+    assert_presented(&session);
+
+    let after = session.document().clone();
+    session.undo();
+    assert!(session.document().changes_to(&before).is_empty());
+    session.redo();
+    assert!(session.document().changes_to(&after).is_empty());
+    assert_presented(&session);
+}
+
+#[test]
 fn a_node_without_inputs_is_created_below_the_current_node_unconnected() {
     let mut session = Session::new();
     let reader = create(&mut session, "a.exr", ORIGIN);
