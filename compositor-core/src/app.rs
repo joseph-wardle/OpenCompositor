@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{ExposureVersion, NodeId, NodeKind, Slot, unconnected_inputs};
+use crate::document::{ExposureVersion, Missing, NodeId, NodeKind, Slot, missing};
 use crate::evaluate::{ResultKey, result_key};
 use crate::gpu::{Drawn, FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
+use crate::parameter::Value;
 use crate::session::Session;
 use crate::worker::{Evaluated, ViewerError, Wanted, Worker};
 
@@ -222,10 +223,12 @@ impl Key {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FileIntent {
     /// A Reader for each file, stacked downwards from a graph point.
-    CreateReaders {
-        at: Point,
+    CreateReaders { at: Point },
+    /// The first file chosen for a node's file parameter.
+    SetFile {
+        node: NodeId,
+        parameter: &'static str,
     },
-    SetReaderPath(NodeId),
 }
 
 impl FileIntent {
@@ -737,7 +740,10 @@ impl App {
                 vec![Request::Redraw(Pane::Graph)]
             }
             Command::ChangeReaderFile => match self.session.document().selection() {
-                &[id] => vec![Request::ChooseFiles(FileIntent::SetReaderPath(id))],
+                &[node] => vec![Request::ChooseFiles(FileIntent::SetFile {
+                    node,
+                    parameter: "file",
+                })],
                 _ => vec![Request::ShowStatus(
                     "Select one Reader to change its file".to_owned(),
                 )],
@@ -809,8 +815,9 @@ impl App {
             FileIntent::CreateReaders { at } => {
                 self.session.create_readers(paths, at);
             }
-            FileIntent::SetReaderPath(node) => {
-                if let Err(error) = self.session.set_reader_path(node, first) {
+            FileIntent::SetFile { node, parameter } => {
+                let file = Value::File(first.into());
+                if let Err(error) = self.session.set_value(node, parameter, file) {
                     return vec![Request::ShowStatus(format!(
                         "Cannot change the file: {error}"
                     ))];
@@ -945,12 +952,16 @@ impl App {
             // The previous image stays until then.
             _ => details.push("updating…".to_owned()),
         }
-        for (id, input) in unconnected_inputs(document, viewed) {
+        for (id, what) in missing(document, viewed) {
+            let (label, lack) = match what {
+                Missing::Input(input) => (input.label, "is not connected"),
+                Missing::File(parameter) => (parameter.label, "is not set"),
+            };
             details.push(if id == viewed {
-                format!("{} is not connected", input.label)
+                format!("{label} {lack}")
             } else {
                 let upstream = document.node(id).expect("inputs name existing nodes");
-                format!("{} of {} is not connected", input.label, upstream.name())
+                format!("{label} of {} {lack}", upstream.name())
             });
         }
         if details.is_empty() {

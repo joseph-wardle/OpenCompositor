@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
 use std::sync::Arc;
 
 use imbl::OrdMap;
@@ -10,7 +9,7 @@ use imbl::ordmap::DiffItem;
 use open_ng::Point;
 
 use crate::parameter::{
-    FloatParameter, Parameter, ParameterKind, Value, ValueError, describe, validate,
+    FloatParameter, Parameter, ParameterKind, Value, ValueError, describe, resolve, validate,
 };
 
 /// A node's identity. A session never gives two nodes the same ID, even after undoing the
@@ -50,9 +49,8 @@ impl Slot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
-    /// Reads one image file. The path is kept as the artist chose it, and shared, so cloning the
-    /// node to move it does not copy the path.
-    Reader { path: Arc<Path> },
+    /// Reads the image file its File names. Without one it gives the empty image.
+    Reader { version: ReaderVersion },
     /// Multiplies R, G and B by two to the power of its Stops and leaves A. On premultiplied
     /// pixels that equals unpremultiplying, scaling and premultiplying again.
     Exposure { version: ExposureVersion },
@@ -62,7 +60,9 @@ impl NodeKind {
     /// What the node offers to be set, as its version describes it.
     pub fn parameters(&self) -> &'static [Parameter] {
         match self {
-            NodeKind::Reader { .. } => &[],
+            NodeKind::Reader {
+                version: ReaderVersion::V1,
+            } => READER_V1,
             NodeKind::Exposure {
                 version: ExposureVersion::V1,
             } => EXPOSURE_V1,
@@ -88,6 +88,23 @@ pub struct NodeInput {
     pub name: &'static str,
     pub label: &'static str,
 }
+
+/// The parameter descriptions a Reader node was created with, as [`ExposureVersion`] is for
+/// Exposure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReaderVersion {
+    V1,
+}
+
+impl ReaderVersion {
+    pub const CURRENT: ReaderVersion = ReaderVersion::V1;
+}
+
+const READER_V1: &[Parameter] = &[Parameter {
+    name: "file",
+    label: "File",
+    kind: ParameterKind::File,
+}];
 
 /// The parameter and input descriptions an Exposure node was created with. A changed default is
 /// a new version, so a node keeps the defaults its values were authored against.
@@ -142,11 +159,12 @@ impl Node {
     /// What the artist calls the node: a Reader's file name, or the node's kind.
     pub fn name(&self) -> String {
         match &self.kind {
-            NodeKind::Reader { path } => path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-                .into_owned(),
+            NodeKind::Reader { .. } => match resolve(self).file("file") {
+                Some(path) => (path.file_name().unwrap_or(path.as_os_str()))
+                    .to_string_lossy()
+                    .into_owned(),
+                None => "Reader".to_owned(),
+            },
             NodeKind::Exposure { .. } => "Exposure".to_owned(),
         }
     }
@@ -162,8 +180,8 @@ impl Node {
     }
 
     /// The value the artist set for a parameter, if they set one.
-    pub fn authored_value(&self, name: &str) -> Option<Value> {
-        self.authored.get(name).copied()
+    pub fn authored_value(&self, name: &str) -> Option<&Value> {
+        self.authored.get(name)
     }
 
     /// Sets a parameter's value, refusing one its description does not allow. A value equal to
@@ -182,30 +200,47 @@ impl Node {
     }
 }
 
-/// Every input that takes no image on the node and upstream of it: the node's own first, each in
-/// declaration order, and each upstream node once, without recursion. Empty if the document has
-/// no such node.
+/// Something a node needs to make its image and lacks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Missing {
+    /// An input that takes no image.
+    Input(&'static NodeInput),
+    /// A file parameter with no file.
+    File(&'static Parameter),
+}
+
+/// Everything missing on the node and upstream of it: the node's own first, its files before its
+/// inputs, each in declaration order, and each upstream node once, without recursion. Empty if
+/// the document has no such node.
 ///
-/// An unconnected input gives the empty image, so this, not the image, says what is incomplete.
-pub fn unconnected_inputs(document: &Document, node: NodeId) -> Vec<(NodeId, &'static NodeInput)> {
-    let mut unconnected = Vec::new();
+/// What is missing gives the empty image, so this, not the image, says what is incomplete.
+pub fn missing(document: &Document, node: NodeId) -> Vec<(NodeId, Missing)> {
+    let mut missing = Vec::new();
     let mut visited = BTreeSet::new();
     let mut pending = vec![node];
     while let Some(id) = pending.pop() {
         let Some(current) = document.node(id).filter(|_| visited.insert(id)) else {
             continue;
         };
+        let resolved = resolve(current);
+        for parameter in current.kind.parameters() {
+            if matches!(parameter.kind, ParameterKind::File)
+                && resolved.get(parameter.name).is_none()
+            {
+                missing.push((id, Missing::File(parameter)));
+            }
+        }
         let mut sources = Vec::new();
         for input in current.kind.inputs() {
             match current.input(input.name) {
                 Some(source) => sources.push(source),
-                None => unconnected.push((id, input)),
+                None => missing.push((id, Missing::Input(input))),
             }
         }
         // Reversed, so that the first input's chain is visited first.
         pending.extend(sources.into_iter().rev());
     }
-    unconnected
+    missing
 }
 
 /// Everything undo restores, and nothing else. Decoded images, GPU resources, Qt objects, the ID

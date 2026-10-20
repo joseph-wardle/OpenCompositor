@@ -4,7 +4,7 @@ use std::path::Path;
 use open_ng::Point;
 
 use super::*;
-use crate::document::{ExposureVersion, NodeKind};
+use crate::document::{ExposureVersion, NodeKind, ReaderVersion};
 
 fn exposure() -> Node {
     Node::new(
@@ -15,15 +15,24 @@ fn exposure() -> Node {
     )
 }
 
+fn reader() -> Node {
+    Node::new(
+        NodeKind::Reader {
+            version: ReaderVersion::V1,
+        },
+        Point { x: 0.0, y: 0.0 },
+    )
+}
+
 fn stops(node: &Node) -> Option<Value> {
-    resolve(node).get("stops")
+    resolve(node).get("stops").cloned()
 }
 
 /// Every built-in node type at every version.
 fn built_in() -> [NodeKind; 2] {
     [
         NodeKind::Reader {
-            path: Path::new("a.exr").into(),
+            version: ReaderVersion::V1,
         },
         NodeKind::Exposure {
             version: ExposureVersion::V1,
@@ -38,7 +47,9 @@ fn built_in_descriptions_are_consistent() {
         let names: HashSet<_> = parameters.iter().map(|parameter| parameter.name).collect();
         assert_eq!(names.len(), parameters.len(), "{kind:?}: names repeat");
         for parameter in parameters {
-            let ParameterKind::Float(float) = &parameter.kind;
+            let ParameterKind::Float(float) = &parameter.kind else {
+                continue;
+            };
             let limits = &float.limits;
             assert!(
                 limits.start().is_finite() && limits.end().is_finite() && !limits.is_empty(),
@@ -71,7 +82,7 @@ fn a_value_set_to_its_default_stays_set_until_reset() {
     assert_eq!(stops(&node), Some(Value::Float(1.5)));
 
     node.set_value("stops", Value::Float(0.0)).unwrap();
-    assert_eq!(node.authored_value("stops"), Some(Value::Float(0.0)));
+    assert_eq!(node.authored_value("stops"), Some(&Value::Float(0.0)));
     let set_to_default = resolve(&node);
 
     node.reset("stops").unwrap();
@@ -100,6 +111,10 @@ fn values_the_description_does_not_allow_are_refused() {
             "{name} {value}"
         );
     }
+    assert_eq!(
+        node.set_value("stops", Value::File(Path::new("a.exr").into())),
+        Err(ValueError::WrongKind)
+    );
     assert_eq!(node.reset("gain"), Err(ValueError::UnknownParameter));
     assert_eq!(stops(&node), Some(Value::Float(2.0)));
 
@@ -109,24 +124,42 @@ fn values_the_description_does_not_allow_are_refused() {
 }
 
 #[test]
-fn a_reader_has_no_parameters_to_set() {
-    let mut reader = Node::new(
-        NodeKind::Reader {
-            path: Path::new("a.exr").into(),
-        },
-        Point { x: 0.0, y: 0.0 },
-    );
+fn a_file_is_absent_until_set_and_never_empty() {
+    let mut node = reader();
+    assert_eq!(resolve(&node).get("file"), None);
+
+    let refusals = [
+        (Value::File(Path::new("").into()), ValueError::EmptyPath),
+        (Value::Float(1.0), ValueError::WrongKind),
+    ];
+    for (value, error) in refusals {
+        assert_eq!(
+            node.set_value("file", value.clone()),
+            Err(error),
+            "{value:?}"
+        );
+    }
     assert_eq!(
-        reader.set_value("stops", Value::Float(1.0)),
+        node.set_value("stops", Value::Float(1.0)),
         Err(ValueError::UnknownParameter)
     );
-    assert_eq!(resolve(&reader), Resolved { values: Vec::new() });
+    assert_eq!(node, reader());
+
+    // Whether the file exists is the read's to say.
+    node.set_value("file", Value::File(Path::new("missing.exr").into()))
+        .unwrap();
+    assert_eq!(
+        resolve(&node).file("file").map(|path| &**path),
+        Some(Path::new("missing.exr"))
+    );
+    node.reset("file").unwrap();
+    assert_eq!(node, reader());
 }
 
 #[test]
 fn negative_zero_is_stored_as_zero() {
     let mut node = exposure();
     node.set_value("stops", Value::Float(-0.0)).unwrap();
-    let Value::Float(stored) = node.authored_value("stops").unwrap();
+    let stored = resolve(&node).float("stops").unwrap();
     assert_eq!(stored.to_bits(), 0.0f64.to_bits());
 }

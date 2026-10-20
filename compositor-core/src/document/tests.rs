@@ -6,16 +6,20 @@ const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 
 /// A document of one Reader, with ID 0, and `exposures` Exposures, with IDs from 1.
 fn document_of(exposures: u64) -> Document {
-    let reader = NodeKind::Reader {
-        path: Path::new("a.exr").into(),
-    };
+    let mut reader = Node::new(
+        NodeKind::Reader {
+            version: ReaderVersion::V1,
+        },
+        ORIGIN,
+    );
+    reader
+        .set_value("file", Value::File(Path::new("a.exr").into()))
+        .unwrap();
     let exposure = NodeKind::Exposure {
         version: ExposureVersion::V1,
     };
     let mut document = Document::default();
-    document
-        .nodes
-        .insert(NodeId(0), Arc::new(Node::new(reader, ORIGIN)));
+    document.nodes.insert(NodeId(0), Arc::new(reader));
     for id in 1..=exposures {
         document
             .nodes
@@ -143,20 +147,30 @@ fn deleting_nodes_clears_what_named_them() {
 }
 
 #[test]
-fn unconnected_inputs_are_found_up_the_chain() {
+fn what_is_missing_is_found_up_the_chain() {
     // 3 takes 2, which takes nothing; 1 takes the Reader and is not upstream of 3.
     let document = document_of(3)
         .assign_inputs(&[connect(3, 2), connect(1, 0)])
         .unwrap();
-    let names = |id: u64| -> Vec<(u64, &str)> {
-        (unconnected_inputs(&document, NodeId(id)).into_iter())
-            .map(|(node, input)| (node.0, input.name))
+    let names = |document: &Document, id: u64| -> Vec<(u64, &str)> {
+        (missing(document, NodeId(id)).into_iter())
+            .map(|(node, missing)| match missing {
+                Missing::Input(input) => (node.0, input.name),
+                Missing::File(parameter) => (node.0, parameter.name),
+            })
             .collect()
     };
 
-    assert_eq!(names(3), [(2, "source")]);
-    assert_eq!(names(2), [(2, "source")]);
-    assert_eq!(names(1), []);
-    assert_eq!(names(0), []);
-    assert_eq!(names(9), []);
+    assert_eq!(names(&document, 3), [(2, "source")]);
+    assert_eq!(names(&document, 2), [(2, "source")]);
+    assert_eq!(names(&document, 1), []);
+    assert_eq!(names(&document, 0), []);
+    assert_eq!(names(&document, 9), []);
+
+    // A Reader without a file is reported where it is, as an unconnected input is.
+    let mut unset = document.clone();
+    let reader = unset.nodes.get_mut(&NodeId(0)).unwrap();
+    Arc::make_mut(reader).reset("file").unwrap();
+    assert_eq!(names(&unset, 1), [(0, "file")]);
+    assert_eq!(names(&unset, 0), [(0, "file")]);
 }

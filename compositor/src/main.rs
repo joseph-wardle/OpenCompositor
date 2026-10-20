@@ -282,7 +282,7 @@ pub fn perform(request: Request) {
         Request::ChooseFiles(intent) => {
             let title = match intent {
                 FileIntent::CreateReaders { .. } => "Read Files",
-                FileIntent::SetReaderPath(_) => "Change the Reader's File",
+                FileIntent::SetFile { .. } => "Choose a File",
             };
             let several = intent.allows_several();
             // SAFETY: the window is live.

@@ -69,7 +69,9 @@ fn a_reader_evaluates_to_the_file_it_points_at() {
     let image = evaluate(&mut evaluator, &session, id).unwrap();
     assert_eq!(pixel(&image), [1.0; 4]);
 
-    session.set_reader_path(id, black).unwrap();
+    session
+        .set_value(id, "file", Value::File(black.into()))
+        .unwrap();
     let image = evaluate(&mut evaluator, &session, id).unwrap();
     assert_eq!(pixel(&image), [0.0, 0.0, 0.0, 1.0]);
 }

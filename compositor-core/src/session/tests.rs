@@ -8,7 +8,7 @@ use open_ng::{
 };
 
 use super::*;
-use crate::document::ExposureVersion;
+use crate::document::{ExposureVersion, ReaderVersion};
 use crate::evaluate::result_key;
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
@@ -24,11 +24,14 @@ fn create(session: &mut Session, name: &str, at: Point) -> NodeId {
     *changes.nodes.first().expect("one node created")
 }
 
-fn reader_path(session: &Session, id: NodeId) -> &Path {
-    match &session.document().node(id).expect("the node exists").kind {
-        NodeKind::Reader { path } => path,
-        kind => panic!("{kind:?} is not a Reader"),
-    }
+fn set_file(session: &mut Session, id: NodeId, name: &str) -> Result<Changes, EditError> {
+    session.set_value(id, "file", Value::File(Path::new(name).into()))
+}
+
+fn file(session: &Session, id: NodeId) -> Option<Arc<Path>> {
+    resolve(session.document().node(id).expect("the node exists"))
+        .file("file")
+        .cloned()
 }
 
 fn slot(digit: u8) -> Slot {
@@ -86,15 +89,15 @@ fn a_node_created_after_an_undo_gets_a_new_id() {
 fn a_new_edit_clears_redo() {
     let mut session = Session::new();
     let reader = create(&mut session, "a.exr", ORIGIN);
-    session.set_reader_path(reader, "b.exr".into()).unwrap();
+    set_file(&mut session, reader, "b.exr").unwrap();
     session.undo();
-    assert_eq!(session.redo_label(), Some("Set Reader Path"));
+    assert_eq!(session.redo_label(), Some("File"));
 
     session.set_mark(slot(1), Some(reader)).unwrap();
 
     assert_eq!(session.redo_label(), None);
     assert!(session.redo().is_empty());
-    assert_eq!(reader_path(&session, reader), Path::new("a.exr"));
+    assert_eq!(file(&session, reader).as_deref(), Some(Path::new("a.exr")));
     assert_presented(&session);
 }
 
@@ -183,7 +186,7 @@ fn the_graph_matches_the_document_after_every_step() {
         &|s| s.set_mark(slot(1), Some(a)).unwrap(),
         &|s| s.set_mark(slot(2), Some(a)).unwrap(),
         &|s| s.set_mark(slot(1), Some(c)).unwrap(),
-        &|s| s.set_reader_path(b, "d.exr".into()).unwrap(),
+        &|s| set_file(s, b, "d.exr").unwrap(),
         &|s| {
             s.apply_response(&Response {
                 positions: vec![(c.into(), Point { x: 10.0, y: 10.0 })],
@@ -229,8 +232,8 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
         ("an empty create", &|s| {
             unchanged(s.create_readers(Vec::new(), ORIGIN));
         }),
-        ("the same path", &|s| {
-            unchanged(s.set_reader_path(reader, "a.exr".into()).unwrap());
+        ("the same file", &|s| {
+            unchanged(set_file(s, reader, "a.exr").unwrap());
         }),
         ("the same mark", &|s| {
             unchanged(s.set_mark(slot(3), Some(reader)).unwrap());
@@ -277,15 +280,13 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
 }
 
 #[test]
-fn repathing_keeps_the_node_its_position_and_its_marks() {
+fn a_new_file_keeps_the_node_its_position_and_its_marks() {
     let mut session = Session::new();
     let at = Point { x: 30.0, y: -40.0 };
     let reader = create(&mut session, "plates/a.exr", at);
     session.set_mark(slot(4), Some(reader)).unwrap();
 
-    let changes = session
-        .set_reader_path(reader, "plates/b.exr".into())
-        .unwrap();
+    let changes = set_file(&mut session, reader, "plates/b.exr").unwrap();
 
     assert_eq!(changes.nodes.iter().copied().collect::<Vec<_>>(), [reader]);
     assert!(!changes.selection);
@@ -304,7 +305,7 @@ fn edits_to_a_node_an_undo_removed_are_refused() {
     session.undo();
 
     let missing = Err(EditError::MissingNode(reader));
-    assert_eq!(session.set_reader_path(reader, "b.exr".into()), missing);
+    assert_eq!(set_file(&mut session, reader, "b.exr"), missing);
     assert_eq!(session.set_mark(slot(0), Some(reader)), missing);
     assert_eq!(
         session.set_value(reader, "stops", Value::Float(1.0)),
@@ -347,23 +348,46 @@ fn an_exposure_node_is_created_selected_and_undoable() {
 }
 
 #[test]
-fn an_exposure_node_has_no_reader_path() {
+fn an_exposure_node_has_no_file() {
     let mut session = Session::new();
-    let changes = session.create_node(
-        NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        },
-        ORIGIN,
-    );
-    let id = *changes.nodes.first().expect("one node created");
+    let id = create_exposure(&mut session, ORIGIN);
     session.set_mark(slot(1), Some(id)).unwrap();
 
     assert_eq!(session.viewed(), Some(id));
     assert_eq!(
-        session.set_reader_path(id, "a.exr".into()),
-        Err(EditError::WrongKind(id))
+        set_file(&mut session, id, "a.exr"),
+        Err(EditError::InvalidValue {
+            node: id,
+            parameter: "file".to_owned(),
+            error: ValueError::UnknownParameter,
+        })
     );
     assert_eq!(session.undo_label(), Some("Mark"));
+}
+
+#[test]
+fn a_reader_without_a_file_is_named_for_its_kind_and_reloads_nothing() {
+    let mut session = Session::new();
+    let created = session.create_node(
+        NodeKind::Reader {
+            version: ReaderVersion::CURRENT,
+        },
+        ORIGIN,
+    );
+    let empty = create(&mut session, "", ORIGIN);
+    for id in [*created.nodes.first().unwrap(), empty] {
+        assert_eq!(file(&session, id), None);
+        assert_eq!(session.graph().node(id.into()).unwrap().title, "Reader");
+        assert!(!session.reload(&[id]));
+    }
+    assert_eq!(
+        set_file(&mut session, empty, ""),
+        Err(EditError::InvalidValue {
+            node: empty,
+            parameter: "file".to_owned(),
+            error: ValueError::EmptyPath,
+        })
+    );
 }
 
 #[test]
@@ -441,7 +465,9 @@ fn create_exposure(session: &mut Session, at: Point) -> NodeId {
 }
 
 fn stops(session: &Session, id: NodeId) -> Option<Value> {
-    resolve(session.document().node(id).expect("the node exists")).get("stops")
+    resolve(session.document().node(id).expect("the node exists"))
+        .get("stops")
+        .cloned()
 }
 
 #[test]

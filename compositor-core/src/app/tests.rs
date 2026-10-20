@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::*;
 use crate::document::NodeKind;
 use crate::evaluate::EvalError;
-use crate::parameter::Value;
+use crate::parameter::{Value, resolve};
 use crate::read::ReadError;
 use crate::worker::{Timing, ViewerImage};
 
@@ -50,14 +50,9 @@ fn input(pane: Pane, input: Input) -> Event {
     Event::Input { pane, input }
 }
 
-fn reader_path(app: &App, id: NodeId) -> Option<&Path> {
-    app.session()
-        .document()
-        .node(id)
-        .and_then(|node| match &node.kind {
-            NodeKind::Reader { path } => Some(&**path),
-            NodeKind::Exposure { .. } => None,
-        })
+fn file(app: &App, id: NodeId) -> Option<Arc<Path>> {
+    let node = app.session().document().node(id)?;
+    resolve(node).file("file").cloned()
 }
 
 /// Creates a Reader for the path, selected, and returns it.
@@ -212,14 +207,20 @@ fn changing_the_selected_readers_file_fails_if_it_went_while_the_dialog_was_open
     let id = app.session().document().selection()[0];
 
     let requests = app.dispatch(Event::Command(Command::ChangeReaderFile));
-    let intent = FileIntent::SetReaderPath(id);
+    let intent = FileIntent::SetFile {
+        node: id,
+        parameter: "file",
+    };
     assert_eq!(requests, [Request::ChooseFiles(intent)]);
     let paths = vec![PathBuf::from("/nonexistent/b.exr")];
     app.dispatch(Event::FilesChosen {
         intent,
         paths: paths.clone(),
     });
-    assert_eq!(reader_path(&app, id), Some(Path::new("/nonexistent/b.exr")));
+    assert_eq!(
+        file(&app, id).as_deref(),
+        Some(Path::new("/nonexistent/b.exr"))
+    );
 
     // Undo, as though from another window while the dialog was open, removes the Reader.
     app.dispatch(Event::Command(Command::Undo));
@@ -233,7 +234,7 @@ fn changing_the_selected_readers_file_fails_if_it_went_while_the_dialog_was_open
             crate::session::EditError::MissingNode(id)
         ))]
     );
-    assert_eq!(reader_path(&app, id), None);
+    assert_eq!(file(&app, id), None);
 }
 
 #[test]
@@ -814,6 +815,25 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
     assert_ne!(color(reader), color(second));
     assert_eq!(color(first), color(second));
+}
+
+#[test]
+fn a_viewed_reader_without_a_file_says_so_where_it_is() {
+    let (mut app, _deliveries) = app();
+    let kind = NodeKind::Reader {
+        version: crate::document::ReaderVersion::CURRENT,
+    };
+    let changes = app.session.create_node(kind, Point::default());
+    let reader = *changes.nodes.first().unwrap();
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(read(&sent(&app), 0, 0));
+    assert_eq!(app.caption, "Slot 1 · Reader · File is not set");
+
+    let exposure = create_exposure(&mut app);
+    app.session.connect(exposure, "source", reader).unwrap();
+    app.dispatch(slot_key(2, CTRL));
+    app.dispatch(read(&sent(&app), 0, 0));
+    assert_eq!(app.caption, "Slot 2 · Exposure · File of Reader is not set");
 }
 
 #[test]

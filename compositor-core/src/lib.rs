@@ -29,8 +29,8 @@ pub mod bench {
 
 pub use app::{App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
 pub use document::{
-    Assignment, Changes, ConnectionError, Document, ExposureVersion, Node, NodeId, NodeInput,
-    NodeKind, Slot, unconnected_inputs,
+    Assignment, Changes, ConnectionError, Document, ExposureVersion, Missing, Node, NodeId,
+    NodeInput, NodeKind, ReaderVersion, Slot, missing,
 };
 pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};

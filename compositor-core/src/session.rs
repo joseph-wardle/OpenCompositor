@@ -8,10 +8,10 @@ use std::sync::Arc;
 use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 
 use crate::document::{
-    Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, Slot,
+    Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, ReaderVersion, Slot,
 };
 use crate::evaluate::{Reloads, ResultKey, result_keys};
-use crate::parameter::{Value, ValueError, describe};
+use crate::parameter::{Value, ValueError, describe, resolve};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
@@ -43,8 +43,6 @@ pub enum EditError {
     /// The target no longer exists, such as a dialog's node removed by an undo while the dialog
     /// was open.
     MissingNode(NodeId),
-    /// The node is of a type the edit does not apply to.
-    WrongKind(NodeId),
     /// A change to the edited node's values came with no edit in progress.
     NoEditInProgress,
     InvalidValue {
@@ -59,7 +57,6 @@ impl fmt::Display for EditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EditError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
-            EditError::WrongKind(id) => write!(f, "node {} has no such setting", id.0),
             EditError::NoEditInProgress => write!(f, "no edit is in progress"),
             EditError::InvalidValue {
                 node,
@@ -213,13 +210,10 @@ impl Session {
     }
 
     /// Makes every Reader of each given Reader's file read it again the next time it is viewed.
-    /// Returns whether any of the nodes is a Reader.
+    /// Returns whether any of the nodes is a Reader with a file.
     pub fn reload(&mut self, nodes: &[NodeId]) -> bool {
         let paths: BTreeSet<Arc<Path>> = (nodes.iter())
-            .filter_map(|&id| match &self.document.node(id)?.kind {
-                NodeKind::Reader { path } => Some(path.clone()),
-                NodeKind::Exposure { .. } => None,
-            })
+            .filter_map(|&id| resolve(self.document.node(id)?).file("file").cloned())
             .collect();
         for path in &paths {
             self.reloads.reload(path.clone());
@@ -272,20 +266,25 @@ impl Session {
         self.redo.last().map(|step| step.label)
     }
 
-    /// Creates a Reader for each path, stacked downwards from `at`, and selects them all.
+    /// Creates a Reader for each path, stacked downwards from `at`, and selects them all. A
+    /// Reader of an empty path has no file.
     pub fn create_readers(&mut self, paths: Vec<PathBuf>, at: Point) -> Changes {
         let mut document = self.document.clone();
         let mut created = Vec::with_capacity(paths.len());
         for (row, path) in paths.into_iter().enumerate() {
             let id = NodeId(self.next_id);
             self.next_id += 1;
-            let node = Node::new(
-                NodeKind::Reader { path: path.into() },
+            let mut node = Node::new(
+                NodeKind::Reader {
+                    version: ReaderVersion::CURRENT,
+                },
                 Point {
                     x: at.x,
                     y: at.y + row as f32 * READER_SPACING,
                 },
             );
+            // Refused only for an empty path, which leaves the file absent.
+            node.set_value("file", Value::File(path.into())).ok();
             document.nodes.insert(id, Arc::new(node));
             created.push(id);
         }
@@ -307,22 +306,6 @@ impl Session {
         document.nodes.insert(id, Arc::new(Node::new(kind, at)));
         document.selection = [id].into();
         self.commit(label, document)
-    }
-
-    /// Points a Reader at another file. It keeps its ID, position, marks and selection.
-    pub fn set_reader_path(&mut self, id: NodeId, path: PathBuf) -> Result<Changes, EditError> {
-        let mut document = self.document.clone();
-        let node = document
-            .nodes
-            .get_mut(&id)
-            .ok_or(EditError::MissingNode(id))?;
-        let NodeKind::Reader { path: current } = &node.kind else {
-            return Err(EditError::WrongKind(id));
-        };
-        if **current != *path {
-            Arc::make_mut(node).kind = NodeKind::Reader { path: path.into() };
-        }
-        Ok(self.commit("Set Reader Path", document))
     }
 
     /// Marks a node in a slot, replacing what the slot marked, or clears the slot.
