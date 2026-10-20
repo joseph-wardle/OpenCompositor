@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 
 use open_ng::Point;
 use opencompositor_core::{
-    Channel, EvalError, Evaluator, ExposureVersion, Image, NodeId, NodeKind, ReadError, Session,
-    Value, result_key,
+    Channel, EvalError, Evaluator, Image, NodeId, ReadError, Session, Value, result_key,
 };
 
 /// A directory of this test's own, emptied first.
@@ -47,12 +46,9 @@ fn pixel(image: &Image) -> [f32; 4] {
 }
 
 fn create_exposure(session: &mut Session) -> NodeId {
-    let changes = session.create_node(
-        NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        },
-        Point { x: 0.0, y: 0.0 },
-    );
+    let changes = session
+        .create_node("exposure", Point { x: 0.0, y: 0.0 }, None)
+        .unwrap();
     *changes.nodes.first().unwrap()
 }
 

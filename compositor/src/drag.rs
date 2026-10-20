@@ -17,9 +17,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use open_ng::Point;
-use opencompositor_core::{
-    Changes, ExposureVersion, NodeId, NodeKind, Pane, Session, Slot, Timing, Value,
-};
+use opencompositor_core::{Changes, NodeId, Pane, Session, Slot, Timing, Value};
 
 use crate::qt::ffi;
 
@@ -125,13 +123,10 @@ fn setup(_: usize) {
     let mut exposure = None;
     crate::edit(|session| {
         let reader = created(session.create_readers(vec![image], Point::default()));
-        let kind = NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        };
-        let node = created(session.create_node(kind, Point { x: 0.0, y: 150.0 }));
-        session
-            .connect(node, "source", reader)
-            .expect("both nodes exist");
+        let node = created(
+            (session.create_node("exposure", Point::default(), Some(reader)))
+                .expect("Exposure is a node type and the Reader exists"),
+        );
         session
             .set_mark(Slot::new(1).expect("1 is a slot"), Some(node))
             .expect("the node exists");

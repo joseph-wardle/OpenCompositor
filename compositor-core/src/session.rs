@@ -9,6 +9,7 @@ use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 
 use crate::document::{
     Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, ReaderVersion, Slot,
+    node_types,
 };
 use crate::evaluate::{Reloads, ResultKey, result_keys};
 use crate::parameter::{Value, ValueError, describe, resolve};
@@ -17,6 +18,9 @@ use crate::viewer::Viewer;
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
 const READER_SPACING: f32 = 70.0;
+
+/// Between a node and one created after it, below or beside it.
+const PLACEMENT_GAP: f32 = 40.0;
 
 /// One undo or redo step: the whole document from before it. Unlike an inverse record, a
 /// snapshot cannot forget to restore a field.
@@ -45,6 +49,8 @@ pub enum EditError {
     MissingNode(NodeId),
     /// A change to the edited node's values came with no edit in progress.
     NoEditInProgress,
+    /// No node type has the name.
+    UnknownType(String),
     InvalidValue {
         node: NodeId,
         parameter: String,
@@ -58,6 +64,7 @@ impl fmt::Display for EditError {
         match self {
             EditError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
             EditError::NoEditInProgress => write!(f, "no edit is in progress"),
+            EditError::UnknownType(name) => write!(f, "no node type is named \"{name}\""),
             EditError::InvalidValue {
                 node,
                 parameter,
@@ -294,18 +301,68 @@ impl Session {
         self.commit("Create Reader", document)
     }
 
-    /// Creates a node of a kind at `at` and selects it alone.
-    pub fn create_node(&mut self, kind: NodeKind, at: Point) -> Changes {
-        let label = match kind {
-            NodeKind::Reader { .. } => "Create Reader",
-            NodeKind::Exposure { .. } => "Create Exposure",
-        };
+    /// Creates a node of the type named `type_name`, one of [`node_types`], as one step, and
+    /// selects it alone.
+    ///
+    /// Without a current node, the node goes at `at`, unconnected. With one, it is inserted after
+    /// it, as Nuke's Tab menu inserts: placed below it, taking it on its first input and taking
+    /// over every input that took it. A type without inputs goes beside it instead, unconnected.
+    /// Marks stay where they are.
+    pub fn create_node(
+        &mut self,
+        type_name: &str,
+        at: Point,
+        current: Option<NodeId>,
+    ) -> Result<Changes, EditError> {
+        let node_type = node_types()
+            .iter()
+            .find(|node_type| node_type.name == type_name)
+            .ok_or_else(|| EditError::UnknownType(type_name.to_owned()))?;
         let id = NodeId(self.next_id);
-        self.next_id += 1;
+        let mut position = at;
+        let mut assignments = Vec::new();
+        if let Some(current) = current {
+            if self.document.node(current).is_none() {
+                return Err(EditError::MissingNode(current));
+            }
+            let outline = (self.graph.node_rect(current.into()))
+                .expect("the graph presents every node the document has");
+            if let Some(input) = node_type.kind.inputs().first() {
+                position = Point {
+                    x: outline.min.x,
+                    y: outline.max.y + PLACEMENT_GAP,
+                };
+                for (consumer, node) in self.document.nodes() {
+                    for (input, source) in node.inputs() {
+                        if source == current {
+                            assignments.push(Assignment {
+                                consumer,
+                                input,
+                                source: Some(id),
+                            });
+                        }
+                    }
+                }
+                assignments.push(Assignment {
+                    consumer: id,
+                    input: input.name,
+                    source: Some(current),
+                });
+            } else {
+                position = Point {
+                    x: outline.max.x + PLACEMENT_GAP,
+                    y: outline.min.y,
+                };
+            }
+        }
         let mut document = self.document.clone();
-        document.nodes.insert(id, Arc::new(Node::new(kind, at)));
+        let node = Node::new(node_type.kind.clone(), position);
+        document.nodes.insert(id, Arc::new(node));
+        let mut document = (document.assign_inputs(&assignments))
+            .expect("a new node takes over existing wires without a cycle");
         document.selection = [id].into();
-        self.commit(label, document)
+        self.next_id += 1;
+        Ok(self.commit(node_type.step, document))
     }
 
     /// Marks a node in a slot, replacing what the slot marked, or clears the slot.

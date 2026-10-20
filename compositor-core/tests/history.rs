@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 use open_ng::{Point, Response};
-use opencompositor_core::{ExposureVersion, NodeId, NodeKind, Session, Value};
+use opencompositor_core::{NodeId, Session, Value};
 
 struct Counting;
 
@@ -79,12 +79,9 @@ const STEP_CEILING: isize = 16 * 1024;
 fn assert_retains_its_node_and_map_path(what: &str, edit: impl Fn(&mut Session, Edited)) {
     let [small, large] = [100, 10_000].map(|readers| {
         let mut session = session_of(readers, 16);
-        let changes = session.create_node(
-            NodeKind::Exposure {
-                version: ExposureVersion::CURRENT,
-            },
-            Point { x: 0.0, y: 0.0 },
-        );
+        let changes = session
+            .create_node("exposure", Point { x: 0.0, y: 0.0 }, None)
+            .unwrap();
         let exposure = *changes.nodes.first().expect("one node created");
         let readers: Vec<_> = (session.document().nodes())
             .map(|(id, _)| id)

@@ -80,6 +80,42 @@ impl NodeKind {
     }
 }
 
+/// A node type the artist and scripts can create.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeType {
+    /// Unchanged across labels and versions: scripts create nodes by it.
+    pub name: &'static str,
+    pub label: &'static str,
+    /// What creating one names in the undo history.
+    pub(crate) step: &'static str,
+    /// What a new node of the type is: its current version.
+    pub(crate) kind: NodeKind,
+}
+
+const NODE_TYPES: &[NodeType] = &[
+    NodeType {
+        name: "reader",
+        label: "Reader",
+        step: "Create Reader",
+        kind: NodeKind::Reader {
+            version: ReaderVersion::CURRENT,
+        },
+    },
+    NodeType {
+        name: "exposure",
+        label: "Exposure",
+        step: "Create Exposure",
+        kind: NodeKind::Exposure {
+            version: ExposureVersion::CURRENT,
+        },
+    },
+];
+
+/// Every node type that can be created, in menu order.
+pub fn node_types() -> &'static [NodeType] {
+    NODE_TYPES
+}
+
 /// One image a node type takes, from another node's output.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeInput {

@@ -8,7 +8,7 @@ use open_ng::{
 };
 
 use super::*;
-use crate::document::{ExposureVersion, ReaderVersion};
+use crate::document::ExposureVersion;
 use crate::evaluate::result_key;
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
@@ -327,15 +327,15 @@ fn an_exposure_node_is_created_selected_and_undoable() {
     let mut session = Session::new();
     let reader = create(&mut session, "a.exr", ORIGIN);
     let at = Point { x: 0.0, y: 100.0 };
-    let exposure = NodeKind::Exposure {
-        version: ExposureVersion::CURRENT,
-    };
 
-    let changes = session.create_node(exposure.clone(), at);
+    let changes = session.create_node("exposure", at, None).unwrap();
 
     let id = *changes.nodes.first().expect("one node created");
     assert!(changes.selection);
     assert_eq!(session.document().selection(), [id]);
+    let exposure = NodeKind::Exposure {
+        version: ExposureVersion::CURRENT,
+    };
     assert_eq!(session.document().node(id), Some(&Node::new(exposure, at)));
     assert_eq!(session.graph().node(id.into()).unwrap().title, "Exposure");
     assert_eq!(session.undo_label(), Some("Create Exposure"));
@@ -345,6 +345,111 @@ fn an_exposure_node_is_created_selected_and_undoable() {
     assert_eq!(session.document().node(id), None);
     assert_eq!(session.document().selection(), [reader]);
     assert_presented(&session);
+}
+
+#[test]
+fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let consumers = [0.0, 200.0].map(|x| {
+        let id = create_exposure(&mut session, Point { x, y: 300.0 });
+        session.connect(id, "source", reader).unwrap();
+        id
+    });
+    session.set_mark(slot(1), Some(reader)).unwrap();
+    let before = session.document().clone();
+    let steps = session.undo.len();
+
+    let changes = session.create_node("exposure", ORIGIN, Some(reader));
+
+    let id = *changes
+        .unwrap()
+        .nodes
+        .last()
+        .expect("the newest ID is created");
+    let document = session.document();
+    let inserted = document.node(id).unwrap();
+    let outline = session.graph().node_rect(reader.into()).unwrap();
+    assert_eq!(
+        inserted.position,
+        Point {
+            x: outline.min.x,
+            y: outline.max.y + PLACEMENT_GAP,
+        }
+    );
+    assert_eq!(inserted.input("source"), Some(reader));
+    for consumer in consumers {
+        assert_eq!(document.node(consumer).unwrap().input("source"), Some(id));
+    }
+    assert_eq!(document.selection(), [id]);
+    assert_eq!(document.mark(slot(1)), Some(reader));
+    assert_eq!(session.undo.len(), steps + 1);
+    assert_eq!(session.undo_label(), Some("Create Exposure"));
+    assert_presented(&session);
+
+    session.undo();
+    assert!(session.document().changes_to(&before).is_empty());
+    assert_presented(&session);
+}
+
+#[test]
+fn a_node_without_inputs_is_created_beside_the_current_node_unconnected() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let exposure = create_exposure(&mut session, Point { x: 0.0, y: 100.0 });
+    session.connect(exposure, "source", reader).unwrap();
+
+    let changes = session.create_node("reader", ORIGIN, Some(exposure));
+
+    let id = *changes
+        .unwrap()
+        .nodes
+        .last()
+        .expect("the newest ID is created");
+    let outline = session.graph().node_rect(exposure.into()).unwrap();
+    assert_eq!(
+        session.document().node(id).unwrap().position,
+        Point {
+            x: outline.max.x + PLACEMENT_GAP,
+            y: outline.min.y,
+        }
+    );
+    assert_eq!(file(&session, id), None);
+    let exposure = session.document().node(exposure).unwrap();
+    assert_eq!(exposure.input("source"), Some(reader));
+    assert_eq!(session.document().selection(), [id]);
+    assert_eq!(session.undo_label(), Some("Create Reader"));
+    assert_presented(&session);
+}
+
+#[test]
+fn creating_by_an_unknown_type_or_after_a_missing_node_changes_nothing() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    session.delete_nodes(&[reader]).unwrap();
+    let steps = session.undo.len();
+
+    assert_eq!(
+        session.create_node("Exposure", ORIGIN, None),
+        Err(EditError::UnknownType("Exposure".to_owned()))
+    );
+    assert_eq!(
+        session.create_node("exposure", ORIGIN, Some(reader)),
+        Err(EditError::MissingNode(reader))
+    );
+    assert_eq!(session.document().nodes().count(), 0);
+    assert_eq!(session.undo.len(), steps);
+}
+
+#[test]
+fn every_node_type_is_created_by_its_name() {
+    let mut session = Session::new();
+    for node_type in node_types() {
+        let changes = session.create_node(node_type.name, ORIGIN, None).unwrap();
+        let id = *changes.nodes.first().expect("one node created");
+        assert_eq!(session.document().node(id).unwrap().kind, node_type.kind);
+        assert_eq!(session.undo_label(), Some(node_type.step));
+    }
 }
 
 #[test]
@@ -368,12 +473,7 @@ fn an_exposure_node_has_no_file() {
 #[test]
 fn a_reader_without_a_file_is_named_for_its_kind_and_reloads_nothing() {
     let mut session = Session::new();
-    let created = session.create_node(
-        NodeKind::Reader {
-            version: ReaderVersion::CURRENT,
-        },
-        ORIGIN,
-    );
+    let created = session.create_node("reader", ORIGIN, None).unwrap();
     let empty = create(&mut session, "", ORIGIN);
     for id in [*created.nodes.first().unwrap(), empty] {
         assert_eq!(file(&session, id), None);
@@ -455,12 +555,7 @@ fn a_node_shows_a_failure_while_its_current_key_failed() {
 }
 
 fn create_exposure(session: &mut Session, at: Point) -> NodeId {
-    let changes = session.create_node(
-        NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        },
-        at,
-    );
+    let changes = session.create_node("exposure", at, None).unwrap();
     *changes.nodes.first().expect("one node created")
 }
 

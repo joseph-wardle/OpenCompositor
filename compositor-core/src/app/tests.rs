@@ -763,10 +763,9 @@ fn delete_in_the_graph_deletes_the_selection_and_the_viewer_lets_go() {
 }
 
 fn create_exposure(app: &mut App) -> NodeId {
-    let kind = NodeKind::Exposure {
-        version: crate::document::ExposureVersion::CURRENT,
-    };
-    let changes = app.session.create_node(kind, Point::default());
+    let changes = (app.session)
+        .create_node("exposure", Point::default(), None)
+        .unwrap();
     *changes.nodes.first().unwrap()
 }
 
@@ -820,10 +819,9 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
 #[test]
 fn a_viewed_reader_without_a_file_says_so_where_it_is() {
     let (mut app, _deliveries) = app();
-    let kind = NodeKind::Reader {
-        version: crate::document::ReaderVersion::CURRENT,
-    };
-    let changes = app.session.create_node(kind, Point::default());
+    let changes = (app.session)
+        .create_node("reader", Point::default(), None)
+        .unwrap();
     let reader = *changes.nodes.first().unwrap();
     app.dispatch(slot_key(1, CTRL));
     app.dispatch(read(&sent(&app), 0, 0));

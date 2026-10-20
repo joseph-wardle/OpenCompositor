@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{ExposureVersion, Missing, NodeId, NodeKind, Slot, missing};
+use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{ResultKey, result_key};
 use crate::gpu::{Drawn, FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
@@ -732,11 +732,9 @@ impl App {
                 at: self.graph_point_at_pointer(),
             })],
             Command::CreateExposure => {
-                let kind = NodeKind::Exposure {
-                    version: ExposureVersion::CURRENT,
-                };
-                self.session
-                    .create_node(kind, self.graph_point_at_pointer());
+                (self.session)
+                    .create_node("exposure", self.graph_point_at_pointer(), None)
+                    .expect("Exposure is a node type");
                 vec![Request::Redraw(Pane::Graph)]
             }
             Command::ChangeReaderFile => match self.session.document().selection() {
