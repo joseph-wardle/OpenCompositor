@@ -354,13 +354,12 @@ fn reloading_a_reader_reloads_every_reader_of_its_file() {
     let other = create(&mut session, "b.exr", ORIGIN);
     let twin = create(&mut session, "a.exr", ORIGIN);
     let selected = create(&mut session, "a.exr", ORIGIN);
-    assert_eq!(session.document().selection(), [selected]);
     let key = |session: &Session, id| result_key(session.document(), session.reloads(), id);
     let before = [selected, twin, other].map(|id| key(&session, id));
     session.record_failure(before[1].as_ref().unwrap());
     assert!(session.failures.nodes.contains(&twin));
 
-    assert!(session.reload_selected());
+    assert!(session.reload(&[selected]));
 
     let after = [selected, twin, other].map(|id| key(&session, id));
     assert_ne!(after[0], before[0]);
@@ -369,8 +368,8 @@ fn reloading_a_reader_reloads_every_reader_of_its_file() {
     assert!(session.failures.nodes.is_empty());
     assert_presented(&session);
 
-    create_exposure(&mut session, ORIGIN);
-    assert!(!session.reload_selected());
+    let exposure = create_exposure(&mut session, ORIGIN);
+    assert!(!session.reload(&[exposure]));
 }
 
 #[test]

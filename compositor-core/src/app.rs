@@ -734,7 +734,8 @@ impl App {
                 )],
             },
             Command::Reload => {
-                if self.session.reload_selected() {
+                let selection = self.session.document().selection().to_vec();
+                if self.session.reload(&selection) {
                     vec![Request::Redraw(Pane::Graph)]
                 } else {
                     vec![Request::ShowStatus("Select Readers to reload".to_owned())]

@@ -210,10 +210,10 @@ impl Session {
         &self.reloads
     }
 
-    /// Makes every Reader of each selected Reader's file read it again the next time it is
-    /// viewed. Returns whether any Reader was selected.
-    pub fn reload_selected(&mut self) -> bool {
-        let paths: BTreeSet<Arc<Path>> = (self.document.selection().iter())
+    /// Makes every Reader of each given Reader's file read it again the next time it is viewed.
+    /// Returns whether any of the nodes is a Reader.
+    pub fn reload(&mut self, nodes: &[NodeId]) -> bool {
+        let paths: BTreeSet<Arc<Path>> = (nodes.iter())
             .filter_map(|&id| match &self.document.node(id)?.kind {
                 NodeKind::Reader { path } => Some(path.clone()),
                 NodeKind::Exposure { .. } => None,
