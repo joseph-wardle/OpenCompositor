@@ -32,10 +32,7 @@ pub use document::{
 };
 pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};
-pub use image::{
-    Channel, Chromaticities, Cicp, ExrChannel, ExrCompression, ExrPart, ExrSource, Image,
-    ImageInfo, PngColorType, PngSource, SampleType, Source, Warning, Window,
-};
+pub use image::{Channel, Chromaticities, Image, ImageInfo, Warning, Window};
 pub use parameter::{
     FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,
 };

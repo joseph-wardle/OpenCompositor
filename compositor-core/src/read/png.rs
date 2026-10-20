@@ -9,12 +9,43 @@ use ::png::{
 use opencompositor_kernels::flush;
 
 use super::{ReadError, Refusal, check_size};
-use crate::image::{
-    Chromaticities, Cicp, Image, PngColorType, PngSource, Source, Warning, Window, zeroed_plane,
-};
+use crate::image::{Chromaticities, Image, Warning, Window, zeroed_plane};
 
 /// `gAMA`'s value for sRGB, which approximates sRGB's curve with a pure power.
 const SRGB_GAMMA: f32 = 1.0 / 2.2;
+
+/// The colour chunks a file carried, whether or not they are used.
+struct ColourChunks {
+    srgb: bool,
+    gamma: Option<f32>,
+    chromaticities: Option<Chromaticities>,
+    icc_profile: bool,
+    cicp: Option<Cicp>,
+}
+
+/// A `cICP` chunk's code points, as ITU-T H.273 numbers them. Its matrix is always 0, RGB: `png`
+/// refuses a file with any other.
+#[derive(Clone, Copy)]
+struct Cicp {
+    primaries: u8,
+    transfer: u8,
+    /// Whether codes span the whole range, rather than 16 to 235 at 8 bits, as video stores them.
+    full_range: bool,
+}
+
+impl Cicp {
+    const BT709_PRIMARIES: u8 = 1;
+    const BT709_TRANSFER: u8 = 1;
+    const GAMMA_22_TRANSFER: u8 = 4;
+    const GAMMA_28_TRANSFER: u8 = 5;
+    const BT601_TRANSFER: u8 = 6;
+    const LINEAR_TRANSFER: u8 = 8;
+    const SRGB_TRANSFER: u8 = 13;
+    const BT2020_10_BIT_TRANSFER: u8 = 14;
+    const BT2020_12_BIT_TRANSFER: u8 = 15;
+    const PQ_TRANSFER: u8 = 16;
+    const HLG_TRANSFER: u8 = 18;
+}
 
 pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
     let icc_profile = has_icc_chunk(&mut file)?;
@@ -28,15 +59,7 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
     let info = reader.info();
     let (width, height) = (info.width, info.height);
     check_size(width.into(), height.into())?;
-    let source = PngSource {
-        bit_depth: info.bit_depth as u8,
-        color_type: match info.color_type {
-            ColorType::Grayscale => PngColorType::Grayscale,
-            ColorType::GrayscaleAlpha => PngColorType::GrayscaleAlpha,
-            ColorType::Rgb => PngColorType::Rgb,
-            ColorType::Rgba => PngColorType::Rgba,
-            ColorType::Indexed => PngColorType::Indexed,
-        },
+    let chunks = ColourChunks {
         srgb: info.srgb.is_some(),
         // `Info::source_gamma` and `source_chromaticities` are never filled when decoding.
         gamma: info.gama_chunk.map(ScaledFloat::into_value),
@@ -48,7 +71,7 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
             full_range: cicp.is_video_full_range_image,
         }),
     };
-    let (decoding, mut warnings) = decoding(&source)?;
+    let (decoding, mut warnings) = decoding(&chunks)?;
     // pHYs gives pixels per unit along each axis; a pixel's width over its height is their
     // inverse ratio.
     let pixel_aspect = match info.pixel_dims {
@@ -76,14 +99,7 @@ pub(super) fn read(mut file: impl BufRead + Seek) -> Result<Image, ReadError> {
         width,
         height,
     };
-    Ok(Image::new(
-        window,
-        window,
-        planes,
-        pixel_aspect,
-        Source::Png(source),
-        warnings,
-    ))
+    Ok(Image::new(window, window, planes, warnings))
 }
 
 fn decode_error(error: DecodingError) -> ReadError {
@@ -155,12 +171,12 @@ enum Transfer {
 ///
 /// A curve or a range is honoured. Primaries are warned about, as is an ICC profile, which only
 /// colour management could read. A curve the reader has no formula for is refused.
-fn decoding(source: &PngSource) -> Result<(Decoding, Vec<Warning>), ReadError> {
+fn decoding(chunks: &ColourChunks) -> Result<(Decoding, Vec<Warning>), ReadError> {
     let srgb = Decoding {
         transfer: Transfer::Srgb,
         narrow_range: false,
     };
-    if let Some(cicp) = source.cicp {
+    if let Some(cicp) = chunks.cicp {
         let transfer = match cicp.transfer {
             Cicp::SRGB_TRANSFER => Transfer::Srgb,
             Cicp::LINEAR_TRANSFER => Transfer::Linear,
@@ -184,20 +200,20 @@ fn decoding(source: &PngSource) -> Result<(Decoding, Vec<Warning>), ReadError> {
         };
         return Ok((decoding, warnings));
     }
-    if source.icc_profile {
+    if chunks.icc_profile {
         return Ok((srgb, vec![Warning::IccProfile]));
     }
-    if source.srgb {
+    if chunks.srgb {
         return Ok((srgb, Vec::new()));
     }
-    let transfer = match source.gamma {
+    let transfer = match chunks.gamma {
         // `png` refuses a gamma of 0.
         Some(gamma) if (gamma - SRGB_GAMMA).abs() > 1e-3 => Transfer::Power(1.0 / gamma),
         // sRGB's own gAMA, or none: PNG's default is sRGB.
         _ => Transfer::Srgb,
     };
     let mut warnings = Vec::new();
-    if let Some(chromaticities) = source.chromaticities
+    if let Some(chromaticities) = chunks.chromaticities
         && !chromaticities.matches(&Chromaticities::REC_709)
     {
         warnings.push(Warning::Primaries(chromaticities));

@@ -9,16 +9,7 @@ fn image(planes: [Arc<[f32]>; 4]) -> Image {
         width: 2,
         height: 1,
     };
-    let source = Source::Png(PngSource {
-        bit_depth: 8,
-        color_type: PngColorType::Rgba,
-        srgb: false,
-        gamma: None,
-        chromaticities: None,
-        icc_profile: false,
-        cicp: None,
-    });
-    Image::new(window, window, planes, 1.0, source, Vec::new())
+    Image::new(window, window, planes, Vec::new())
 }
 
 fn plane(values: [f32; 2]) -> [Arc<[f32]>; 4] {

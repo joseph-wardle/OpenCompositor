@@ -426,7 +426,6 @@ fn colour_and_shape_the_reader_cannot_honour_load_with_warnings() {
     let mut anamorphic = display(0, 0, 4, 3);
     anamorphic.pixel_aspect = 2.0;
     let image = read_bytes(&grey(anamorphic)).unwrap();
-    assert_eq!(image.pixel_aspect(), 2.0);
     assert_eq!(image.warnings(), [Warning::PixelAspect(2.0)]);
 
     for invalid in [f32::NAN, 0.0, -2.0, f32::INFINITY] {
@@ -437,7 +436,6 @@ fn colour_and_shape_the_reader_cannot_honour_load_with_warnings() {
             &invalid.to_le_bytes(),
         );
         let image = read_bytes(&bytes).unwrap();
-        assert_eq!(image.pixel_aspect(), 1.0, "for {invalid}");
         assert!(
             matches!(image.warnings(), [Warning::PixelAspect(aspect)] if aspect.to_bits() == invalid.to_bits()),
             "for {invalid}: {:?}",
@@ -460,16 +458,6 @@ fn the_first_part_with_rgb_is_shown_and_the_others_named() {
     let image = read_bytes(&bytes).unwrap();
 
     assert_eq!(rgba(&image, 0, 0), [0.18, 0.18, 0.18, 1.0]);
-    let Some(Source::Exr(source)) = image.source() else {
-        panic!("an EXR source")
-    };
-    assert_eq!(source.shown_part, 1);
-    let names: Vec<_> = source
-        .parts
-        .iter()
-        .map(|part| part.name.as_deref())
-        .collect();
-    assert_eq!(names, [Some("depth"), Some("beauty"), Some("normals")]);
     assert_eq!(
         image.warnings(),
         [Warning::SeveralParts {

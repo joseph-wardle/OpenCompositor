@@ -11,18 +11,15 @@ use ::exr::block::{BlockIndex, UncompressedBlock};
 use ::exr::compression::Compression;
 use ::exr::error::Error;
 use ::exr::math::Vec2;
+use ::exr::meta::MetaData;
 use ::exr::meta::attribute::{self, Text};
 use ::exr::meta::header::Header;
-use ::exr::meta::{BlockDescription, MetaData};
 use half::f16;
 use half::slice::HalfFloatSliceExt;
 use opencompositor_kernels::flush;
 
 use super::{ReadError, Refusal, check_size, window};
-use crate::image::{
-    Channel, Chromaticities, ExrChannel, ExrCompression, ExrPart, ExrSource, Image, SampleType,
-    Source, Warning, Window, zeroed_plane,
-};
+use crate::image::{Channel, Chromaticities, Image, Warning, Window, zeroed_plane};
 
 pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadError> {
     // Only the headers, nothing allocated for pixels yet. Unvalidated, because validation
@@ -41,25 +38,20 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
     for header in &meta.headers {
         check_size(header.layer_size.0 as u64, header.layer_size.1 as u64)?;
     }
-    let parts = meta
-        .headers
-        .iter()
-        .map(describe_part)
-        .collect::<Result<Vec<_>, _>>()?;
+    let parts: Vec<Part> = meta.headers.iter().map(describe_part).collect();
     // `exr` reads no file with a deep part, not even its flat parts.
     if parts.iter().any(|part| part.deep) {
         return Err(ReadError::Refused(Refusal::Deep));
     }
     let shown_part = choose_part(&parts)?;
     let header = &meta.headers[shown_part];
-    let compression = parts[shown_part].compression;
-    if matches!(
-        compression,
-        ExrCompression::Htj2k32 | ExrCompression::Htj2k256
-    ) {
-        return Err(ReadError::Refused(Refusal::Compression(
-            compression.to_string(),
-        )));
+    let unsupported = match header.compression {
+        Compression::HTJ2K32 => Some("HTJ2K32"),
+        Compression::HTJ2K256 => Some("HTJ2K256"),
+        _ => None,
+    };
+    if let Some(name) = unsupported {
+        return Err(ReadError::Refused(Refusal::Compression(name.into())));
     }
     let chromaticities = header
         .shared_attributes
@@ -75,26 +67,17 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
     }
     let display = header.shared_attributes.display_window;
     let display_window = window(display.position.0, 0, display.size.0, display.size.1)?;
-    let pixel_aspect = header.shared_attributes.pixel_aspect;
-    let source = ExrSource {
-        views: header
-            .own_attributes
-            .multi_view_names
-            .iter()
-            .flatten()
-            .map(Text::to_string)
-            .collect(),
-        parts,
-        shown_part,
+    let views: Vec<String> = (header.own_attributes.multi_view_names.iter())
+        .flatten()
+        .map(Text::to_string)
+        .collect();
+    let warnings = warnings(
         chromaticities,
-    };
-    let warnings = warnings(&source, pixel_aspect);
-    // Unvalidated headers can hold any float here; the warning names it.
-    let pixel_aspect = if pixel_aspect.is_finite() && pixel_aspect > 0.0 {
-        pixel_aspect
-    } else {
-        1.0
-    };
+        header.shared_attributes.pixel_aspect,
+        &parts,
+        shown_part,
+        &views,
+    );
 
     file.rewind()?;
     let planes = read_planes(file, shown_part)?;
@@ -103,14 +86,7 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
         header.own_attributes.layer_position,
         header.layer_size,
     )?;
-    Ok(Image::new(
-        display_window,
-        data_window,
-        planes,
-        pixel_aspect,
-        Source::Exr(source),
-        warnings,
-    ))
+    Ok(Image::new(display_window, data_window, planes, warnings))
 }
 
 /// The part's R, G, B and A at its largest resolution, in `Channel::ALL`'s order, bottom row
@@ -382,42 +358,25 @@ fn decode_error(error: Error) -> ReadError {
     }
 }
 
-fn describe_part(header: &Header) -> Result<ExrPart, ReadError> {
+/// What choosing a part and warning about the others needs of each.
+struct Part {
+    name: Option<String>,
+    /// The part's `view` attribute, which names its eye in a stereo file.
+    view: Option<String>,
+    channels: Vec<String>,
+    deep: bool,
+}
+
+fn describe_part(header: &Header) -> Part {
     let attributes = &header.own_attributes;
-    Ok(ExrPart {
+    Part {
         name: attributes.layer_name.as_ref().map(Text::to_string),
         view: attributes.view_name.as_ref().map(Text::to_string),
-        channels: header
-            .channels
-            .list
-            .iter()
-            .map(|channel| ExrChannel {
-                name: channel.name.to_string(),
-                sample_type: match channel.sample_type {
-                    attribute::SampleType::U32 => SampleType::U32,
-                    attribute::SampleType::F16 => SampleType::F16,
-                    attribute::SampleType::F32 => SampleType::F32,
-                },
-            })
+        channels: (header.channels.list.iter())
+            .map(|channel| channel.name.to_string())
             .collect(),
-        compression: match header.compression {
-            Compression::Uncompressed => ExrCompression::None,
-            Compression::RLE => ExrCompression::Rle,
-            Compression::ZIP1 => ExrCompression::Zips,
-            Compression::ZIP16 => ExrCompression::Zip,
-            Compression::PIZ => ExrCompression::Piz,
-            Compression::PXR24 => ExrCompression::Pxr24,
-            Compression::B44 => ExrCompression::B44,
-            Compression::B44A => ExrCompression::B44a,
-            Compression::DWAA(_) => ExrCompression::Dwaa,
-            Compression::DWAB(_) => ExrCompression::Dwab,
-            Compression::HTJ2K32 => ExrCompression::Htj2k32,
-            Compression::HTJ2K256 => ExrCompression::Htj2k256,
-        },
-        tiled: matches!(header.blocks, BlockDescription::Tiles(_)),
         deep: header.deep,
-        data_window: flipped(header, attributes.layer_position, header.layer_size)?,
-    })
+    }
 }
 
 /// A window from EXR's y-down position and size, in y-up coordinates whose row 0 is the display
@@ -434,8 +393,8 @@ fn flipped(header: &Header, position: Vec2<i32>, size: Vec2<usize>) -> Result<Wi
 }
 
 /// The first part with R, G and B; otherwise, why there is none.
-fn choose_part(parts: &[ExrPart]) -> Result<usize, ReadError> {
-    let has = |part: &ExrPart, name: &str| part.channels.iter().any(|c| c.name == name);
+fn choose_part(parts: &[Part]) -> Result<usize, ReadError> {
+    let has = |part: &Part, name: &str| part.channels.iter().any(|channel| channel == name);
     if let Some(index) = parts
         .iter()
         .position(|part| ["R", "G", "B"].iter().all(|name| has(part, name)))
@@ -451,43 +410,50 @@ fn choose_part(parts: &[ExrPart]) -> Result<usize, ReadError> {
         Refusal::NoRgb {
             channels: parts
                 .iter()
-                .flat_map(|part| &part.channels)
-                .map(|channel| channel.name.clone())
+                .flat_map(|part| part.channels.iter().cloned())
                 .collect(),
         }
     };
     Err(ReadError::Refused(refusal))
 }
 
-fn warnings(source: &ExrSource, pixel_aspect: f32) -> Vec<Warning> {
+/// `views` are the shown part's, from its `multiView` attribute; the first is the one shown.
+fn warnings(
+    chromaticities: Option<Chromaticities>,
+    pixel_aspect: f32,
+    parts: &[Part],
+    shown_part: usize,
+    views: &[String],
+) -> Vec<Warning> {
     let mut warnings = Vec::new();
-    if let Some(chromaticities) = source.chromaticities
+    if let Some(chromaticities) = chromaticities
         && !chromaticities.matches(&Chromaticities::REC_709)
     {
         warnings.push(Warning::Primaries(chromaticities));
     }
+    // Unvalidated headers can hold any float here; the warning names it.
     if pixel_aspect.is_nan() || (pixel_aspect - 1.0).abs() > 1e-3 {
         warnings.push(Warning::PixelAspect(pixel_aspect));
     }
-    let shown = &source.parts[source.shown_part];
-    if source.parts.len() > 1 {
+    let shown = &parts[shown_part];
+    if parts.len() > 1 {
         warnings.push(Warning::SeveralParts {
-            count: source.parts.len(),
+            count: parts.len(),
             shown: match &shown.name {
-                Some(name) => format!("part {} ({name})", source.shown_part),
-                None => format!("part {}", source.shown_part),
+                Some(name) => format!("part {shown_part} ({name})"),
+                None => format!("part {shown_part}"),
             },
         });
     }
     // A stereo file is either one part with a `multiView` list, or a part per view.
-    if source.views.len() > 1 {
+    if views.len() > 1 {
         warnings.push(Warning::SeveralViews {
-            views: source.views.clone(),
-            shown: source.views[0].clone(),
+            views: views.to_vec(),
+            shown: views[0].clone(),
         });
     } else if let Some(view) = &shown.view {
         let mut views: Vec<String> = Vec::new();
-        for part in &source.parts {
+        for part in parts {
             if let Some(view) = &part.view
                 && !views.contains(view)
             {

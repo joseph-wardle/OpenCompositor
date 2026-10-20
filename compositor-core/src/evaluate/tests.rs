@@ -6,7 +6,7 @@ use open_ng::Point;
 
 use super::*;
 use crate::document::Assignment;
-use crate::image::{Channel, PngColorType, PngSource, Source, Window};
+use crate::image::{Channel, Window};
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 
@@ -105,16 +105,7 @@ fn image(width: u32, height: u32, planes: [Arc<[f32]>; 4]) -> Image {
         width,
         height,
     };
-    let source = Source::Png(PngSource {
-        bit_depth: 8,
-        color_type: PngColorType::Rgba,
-        srgb: false,
-        gamma: None,
-        chromaticities: None,
-        icc_profile: false,
-        cicp: None,
-    });
-    Image::new(window, window, planes, 1.0, source, Vec::new())
+    Image::new(window, window, planes, Vec::new())
 }
 
 /// `len` finite values of both signs, from tiny to huge, different for each `seed`.
@@ -244,7 +235,6 @@ fn exposure_scales_colour_and_shares_alpha() {
         exposed.plane(Channel::A)
     ));
     assert_eq!(exposed.data_window(), read.data_window());
-    assert_eq!(exposed.source(), read.source());
 }
 
 #[test]
@@ -274,7 +264,6 @@ fn an_unconnected_input_gives_the_empty_image() {
     assert_eq!(image.display_window().width, 0);
     assert_eq!(image.data_window().height, 0);
     assert!(image.plane(Channel::R).is_empty());
-    assert_eq!(image.source(), None);
 }
 
 #[test]

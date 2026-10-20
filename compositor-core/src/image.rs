@@ -1,4 +1,4 @@
-//! Images as evaluation produces them, with a description of the file they came from.
+//! Images as evaluation produces them, with what the artist should know about their files.
 
 use std::fmt;
 use std::sync::Arc;
@@ -6,9 +6,9 @@ use std::sync::Arc;
 /// A rectangle of whole pixels in image coordinates: y up, so `(x, y)` is the bottom-left pixel.
 /// Either corner may be negative.
 ///
-/// Y up is Nuke's and OpenFX's convention; readers convert files that count rows down, such as
-/// EXR, keeping the display window's bottom row at 0 so that images of differing formats align
-/// at their bottom-left.
+/// Y up is Nuke's and OpenFX's convention. Readers convert files that count rows down, such as
+/// EXR, placing the display window's bottom row at 0 so that images of differing formats align
+/// at their bottom. A file's own row origin is not kept; its column origin is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window {
     pub x: i32,
@@ -65,9 +65,6 @@ pub struct Image {
     data_window: Window,
     /// In `Channel::ALL`'s order.
     planes: [Arc<[f32]>; 4],
-    pixel_aspect: f32,
-    /// `None` for an image no file was read for: the empty image, and what operations make of it.
-    source: Option<Source>,
     warnings: Vec<Warning>,
 }
 
@@ -77,8 +74,6 @@ impl Image {
         display_window: Window,
         data_window: Window,
         planes: [Arc<[f32]>; 4],
-        pixel_aspect: f32,
-        source: Source,
         warnings: Vec<Warning>,
     ) -> Image {
         check_planes(&planes, data_window);
@@ -86,8 +81,6 @@ impl Image {
             display_window,
             data_window,
             planes,
-            pixel_aspect,
-            source: Some(source),
             warnings,
         }
     }
@@ -105,8 +98,6 @@ impl Image {
             display_window: window,
             data_window: window,
             planes: [(); 4].map(|()| plane.clone()),
-            pixel_aspect: 1.0,
-            source: None,
             warnings: Vec::new(),
         }
     }
@@ -118,8 +109,6 @@ impl Image {
             display_window: self.display_window,
             data_window: self.data_window,
             planes,
-            pixel_aspect: self.pixel_aspect,
-            source: self.source.clone(),
             warnings: self.warnings.clone(),
         }
     }
@@ -152,16 +141,6 @@ impl Image {
         let column = (i64::from(x) - i64::from(window.x)) as usize;
         let row = (i64::from(y) - i64::from(window.y)) as usize;
         self.plane(channel)[row * window.width as usize + column]
-    }
-
-    /// A pixel's width over its height. Pixels are shown square for now.
-    pub fn pixel_aspect(&self) -> f32 {
-        self.pixel_aspect
-    }
-
-    /// The file the image's pixels came from, through any operations.
-    pub fn source(&self) -> Option<&Source> {
-        self.source.as_ref()
     }
 
     /// What the artist should know about how the file was interpreted.
@@ -211,132 +190,6 @@ pub struct ImageInfo {
     pub display_window: Window,
     pub data_window: Window,
     pub warnings: Vec<Warning>,
-}
-
-/// The file an image was read from, described in our own terms so that a decoder can be replaced
-/// without changing what callers see.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Source {
-    Exr(ExrSource),
-    Png(PngSource),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExrSource {
-    /// Every part in the file, including those not shown.
-    pub parts: Vec<ExrPart>,
-    /// The index of the part shown.
-    pub shown_part: usize,
-    /// The shown part's views, from its `multiView` attribute; the first is the default view,
-    /// the one shown.
-    pub views: Vec<String>,
-    pub chromaticities: Option<Chromaticities>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExrPart {
-    pub name: Option<String>,
-    /// The part's `view` attribute, which names its eye in a stereo file.
-    pub view: Option<String>,
-    pub channels: Vec<ExrChannel>,
-    pub compression: ExrCompression,
-    pub tiled: bool,
-    pub deep: bool,
-    pub data_window: Window,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExrChannel {
-    pub name: String,
-    pub sample_type: SampleType,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SampleType {
-    U32,
-    F16,
-    F32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExrCompression {
-    None,
-    Rle,
-    Zips,
-    Zip,
-    Piz,
-    Pxr24,
-    B44,
-    B44a,
-    Dwaa,
-    Dwab,
-    Htj2k32,
-    Htj2k256,
-}
-
-impl fmt::Display for ExrCompression {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            ExrCompression::None => "none",
-            ExrCompression::Rle => "RLE",
-            ExrCompression::Zips => "ZIPS",
-            ExrCompression::Zip => "ZIP",
-            ExrCompression::Piz => "PIZ",
-            ExrCompression::Pxr24 => "PXR24",
-            ExrCompression::B44 => "B44",
-            ExrCompression::B44a => "B44A",
-            ExrCompression::Dwaa => "DWAA",
-            ExrCompression::Dwab => "DWAB",
-            ExrCompression::Htj2k32 => "HTJ2K32",
-            ExrCompression::Htj2k256 => "HTJ2K256",
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PngSource {
-    /// As stored, before expansion to 8 or 16 bits.
-    pub bit_depth: u8,
-    pub color_type: PngColorType,
-    /// The colour chunks the file carried, whether or not they were used.
-    pub srgb: bool,
-    pub gamma: Option<f32>,
-    pub chromaticities: Option<Chromaticities>,
-    pub icc_profile: bool,
-    pub cicp: Option<Cicp>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PngColorType {
-    Grayscale,
-    GrayscaleAlpha,
-    Rgb,
-    Rgba,
-    Indexed,
-}
-
-/// A PNG `cICP` chunk's code points, as ITU-T H.273 numbers them. Its matrix is always 0, RGB:
-/// `png` refuses a file with any other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cicp {
-    pub primaries: u8,
-    pub transfer: u8,
-    /// Whether codes span the whole range, rather than 16 to 235 at 8 bits, as video stores them.
-    pub full_range: bool,
-}
-
-impl Cicp {
-    pub const BT709_PRIMARIES: u8 = 1;
-    pub const BT709_TRANSFER: u8 = 1;
-    pub const GAMMA_22_TRANSFER: u8 = 4;
-    pub const GAMMA_28_TRANSFER: u8 = 5;
-    pub const BT601_TRANSFER: u8 = 6;
-    pub const LINEAR_TRANSFER: u8 = 8;
-    pub const SRGB_TRANSFER: u8 = 13;
-    pub const BT2020_10_BIT_TRANSFER: u8 = 14;
-    pub const BT2020_12_BIT_TRANSFER: u8 = 15;
-    pub const PQ_TRANSFER: u8 = 16;
-    pub const HLG_TRANSFER: u8 = 18;
 }
 
 /// CIE xy coordinates of a colour space's primaries and white point.
