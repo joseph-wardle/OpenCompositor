@@ -555,6 +555,7 @@ impl Pool {
         dst: &mut [f32],
         kernel: impl Fn(Level, &[f32], &mut [f32]) + Sync,
     ) {
+        assert_eq!(src.len(), dst.len(), "the planes have one length");
         // An empty plane has no chunks, whichever of its sides is zero.
         let chunk = (CHUNK_ROWS * width).max(1);
         let level = self.level;

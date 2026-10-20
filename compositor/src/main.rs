@@ -392,6 +392,8 @@ fn with_pane_window<R>(pane: Pane, use_window: impl FnOnce(Pin<&mut qt::Pane>) -
     // reference may overlap the one Qt passes to the pane's `event` further up the stack, since
     // requests are performed while dispatching its events, but `Pane` is a zero-sized opaque type:
     // neither covers memory that Rust reads or writes, and Qt reaches the window only from C++.
+    // Rust reads the pane's own state with `rust()` alone; a `rust_mut()` held across a dispatch
+    // would put a real `&mut PaneRust` under one held further up.
     use_window(unsafe { Pin::new_unchecked(&mut *window) })
 }
 

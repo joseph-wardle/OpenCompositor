@@ -116,12 +116,10 @@ pub(crate) fn record(
     id: NodeId,
     node: &Node,
 ) -> NodeRecord {
-    let (mut title, color) = match &node.kind {
-        NodeKind::Reader { path } => {
-            let name = path.file_name().unwrap_or(path.as_os_str());
-            (shorten(&name.to_string_lossy()), READER_COLOR)
-        }
-        NodeKind::Exposure { .. } => ("Exposure".to_owned(), EXPOSURE_COLOR),
+    let mut title = shorten(&node.name());
+    let color = match node.kind {
+        NodeKind::Reader { .. } => READER_COLOR,
+        NodeKind::Exposure { .. } => EXPOSURE_COLOR,
     };
     // Slot numbers go in the title, and a failure in the colour, until OpenNG has badges.
     // Nothing shows an evaluation in progress: the title would widen the node while it lasted, and the

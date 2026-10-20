@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{ExposureVersion, Node, NodeId, NodeKind, Slot, unconnected_inputs};
+use crate::document::{ExposureVersion, NodeId, NodeKind, Slot, unconnected_inputs};
 use crate::evaluate::{ResultKey, result_key};
 use crate::gpu::{Drawn, FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
@@ -397,24 +397,7 @@ impl App {
             }
             Event::Exposed(pane) | Event::Draw(pane) => self.draw(pane),
             Event::SurfaceCreated { pane, window, size } => {
-                if let Err(error) = self.gpu.attach(pane, window, size) {
-                    return vec![Request::ShowError(error)];
-                }
-                let mut requests = Vec::new();
-                match self.drawing {
-                    Drawing::Ready { .. } if !self.gpu.has_device() => {
-                        requests = self.make_device();
-                    }
-                    Drawing::Ready { .. } => {}
-                    // The new window may be what the last attempt lacked, so the next one does
-                    // not wait out the backoff.
-                    Drawing::Unavailable { .. } => {
-                        requests.push(self.request_attempt(FIRST_RETRY));
-                    }
-                }
-                self.resize(pane, size);
-                requests.extend(self.draw(pane));
-                requests
+                self.surface_created(pane, window, size)
             }
             Event::SurfaceDestroyed(pane) => {
                 self.gpu.detach(pane);
@@ -456,6 +439,32 @@ impl App {
             },
         };
         self.after_change(requests)
+    }
+
+    fn surface_created(
+        &mut self,
+        pane: Pane,
+        window: NativeWindow,
+        size: PaneSize,
+    ) -> Vec<Request> {
+        if let Err(error) = self.gpu.attach(pane, window, size) {
+            return vec![Request::ShowError(error)];
+        }
+        let mut requests = Vec::new();
+        match self.drawing {
+            Drawing::Ready { .. } if !self.gpu.has_device() => {
+                requests = self.make_device();
+            }
+            Drawing::Ready { .. } => {}
+            // The new window may be what the last attempt lacked, so the next one does not wait
+            // out the backoff.
+            Drawing::Unavailable { .. } => {
+                requests.push(self.request_attempt(FIRST_RETRY));
+            }
+        }
+        self.resize(pane, size);
+        requests.extend(self.draw(pane));
+        requests
     }
 
     /// Follows whatever the event or edit changed: the viewer, then the labels the shell shows.
@@ -941,17 +950,13 @@ impl App {
                 format!("{} is not connected", input.label)
             } else {
                 let upstream = document.node(id).expect("inputs name existing nodes");
-                format!(
-                    "{} of {} is not connected",
-                    input.label,
-                    node_name(upstream)
-                )
+                format!("{} of {} is not connected", input.label, upstream.name())
             });
         }
         if details.is_empty() {
             details.push("empty".to_owned());
         }
-        format!("Slot {slot} · {} · {}", node_name(node), details.join("; "))
+        format!("Slot {slot} · {} · {}", node.name(), details.join("; "))
     }
 }
 
@@ -1011,18 +1016,6 @@ fn redraw_if(pane: Pane, needed: bool) -> Vec<Request> {
         vec![Request::Redraw(pane)]
     } else {
         Vec::new()
-    }
-}
-
-/// A Reader's file name, or the node's kind.
-fn node_name(node: &Node) -> String {
-    match &node.kind {
-        NodeKind::Reader { path } => path
-            .file_name()
-            .unwrap_or(path.as_os_str())
-            .to_string_lossy()
-            .into_owned(),
-        NodeKind::Exposure { .. } => "Exposure".to_owned(),
     }
 }
 

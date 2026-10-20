@@ -195,7 +195,8 @@ impl Gpu {
     }
 
     /// Keeps the pane's native window, for every device made from now on, and makes its surface
-    /// on the device if there is one. On failure the pane draws nothing; the error says why.
+    /// on the device if there is one. A pane whose surface fails gives up its window, as in
+    /// [`Gpu::make_device`], so that it attaches again when next exposed; the error says why.
     pub(crate) fn attach(
         &mut self,
         pane: Pane,
@@ -207,10 +208,19 @@ impl Gpu {
             return Ok(());
         };
         let instance = self.instance.as_ref().expect("made before the device");
-        let surface = make_surface(instance, pane, window)?;
-        device.surfaces[pane.index()] =
-            Some(device.configure(pane, surface, size, self.checks.is_some())?);
-        Ok(())
+        let checks = self.checks.is_some();
+        let configured = make_surface(instance, pane, window)
+            .and_then(|surface| device.configure(pane, surface, size, checks));
+        match configured {
+            Ok(configured) => {
+                device.surfaces[pane.index()] = Some(configured);
+                Ok(())
+            }
+            Err(error) => {
+                self.windows[pane.index()] = None;
+                Err(error)
+            }
+        }
     }
 
     /// Makes a device with a surface on it for each pane with a native window: the one way a

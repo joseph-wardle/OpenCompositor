@@ -139,6 +139,18 @@ impl Node {
         }
     }
 
+    /// What the artist calls the node: a Reader's file name, or the node's kind.
+    pub fn name(&self) -> String {
+        match &self.kind {
+            NodeKind::Reader { path } => path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            NodeKind::Exposure { .. } => "Exposure".to_owned(),
+        }
+    }
+
     /// The node an input takes its image from, if the input is connected.
     pub fn input(&self, name: &str) -> Option<NodeId> {
         self.inputs.get(name).copied()

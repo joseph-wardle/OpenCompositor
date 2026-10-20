@@ -540,6 +540,11 @@ impl Session {
     ///
     /// An edit in progress is finished first as its own step: steps are whole documents, so
     /// otherwise undoing one would undo or half-restore the other.
+    ///
+    /// Every change to which nodes exist comes through here, or through undo and redo, which
+    /// cancel the edit first; `swap_in` carries only the selection and the edit in progress. So
+    /// the node an edit in progress changes always exists, which its `expect`s rely on. A new way
+    /// to replace the document must keep that.
     fn commit(&mut self, label: &'static str, after: Document) -> Changes {
         let changes = self.document.changes_to(&after);
         if changes.is_empty() {
