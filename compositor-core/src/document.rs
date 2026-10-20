@@ -69,6 +69,14 @@ impl NodeKind {
         }
     }
 
+    /// What the artist calls the node's type.
+    pub fn label(&self) -> &'static str {
+        match self {
+            NodeKind::Reader { .. } => "Reader",
+            NodeKind::Exposure { .. } => "Exposure",
+        }
+    }
+
     /// The images the node takes, as its version declares them.
     pub fn inputs(&self) -> &'static [NodeInput] {
         match self {
@@ -85,7 +93,6 @@ impl NodeKind {
 pub struct NodeType {
     /// Unchanged across labels and versions: scripts create nodes by it.
     pub name: &'static str,
-    pub label: &'static str,
     /// What creating one names in the undo history.
     pub(crate) step: &'static str,
     /// What a new node of the type is: its current version.
@@ -95,7 +102,6 @@ pub struct NodeType {
 const NODE_TYPES: &[NodeType] = &[
     NodeType {
         name: "reader",
-        label: "Reader",
         step: "Create Reader",
         kind: NodeKind::Reader {
             version: ReaderVersion::CURRENT,
@@ -103,13 +109,18 @@ const NODE_TYPES: &[NodeType] = &[
     },
     NodeType {
         name: "exposure",
-        label: "Exposure",
         step: "Create Exposure",
         kind: NodeKind::Exposure {
             version: ExposureVersion::CURRENT,
         },
     },
 ];
+
+impl NodeType {
+    pub fn label(&self) -> &'static str {
+        self.kind.label()
+    }
+}
 
 /// Every node type that can be created, in menu order.
 pub fn node_types() -> &'static [NodeType] {
@@ -199,9 +210,9 @@ impl Node {
                 Some(path) => (path.file_name().unwrap_or(path.as_os_str()))
                     .to_string_lossy()
                     .into_owned(),
-                None => "Reader".to_owned(),
+                None => self.kind.label().to_owned(),
             },
-            NodeKind::Exposure { .. } => "Exposure".to_owned(),
+            NodeKind::Exposure { .. } => self.kind.label().to_owned(),
         }
     }
 

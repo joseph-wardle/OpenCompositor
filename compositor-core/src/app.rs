@@ -12,6 +12,7 @@ use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{ResultKey, result_key};
 use crate::gpu::{Drawn, FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
+use crate::panel::Panel;
 use crate::parameter::Value;
 use crate::session::Session;
 use crate::worker::{Evaluated, ViewerError, Wanted, Worker};
@@ -155,6 +156,9 @@ pub enum Request {
         undo: Option<&'static str>,
         redo: Option<&'static str>,
     },
+    /// Show the node's parameters in the parameter panel, or that no node is selected with
+    /// `None`. The panel starts empty.
+    ShowPanel(Option<Panel>),
     /// Show the text in the status bar's permanent GPU label, or hide the label with `None`.
     /// It changes when the panes stop or start drawing, and when a GPU error is counted.
     ShowGpuLabel(Option<String>),
@@ -172,6 +176,11 @@ pub enum Command {
     CreateExposure,
     /// A new file for the one selected Reader.
     ChangeReaderFile,
+    /// Keeps the parameter panel on the node it shows, whatever is selected, until unpinned or
+    /// the node is deleted.
+    PinPanel,
+    /// Has the parameter panel show the current node, the last selected, again.
+    UnpinPanel,
     /// Reads the selected Readers' files again, for every Reader of them, when they are next
     /// viewed, at once if they are.
     Reload,
@@ -352,6 +361,10 @@ pub struct App {
     undo_labels: [Option<&'static str>; 2],
     /// The status bar's GPU label as last requested.
     gpu_label: Option<String>,
+    /// The node the parameter panel stays on instead of the current node.
+    pinned: Option<NodeId>,
+    /// The parameter panel as last requested.
+    panel: Option<Panel>,
 }
 
 impl App {
@@ -376,6 +389,8 @@ impl App {
             caption: String::new(),
             undo_labels: [None, None],
             gpu_label: None,
+            pinned: None,
+            panel: None,
         }
     }
 
@@ -470,11 +485,17 @@ impl App {
         requests
     }
 
-    /// Follows whatever the event or edit changed: the viewer, then the labels the shell shows.
+    /// Follows whatever the event or edit changed: the viewer, then the panel and the labels the
+    /// shell shows.
     fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
         self.follow_viewer(&mut requests);
-        // The labels go first, since performing another request may dispatch again and show
-        // newer ones.
+        // These go first, since performing another request may dispatch again and show newer
+        // ones.
+        let panel = self.panel();
+        if panel != self.panel {
+            self.panel.clone_from(&panel);
+            requests.insert(0, Request::ShowPanel(panel));
+        }
         let undo_labels = [self.session.undo_label(), self.session.redo_label()];
         if undo_labels != self.undo_labels {
             self.undo_labels = undo_labels;
@@ -487,6 +508,20 @@ impl App {
             requests.insert(0, Request::ShowGpuLabel(gpu_label));
         }
         requests
+    }
+
+    /// The pinned node's panel, or the current node's. A pin on a deleted node is dropped, so
+    /// undoing the delete does not pin it again.
+    fn panel(&mut self) -> Option<Panel> {
+        let document = self.session.document();
+        if let Some(pinned) = self.pinned {
+            match Panel::of(document, pinned, true) {
+                Some(panel) => return Some(panel),
+                None => self.pinned = None,
+            }
+        }
+        let current = *document.selection().last()?;
+        Panel::of(document, current, false)
     }
 
     /// Whether the panes cannot draw, and how many GPU errors there were, which the status bar
@@ -746,6 +781,17 @@ impl App {
                     "Select one Reader to change its file".to_owned(),
                 )],
             },
+            Command::PinPanel => match &self.panel {
+                Some(panel) => {
+                    self.pinned = Some(panel.node);
+                    Vec::new()
+                }
+                None => vec![Request::ShowStatus("Select a node to pin it".to_owned())],
+            },
+            Command::UnpinPanel => {
+                self.pinned = None;
+                Vec::new()
+            }
             Command::Reload => {
                 let selection = self.session.document().selection().to_vec();
                 if self.session.reload(&selection) {

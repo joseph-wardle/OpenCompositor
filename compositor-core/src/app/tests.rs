@@ -5,6 +5,7 @@ use std::time::Duration;
 use super::*;
 use crate::document::NodeKind;
 use crate::evaluate::EvalError;
+use crate::panel::ValueState;
 use crate::parameter::{Value, resolve};
 use crate::read::ReadError;
 use crate::worker::{Timing, ViewerImage};
@@ -104,6 +105,14 @@ fn title(app: &App, id: NodeId) -> String {
     app.session().graph().node(id.into()).unwrap().title.clone()
 }
 
+/// The panel the requests show, if they change it.
+fn shown_panel(requests: &[Request]) -> Option<Option<&Panel>> {
+    requests.iter().find_map(|request| match request {
+        Request::ShowPanel(panel) => Some(panel.as_ref()),
+        _ => None,
+    })
+}
+
 fn receive(deliveries: &Receiver<Evaluated>) -> Evaluated {
     deliveries
         .recv_timeout(Duration::from_secs(10))
@@ -131,8 +140,11 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
         PathBuf::from("/nonexistent/a.exr"),
         "/nonexistent/b.exr".into(),
     ];
-    let requests = app.dispatch(Event::FilesChosen { intent, paths });
+    let mut requests = app.dispatch(Event::FilesChosen { intent, paths });
 
+    let panel = shown_panel(&requests).expect("the panel follows the selection");
+    assert_eq!(panel.map(|panel| panel.name.as_str()), Some("b.exr"));
+    requests.retain(|request| !matches!(request, Request::ShowPanel(_)));
     assert_eq!(
         requests,
         [
@@ -915,4 +927,98 @@ fn an_edit_names_itself_as_what_undo_would_undo() {
         redo: Some("Stops"),
     };
     assert!(requests.contains(&labels), "{requests:?}");
+}
+
+/// The one row of the panel the requests show, as its value and state.
+fn only_row(requests: &[Request]) -> (Option<Value>, ValueState) {
+    let panel = shown_panel(requests).flatten().expect("a panel is shown");
+    let [row] = panel.rows.as_slice() else {
+        panic!("one row")
+    };
+    (row.value.clone(), row.state)
+}
+
+#[test]
+fn the_panel_follows_the_current_node_and_whether_its_values_were_set() {
+    let (mut app, _deliveries) = app();
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    let panel = app.panel.clone().unwrap();
+    assert_eq!(
+        (
+            panel.node,
+            panel.name.as_str(),
+            panel.type_label,
+            panel.pinned
+        ),
+        (reader, "a.exr", "Reader", false)
+    );
+
+    let requests = app.dispatch(Event::Command(Command::CreateExposure));
+    let exposure = app.session().document().selection()[0];
+    assert_eq!(app.panel.as_ref().unwrap().node, exposure);
+    let default = (Some(Value::Float(0.0)), ValueState::Absent);
+    assert_eq!(only_row(&requests), default);
+
+    // A value set to its default is still set.
+    let (requests, _) = app.edit(|session| {
+        session
+            .set_value(exposure, "stops", Value::Float(0.0))
+            .unwrap();
+    });
+    let set = (Some(Value::Float(0.0)), ValueState::Authored);
+    assert_eq!(only_row(&requests), set);
+    let (requests, _) = app.edit(|session| {
+        session.reset_value(exposure, "stops").unwrap();
+    });
+    assert_eq!(only_row(&requests), default);
+    assert_eq!(only_row(&app.dispatch(Event::Command(Command::Undo))), set);
+    assert_eq!(
+        only_row(&app.dispatch(Event::Command(Command::Redo))),
+        default
+    );
+
+    // What changes nothing the panel shows requests nothing.
+    let moved = Input::PointerMoved {
+        position: PhysicalPoint { x: 1.0, y: 1.0 },
+    };
+    assert_eq!(shown_panel(&app.dispatch(input(Pane::Graph, moved))), None);
+
+    app.dispatch(input(Pane::Graph, Input::PointerEntered));
+    let requests = app.dispatch(Event::KeyPressed {
+        key: Key::Delete,
+        modifiers: NONE,
+    });
+    assert_eq!(shown_panel(&requests), Some(None));
+}
+
+#[test]
+fn a_pinned_panel_stays_on_its_node_until_unpinned_or_the_node_is_deleted() {
+    let (mut app, _deliveries) = app();
+    let requests = app.dispatch(Event::Command(Command::PinPanel));
+    assert!(matches!(requests.as_slice(), [Request::ShowStatus(_)]));
+
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    let requests = app.dispatch(Event::Command(Command::PinPanel));
+    let panel = shown_panel(&requests).flatten().unwrap();
+    assert_eq!((panel.node, panel.pinned), (reader, true));
+
+    let requests = app.dispatch(Event::Command(Command::CreateExposure));
+    assert_eq!(shown_panel(&requests), None);
+    let exposure = app.session().document().selection()[0];
+
+    let requests = app.dispatch(Event::Command(Command::UnpinPanel));
+    let panel = shown_panel(&requests).flatten().unwrap();
+    assert_eq!((panel.node, panel.pinned), (exposure, false));
+
+    // Undoing the delete brings the node back, not the pin.
+    app.dispatch(Event::Command(Command::PinPanel));
+    app.dispatch(input(Pane::Graph, Input::PointerEntered));
+    app.dispatch(Event::KeyPressed {
+        key: Key::Delete,
+        modifiers: NONE,
+    });
+    assert_eq!(app.panel, None);
+    app.dispatch(Event::Command(Command::Undo));
+    let panel = app.panel.as_ref().unwrap();
+    assert_eq!((panel.node, panel.pinned), (exposure, false));
 }

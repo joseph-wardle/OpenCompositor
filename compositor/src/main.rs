@@ -304,6 +304,8 @@ pub fn perform(request: Request) {
             ffi::set_caption(widgets.caption, &QString::from(&text))
         },
         Request::ShowUndoLabels { undo, redo } => show_undo_labels([undo, redo]),
+        // Until the parameter panel's dock exists.
+        Request::ShowPanel(_) => {}
         // SAFETY: the window owns the label, and lives as long as it.
         Request::ShowGpuLabel(text) => unsafe {
             let text = QString::from(text.as_deref().unwrap_or_default());
