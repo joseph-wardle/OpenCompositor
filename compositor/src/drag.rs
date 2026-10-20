@@ -249,7 +249,8 @@ fn check_steps() -> Vec<String> {
     let (exposure, slider, span) =
         with(|check| (check.exposure.expect("set up"), check.slider, check.span));
     let state = || {
-        crate::read_session(|session| {
+        crate::read_app(|app| {
+            let session = app.session();
             let stops = (session.document().node(exposure))
                 .and_then(|node| node.authored_value("stops").cloned());
             (stops, session.undo_label(), session.editing().is_some())

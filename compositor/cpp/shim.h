@@ -13,7 +13,9 @@
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QMenu>
 #include <QtWidgets/QSlider>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <qpa/qplatformwindow_p.h>
 
@@ -36,8 +38,8 @@ namespace shim {
 using QWaylandWindow = QNativeInterface::Private::QWaylandWindow;
 
 // One node's parameters in rows, shown as Rust sends them, each gesture on them sent back with the
-// row's parameter name. Rows are rebuilt only when Rust says the node changed, otherwise refreshed
-// in place, so that a drag survives the refreshes it causes. Nothing is sent during a refresh.
+// row's parameter name. Rows are rebuilt only when the node changed, otherwise refreshed in place,
+// so that a drag survives the refreshes it causes. Nothing is sent during a refresh.
 class ParameterPanel : public QWidget {
   public:
     ParameterPanel(rust::Fn<void(PanelGesture)> gestures, QWidget *parent);
@@ -71,6 +73,8 @@ class ParameterPanel : public QWidget {
 
     rust::Fn<void(PanelGesture)> gestures;
     bool refreshing = false;
+    // The node the rows are of, if any.
+    std::optional<uint64_t> node;
     QLabel *title;
     QToolButton *pin;
     QLabel *empty;

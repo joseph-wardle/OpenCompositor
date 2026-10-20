@@ -211,7 +211,7 @@ fn a_cancelled_dialog_changes_nothing() {
 }
 
 #[test]
-fn changing_the_selected_readers_file_fails_if_it_went_while_the_dialog_was_open() {
+fn changing_a_readers_file_fails_if_it_went_while_the_dialog_was_open() {
     let (mut app, _deliveries) = app();
     let create = FileIntent::CreateReaders(Anchor {
         at: Point::default(),
@@ -224,12 +224,11 @@ fn changing_the_selected_readers_file_fails_if_it_went_while_the_dialog_was_open
     });
     let id = app.session().document().selection()[0];
 
-    let requests = app.dispatch(Event::Command(Command::ChangeReaderFile));
+    // As the panel's Browse… asks.
     let intent = FileIntent::SetFile {
         node: id,
         parameter: "file",
     };
-    assert_eq!(requests, [Request::ChooseFiles(intent)]);
     let paths = vec![PathBuf::from("/nonexistent/b.exr")];
     app.dispatch(Event::FilesChosen {
         intent,
@@ -260,9 +259,6 @@ fn commands_that_need_a_selection_or_a_mark_say_so_without_one() {
     let (mut app, _deliveries) = app();
     let explains = |requests: Vec<Request>| matches!(requests.as_slice(), [Request::ShowStatus(_)]);
 
-    assert!(explains(
-        app.dispatch(Event::Command(Command::ChangeReaderFile))
-    ));
     assert!(explains(app.dispatch(Event::Command(Command::Reload))));
     assert!(explains(app.dispatch(slot_key(1, CTRL))));
     assert!(explains(app.dispatch(slot_key(1, SHIFT))));

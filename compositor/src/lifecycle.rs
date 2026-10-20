@@ -26,8 +26,7 @@ use std::time::Duration;
 use cxx_qt_lib::QString;
 use open_ng::{Modifiers, Point};
 use opencompositor_core::{
-    Anchor, Event, FileIntent, FrameCheck, Input, Key, NodeId, NodeKind, Pane, Request, Session,
-    Slot, Value,
+    Anchor, Event, FileIntent, FrameCheck, Input, Key, NodeId, NodeKind, Pane, Request, Slot, Value,
 };
 
 use crate::keys::qt_key;
@@ -234,7 +233,7 @@ fn step(index: usize) {
         20 => ffi::close_modal_dialog(),
         21 => {
             check_undo_label("Stops", "after the Reader's dialog was cancelled");
-            let nodes = crate::read_session(|session| session.document().nodes().count());
+            let nodes = crate::read_app(|app| app.session().document().nodes().count());
             if nodes != 2 {
                 fail(format!(
                     "{nodes} nodes after the Reader's dialog was cancelled, not 2"
@@ -288,7 +287,7 @@ fn press_key(key: i32, text: &str) {
 }
 
 fn check_undo_label(expected: &str, when: &str) {
-    let label = crate::read_session(Session::undo_label);
+    let label = crate::read_app(|app| app.session().undo_label());
     if label != Some(expected) {
         fail(format!("the step to undo was {label:?} {when}"));
     }
@@ -298,8 +297,8 @@ fn check_undo_label(expected: &str, when: &str) {
 /// returns it.
 fn check_inserted_exposure() -> Option<NodeId> {
     let slot = Slot::new(1).expect("1 is a slot");
-    let (selection, source, marked) = crate::read_session(|session| {
-        let document = session.document();
+    let (selection, source, marked) = crate::read_app(|app| {
+        let document = app.session().document();
         let &[exposure] = document.selection() else {
             return (document.selection().to_vec(), None, None);
         };
@@ -327,7 +326,7 @@ fn edit_stops(exposure: NodeId) {
         let edited = session.set_value(exposure, "stops", Value::Float(2.0));
         (edited, session.version())
     });
-    let version = crate::read_session(Session::version);
+    let version = crate::read_app(|app| app.session().version());
     let after = stops_slider().map(|slider| slider.value());
     STOPS_TICK.with(|cell| cell.set(after));
     match edited {

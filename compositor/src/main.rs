@@ -119,12 +119,6 @@ fn main() {
     add(file_menu, "&Read Files…", "R", Command::ReadFiles);
     add(
         file_menu,
-        "&Change the Reader's File…",
-        "",
-        Command::ChangeReaderFile,
-    );
-    add(
-        file_menu,
         "Re&load the Selected Readers",
         "",
         Command::Reload,
@@ -269,9 +263,9 @@ pub fn edit<R>(edit: impl FnOnce(&mut Session) -> R) -> R {
     edited
 }
 
-/// Reads the session, in the drag check.
-pub fn read_session<R>(read: impl FnOnce(&Session) -> R) -> R {
-    APP.with(|cell| read(cell.borrow().as_ref().expect("the app runs").session()))
+/// Reads the app: its session in the checks, its panel for a gesture on it.
+pub fn read_app<R>(read: impl FnOnce(&App) -> R) -> R {
+    APP.with(|cell| read(cell.borrow().as_ref().expect("the app runs")))
 }
 
 /// Names in the Edit menu what undo and redo would do, and disables either when there is nothing.
@@ -335,7 +329,7 @@ pub fn perform(request: Request) {
         },
         Request::ShowUndoLabels { undo, redo } => show_undo_labels([undo, redo]),
         Request::ShowCreationMenu(anchor) => creation::show(anchor),
-        Request::ShowPanel(shown) => panel::show(shown),
+        Request::ShowPanel(shown) => panel::show(shown.as_ref()),
         // SAFETY: the window owns the label, and lives as long as it.
         Request::ShowGpuLabel(text) => unsafe {
             let text = QString::from(text.as_deref().unwrap_or_default());

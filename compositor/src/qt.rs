@@ -149,10 +149,11 @@ pub mod ffi {
     struct PanelData {
         /// Whether a node is shown, or that none is selected.
         shown: bool,
+        /// The shown node's id: rows of another node than last shown are made anew, otherwise
+        /// they refresh in place.
+        node: u64,
         title: QString,
         pinned: bool,
-        /// Whether the rows are another node's, and so made anew; otherwise they refresh in place.
-        rebuild: bool,
         rows: Vec<PanelRow>,
     }
 
@@ -183,7 +184,7 @@ pub mod ffi {
         parameter: QString,
         /// Where the slider is, for a drag began or dragged.
         tick: i32,
-        /// What was typed.
+        /// What was typed, into a field of either kind.
         text: QString,
     }
 
@@ -197,7 +198,6 @@ pub mod ffi {
         Typed,
         Reset,
         Browse,
-        FileTyped,
         Pin,
         Unpin,
     }

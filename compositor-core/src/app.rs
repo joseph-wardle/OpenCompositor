@@ -182,8 +182,6 @@ pub enum Command {
     /// A Reader for each file chosen, placed where the pointer is over the graph, or below the
     /// current node.
     ReadFiles,
-    /// A new file for the one selected Reader.
-    ChangeReaderFile,
     /// Keeps the parameter panel on the node it shows, whatever is selected, until unpinned or
     /// the node is deleted.
     PinPanel,
@@ -383,6 +381,8 @@ pub struct App {
     gpu_label: Option<String>,
     /// The node the parameter panel stays on instead of the current node.
     pinned: Option<NodeId>,
+    /// The session's version and the pin when the panel last followed them.
+    panel_followed: Option<(u64, Option<NodeId>)>,
     /// The parameter panel as last requested.
     panel: Option<Panel>,
 }
@@ -410,6 +410,7 @@ impl App {
             undo_labels: [None, None],
             gpu_label: None,
             pinned: None,
+            panel_followed: None,
             panel: None,
         }
     }
@@ -517,11 +518,7 @@ impl App {
         self.follow_viewer(&mut requests);
         // These go first, since performing another request may dispatch again and show newer
         // ones.
-        let panel = self.panel();
-        if panel != self.panel {
-            self.panel.clone_from(&panel);
-            requests.insert(0, Request::ShowPanel(panel));
-        }
+        self.follow_panel(&mut requests);
         let undo_labels = [self.session.undo_label(), self.session.redo_label()];
         if undo_labels != self.undo_labels {
             self.undo_labels = undo_labels;
@@ -536,18 +533,36 @@ impl App {
         requests
     }
 
-    /// The pinned node's panel, or the current node's. A pin on a deleted node is dropped, so
-    /// undoing the delete does not pin it again.
-    fn panel(&mut self) -> Option<Panel> {
+    /// Keeps the panel on the pinned node, or the current node: shows it when it changed. A pin
+    /// on a deleted node is dropped, so undoing the delete does not pin it again.
+    fn follow_panel(&mut self, requests: &mut Vec<Request>) {
         let document = self.session.document();
-        if let Some(pinned) = self.pinned {
-            match Panel::of(document, pinned, true) {
-                Some(panel) => return Some(panel),
-                None => self.pinned = None,
-            }
+        if self
+            .pinned
+            .is_some_and(|pinned| document.node(pinned).is_none())
+        {
+            self.pinned = None;
         }
-        let current = *document.selection().last()?;
-        Panel::of(document, current, false)
+        // Building the panel clones the node's values, so not on every pointer move.
+        let followed = Some((self.session.version(), self.pinned));
+        if followed == self.panel_followed {
+            return;
+        }
+        self.panel_followed = followed;
+        let panel = match self.pinned {
+            Some(pinned) => Panel::of(document, pinned, true),
+            None => (document.selection().last())
+                .and_then(|&current| Panel::of(document, current, false)),
+        };
+        if panel != self.panel {
+            self.panel.clone_from(&panel);
+            requests.insert(0, Request::ShowPanel(panel));
+        }
+    }
+
+    /// The parameter panel as last shown.
+    pub fn panel(&self) -> Option<&Panel> {
+        self.panel.as_ref()
     }
 
     /// Whether the panes cannot draw, and how many GPU errors there were, which the status bar
@@ -795,15 +810,6 @@ impl App {
             Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders(
                 self.anchor(),
             ))],
-            Command::ChangeReaderFile => match self.session.document().selection() {
-                &[node] => vec![Request::ChooseFiles(FileIntent::SetFile {
-                    node,
-                    parameter: "file",
-                })],
-                _ => vec![Request::ShowStatus(
-                    "Select one Reader to change its file".to_owned(),
-                )],
-            },
             Command::PinPanel => match &self.panel {
                 Some(panel) => {
                     self.pinned = Some(panel.node);

@@ -225,7 +225,11 @@ void ParameterPanel::show_panel(const PanelData &data) {
     title->setToolTip(data.title);
     empty->setVisible(!data.shown);
     scroll->setVisible(data.shown);
-    if (data.rebuild) rebuild(data);
+    std::optional<uint64_t> shown = data.shown ? std::optional(data.node) : std::nullopt;
+    if (shown != node) {
+        node = shown;
+        rebuild(data);
+    }
     for (size_t i = 0; i < rows.size() && i < data.rows.size(); ++i) refresh(rows[i], data.rows[i]);
 }
 
@@ -322,8 +326,7 @@ ParameterPanel::Row *ParameterPanel::row(const QString &name) {
 void ParameterPanel::committed(const QString &name) {
     Row *row = this->row(name);
     if (!row || row->field->text() == row->shown) return;
-    send(row->slider ? PanelGestureKind::Typed : PanelGestureKind::FileTyped, name, 0,
-         row->field->text());
+    send(PanelGestureKind::Typed, name, 0, row->field->text());
 }
 
 bool ParameterPanel::eventFilter(QObject *watched, QEvent *event) {

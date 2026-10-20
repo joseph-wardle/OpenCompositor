@@ -1,7 +1,6 @@
 //! The parameter panel's dock: the app's [`Panel`] sent to the shim's `ParameterPanel`, and the
 //! gestures it sends back made into session edits.
 
-use std::cell::RefCell;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,32 +13,19 @@ use opencompositor_core::{
 
 use crate::qt::ffi::{self, PanelGestureKind, RowKind};
 
-thread_local! {
-    /// The panel the shim shows. Every gesture is on it, since the shim sends none while it
-    /// refreshes.
-    static SHOWN: RefCell<Option<Panel>> = const { RefCell::new(None) };
+/// Shows the app's panel again, putting back what a refused or unchanged edit left in a field.
+fn refresh() {
+    let panel = crate::read_app(|app| app.panel().cloned());
+    show(panel.as_ref());
 }
 
 /// Shows the panel, or that no node is selected.
-pub fn show(panel: Option<Panel>) {
-    let rebuild = SHOWN.with(|cell| {
-        cell.borrow().as_ref().map(|shown| shown.node) != panel.as_ref().map(|panel| panel.node)
-    });
-    send(panel.as_ref(), rebuild);
-    SHOWN.with(|cell| *cell.borrow_mut() = panel);
-}
-
-/// Shows the panel again, putting back what a refused or unchanged edit left in a field.
-fn refresh() {
-    SHOWN.with(|cell| send(cell.borrow().as_ref(), false));
-}
-
-fn send(panel: Option<&Panel>, rebuild: bool) {
+pub fn show(panel: Option<&Panel>) {
     let data = ffi::PanelData {
         shown: panel.is_some(),
+        node: panel.map_or(0, |panel| open_ng::NodeId::from(panel.node).0),
         title: QString::from(&panel.map(title).unwrap_or_default()),
         pinned: panel.is_some_and(|panel| panel.pinned),
-        rebuild,
         rows: panel.map_or_else(Vec::new, |panel| panel.rows.iter().map(row).collect()),
     };
     // SAFETY: the dock owns the panel, and lives until the main window is destroyed after the
@@ -154,10 +140,10 @@ pub fn gesture(gesture: ffi::PanelGesture) {
         PanelGestureKind::Unpin => return crate::dispatch(Event::Command(Command::UnpinPanel)),
         _ => {}
     }
+    // The gesture is on the panel last shown, since the shim sends none while it refreshes.
     let name = String::from(&gesture.parameter);
-    let shown = SHOWN.with(|cell| {
-        let shown = cell.borrow();
-        let panel = shown.as_ref()?;
+    let shown = crate::read_app(|app| {
+        let panel = app.panel()?;
         let row = panel.rows.iter().find(|row| row.parameter.name == name)?;
         Some((panel.node, row.parameter))
     });
@@ -193,22 +179,25 @@ pub fn gesture(gesture: ffi::PanelGesture) {
             }));
             return;
         }
-        PanelGestureKind::Typed => {
-            // Text that is no number goes in as NaN, which the session refuses as from a script.
-            let value = String::from(&gesture.text)
-                .trim()
-                .parse()
-                .unwrap_or(f64::NAN);
-            crate::edit(|session| session.set_value(node, parameter.name, Value::Float(value)))
-        }
-        // An emptied field unsets the file, as its placeholder says.
-        PanelGestureKind::FileTyped if String::from(&gesture.text).trim().is_empty() => {
-            crate::edit(|session| session.reset_value(node, parameter.name))
-        }
-        PanelGestureKind::FileTyped => {
-            let path: Arc<Path> = crate::path(&gesture.text).into();
-            crate::edit(|session| session.set_value(node, parameter.name, Value::File(path)))
-        }
+        PanelGestureKind::Typed => match &parameter.kind {
+            ParameterKind::Float(_) => {
+                // Text that is no number goes in as NaN, which the session refuses as from a
+                // script.
+                let value = String::from(&gesture.text)
+                    .trim()
+                    .parse()
+                    .unwrap_or(f64::NAN);
+                crate::edit(|session| session.set_value(node, parameter.name, Value::Float(value)))
+            }
+            // An emptied field unsets the file, as its placeholder says.
+            ParameterKind::File if String::from(&gesture.text).trim().is_empty() => {
+                crate::edit(|session| session.reset_value(node, parameter.name))
+            }
+            ParameterKind::File => {
+                let path: Arc<Path> = crate::path(&gesture.text).into();
+                crate::edit(|session| session.set_value(node, parameter.name, Value::File(path)))
+            }
+        },
         _ => unreachable!("handled above"),
     };
     match edited {
@@ -222,10 +211,7 @@ pub fn gesture(gesture: ffi::PanelGesture) {
     // short, the panel must catch up with the document.
     if matches!(
         gesture.kind,
-        PanelGestureKind::Typed
-            | PanelGestureKind::FileTyped
-            | PanelGestureKind::DragEnded
-            | PanelGestureKind::DragCancelled
+        PanelGestureKind::Typed | PanelGestureKind::DragEnded | PanelGestureKind::DragCancelled
     ) {
         refresh();
     }
