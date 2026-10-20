@@ -11,7 +11,7 @@ use crate::document::{
     Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, Slot,
 };
 use crate::evaluate::{Reloads, ResultKey, result_keys};
-use crate::parameter::{Value, ValueError};
+use crate::parameter::{Value, ValueError, describe};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
@@ -45,7 +45,7 @@ pub enum EditError {
     MissingNode(NodeId),
     /// The node is of a type the edit does not apply to.
     WrongKind(NodeId),
-    /// Values change only between beginning and finishing an edit.
+    /// A change to the edited node's values came with no edit in progress.
     NoEditInProgress,
     InvalidValue {
         node: NodeId,
@@ -97,10 +97,12 @@ struct Failures {
 /// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
 /// before returning the [`Changes`] it made. An edit that changes nothing records no step.
 ///
-/// Parameter values change through an edit in progress: [`begin_edit`](Session::begin_edit),
-/// any number of value changes, then [`finish_edit`](Session::finish_edit) to record them as one
-/// step or [`cancel_edit`](Session::cancel_edit) to restore the document from the beginning. A
-/// one-shot change is a begin, one change and a finish.
+/// A parameter value changes in one step through [`set_value`](Session::set_value) or
+/// [`reset_value`](Session::reset_value), or continuously through an edit in progress:
+/// [`begin_edit`](Session::begin_edit), any number of [`edit_value`](Session::edit_value) and
+/// [`edit_reset`](Session::edit_reset), then [`finish_edit`](Session::finish_edit) to record them
+/// as one step or [`cancel_edit`](Session::cancel_edit) to restore the document from the
+/// beginning.
 #[derive(Debug)]
 pub struct Session {
     document: Document,
@@ -449,34 +451,65 @@ impl Session {
 
     /// Sets a value of the edited node in the live document, recording no step yet. A value equal
     /// to the default stays set.
-    pub fn set_value(&mut self, parameter: &str, value: Value) -> Result<Changes, EditError> {
-        self.edit_value(parameter, |node| node.set_value(parameter, value))
+    pub fn edit_value(&mut self, parameter: &str, value: Value) -> Result<Changes, EditError> {
+        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
+        let (document, _) =
+            self.with_value(id, parameter, |node| node.set_value(parameter, value))?;
+        Ok(self.swap_in(document))
     }
 
     /// Removes a value of the edited node in the live document, so it reads as its default.
-    pub fn reset_value(&mut self, parameter: &str) -> Result<Changes, EditError> {
-        self.edit_value(parameter, |node| node.reset(parameter))
+    pub fn edit_reset(&mut self, parameter: &str) -> Result<Changes, EditError> {
+        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
+        let (document, _) = self.with_value(id, parameter, |node| node.reset(parameter))?;
+        Ok(self.swap_in(document))
     }
 
-    fn edit_value(
+    /// Sets a node's value as one step named after the parameter, as a typed value does. A value
+    /// equal to the default stays set.
+    pub fn set_value(
         &mut self,
+        node: NodeId,
+        parameter: &str,
+        value: Value,
+    ) -> Result<Changes, EditError> {
+        let (document, label) =
+            self.with_value(node, parameter, |edited| edited.set_value(parameter, value))?;
+        Ok(self.commit(label, document))
+    }
+
+    /// Removes a node's value as one step, so it reads as its default.
+    pub fn reset_value(&mut self, node: NodeId, parameter: &str) -> Result<Changes, EditError> {
+        let (document, _) = self.with_value(node, parameter, |edited| edited.reset(parameter))?;
+        Ok(self.commit("Reset", document))
+    }
+
+    /// The document with one node's values edited, and the edited parameter's label.
+    fn with_value(
+        &self,
+        id: NodeId,
         parameter: &str,
         edit: impl FnOnce(&mut Node) -> Result<(), ValueError>,
-    ) -> Result<Changes, EditError> {
-        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
-        let mut document = self.document.clone();
-        // Every recorded edit, undo and redo ends the edit first, so its node still exists.
-        let node = document.nodes.get_mut(&id).expect("the edited node exists");
-        let mut edited = Node::clone(node);
-        edit(&mut edited).map_err(|error| EditError::InvalidValue {
+    ) -> Result<(Document, &'static str), EditError> {
+        let invalid = |error| EditError::InvalidValue {
             node: id,
             parameter: parameter.to_owned(),
             error,
-        })?;
+        };
+        let mut document = self.document.clone();
+        let node = document
+            .nodes
+            .get_mut(&id)
+            .ok_or(EditError::MissingNode(id))?;
+        let label = describe(node.kind.parameters(), parameter)
+            .map_err(invalid)?
+            .label;
+        let mut edited = Node::clone(node);
+        edit(&mut edited).map_err(invalid)?;
         if edited != **node {
             *node = Arc::new(edited);
         }
-        Ok(self.swap_in(document))
+        Ok((document, label))
     }
 
     /// Records the edit in progress as one step, unless it changed nothing.
@@ -543,8 +576,8 @@ impl Session {
     ///
     /// Every change to which nodes exist comes through here, or through undo and redo, which
     /// cancel the edit first; `swap_in` carries only the selection and the edit in progress. So
-    /// the node an edit in progress changes always exists, which its `expect`s rely on. A new way
-    /// to replace the document must keep that.
+    /// an edit in progress never outlives its node. A new way to replace the document must keep
+    /// that.
     fn commit(&mut self, label: &'static str, after: Document) -> Changes {
         let changes = self.document.changes_to(&after);
         if changes.is_empty() {

@@ -115,7 +115,7 @@ fn a_value_edit_retains_its_node_and_map_path_alone() {
         session.begin_edit(edited.exposure, "Set Stops").unwrap();
         for stops in 1..=100 {
             session
-                .set_value("stops", Value::Float(stops as f64 / 10.0))
+                .edit_value("stops", Value::Float(stops as f64 / 10.0))
                 .unwrap();
         }
         session.finish_edit();

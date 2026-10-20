@@ -225,7 +225,7 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
 
     let unchanged = |changes: Changes| assert!(changes.is_empty());
     type Edit<'a> = (&'a str, &'a dyn Fn(&mut Session));
-    let edits: [Edit; 8] = [
+    let edits: [Edit; 9] = [
         ("an empty create", &|s| {
             unchanged(s.create_readers(Vec::new(), ORIGIN));
         }),
@@ -249,9 +249,12 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
         }),
         ("a value set then reset", &|s| {
             s.begin_edit(connected, "Set Stops").unwrap();
-            s.set_value("stops", Value::Float(1.0)).unwrap();
-            s.reset_value("stops").unwrap();
+            s.edit_value("stops", Value::Float(1.0)).unwrap();
+            s.edit_reset("stops").unwrap();
             s.finish_edit();
+        }),
+        ("a reset of an unset value", &|s| {
+            unchanged(s.reset_value(unconnected, "stops").unwrap());
         }),
         // Selection changes the document, but is not a step.
         ("a deselection", &|s| {
@@ -303,6 +306,10 @@ fn edits_to_a_node_an_undo_removed_are_refused() {
     let missing = Err(EditError::MissingNode(reader));
     assert_eq!(session.set_reader_path(reader, "b.exr".into()), missing);
     assert_eq!(session.set_mark(slot(0), Some(reader)), missing);
+    assert_eq!(
+        session.set_value(reader, "stops", Value::Float(1.0)),
+        missing
+    );
     assert_eq!(session.redo_label(), Some("Create Reader"));
 
     let stale = Response {
@@ -401,7 +408,7 @@ fn a_node_shows_a_failure_while_its_current_key_failed() {
 
     // An edit downstream leaves the Reader's key, and its failure, as they were.
     session.begin_edit(exposure, "Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
     session.finish_edit();
     assert_eq!(failing(&session), [reader, twin]);
 
@@ -445,7 +452,7 @@ fn a_drag_shows_each_value_and_records_one_step() {
 
     session.begin_edit(exposure, "Set Stops").unwrap();
     for value in [0.5, 1.0, 1.5] {
-        let changes = session.set_value("stops", Value::Float(value)).unwrap();
+        let changes = session.edit_value("stops", Value::Float(value)).unwrap();
         assert_eq!(
             changes.nodes.iter().copied().collect::<Vec<_>>(),
             [exposure]
@@ -477,12 +484,12 @@ fn cancelling_restores_the_document_from_the_beginning() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(2.0)).unwrap();
+    session.edit_value("stops", Value::Float(2.0)).unwrap();
     session.finish_edit();
     let steps = session.undo.len();
 
     session.begin_edit(exposure, "Reset Stops").unwrap();
-    session.reset_value("stops").unwrap();
+    session.edit_reset("stops").unwrap();
     assert_eq!(stops(&session, exposure), Some(Value::Float(0.0)));
     let changes = session.cancel_edit();
 
@@ -498,7 +505,7 @@ fn undo_during_an_edit_cancels_it_then_undoes() {
     let reader = create(&mut session, "a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, Point { x: 0.0, y: 100.0 });
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
 
     let changes = session.undo();
 
@@ -518,7 +525,7 @@ fn another_edit_finishes_the_edit_in_progress_as_its_own_step() {
     let exposure = create_exposure(&mut session, ORIGIN);
     let reader = create(&mut session, "a.exr", Point { x: 0.0, y: 100.0 });
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
 
     let moved = Point { x: 40.0, y: 100.0 };
     let changes = session.apply_response(&Response {
@@ -561,7 +568,7 @@ fn selecting_leaves_the_edit_in_progress_running() {
         ..Response::default()
     });
     // The edit belongs to its node, not to the selection.
-    session.set_value("stops", Value::Float(-1.0)).unwrap();
+    session.edit_value("stops", Value::Float(-1.0)).unwrap();
     session.finish_edit();
 
     assert_eq!(session.document().selection(), [reader]);
@@ -574,17 +581,17 @@ fn refused_values_leave_the_edit_and_document_unchanged() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     assert_eq!(
-        session.set_value("stops", Value::Float(1.0)),
+        session.edit_value("stops", Value::Float(1.0)),
         Err(EditError::NoEditInProgress)
     );
     assert_eq!(
-        session.reset_value("stops"),
+        session.edit_reset("stops"),
         Err(EditError::NoEditInProgress)
     );
 
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
-    let refused = session.set_value("stops", Value::Float(f64::NAN));
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
+    let refused = session.edit_value("stops", Value::Float(f64::NAN));
 
     assert_eq!(
         refused,
@@ -611,8 +618,8 @@ fn a_reader_has_no_values_to_edit() {
         parameter: "stops".to_owned(),
         error: ValueError::UnknownParameter,
     });
-    assert_eq!(session.set_value("stops", Value::Float(1.0)), unknown);
-    assert_eq!(session.reset_value("stops"), unknown);
+    assert_eq!(session.edit_value("stops", Value::Float(1.0)), unknown);
+    assert_eq!(session.edit_reset("stops"), unknown);
     session.finish_edit();
 
     assert!(before.changes_to(session.document()).is_empty());
@@ -629,6 +636,74 @@ fn an_edit_begins_only_on_an_existing_node() {
         Err(EditError::MissingNode(exposure))
     );
     assert_eq!(session.editing(), None);
+}
+
+#[test]
+fn a_set_or_reset_is_one_step_named_for_it() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+
+    let changes = session
+        .set_value(exposure, "stops", Value::Float(1.5))
+        .unwrap();
+    assert_eq!(
+        changes.nodes.iter().copied().collect::<Vec<_>>(),
+        [exposure]
+    );
+    assert_eq!(session.undo_label(), Some("Stops"));
+    session.reset_value(exposure, "stops").unwrap();
+    assert_eq!(session.undo_label(), Some("Reset"));
+    assert_eq!(stops(&session, exposure), Some(Value::Float(0.0)));
+
+    session.undo();
+    assert_eq!(stops(&session, exposure), Some(Value::Float(1.5)));
+    session.undo();
+    assert_eq!(stops(&session, exposure), Some(Value::Float(0.0)));
+    assert_eq!(session.undo_label(), Some("Create Exposure"));
+    assert_presented(&session);
+}
+
+#[test]
+fn a_set_finishes_the_edit_in_progress_as_its_own_step() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+    session.begin_edit(exposure, "Set Stops").unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
+
+    session
+        .set_value(exposure, "stops", Value::Float(2.0))
+        .unwrap();
+
+    assert_eq!(session.editing(), None);
+    assert_eq!(session.undo_label(), Some("Stops"));
+    session.undo();
+    assert_eq!(stops(&session, exposure), Some(Value::Float(1.0)));
+    assert_eq!(session.undo_label(), Some("Set Stops"));
+}
+
+#[test]
+fn a_refused_set_leaves_the_document_and_history_unchanged() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+    let steps = session.undo.len();
+
+    assert_eq!(
+        session.set_value(exposure, "stops", Value::Float(65.0)),
+        Err(EditError::InvalidValue {
+            node: exposure,
+            parameter: "stops".to_owned(),
+            error: ValueError::OutOfLimits(-64.0..=64.0),
+        })
+    );
+    assert!(matches!(
+        session.reset_value(exposure, "gain"),
+        Err(EditError::InvalidValue {
+            error: ValueError::UnknownParameter,
+            ..
+        })
+    ));
+    assert_eq!(session.undo.len(), steps);
+    assert_eq!(stops(&session, exposure), Some(Value::Float(0.0)));
 }
 
 fn source_of(session: &Session, consumer: NodeId) -> Option<NodeId> {
@@ -735,7 +810,7 @@ fn deleting_the_edited_node_records_its_edit_as_its_own_step() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
 
     session.delete_nodes(&[exposure]).unwrap();
     assert_eq!(session.editing(), None);

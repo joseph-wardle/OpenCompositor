@@ -113,7 +113,7 @@ fn an_exposure_node_scales_its_source_by_its_stops() {
     session.connect(exposure, "source", source).unwrap();
     session.begin_edit(exposure, "Stops").unwrap();
     for (stops, expected) in [(1.0, 2.0), (-2.0, 0.25)] {
-        session.set_value("stops", Value::Float(stops)).unwrap();
+        session.edit_value("stops", Value::Float(stops)).unwrap();
         let image = evaluate(&mut evaluator, &session, exposure).unwrap();
         assert_eq!(pixel(&image), [expected, expected, expected, 1.0]);
     }

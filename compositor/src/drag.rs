@@ -180,7 +180,7 @@ fn step(index: usize) {
     let at = Instant::now();
     let request = crate::edit(|session| {
         session
-            .set_value("stops", Value::Float(stops))
+            .edit_value("stops", Value::Float(stops))
             .expect("Stops takes the value");
     });
     let period = with(|check| {

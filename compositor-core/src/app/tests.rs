@@ -863,7 +863,7 @@ fn the_viewer_follows_value_edits_and_their_undo() {
 
     app.edit(|session| {
         session.begin_edit(exposure, "Stops").unwrap();
-        session.set_value("stops", Value::Float(1.0)).unwrap();
+        session.edit_value("stops", Value::Float(1.0)).unwrap();
         session.finish_edit();
     });
     let edited = sent(&app).key;
@@ -882,7 +882,7 @@ fn an_edit_names_itself_as_what_undo_would_undo() {
 
     let (requests, _) = app.edit(|session| {
         session.begin_edit(exposure, "Stops").unwrap();
-        session.set_value("stops", Value::Float(1.0)).unwrap();
+        session.edit_value("stops", Value::Float(1.0)).unwrap();
         session.finish_edit();
     });
 
