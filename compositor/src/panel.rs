@@ -201,6 +201,10 @@ pub fn gesture(gesture: ffi::PanelGesture) {
                 .unwrap_or(f64::NAN);
             crate::edit(|session| session.set_value(node, parameter.name, Value::Float(value)))
         }
+        // An emptied field unsets the file, as its placeholder says.
+        PanelGestureKind::FileTyped if String::from(&gesture.text).trim().is_empty() => {
+            crate::edit(|session| session.reset_value(node, parameter.name))
+        }
         PanelGestureKind::FileTyped => {
             let path: Arc<Path> = crate::path(&gesture.text).into();
             crate::edit(|session| session.set_value(node, parameter.name, Value::File(path)))
@@ -213,9 +217,15 @@ pub fn gesture(gesture: ffi::PanelGesture) {
         Err(EditError::NoEditInProgress) => {}
         Err(error) => crate::perform(Request::ShowStatus(refusal(parameter, &error))),
     }
+    // A field keeps what was typed or dragged into it until shown again, which only a change to
+    // the document does; after an edit the session refused, or a drag an undo or a script cut
+    // short, the panel must catch up with the document.
     if matches!(
         gesture.kind,
-        PanelGestureKind::Typed | PanelGestureKind::FileTyped
+        PanelGestureKind::Typed
+            | PanelGestureKind::FileTyped
+            | PanelGestureKind::DragEnded
+            | PanelGestureKind::DragCancelled
     ) {
         refresh();
     }
