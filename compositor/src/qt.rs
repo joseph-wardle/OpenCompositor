@@ -23,6 +23,9 @@ pub mod ffi {
         include!(<QtWidgets/QLabel>);
         #[allow(missing_debug_implementations)]
         type QLabel;
+        include!(<QtWidgets/QSlider>);
+        #[allow(missing_debug_implementations)]
+        type QSlider;
     }
 
     unsafe extern "C++Qt" {
@@ -139,9 +142,70 @@ pub mod ffi {
         surface_about_to_be_destroyed: bool,
     }
 
+    /// The parameter panel as Rust sends it.
+    #[derive(Debug)]
+    struct PanelData {
+        /// Whether a node is shown, or that none is selected.
+        shown: bool,
+        title: QString,
+        pinned: bool,
+        /// Whether the rows are another node's, and so made anew; otherwise they refresh in place.
+        rebuild: bool,
+        rows: Vec<PanelRow>,
+    }
+
+    #[derive(Debug)]
+    struct PanelRow {
+        name: QString,
+        label: QString,
+        kind: RowKind,
+        authored: bool,
+        tooltip: QString,
+        /// The field's text.
+        text: QString,
+        /// Float only: the slider's positions from 0, and where it is.
+        ticks: i32,
+        tick: i32,
+    }
+
+    #[derive(Debug)]
+    enum RowKind {
+        Float,
+        File,
+    }
+
+    /// What the artist did to the panel, on the row of the parameter named.
+    #[derive(Debug)]
+    struct PanelGesture {
+        kind: PanelGestureKind,
+        parameter: QString,
+        /// Where the slider is, for a drag began or dragged.
+        tick: i32,
+        /// What was typed.
+        text: QString,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum PanelGestureKind {
+        DragBegan,
+        Dragged,
+        DragEnded,
+        DragCancelled,
+        Typed,
+        Reset,
+        Browse,
+        FileTyped,
+        Pin,
+        Unpin,
+    }
+
     #[namespace = "shim"]
     unsafe extern "C++" {
         include!("shim.h");
+
+        #[allow(missing_debug_implementations)]
+        type ParameterPanel;
 
         fn new_application();
         fn exec() -> i32;
@@ -182,6 +246,26 @@ pub mod ffi {
         unsafe fn container(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QWidget;
         /// Puts the pane in the dock above a one-line caption, which the dock owns too.
         unsafe fn container_with_caption(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QLabel;
+        /// The parameter panel, in a "Parameters" dock listed in `menu`, which divides the
+        /// viewer's dock area: the viewer over the graph, the panel beside both. The window owns
+        /// the dock, and the dock the panel. It sends each gesture to `send`.
+        unsafe fn new_parameter_panel(
+            window: *mut QMainWindow,
+            menu: *mut QMenu,
+            viewer: *mut QDockWidget,
+            graph: *mut QDockWidget,
+            send: fn(PanelGesture),
+        ) -> *mut ParameterPanel;
+        unsafe fn show_panel(panel: *mut ParameterPanel, data: &PanelData);
+        /// The named row's slider, or null, for the drag check.
+        unsafe fn panel_slider(panel: *mut ParameterPanel, name: &QString) -> *mut QSlider;
+        /// How many pixels a drag along the panel slider's groove covers.
+        unsafe fn slider_span(slider: *mut QSlider) -> i32;
+        /// Sends the panel slider a left-button mouse event of the `QEvent::Type`, where the
+        /// handle sits `pixel` along its span.
+        unsafe fn drag_slider(slider: *mut QSlider, kind: i32, pixel: i32);
+        /// Presses and releases Escape in the widget's window, as the platform does.
+        unsafe fn press_escape(widget: *mut QSlider);
         /// Sets the caption's text, and its tooltip for when the text is clipped.
         unsafe fn set_caption(label: *mut QLabel, text: &QString);
         unsafe fn label_text(label: *mut QLabel) -> QString;
@@ -207,13 +291,16 @@ pub mod ffi {
         ) -> QStringList;
         /// A path as the file system names it.
         fn encode_name(path: &QString) -> QByteArray;
+        /// A file system name as a path.
+        fn decode_name(name: &[u8]) -> QString;
         fn close_modal_dialog();
 
         /// Calls `handle(event type, fields)` for every key press and release in the application,
         /// before any window or widget receives it, and for the application losing the
         /// keyboard. The event goes no further if `handle` returns true.
         fn filter_keys(handle: fn(i32, InputFields) -> bool);
-        /// Whether a text field, a dialog or a menu has the keyboard, rather than the window.
+        /// Whether a text field, a dialog, a menu or a widget's grab has the keyboard, rather
+        /// than the window.
         fn keyboard_taken() -> bool;
 
         fn new_pane(index: usize) -> *mut Pane;

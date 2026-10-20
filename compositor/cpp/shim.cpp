@@ -10,9 +10,17 @@
 #include <QtGui/QWheelEvent>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QFileDialog>
+#include <QtWidgets/QGridLayout>
+#include <QtWidgets/QLineEdit>
 #include <QtWidgets/QMenuBar>
+#include <QtWidgets/QProxyStyle>
+#include <QtWidgets/QPushButton>
+#include <QtWidgets/QScrollArea>
 #include <QtWidgets/QStatusBar>
+#include <QtWidgets/QStyleOptionSlider>
+#include <QtWidgets/QToolButton>
 #include <QtWidgets/QVBoxLayout>
+#include <functional>
 
 namespace shim {
 static int argc = 1;
@@ -76,6 +84,305 @@ QLabel *container_with_caption(Pane *pane, QDockWidget *dock) {
     dock->setWidget(widget);
     return label;
 }
+
+namespace {
+// A click on the groove moves the handle there, rather than a page towards it.
+class AbsoluteSetStyle : public QProxyStyle {
+  public:
+    int styleHint(StyleHint hint, const QStyleOption *option, const QWidget *widget,
+                  QStyleHintReturn *returned) const override {
+        if (hint == SH_Slider_AbsoluteSetButtons) return Qt::LeftButton;
+        return QProxyStyle::styleHint(hint, option, widget, returned);
+    }
+};
+
+// A slider edited only by dragging: a press anywhere starts the drag, Escape during it cancels,
+// Ctrl+click resets, and keys and the wheel pass to the panel.
+class ParameterSlider : public QSlider {
+  public:
+    explicit ParameterSlider(QWidget *parent) : QSlider(Qt::Horizontal, parent) {
+        static auto *style = [] {
+            auto *style = new AbsoluteSetStyle;
+            style->setParent(qApp);
+            return style;
+        }();
+        setStyle(style);
+        setFocusPolicy(Qt::NoFocus);
+    }
+    std::function<void()> cancelled;
+    std::function<void()> reset;
+
+    // How many pixels a drag along the groove covers.
+    int span() {
+        auto [groove, handle] = rects();
+        return groove.width() - handle.width();
+    }
+    // Where to press or move for the handle to sit `pixel` along the span.
+    QPoint point_at(int pixel) {
+        auto [groove, handle] = rects();
+        return QPoint(groove.x() + pixel + (handle.center() - handle.topLeft()).x(),
+                      height() / 2);
+    }
+
+  protected:
+    void mousePressEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton && event->modifiers() & Qt::ControlModifier) {
+            event->accept();
+            reset();
+            return;
+        }
+        QSlider::mousePressEvent(event);
+        // The window's key filter takes Escape unless something grabs the keyboard.
+        if (isSliderDown()) grabKeyboard();
+    }
+    void mouseMoveEvent(QMouseEvent *event) override {
+        // After a cancel the button is still held, and the handle stays put.
+        if (!isSliderDown()) {
+            event->ignore();
+            return;
+        }
+        QSlider::mouseMoveEvent(event);
+    }
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        QSlider::mouseReleaseEvent(event);
+        if (!isSliderDown()) releaseKeyboard();
+    }
+    void keyPressEvent(QKeyEvent *event) override {
+        if (event->key() == Qt::Key_Escape && isSliderDown()) {
+            {
+                // Not released: the drag ends without its step.
+                QSignalBlocker blocker(this);
+                setSliderDown(false);
+            }
+            releaseKeyboard();
+            cancelled();
+            return;
+        }
+        event->ignore();
+    }
+    void wheelEvent(QWheelEvent *event) override { event->ignore(); }
+
+  private:
+    std::pair<QRect, QRect> rects() {
+        QStyleOptionSlider option;
+        initStyleOption(&option);
+        return {style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderGroove, this),
+                style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderHandle, this)};
+    }
+};
+
+// Sets refreshing for as long as it lives.
+class Refreshing {
+  public:
+    explicit Refreshing(bool &flag) : flag(flag) { flag = true; }
+    ~Refreshing() { flag = false; }
+
+  private:
+    bool &flag;
+};
+} // namespace
+
+ParameterPanel::ParameterPanel(rust::Fn<void(PanelGesture)> gestures, QWidget *parent)
+    : QWidget(parent), gestures(gestures) {
+    auto *layout = new QVBoxLayout(this);
+    auto *header = new QHBoxLayout;
+    title = new QLabel;
+    title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    QFont bold = title->font();
+    bold.setBold(true);
+    title->setFont(bold);
+    pin = new QToolButton;
+    pin->setText(QStringLiteral("Pin"));
+    pin->setCheckable(true);
+    pin->setEnabled(false);
+    pin->setToolTip(QStringLiteral("Keep the panel on this node whatever is selected"));
+    connect(pin, &QToolButton::toggled, this, [this](bool pinned) {
+        send(pinned ? PanelGestureKind::Pin : PanelGestureKind::Unpin, QString());
+    });
+    header->addWidget(title, 1);
+    header->addWidget(pin);
+    layout->addLayout(header);
+    empty = new QLabel(QStringLiteral("No node selected"));
+    empty->setAlignment(Qt::AlignCenter);
+    empty->setEnabled(false);
+    layout->addWidget(empty, 1);
+    scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->hide();
+    layout->addWidget(scroll, 1);
+}
+
+void ParameterPanel::show_panel(const PanelData &data) {
+    Refreshing refreshing(this->refreshing);
+    pin->setChecked(data.pinned);
+    pin->setEnabled(data.shown);
+    title->setText(data.title);
+    title->setToolTip(data.title);
+    empty->setVisible(!data.shown);
+    scroll->setVisible(data.shown);
+    if (data.rebuild) rebuild(data);
+    for (size_t i = 0; i < rows.size() && i < data.rows.size(); ++i) refresh(rows[i], data.rows[i]);
+}
+
+QSlider *ParameterPanel::slider(const QString &name) const {
+    for (const Row &row : rows)
+        if (row.name == name) return row.slider;
+    return nullptr;
+}
+
+void ParameterPanel::rebuild(const PanelData &data) {
+    // Later, since a gesture on one of the old rows may be running further up the stack.
+    if (QWidget *old = scroll->takeWidget()) {
+        old->hide();
+        old->deleteLater();
+    }
+    rows.clear();
+    auto *content = new QWidget;
+    auto *grid = new QGridLayout(content);
+    grid->setColumnStretch(2, 1);
+    int index = 0;
+    for (const PanelRow &data : data.rows) {
+        QString name = data.name;
+        auto *label = new QLabel(data.label);
+        label->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(label, &QLabel::customContextMenuRequested, this, [=, this](const QPoint &at) {
+            popup_reset_menu(name, new QMenu(this), label->mapToGlobal(at));
+        });
+        auto *field = new QLineEdit;
+        field->installEventFilter(this);
+        field->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(field, &QLineEdit::customContextMenuRequested, this, [=, this](const QPoint &at) {
+            popup_reset_menu(name, field->createStandardContextMenu(), field->mapToGlobal(at));
+        });
+        connect(field, &QLineEdit::editingFinished, this, [=, this] { committed(name); });
+        grid->addWidget(label, index, 0);
+        QSlider *row_slider = nullptr;
+        if (data.kind == RowKind::Float) {
+            field->setFixedWidth(field->fontMetrics().horizontalAdvance(QStringLiteral("-000.0000")) +
+                                 12);
+            auto *slider = new ParameterSlider(content);
+            slider->setRange(0, data.ticks);
+            connect(slider, &QSlider::sliderPressed, this,
+                    [=, this] { send(PanelGestureKind::DragBegan, name, slider->value()); });
+            connect(slider, &QSlider::sliderMoved, this,
+                    [=, this](int tick) { send(PanelGestureKind::Dragged, name, tick); });
+            connect(slider, &QSlider::sliderReleased, this,
+                    [=, this] { send(PanelGestureKind::DragEnded, name); });
+            slider->cancelled = [=, this] { send(PanelGestureKind::DragCancelled, name); };
+            slider->reset = [=, this] { send(PanelGestureKind::Reset, name); };
+            grid->addWidget(field, index, 1);
+            grid->addWidget(slider, index, 2);
+            row_slider = slider;
+        } else {
+            field->setPlaceholderText(QStringLiteral("No file"));
+            auto *browse = new QPushButton(QStringLiteral("Browse…"));
+            // From the event loop: the dialog's nested loop may rebuild the rows, deleting the
+            // button under its own click.
+            connect(browse, &QPushButton::clicked, this, [=, this] {
+                QTimer::singleShot(0, this, [=, this] { send(PanelGestureKind::Browse, name); });
+            });
+            auto *box = new QHBoxLayout;
+            box->addWidget(field, 1);
+            box->addWidget(browse);
+            grid->addLayout(box, index, 1, 1, 2);
+        }
+        rows.push_back(Row{name, label, field, row_slider, QString(), false});
+        ++index;
+    }
+    grid->setRowStretch(index, 1);
+    scroll->setWidget(content);
+}
+
+void ParameterPanel::refresh(Row &row, const PanelRow &data) {
+    row.authored = data.authored;
+    QFont font = row.label->font();
+    font.setBold(data.authored);
+    row.label->setFont(font);
+    row.label->setToolTip(data.tooltip);
+    row.shown = data.text;
+    row.field->setText(data.text);
+    row.field->setCursorPosition(0);
+    if (row.slider && !row.slider->isSliderDown()) {
+        QSignalBlocker blocker(row.slider);
+        row.slider->setValue(data.tick);
+    }
+}
+
+ParameterPanel::Row *ParameterPanel::row(const QString &name) {
+    for (Row &row : rows)
+        if (row.name == name) return &row;
+    return nullptr;
+}
+
+void ParameterPanel::committed(const QString &name) {
+    Row *row = this->row(name);
+    if (!row || row->field->text() == row->shown) return;
+    send(row->slider ? PanelGestureKind::Typed : PanelGestureKind::FileTyped, name, 0,
+         row->field->text());
+}
+
+bool ParameterPanel::eventFilter(QObject *watched, QEvent *event) {
+    if (event->type() == QEvent::KeyPress &&
+        static_cast<QKeyEvent *>(event)->key() == Qt::Key_Escape) {
+        for (Row &row : rows) {
+            if (row.field != watched) continue;
+            row.field->setText(row.shown);
+            row.field->clearFocus();
+            return true;
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+void ParameterPanel::popup_reset_menu(const QString &name, QMenu *menu, const QPoint &at) {
+    Row *row = this->row(name);
+    if (!menu->isEmpty()) menu->addSeparator();
+    QAction *reset = menu->addAction(QStringLiteral("Reset to Default"));
+    reset->setEnabled(row && row->authored);
+    connect(reset, &QAction::triggered, this, [=, this] { send(PanelGestureKind::Reset, name); });
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    menu->popup(at);
+}
+
+void ParameterPanel::send(PanelGestureKind kind, const QString &parameter, int tick,
+                          const QString &text) {
+    if (refreshing) return;
+    gestures(PanelGesture{kind, parameter, tick, text});
+}
+
+ParameterPanel *new_parameter_panel(QMainWindow *window, QMenu *menu, QDockWidget *viewer,
+                                    QDockWidget *graph, rust::Fn<void(PanelGesture)> send) {
+    auto *dock = new_dock(window, menu, QStringLiteral("Parameters"), window->dockWidgetArea(viewer));
+    auto *panel = new ParameterPanel(send, dock);
+    dock->setWidget(panel);
+    // Docks in one area keep the sizes they are given. Without a central widget, a dock in an
+    // area of its own takes every spare pixel of the window.
+    window->splitDockWidget(viewer, dock, Qt::Horizontal);
+    window->splitDockWidget(viewer, graph, Qt::Vertical);
+    window->resizeDocks({viewer, dock}, {1040, 360}, Qt::Horizontal);
+    return panel;
+}
+void show_panel(ParameterPanel *panel, const PanelData &data) { panel->show_panel(data); }
+QSlider *panel_slider(ParameterPanel *panel, const QString &name) { return panel->slider(name); }
+int slider_span(QSlider *slider) { return static_cast<ParameterSlider *>(slider)->span(); }
+void drag_slider(QSlider *slider, int type, int pixel) {
+    QPointF at = static_cast<ParameterSlider *>(slider)->point_at(pixel);
+    auto button = type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton;
+    auto buttons = type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton;
+    QMouseEvent event(QEvent::Type(type), at, slider->mapToGlobal(at), button, buttons,
+                      Qt::NoModifier);
+    QCoreApplication::sendEvent(slider, &event);
+}
+void press_escape(QSlider *widget) {
+    // To the window, as the platform delivers keys, so that the key filter sees it first.
+    QWindow *window = widget->window()->windowHandle();
+    for (auto type : {QEvent::KeyPress, QEvent::KeyRelease}) {
+        QKeyEvent event(type, Qt::Key_Escape, Qt::NoModifier);
+        QCoreApplication::sendEvent(window, &event);
+    }
+}
+
 void set_caption(QLabel *label, const QString &text) {
     label->setText(text);
     label->setToolTip(text);
@@ -107,6 +414,10 @@ QStringList choose_files(QMainWindow *window, const QString &title, bool several
     return file.isEmpty() ? QStringList() : QStringList(file);
 }
 QByteArray encode_name(const QString &path) { return QFile::encodeName(path); }
+QString decode_name(rust::Slice<const uint8_t> name) {
+    return QFile::decodeName(
+        QByteArray::fromRawData(reinterpret_cast<const char *>(name.data()), name.size()));
+}
 void close_modal_dialog() {
     if (auto *dialog = QApplication::activeModalWidget()) dialog->close();
 }
@@ -134,7 +445,9 @@ void filter_keys(rust::Fn<bool(int, InputFields)> handle) {
     qApp->installEventFilter(new KeyFilter(handle));
 }
 bool keyboard_taken() {
-    if (QApplication::activeModalWidget() || QApplication::activePopupWidget()) return true;
+    if (QApplication::activeModalWidget() || QApplication::activePopupWidget() ||
+        QWidget::keyboardGrabber())
+        return true;
     QObject *focus = QGuiApplication::focusObject();
     if (!focus) return false;
     QInputMethodQueryEvent query(Qt::ImEnabled);

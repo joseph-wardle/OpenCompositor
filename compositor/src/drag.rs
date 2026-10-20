@@ -1,29 +1,34 @@
-//! `--drag-check IMAGE`: drags Exposure's Stops on a Reader → Exposure chain of IMAGE, one edit
-//! per refresh of the viewer's screen, and reports how the viewer kept up. The worker evaluates the
-//! latest request and discards the rest, so an edit's latency ends at the first viewer frame
-//! submitted that samples a result from its request or a later one: a superseded edit is answered
-//! by the frame showing a newer value, as the artist sees it. The check reports the latencies over
-//! every edit, the final edit's own, how many edits' own values were shown, the stages of the
-//! worker's path for the edits whose result it delivered, and the process's resident memory. It
-//! exits 0 if the latencies' p95 and the final edit's met the budget and 1 otherwise.
+//! `--drag-check IMAGE`: drags the parameter panel's Stops slider on a Reader → Exposure chain of
+//! IMAGE with synthetic mouse events: a press at the groove's start, a move one pixel along it each
+//! refresh of the viewer's screen, and a release at its end. It reports how the viewer kept up. The
+//! worker evaluates the latest request and discards the rest, so an edit's latency ends at the
+//! first viewer frame submitted that samples a result from its request or a later one: a
+//! superseded edit is answered by the frame showing a newer value, as the artist sees it. The check
+//! reports the latencies over every edit, the final edit's own, how many edits' own values were
+//! shown, how long the GUI thread took to dispatch each mouse event from the slider to the requests
+//! performed, the stages of the worker's path for the edits whose result it delivered, and the
+//! process's resident memory. Then it checks that the drag undoes as one step and that a drag
+//! cancelled with Escape leaves the value as it was. It exits 0 if those held and the latencies'
+//! p95 and the final edit's met the budget, and 1 otherwise.
 //!
 //! Run it in a release build on the workstation, and twice, since the first run's shader and
 //! file caches are cold. A frame counts when the GUI thread submits it, not when the display
 //! shows it, which needs the display.
 
 use std::cell::RefCell;
-use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use cxx_qt_lib::QString;
 use open_ng::Point;
-use opencompositor_core::{Changes, NodeId, Pane, Session, Slot, Timing, Value};
+use opencompositor_core::{Changes, Command, Event, NodeId, Pane, Slot, Timing};
 
 use crate::qt::ffi;
 
-/// How many Stops edits the drag makes, spread over this range.
-const EDITS: usize = 200;
-const STOPS: RangeInclusive<f64> = -3.0..=3.0;
+/// `QEvent::Type` values.
+const MOUSE_BUTTON_PRESS: i32 = 2;
+const MOUSE_BUTTON_RELEASE: i32 = 3;
+const MOUSE_MOVE: i32 = 5;
 
 /// What the latencies' p95 and the final edit's latency must meet in a CPU session on the
 /// workstation.
@@ -37,9 +42,14 @@ const LONGEST_WAIT: Duration = Duration::from_secs(60);
 struct Check {
     image: PathBuf,
     exposure: Option<NodeId>,
-    /// Between edits: the viewer's refresh period, to Qt's millisecond timers.
+    /// The panel's Stops slider, and how many pixels its drag covers.
+    slider: *mut ffi::QSlider,
+    span: i32,
+    /// Between moves: the viewer's refresh period, to Qt's millisecond timers.
     period: i32,
     edits: Vec<Edit>,
+    /// How long each mouse event took the GUI thread.
+    dispatches: Vec<Duration>,
 }
 
 struct Edit {
@@ -64,8 +74,11 @@ pub fn start(image: PathBuf) {
         *cell.borrow_mut() = Some(Check {
             image,
             exposure: None,
+            slider: std::ptr::null_mut(),
+            span: 0,
             period: 0,
             edits: Vec::new(),
+            dispatches: Vec::new(),
         })
     });
     ffi::single_shot(1000, setup, 0);
@@ -117,11 +130,11 @@ fn poll_in(tries: usize) -> i32 {
     POLL.as_millis() as i32 * tries as i32
 }
 
-/// Makes the chain and marks it in the viewer's slot, which asks the worker for it.
+/// Makes the chain, which selects the Exposure for the panel, and marks it in the viewer's slot,
+/// which asks the worker for it.
 fn setup(_: usize) {
     let image = with(|check| check.image.clone());
-    let mut exposure = None;
-    crate::edit(|session| {
+    let exposure = crate::edit(|session| {
         let reader = created(session.create_readers(vec![image], Point::default()));
         let node = created(
             (session.create_node("exposure", Point::default(), Some(reader)))
@@ -130,9 +143,9 @@ fn setup(_: usize) {
         session
             .set_mark(Slot::new(1).expect("1 is a slot"), Some(node))
             .expect("the node exists");
-        exposure = Some(node);
+        node
     });
-    with(|check| check.exposure = exposure);
+    with(|check| check.exposure = Some(exposure));
     ffi::single_shot(poll_in(1), wait_for_image, 1);
 }
 
@@ -154,44 +167,64 @@ fn wait_for_image(tries: usize) {
     }
 }
 
-/// Begins the edit and schedules its first step a refresh away.
+/// Presses the slider at the start of its groove and schedules the first move a refresh away.
 fn begin() {
-    let exposure = with(|check| check.exposure.expect("set up"));
-    crate::edit(|session| {
-        session
-            .begin_edit(exposure, "Stops")
-            .expect("the node exists");
-    });
+    // SAFETY: the panel lives as long as its dock, until the main window is destroyed after the
+    // event loop; the slider until the panel shows another node, which nothing selects here.
+    let slider = unsafe { ffi::panel_slider(crate::widgets().panel, &QString::from("stops")) };
+    if slider.is_null() {
+        return report(vec!["the panel shows no Stops slider".to_owned()]);
+    }
+    // SAFETY: as above.
+    let span = unsafe { ffi::slider_span(slider) };
+    if span < 1 {
+        return report(vec![format!("the Stops slider spans {span} pixels")]);
+    }
     let refresh =
         crate::with_pane_window(Pane::Viewer, |window| crate::pace::refresh_period(&window));
     let period = ((refresh.as_micros() + 500) / 1000).max(1) as i32;
-    with(|check| check.period = period);
-    ffi::single_shot(period, step, 0);
+    with(|check| {
+        check.slider = slider;
+        check.span = span;
+        check.period = period;
+    });
+    send(MOUSE_BUTTON_PRESS, 0);
+    ffi::single_shot(period, step, 1);
 }
 
-/// One Stops edit, and the next a refresh later, until the last, which finishes the edit.
-fn step(index: usize) {
-    let stops = STOPS.start() + (STOPS.end() - STOPS.start()) * (index + 1) as f64 / EDITS as f64;
+/// Sends the slider a mouse event, timing it, and records the edit if it asked for a new result.
+fn send(kind: i32, pixel: i32) {
+    let slider = with(|check| check.slider);
+    let request = crate::latest_request();
     let at = Instant::now();
-    let request = crate::edit(|session| {
-        session
-            .edit_value("stops", Value::Float(stops))
-            .expect("Stops takes the value");
+    // SAFETY: as in `begin`.
+    unsafe { ffi::drag_slider(slider, kind, pixel) };
+    let took = at.elapsed();
+    let latest = crate::latest_request();
+    with(|check| {
+        check.dispatches.push(took);
+        if latest != request {
+            check.edits.push(Edit {
+                request: latest,
+                at,
+                delivered: None,
+                framed: None,
+                shown: false,
+            });
+        }
     });
-    let period = with(|check| {
-        check.edits.push(Edit {
-            request,
-            at,
-            delivered: None,
-            framed: None,
-            shown: false,
-        });
-        check.period
-    });
-    if index + 1 < EDITS {
-        ffi::single_shot(period, step, index + 1);
+}
+
+/// One move a pixel along, and the next a refresh later, until the end of the groove, where the
+/// slider is released.
+fn step(pixel: usize) {
+    let (span, period) = with(|check| (check.span, check.period));
+    let pixel = pixel as i32;
+    send(MOUSE_MOVE, pixel);
+    if pixel < span {
+        ffi::single_shot(period, step, pixel as usize + 1);
     } else {
-        crate::edit(Session::finish_edit);
+        send(MOUSE_BUTTON_RELEASE, span);
         ffi::single_shot(poll_in(1), wait_for_final, 1);
     }
 }
@@ -199,7 +232,7 @@ fn step(index: usize) {
 fn wait_for_final(tries: usize) {
     let framed = with(|check| check.edits.last().is_some_and(|edit| edit.framed.is_some()));
     if framed {
-        report(Vec::new());
+        report(check_steps());
     } else if POLL * tries as u32 >= LONGEST_WAIT {
         report(vec![format!(
             "the final edit reached no frame within {LONGEST_WAIT:?}: {}",
@@ -208,6 +241,56 @@ fn wait_for_final(tries: usize) {
     } else {
         ffi::single_shot(poll_in(1), wait_for_final, tries + 1);
     }
+}
+
+/// Checks that the drag was one step, which one undo removes, and that a drag cancelled with
+/// Escape changes nothing. Returns the failures.
+fn check_steps() -> Vec<String> {
+    let (exposure, slider, span) =
+        with(|check| (check.exposure.expect("set up"), check.slider, check.span));
+    let state = || {
+        crate::read_session(|session| {
+            let stops = (session.document().node(exposure))
+                .and_then(|node| node.authored_value("stops").cloned());
+            (stops, session.undo_label(), session.editing().is_some())
+        })
+    };
+    let mut failures = Vec::new();
+    let dragged = state();
+    if dragged.1 != Some("Stops") || dragged.2 {
+        failures.push(format!(
+            "after the release, undo would undo {:?}, with an edit in progress: {}",
+            dragged.1, dragged.2
+        ));
+    }
+    let middle = span / 2;
+    for (kind, pixel) in [
+        (MOUSE_BUTTON_PRESS, middle),
+        (MOUSE_MOVE, (middle + 10).min(span)),
+    ] {
+        // SAFETY: as in `begin`.
+        unsafe { ffi::drag_slider(slider, kind, pixel) };
+    }
+    let moved = state().0;
+    // SAFETY: as in `begin`.
+    unsafe {
+        ffi::press_escape(slider);
+        ffi::drag_slider(slider, MOUSE_BUTTON_RELEASE, middle);
+    }
+    let cancelled = state();
+    if moved == dragged.0 || cancelled != dragged {
+        failures.push(format!(
+            "a drag cancelled with Escape moved Stops from {:?} to {moved:?} and left {:?}, then \
+             undo would undo {:?}, with an edit in progress: {}",
+            dragged.0, cancelled.0, cancelled.1, cancelled.2
+        ));
+    }
+    crate::dispatch(Event::Command(Command::Undo));
+    let undone = state().0;
+    if undone.is_some() {
+        failures.push(format!("one undo after the drag left Stops at {undone:?}"));
+    }
+    failures
 }
 
 fn caption() -> String {
@@ -233,6 +316,8 @@ fn report(mut failures: Vec<String>) {
         .map(|pair| pair[1].at - pair[0].at)
         .collect();
     spacing.sort();
+    let mut dispatches = check.dispatches.clone();
+    dispatches.sort();
     eprintln!("drag check: {}", caption());
     if let (Some(first), Some(last)) = (edits.first(), edits.last()) {
         eprintln!(
@@ -243,6 +328,14 @@ fn report(mut failures: Vec<String>) {
             last.at - first.at
         );
     }
+    eprintln!(
+        "drag check: {} mouse events over {} pixels took the GUI thread p50 {:.1?}, p95 {:.1?}, max {:.1?}",
+        dispatches.len(),
+        check.span,
+        percentile(&dispatches, 0.5),
+        percentile(&dispatches, 0.95),
+        percentile(&dispatches, 1.0),
+    );
     eprintln!(
         "drag check: edit → frame p50 {:.1?}, p95 {:.1?}, max {:.1?}; the final edit {}; {} of {} edits' own values were shown",
         percentile(&latencies, 0.5),

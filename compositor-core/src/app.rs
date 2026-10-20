@@ -398,13 +398,18 @@ impl App {
         &self.session
     }
 
-    /// Edits the session as a parameter panel will, which the shell's drag check stands in for,
-    /// then follows the change as [`App::dispatch`] does. Returns the requests, and the number of
-    /// the request whose result shows the edited session.
-    pub fn edit(&mut self, edit: impl FnOnce(&mut Session)) -> (Vec<Request>, u64) {
-        edit(&mut self.session);
+    /// Edits the session, as the parameter panel does, then follows the change as
+    /// [`App::dispatch`] does. Returns the requests, and what the edit returned.
+    pub fn edit<R>(&mut self, edit: impl FnOnce(&mut Session) -> R) -> (Vec<Request>, R) {
+        let edited = edit(&mut self.session);
         let requests = self.after_change(vec![Request::Redraw(Pane::Graph)]);
-        (requests, self.requests_sent)
+        (requests, edited)
+    }
+
+    /// The number of the latest request to the worker, whose result shows the session as it is,
+    /// for the drag check.
+    pub fn latest_request(&self) -> u64 {
+        self.requests_sent
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {

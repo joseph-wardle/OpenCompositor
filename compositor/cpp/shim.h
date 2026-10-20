@@ -1,4 +1,5 @@
-// One-liners for what cxx cannot bind: constructors, statics, templates and casts. No logic.
+// What cxx cannot bind: one-liners for constructors, statics, templates and casts, and the
+// parameter panel, a plain Qt class that Rust fills and that sends its gestures back.
 #pragma once
 #include <QtCore/QByteArray>
 #include <QtCore/QEvent>
@@ -9,7 +10,9 @@
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QMenu>
+#include <QtWidgets/QSlider>
 #include <memory>
+#include <vector>
 #include <qpa/qplatformwindow_p.h>
 
 #include "rust/cxx.h"
@@ -17,9 +20,59 @@
 class Pane;
 class Waker;
 struct InputFields;
+struct PanelData;
+struct PanelRow;
+struct PanelGesture;
+enum class PanelGestureKind : uint8_t;
+class QLineEdit;
+class QScrollArea;
+class QToolButton;
 
 namespace shim {
 using QWaylandWindow = QNativeInterface::Private::QWaylandWindow;
+
+// One node's parameters in rows, shown as Rust sends them, each gesture on them sent back with the
+// row's parameter name. Rows are rebuilt only when Rust says the node changed, otherwise refreshed
+// in place, so that a drag survives the refreshes it causes. Nothing is sent during a refresh.
+class ParameterPanel : public QWidget {
+  public:
+    ParameterPanel(rust::Fn<void(PanelGesture)> gestures, QWidget *parent);
+    void show_panel(const PanelData &data);
+    // The named row's slider, or null.
+    QSlider *slider(const QString &name) const;
+
+  protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
+  private:
+    struct Row {
+        QString name;
+        QLabel *label;
+        QLineEdit *field;
+        // Null for a file.
+        QSlider *slider;
+        // The field's text as last refreshed, which Escape restores.
+        QString shown;
+        bool authored;
+    };
+    void rebuild(const PanelData &data);
+    void refresh(Row &row, const PanelRow &data);
+    Row *row(const QString &name);
+    // The field's text, if the artist changed it.
+    void committed(const QString &name);
+    // Adds Reset to Default to the menu and pops it up, deleting it once closed.
+    void popup_reset_menu(const QString &name, QMenu *menu, const QPoint &at);
+    void send(PanelGestureKind kind, const QString &parameter, int tick = 0,
+              const QString &text = QString());
+
+    rust::Fn<void(PanelGesture)> gestures;
+    bool refreshing = false;
+    QLabel *title;
+    QToolButton *pin;
+    QLabel *empty;
+    QScrollArea *scroll;
+    std::vector<Row> rows;
+};
 
 void new_application();
 int exec();
@@ -40,6 +93,13 @@ void set_action(QAction *action, const QString &text, bool enabled);
 QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area);
 QWidget *container(Pane *pane, QDockWidget *dock);
 QLabel *container_with_caption(Pane *pane, QDockWidget *dock);
+ParameterPanel *new_parameter_panel(QMainWindow *window, QMenu *menu, QDockWidget *viewer,
+                                    QDockWidget *graph, rust::Fn<void(PanelGesture)> send);
+void show_panel(ParameterPanel *panel, const PanelData &data);
+QSlider *panel_slider(ParameterPanel *panel, const QString &name);
+int slider_span(QSlider *slider);
+void drag_slider(QSlider *slider, int type, int pixel);
+void press_escape(QSlider *widget);
 void set_caption(QLabel *label, const QString &text);
 QString label_text(QLabel *label);
 void tabify(QMainWindow *window, QDockWidget *first, QDockWidget *second);
@@ -49,6 +109,7 @@ QLabel *new_permanent_status(QMainWindow *window);
 void set_permanent_status(QLabel *label, const QString &text);
 QStringList choose_files(QMainWindow *window, const QString &title, bool several);
 QByteArray encode_name(const QString &path);
+QString decode_name(rust::Slice<const uint8_t> name);
 void close_modal_dialog();
 
 void filter_keys(rust::Fn<bool(int, InputFields)> handle);

@@ -6,6 +6,7 @@ mod keys;
 mod lifecycle;
 mod pace;
 mod pane;
+mod panel;
 mod qt;
 
 use std::cell::{OnceCell, RefCell};
@@ -23,9 +24,8 @@ use opencompositor_core::{
 
 use crate::qt::ffi;
 
-/// `Qt::DockWidgetArea` values.
+/// A `Qt::DockWidgetArea` value.
 const TOP_DOCK_AREA: i32 = 4;
-const BOTTOM_DOCK_AREA: i32 = 8;
 
 thread_local! {
     /// Borrowed only while the app handles an event, during which nothing calls Qt: Qt can call
@@ -46,6 +46,7 @@ pub struct Widgets {
     pub window: *mut ffi::QMainWindow,
     pub docks: [*mut ffi::QDockWidget; Pane::COUNT],
     pub panes: [*mut qt::Pane; Pane::COUNT],
+    pub panel: *mut ffi::ParameterPanel,
     /// Under the viewer.
     pub caption: *mut ffi::QLabel,
     /// At the status bar's right, while the GPU is unavailable or has reported errors.
@@ -165,16 +166,34 @@ fn main() {
     // SAFETY: the viewer menu is live; it owns the note.
     unsafe { ffi::add_note(viewer_menu, &QString::from("Pan\tSpace+Drag, Middle-Drag")) };
     COMMANDS.with(|cell| cell.set(commands).expect("menus are made once"));
+    // In one area, which the parameter panel's dock then divides.
     let docks = Pane::ALL.map(|pane| {
-        let (title, area) = match pane {
-            Pane::Graph => ("Node Graph", BOTTOM_DOCK_AREA),
-            Pane::Viewer => ("Viewer", TOP_DOCK_AREA),
+        let title = match pane {
+            Pane::Graph => "Node Graph",
+            Pane::Viewer => "Viewer",
         };
         // SAFETY: the window and menu are live; the window owns the dock.
-        unsafe { ffi::new_dock(window_ptr, window_menu, &QString::from(title), area) }
+        unsafe {
+            ffi::new_dock(
+                window_ptr,
+                window_menu,
+                &QString::from(title),
+                TOP_DOCK_AREA,
+            )
+        }
     });
     let panes = Pane::ALL.map(|pane| ffi::new_pane(pane.index()));
     let [graph_dock, viewer_dock] = Pane::ALL.map(|pane| docks[pane.index()]);
+    // SAFETY: the window, menu and docks are live.
+    let panel = unsafe {
+        ffi::new_parameter_panel(
+            window_ptr,
+            window_menu,
+            viewer_dock,
+            graph_dock,
+            panel::gesture,
+        )
+    };
     // SAFETY: the docks are live; each owns its pane, and the viewer's its caption, from here on.
     let caption = unsafe {
         ffi::container(panes[Pane::Graph.index()], graph_dock);
@@ -187,6 +206,7 @@ fn main() {
             window: window_ptr,
             docks,
             panes,
+            panel,
             caption,
             gpu_label,
             undo,
@@ -229,19 +249,23 @@ pub fn dispatch(event: Event) {
     }
 }
 
-/// Edits the session for the drag check, then does what the app asks. Returns the number of the
-/// request whose result shows the edited session.
-pub fn edit(edit: impl FnOnce(&mut Session)) -> u64 {
-    let (requests, request) = APP.with(|cell| {
+/// Edits the session, then does what the app asks. Returns what the edit returned.
+pub fn edit<R>(edit: impl FnOnce(&mut Session) -> R) -> R {
+    let (requests, edited) = APP.with(|cell| {
         let mut app = cell.borrow_mut();
         app.as_mut()
-            .expect("the drag check edits while the app runs")
+            .expect("the panel and the drag check edit while the app runs")
             .edit(edit)
     });
     for request in requests {
         perform(request);
     }
-    request
+    edited
+}
+
+/// Reads the session, in the drag check.
+pub fn read_session<R>(read: impl FnOnce(&Session) -> R) -> R {
+    APP.with(|cell| read(cell.borrow().as_ref().expect("the app runs").session()))
 }
 
 /// Names in the Edit menu what undo and redo would do, and disables either when there is nothing.
@@ -304,8 +328,7 @@ pub fn perform(request: Request) {
             ffi::set_caption(widgets.caption, &QString::from(&text))
         },
         Request::ShowUndoLabels { undo, redo } => show_undo_labels([undo, redo]),
-        // Until the parameter panel's dock exists.
-        Request::ShowPanel(_) => {}
+        Request::ShowPanel(shown) => panel::show(shown),
         // SAFETY: the window owns the label, and lives as long as it.
         Request::ShowGpuLabel(text) => unsafe {
             let text = QString::from(text.as_deref().unwrap_or_default());
@@ -344,7 +367,7 @@ fn retry_device_creation(attempt: usize) {
     lifecycle::attempt_took(started.elapsed());
 }
 
-fn path(name: &QString) -> PathBuf {
+pub fn path(name: &QString) -> PathBuf {
     let bytes = ffi::encode_name(name);
     PathBuf::from(OsString::from_vec(bytes.as_slice().to_vec()))
 }
@@ -375,6 +398,11 @@ pub fn destroy_device() {
 /// How many GPU errors this session went uncaptured.
 pub fn gpu_errors() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))
+}
+
+/// The number of the latest request to the worker, in the drag check.
+pub fn latest_request() -> u64 {
+    APP.with(|cell| cell.borrow().as_ref().map_or(0, App::latest_request))
 }
 
 /// The number of the request whose image the viewer last presented, in the drag check.
