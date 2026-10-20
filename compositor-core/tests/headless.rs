@@ -7,7 +7,10 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use open_ng::Point;
-use opencompositor_core::{EvalError, NodeId, ReadError, Session, evaluate};
+use opencompositor_core::{
+    Channel, EvalError, Evaluator, ExposureVersion, Image, NodeId, NodeKind, ReadError, Session,
+    Value, result_key,
+};
 
 /// A directory of this test's own, emptied first.
 fn directory(name: &str) -> PathBuf {
@@ -31,6 +34,28 @@ fn reader(session: &mut Session, path: PathBuf) -> NodeId {
     *changes.nodes.first().unwrap()
 }
 
+/// The node's image as the session's document and reloads describe it.
+fn evaluate(evaluator: &mut Evaluator, session: &Session, id: NodeId) -> Result<Image, EvalError> {
+    let key = result_key(session.document(), session.reloads(), id).expect("the node exists");
+    evaluator
+        .evaluate(&key, || false)
+        .expect("nothing stops it")
+}
+
+fn pixel(image: &Image) -> [f32; 4] {
+    Channel::ALL.map(|c| image.value(c, 0, 0))
+}
+
+fn create_exposure(session: &mut Session) -> NodeId {
+    let changes = session.create_node(
+        NodeKind::Exposure {
+            version: ExposureVersion::CURRENT,
+        },
+        Point { x: 0.0, y: 0.0 },
+    );
+    *changes.nodes.first().unwrap()
+}
+
 #[test]
 fn a_reader_evaluates_to_the_file_it_points_at() {
     let directory = directory("reader_pixels");
@@ -38,32 +63,59 @@ fn a_reader_evaluates_to_the_file_it_points_at() {
     write_png(&white, 255);
     write_png(&black, 0);
     let mut session = Session::new();
+    let mut evaluator = Evaluator::new();
 
     let id = reader(&mut session, white);
-    let image = evaluate(session.document(), id).unwrap();
-    assert_eq!(image.pixel(0, 0), [1.0; 4]);
+    let image = evaluate(&mut evaluator, &session, id).unwrap();
+    assert_eq!(pixel(&image), [1.0; 4]);
 
     session.set_reader_path(id, black).unwrap();
-    let image = evaluate(session.document(), id).unwrap();
-    assert_eq!(image.pixel(0, 0), [0.0, 0.0, 0.0, 1.0]);
+    let image = evaluate(&mut evaluator, &session, id).unwrap();
+    assert_eq!(pixel(&image), [0.0, 0.0, 0.0, 1.0]);
 }
 
 #[test]
-fn evaluation_reports_what_went_wrong() {
+fn evaluation_reports_what_went_wrong_and_where() {
     let missing = directory("reader_errors").join("missing.exr");
     let mut session = Session::new();
-
+    let mut evaluator = Evaluator::new();
     let id = reader(&mut session, missing);
-    let error = evaluate(session.document(), id).unwrap_err();
+    let exposure = create_exposure(&mut session);
+    session.connect(exposure, "source", id).unwrap();
+
+    let error = evaluate(&mut evaluator, &session, exposure).unwrap_err();
     assert!(
         matches!(&error, EvalError::Read { error: ReadError::Io(io), .. } if io.kind() == std::io::ErrorKind::NotFound),
         "{error:?}"
     );
+    assert_eq!(
+        Some(error.origin()),
+        result_key(session.document(), session.reloads(), id).as_ref()
+    );
     assert!(error.to_string().contains("missing.exr"), "{error}");
 
-    // Undo is the only way to remove a node yet.
-    session.undo();
-    assert!(
-        matches!(evaluate(session.document(), id), Err(EvalError::MissingNode(missing)) if missing == id)
-    );
+    session.delete_nodes(&[id]).unwrap();
+    assert_eq!(result_key(session.document(), session.reloads(), id), None);
+}
+
+#[test]
+fn an_exposure_node_scales_its_source_by_its_stops() {
+    let white = directory("exposure").join("white.png");
+    write_png(&white, 255);
+    let mut session = Session::new();
+    let mut evaluator = Evaluator::new();
+    let exposure = create_exposure(&mut session);
+
+    let image = evaluate(&mut evaluator, &session, exposure).unwrap();
+    assert_eq!(image.data_window().width, 0);
+
+    let source = reader(&mut session, white);
+    session.connect(exposure, "source", source).unwrap();
+    session.begin_edit(exposure, "Stops").unwrap();
+    for (stops, expected) in [(1.0, 2.0), (-2.0, 0.25)] {
+        session.set_value("stops", Value::Float(stops)).unwrap();
+        let image = evaluate(&mut evaluator, &session, exposure).unwrap();
+        assert_eq!(pixel(&image), [expected, expected, expected, 1.0]);
+    }
+    session.finish_edit();
 }

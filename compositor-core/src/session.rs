@@ -1,15 +1,18 @@
 //! One open document with its history, its presentation in OpenNG, and the viewer's state.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use open_ng::{ConnectionEdit, Graph, InputEvent, Point, Response, Verdict, View, Viewport};
+use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 
-use crate::document::{Changes, Document, Node, NodeId, NodeKind, Slot};
-use crate::loader::LoadRequest;
-use crate::presentation::present;
+use crate::document::{
+    Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, Slot,
+};
+use crate::evaluate::{Reloads, ResultKey, result_keys};
+use crate::parameter::{Value, ValueError};
+use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
@@ -23,76 +26,97 @@ struct Step {
     document: Document,
 }
 
-/// An edit refused because its target no longer exists, such as a dialog's node removed by an
-/// undo while the dialog was open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// An edit applied to the live document as it happens, recorded as one step when it finishes:
+/// a slider drag, or a script setting several values.
+#[derive(Debug)]
+struct EditInProgress {
+    label: &'static str,
+    /// The edit belongs to this node, not to the selection.
+    node: NodeId,
+    /// The document from when the edit began, which finishing records and cancelling restores.
+    before: Document,
+}
+
+/// An edit refused before applying.
+#[derive(Clone, Debug, PartialEq)]
 pub enum EditError {
+    /// The target no longer exists, such as a dialog's node removed by an undo while the dialog
+    /// was open.
     MissingNode(NodeId),
+    /// The node is of a type the edit does not apply to.
+    WrongKind(NodeId),
+    /// Values change only between beginning and finishing an edit.
+    NoEditInProgress,
+    InvalidValue {
+        node: NodeId,
+        parameter: String,
+        error: ValueError,
+    },
+    Connection(ConnectionError),
 }
 
 impl fmt::Display for EditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EditError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
+            EditError::WrongKind(id) => write!(f, "node {} has no such setting", id.0),
+            EditError::NoEditInProgress => write!(f, "no edit is in progress"),
+            EditError::InvalidValue {
+                node,
+                parameter,
+                error,
+            } => write!(f, "node {}, {parameter}: {error}", node.0),
+            EditError::Connection(error) => write!(f, "{error}"),
         }
     }
 }
 
-impl std::error::Error for EditError {}
-
-/// What the viewer's slot leads to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Viewed {
-    Unmarked,
-    /// The slot marks a node the document no longer has.
-    Missing(NodeId),
-    Node(LoadRequest),
+impl std::error::Error for EditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EditError::InvalidValue { error, .. } => Some(error),
+            EditError::Connection(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
-/// What the session knows of reading nodes' files. Unsaved and not undoable.
+/// Evaluations that failed, by the key of the node each failed at. A node is shown failed while
+/// its current key is one of them, so evaluating that key again successfully clears it, a deleted
+/// node never shows it and equal nodes show it alike. Unsaved and not undoable.
 #[derive(Debug, Default)]
-pub(crate) struct Loads {
-    /// Each node's reloads; a node never reloaded is absent.
-    reloads: HashMap<NodeId, u64>,
-    /// Each node's last failed read.
-    failed: HashMap<NodeId, LoadRequest>,
+struct Failures {
+    keys: Vec<ResultKey>,
+    /// The nodes the graph shows failed.
+    nodes: BTreeSet<NodeId>,
 }
 
-impl Loads {
-    /// What reading the node's file means now.
-    fn request(&self, document: &Document, id: NodeId) -> Option<LoadRequest> {
-        let NodeKind::Reader { path } = &document.node(id)?.kind;
-        Some(LoadRequest {
-            node: id,
-            path: path.clone(),
-            reload: self.reloads.get(&id).copied().unwrap_or(0),
-        })
-    }
-
-    /// Whether reading the node's file failed, and it would read the same file again.
-    pub(crate) fn failed(&self, document: &Document, id: NodeId) -> bool {
-        self.failed
-            .get(&id)
-            .is_some_and(|failed| self.request(document, id).as_ref() == Some(failed))
-    }
-}
-
-/// A document with its undo history, its OpenNG graph and the view of it, the viewer, and what
-/// is known of reading each node's file.
+/// A document with its undo history, its OpenNG graph and the view of it, the viewer, how many
+/// times each file has been reloaded, and which evaluations failed.
 ///
 /// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
 /// before returning the [`Changes`] it made. An edit that changes nothing records no step.
+///
+/// Parameter values change through an edit in progress: [`begin_edit`](Session::begin_edit),
+/// any number of value changes, then [`finish_edit`](Session::finish_edit) to record them as one
+/// step or [`cancel_edit`](Session::cancel_edit) to restore the document from the beginning. A
+/// one-shot change is a begin, one change and a finish.
 #[derive(Debug)]
 pub struct Session {
     document: Document,
     undo: Vec<Step>,
     redo: Vec<Step>,
+    editing: Option<EditInProgress>,
     /// Outside every snapshot, so undo never rewinds it.
     next_id: u64,
     graph: Graph,
     graph_view: View,
     viewer: Viewer,
-    loads: Loads,
+    /// Unsaved and not undoable.
+    reloads: Reloads,
+    failures: Failures,
+    /// Counts changes to the document and the reloads, which every key is made from.
+    version: u64,
 }
 
 impl Default for Session {
@@ -107,6 +131,7 @@ impl Session {
             document: Document::default(),
             undo: Vec::new(),
             redo: Vec::new(),
+            editing: None,
             next_id: 1,
             graph: Graph::default(),
             graph_view: View::new(Viewport {
@@ -117,7 +142,9 @@ impl Session {
                 scale_factor: 1.0,
             }),
             viewer: Viewer::new(),
-            loads: Loads::default(),
+            reloads: Reloads::default(),
+            failures: Failures::default(),
+            version: 0,
         }
     }
 
@@ -141,37 +168,65 @@ impl Session {
         &mut self.viewer
     }
 
-    /// What the viewer's slot leads to.
-    pub fn viewed(&self) -> Viewed {
-        match self.document.mark(self.viewer.slot()) {
-            None => Viewed::Unmarked,
-            Some(id) => match self.loads.request(&self.document, id) {
-                Some(request) => Viewed::Node(request),
-                None => Viewed::Missing(id),
-            },
-        }
+    /// Changes whenever the document or the reloads do, so that a key built at one version is
+    /// current while the version is.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
-    /// Records how a read of a node's file ended. Returns whether the graph changed.
-    pub(crate) fn record_read(&mut self, request: LoadRequest, failed: bool) -> bool {
-        let node = request.node;
-        if failed {
-            self.loads.failed.insert(node, request);
-        } else {
-            self.loads.failed.remove(&node);
-        }
-        self.present_statuses([node])
+    /// The node the viewer's slot marks.
+    pub fn viewed(&self) -> Option<NodeId> {
+        self.document.mark(self.viewer.slot())
     }
 
-    /// Makes each selected node read its file again the next time it is viewed. Returns whether
-    /// any was selected.
-    pub fn reload_selected(&mut self) -> bool {
-        let selected: Vec<NodeId> = self.document.selection().to_vec();
-        for &id in &selected {
-            *self.loads.reloads.entry(id).or_default() += 1;
+    /// Records that a key was evaluated, which clears the failures of it and of every key
+    /// inside it. Returns whether the graph changed.
+    pub(crate) fn record_success(&mut self, key: &ResultKey) -> bool {
+        let inside = key.with_upstream();
+        self.failures
+            .keys
+            .retain(|failed| !inside.contains(&failed));
+        self.present_failures()
+    }
+
+    /// Records a failure at the key of the node it happened at, if that is still some node's
+    /// key: a failure superseded by an edit would otherwise stay recorded with nothing to clear
+    /// it. Every key inside that one was evaluated, which clears their failures. Returns whether
+    /// the graph changed.
+    pub(crate) fn record_failure(&mut self, origin: &ResultKey) -> bool {
+        let inside = origin.with_upstream();
+        self.failures
+            .keys
+            .retain(|failed| !inside.contains(&failed));
+        let keys = result_keys(&self.document, &self.reloads);
+        if keys.values().any(|key| key == origin) {
+            self.failures.keys.push(origin.clone());
         }
-        self.present_statuses(selected.iter().copied());
-        !selected.is_empty()
+        self.present_failures()
+    }
+
+    /// How many times each file has been reloaded.
+    pub fn reloads(&self) -> &Reloads {
+        &self.reloads
+    }
+
+    /// Makes every Reader of each given Reader's file read it again the next time it is viewed.
+    /// Returns whether any of the nodes is a Reader.
+    pub fn reload(&mut self, nodes: &[NodeId]) -> bool {
+        let paths: BTreeSet<Arc<Path>> = (nodes.iter())
+            .filter_map(|&id| match &self.document.node(id)?.kind {
+                NodeKind::Reader { path } => Some(path.clone()),
+                NodeKind::Exposure { .. } => None,
+            })
+            .collect();
+        for path in &paths {
+            self.reloads.reload(path.clone());
+        }
+        if !paths.is_empty() {
+            self.version += 1;
+        }
+        self.present_failures();
+        !paths.is_empty()
     }
 
     /// Centres the node a slot marks in the graph view. Returns whether the slot marks one.
@@ -186,10 +241,13 @@ impl Session {
     /// Passes an event to the graph view and applies what it asks for. Returns whether the view
     /// needs drawing again.
     pub fn graph_input(&mut self, event: InputEvent) -> bool {
+        let document = &self.document;
         let response = self
             .graph_view
-            .handle_input(&self.graph, event, refuse_connections);
-        let asks = response.selection.is_some() || !response.positions.is_empty();
+            .handle_input(&self.graph, event, |edit| judge(document, edit));
+        let asks = response.selection.is_some()
+            || !response.positions.is_empty()
+            || response.connections.is_some();
         let changed = asks && !self.apply_response(&response).is_empty();
         response.handled || changed
     }
@@ -219,13 +277,13 @@ impl Session {
         for (row, path) in paths.into_iter().enumerate() {
             let id = NodeId(self.next_id);
             self.next_id += 1;
-            let node = Node {
-                kind: NodeKind::Reader { path },
-                position: Point {
+            let node = Node::new(
+                NodeKind::Reader { path: path.into() },
+                Point {
                     x: at.x,
                     y: at.y + row as f32 * READER_SPACING,
                 },
-            };
+            );
             document.nodes.insert(id, Arc::new(node));
             created.push(id);
         }
@@ -235,6 +293,20 @@ impl Session {
         self.commit("Create Reader", document)
     }
 
+    /// Creates a node of a kind at `at` and selects it alone.
+    pub fn create_node(&mut self, kind: NodeKind, at: Point) -> Changes {
+        let label = match kind {
+            NodeKind::Reader { .. } => "Create Reader",
+            NodeKind::Exposure { .. } => "Create Exposure",
+        };
+        let id = NodeId(self.next_id);
+        self.next_id += 1;
+        let mut document = self.document.clone();
+        document.nodes.insert(id, Arc::new(Node::new(kind, at)));
+        document.selection = [id].into();
+        self.commit(label, document)
+    }
+
     /// Points a Reader at another file. It keeps its ID, position, marks and selection.
     pub fn set_reader_path(&mut self, id: NodeId, path: PathBuf) -> Result<Changes, EditError> {
         let mut document = self.document.clone();
@@ -242,10 +314,11 @@ impl Session {
             .nodes
             .get_mut(&id)
             .ok_or(EditError::MissingNode(id))?;
-        let NodeKind::Reader { path: current } = &node.kind;
-        if *current != path {
-            let NodeKind::Reader { path: current } = &mut Arc::make_mut(node).kind;
-            *current = path;
+        let NodeKind::Reader { path: current } = &node.kind else {
+            return Err(EditError::WrongKind(id));
+        };
+        if **current != *path {
+            Arc::make_mut(node).kind = NodeKind::Reader { path: path.into() };
         }
         Ok(self.commit("Set Reader Path", document))
     }
@@ -263,12 +336,65 @@ impl Session {
         Ok(self.commit(label, document))
     }
 
+    /// Deletes nodes as one step, disconnecting every input that took one and clearing their
+    /// marks and selection. Refused whole if any of them is already gone.
+    ///
+    /// A gesture in the graph view ends unapplied, since it may hold a deleted node. Reads of a
+    /// deleted node are left alone: IDs are never reused, so nothing can mistake them.
+    pub fn delete_nodes(&mut self, ids: &[NodeId]) -> Result<Changes, EditError> {
+        if let Some(&missing) = ids.iter().find(|&&id| self.document.node(id).is_none()) {
+            return Err(EditError::MissingNode(missing));
+        }
+        if ids.is_empty() {
+            return Ok(Changes::default());
+        }
+        self.graph_view.cancel_gesture();
+        let document = self.document.without_nodes(ids);
+        // Committing finishes an edit in progress, which may belong to a deleted node.
+        Ok(self.commit("Delete", document))
+    }
+
+    /// Connects a node's input to the output of `source`, replacing what the input took.
+    pub fn connect(
+        &mut self,
+        consumer: NodeId,
+        input: &str,
+        source: NodeId,
+    ) -> Result<Changes, EditError> {
+        self.assign_inputs(&[Assignment {
+            consumer,
+            input,
+            source: Some(source),
+        }])
+    }
+
+    /// Disconnects a node's input.
+    pub fn disconnect(&mut self, consumer: NodeId, input: &str) -> Result<Changes, EditError> {
+        self.assign_inputs(&[Assignment {
+            consumer,
+            input,
+            source: None,
+        }])
+    }
+
+    /// Applies connection assignments as one step, or none of them.
+    fn assign_inputs(&mut self, assignments: &[Assignment]) -> Result<Changes, EditError> {
+        let document = self
+            .document
+            .assign_inputs(assignments)
+            .map_err(EditError::Connection)?;
+        Ok(self.commit(connection_label(assignments), document))
+    }
+
     /// Applies a view's response. A move is one step, selection included, so that a press that
     /// selects a node and drags it undoes at once. Selecting alone records no step, as in Nuke and
     /// Houdini: undo goes back to the last edit, not the last click, and redo survives a click.
     ///
+    /// A connection edit is decided again against the document as it is now, and applied whole,
+    /// with any move, as one step, or not at all.
+    ///
     /// Nodes the document no longer has are left out: a window-wide undo can remove a node during
-    /// a gesture. Readers have no groups and no inputs, so a response never folds or connects.
+    /// a gesture. No node has groups yet, so a response never folds.
     pub fn apply_response(&mut self, response: &Response) -> Changes {
         let mut document = self.document.clone();
         if let Some(selection) = &response.selection {
@@ -287,29 +413,113 @@ impl Session {
                 moved = true;
             }
         }
-        if moved {
+        let connected = response.connections.as_ref().and_then(|edit| {
+            let assignments = assignments(&document, edit).ok()?;
+            let connected = document.assign_inputs(&assignments).ok()?;
+            let changed = !document.changes_to(&connected).is_empty();
+            changed.then(|| (connection_label(&assignments), connected))
+        });
+        if let Some((label, connected)) = connected {
+            self.commit(label, connected)
+        } else if moved {
             self.commit("Move", document)
         } else {
-            self.select(document)
+            self.swap_in(document)
         }
     }
 
-    /// Restores the document from before the last step. Returns no changes if there is none.
-    pub fn undo(&mut self) -> Changes {
-        let Some(step) = self.undo.pop() else {
-            return Changes::default();
+    /// Begins an edit of a node's values, finishing any edit in progress first.
+    pub fn begin_edit(&mut self, node: NodeId, label: &'static str) -> Result<(), EditError> {
+        if self.document.node(node).is_none() {
+            return Err(EditError::MissingNode(node));
+        }
+        self.finish_edit();
+        self.editing = Some(EditInProgress {
+            label,
+            node,
+            before: self.document.clone(),
+        });
+        Ok(())
+    }
+
+    /// The node an edit in progress belongs to.
+    pub fn editing(&self) -> Option<NodeId> {
+        self.editing.as_ref().map(|edit| edit.node)
+    }
+
+    /// Sets a value of the edited node in the live document, recording no step yet. A value equal
+    /// to the default stays set.
+    pub fn set_value(&mut self, parameter: &str, value: Value) -> Result<Changes, EditError> {
+        self.edit_value(parameter, |node| node.set_value(parameter, value))
+    }
+
+    /// Removes a value of the edited node in the live document, so it reads as its default.
+    pub fn reset_value(&mut self, parameter: &str) -> Result<Changes, EditError> {
+        self.edit_value(parameter, |node| node.reset(parameter))
+    }
+
+    fn edit_value(
+        &mut self,
+        parameter: &str,
+        edit: impl FnOnce(&mut Node) -> Result<(), ValueError>,
+    ) -> Result<Changes, EditError> {
+        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
+        let mut document = self.document.clone();
+        // Every recorded edit, undo and redo ends the edit first, so its node still exists.
+        let node = document.nodes.get_mut(&id).expect("the edited node exists");
+        let mut edited = Node::clone(node);
+        edit(&mut edited).map_err(|error| EditError::InvalidValue {
+            node: id,
+            parameter: parameter.to_owned(),
+            error,
+        })?;
+        if edited != **node {
+            *node = Arc::new(edited);
+        }
+        Ok(self.swap_in(document))
+    }
+
+    /// Records the edit in progress as one step, unless it changed nothing.
+    pub fn finish_edit(&mut self) {
+        let Some(edit) = self.editing.take() else {
+            return;
         };
-        let (redo, changes) = self.restore(step);
-        self.redo.push(redo);
+        if !edit.before.changes_to(&self.document).is_empty() {
+            self.undo.push(Step {
+                label: edit.label,
+                document: edit.before,
+            });
+            self.redo.clear();
+        }
+    }
+
+    /// Ends the edit in progress, restoring the document from when it began.
+    pub fn cancel_edit(&mut self) -> Changes {
+        match self.editing.take() {
+            Some(edit) => self.swap_in(edit.before),
+            None => Changes::default(),
+        }
+    }
+
+    /// Restores the document from before the last step, cancelling any edit in progress first.
+    pub fn undo(&mut self) -> Changes {
+        let mut changes = self.cancel_edit();
+        if let Some(step) = self.undo.pop() {
+            let (redo, undone) = self.restore(step);
+            self.redo.push(redo);
+            changes.extend(undone);
+        }
         changes
     }
 
+    /// Reapplies the last undone step, cancelling any edit in progress first.
     pub fn redo(&mut self) -> Changes {
-        let Some(step) = self.redo.pop() else {
-            return Changes::default();
-        };
-        let (undo, changes) = self.restore(step);
-        self.undo.push(undo);
+        let mut changes = self.cancel_edit();
+        if let Some(step) = self.redo.pop() {
+            let (undo, redone) = self.restore(step);
+            self.undo.push(undo);
+            changes.extend(redone);
+        }
         changes
     }
 
@@ -317,6 +527,7 @@ impl Session {
     fn restore(&mut self, step: Step) -> (Step, Changes) {
         let changes = self.document.changes_to(&step.document);
         let current = std::mem::replace(&mut self.document, step.document);
+        self.version += 1;
         self.present(&changes);
         let reverse = Step {
             label: step.label,
@@ -326,12 +537,22 @@ impl Session {
     }
 
     /// Records an edit as one step, unless it changed nothing. A new step clears redo.
+    ///
+    /// An edit in progress is finished first as its own step: steps are whole documents, so
+    /// otherwise undoing one would undo or half-restore the other.
+    ///
+    /// Every change to which nodes exist comes through here, or through undo and redo, which
+    /// cancel the edit first; `swap_in` carries only the selection and the edit in progress. So
+    /// the node an edit in progress changes always exists, which its `expect`s rely on. A new way
+    /// to replace the document must keep that.
     fn commit(&mut self, label: &'static str, after: Document) -> Changes {
         let changes = self.document.changes_to(&after);
         if changes.is_empty() {
             return changes;
         }
+        self.finish_edit();
         let before = std::mem::replace(&mut self.document, after);
+        self.version += 1;
         self.undo.push(Step {
             label,
             document: before,
@@ -341,11 +562,13 @@ impl Session {
         changes
     }
 
-    /// Swaps in a document that differs at most in its selection, recording no step.
-    fn select(&mut self, after: Document) -> Changes {
+    /// Swaps in a document without recording a step: a change of selection, or of the edit in
+    /// progress.
+    fn swap_in(&mut self, after: Document) -> Changes {
         let changes = self.document.changes_to(&after);
         if !changes.is_empty() {
             self.document = after;
+            self.version += 1;
             self.present(&changes);
         }
         changes
@@ -353,24 +576,56 @@ impl Session {
 
     /// Updates the graph, then the view, which cannot notice a change to the graph on its own.
     /// Returns whether the graph changed.
+    ///
+    /// An edit changes the keys of every node downstream of what it changes, so whether each node
+    /// shows a failure is decided again for all of them.
     fn present(&mut self, changes: &Changes) -> bool {
-        let changed = present(&mut self.graph, &self.document, &self.loads, changes);
-        self.graph_view.refresh(&self.graph, refuse_connections);
+        let failing = self.failing_nodes();
+        let mut nodes = changes.nodes.clone();
+        nodes.extend(failing.symmetric_difference(&self.failures.nodes));
+        self.failures.nodes = failing;
+        let changes = Changes {
+            nodes,
+            selection: changes.selection,
+        };
+        let changed = present(
+            &mut self.graph,
+            &self.document,
+            &self.failures.nodes,
+            &changes,
+        );
+        let document = &self.document;
+        self.graph_view
+            .refresh(&self.graph, |edit| judge(document, edit));
         changed
     }
 
-    /// Presents nodes whose failure to read may have changed. Returns whether any did.
-    fn present_statuses(&mut self, nodes: impl IntoIterator<Item = NodeId>) -> bool {
-        self.present(&Changes {
-            nodes: nodes.into_iter().collect::<BTreeSet<_>>(),
-            selection: false,
-        })
+    /// Presents nodes whose failure may have changed. Returns whether any did.
+    fn present_failures(&mut self) -> bool {
+        self.present(&Changes::default())
+    }
+
+    /// The nodes whose current key failed.
+    fn failing_nodes(&self) -> BTreeSet<NodeId> {
+        if self.failures.keys.is_empty() {
+            return BTreeSet::new();
+        }
+        (result_keys(&self.document, &self.reloads).into_iter())
+            .filter(|(_, key)| self.failures.keys.contains(key))
+            .map(|(id, _)| id)
+            .collect()
     }
 }
 
-/// Readers have no inputs, so nothing can be connected yet.
-fn refuse_connections(_: &ConnectionEdit) -> Verdict {
-    Verdict::Refuse { reason: None }
+fn connection_label(assignments: &[Assignment]) -> &'static str {
+    if assignments
+        .iter()
+        .any(|assignment| assignment.source.is_some())
+    {
+        "Connect"
+    } else {
+        "Disconnect"
+    }
 }
 
 #[cfg(test)]

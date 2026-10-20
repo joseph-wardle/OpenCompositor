@@ -14,8 +14,8 @@ const MAX_ZOOM: f32 = 64.0;
 /// The fraction of the pane a fitted display window fills, leaving its outline in view.
 const FIT_FILL: f32 = 0.9;
 
-/// Where an image appears in the viewer pane: a point in image pixels lands at `point * scale +
-/// offset` in the pane's physical pixels.
+/// Where an image appears in the viewer pane: a point in image pixels lands at `(x * scale +
+/// offset[0], offset[1] - y * scale)` in the pane's physical pixels, whose y counts down.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
     pub scale: f32,
@@ -26,7 +26,7 @@ impl Placement {
     pub fn to_image(self, point: PhysicalPoint) -> [f32; 2] {
         [
             (point.x - self.offset[0]) / self.scale,
-            (point.y - self.offset[1]) / self.scale,
+            (self.offset[1] - point.y) / self.scale,
         ]
     }
 }
@@ -89,7 +89,7 @@ impl Viewer {
             scale: zoom,
             offset: [
                 self.size.width as f32 / 2.0 - centre[0] * zoom,
-                self.size.height as f32 / 2.0 - centre[1] * zoom,
+                self.size.height as f32 / 2.0 + centre[1] * zoom,
             ],
         }
     }
@@ -151,7 +151,7 @@ impl Viewer {
         self.camera = Camera::Placed {
             centre: [
                 centre[0] - (position.x - last.x) / zoom,
-                centre[1] - (position.y - last.y) / zoom,
+                centre[1] + (position.y - last.y) / zoom,
             ],
             zoom,
         };
@@ -166,7 +166,7 @@ impl Viewer {
         self.camera = Camera::Placed {
             centre: [
                 anchor[0] - (position.x - self.size.width as f32 / 2.0) / zoom,
-                anchor[1] - (position.y - self.size.height as f32 / 2.0) / zoom,
+                anchor[1] + (position.y - self.size.height as f32 / 2.0) / zoom,
             ],
             zoom,
         };

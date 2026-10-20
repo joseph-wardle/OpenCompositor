@@ -8,17 +8,46 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Pinned, never `ubuntu-latest`: its Mesa release decides what lavapipe accepts.
   workspace:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # The GPU kernel tests fail without a Vulkan adapter; lavapipe is the runner's, and each
+      # test prints the adapter and driver it ran on.
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo fmt --all --check
       # The shell needs Qt, which the `shell` job installs.
       - run: cargo clippy --workspace --exclude opencompositor --all-targets --locked -- -D warnings
       - run: cargo build --workspace --exclude opencompositor --all-targets --locked
-      - run: cargo test --workspace --exclude opencompositor --locked
+      # --nocapture: the kernel tests say which adapter and which CPU level ran.
+      - run: cargo test --workspace --exclude opencompositor --locked -- --nocapture
+
+  # Rebuilds the committed SPIR-V module with the builder's own nightly and fails on any byte
+  # difference, so nobody needs that nightly to know the bytes are what the source builds. It
+  # runs no tests: a passing comparison means the `workspace` job tested this module.
+  shaders:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: compositor-kernels/shaders
+    steps:
+      - uses: actions/checkout@v7
+      # rustup reads the builder's rust-toolchain.toml here, not the workspace's.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compositor-kernels/shaders
+      - run: cargo run --locked
+      - name: Compare with the committed module
+        run: |
+          if git diff --quiet -- ../kernels.spv; then exit 0; fi
+          sudo apt-get update && sudo apt-get install -y spirv-tools
+          diff <(git show HEAD:compositor-kernels/kernels.spv | spirv-dis -) <(spirv-dis ../kernels.spv) || true
+          echo "::error::compositor-kernels/kernels.spv differs from the module rebuilt from source; the disassembly diff is above"
+          exit 1
 
   shell:
     runs-on: ubuntu-latest

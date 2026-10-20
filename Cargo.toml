@@ -1,5 +1,5 @@
 [workspace]
-members = ["open-ng", "compositor", "compositor-core"]
+members = ["open-ng", "compositor", "compositor-core", "compositor-kernels"]
 resolver = "3"
 
 [workspace.package]
@@ -9,6 +9,8 @@ license = "MIT OR Apache-2.0"
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
 unsafe_op_in_unsafe_fn = "warn"
+# The kernel crate's GPU build targets SPIR-V, an architecture rustc does not list.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"

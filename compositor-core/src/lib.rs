@@ -5,23 +5,40 @@
 mod app;
 mod document;
 mod evaluate;
+#[cfg(test)]
+mod fixtures;
 mod gpu;
 mod image;
-mod loader;
+// The GPU half is used by the worker once it dispatches; until then only the tests do.
+#[cfg_attr(not(test), expect(dead_code))]
+mod kernels;
+mod parameter;
 mod presentation;
 mod read;
 mod session;
 mod viewer;
+mod worker;
 
-pub use app::{App, Command, Event, FileIntent, Input, Key, Pane, Request};
-pub use document::{Changes, Document, Node, NodeId, NodeKind, Slot};
-pub use evaluate::{EvalError, evaluate};
-pub use gpu::{FrameCheck, NativeWindow, PaneSize};
-pub use image::{
-    Chromaticities, Cicp, ExrChannel, ExrCompression, ExrPart, ExrSource, Image, ImageInfo,
-    PngColorType, PngSource, SampleType, Source, Warning, Window,
+/// What `benches/kernels.rs` measures. The benchmark is a crate of its own, so this is the one
+/// place the pool and the CPU kernels are reachable from outside; nothing else is public here.
+#[doc(hidden)]
+pub mod bench {
+    pub use crate::evaluate::Pool;
+    pub use crate::kernels::cpu::{Level, exposure};
+}
+
+pub use app::{App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
+pub use document::{
+    Assignment, Changes, ConnectionError, Document, ExposureVersion, Node, NodeId, NodeInput,
+    NodeKind, Slot, unconnected_inputs,
 };
-pub use loader::{Decoded, LoadError, LoadRequest, Loaded};
+pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
+pub use gpu::{FrameCheck, NativeWindow, PaneSize};
+pub use image::{Channel, Chromaticities, Image, ImageInfo, Warning, Window};
+pub use parameter::{
+    FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,
+};
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
-pub use session::{EditError, Session, Viewed};
+pub use session::{EditError, Session};
 pub use viewer::{Placement, Viewer};
+pub use worker::{Evaluated, StagingTiming, Timing, ViewerError, ViewerImage};

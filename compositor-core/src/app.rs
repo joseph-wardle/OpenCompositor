@@ -1,15 +1,19 @@
-//! The interactive compositor: a session, the GPU that draws its panes, and the loader, changed
-//! only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
+//! The interactive compositor: a session, the GPU that draws its panes, and the evaluator's
+//! worker, changed only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
 
-use std::path::{Path, PathBuf};
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{NodeId, Slot};
-use crate::gpu::{FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
+use crate::document::{ExposureVersion, NodeId, NodeKind, Slot, unconnected_inputs};
+use crate::evaluate::{ResultKey, result_key};
+use crate::gpu::{Drawn, FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
-use crate::loader::{LoadRequest, Loaded, Loader, is_empty};
-use crate::session::{Session, Viewed};
+use crate::session::Session;
+use crate::worker::{Evaluated, ViewerError, Wanted, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,8 +33,12 @@ impl Pane {
 
 /// Something that happened in the shell.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a result is dispatched once and never stored, where a box would allocate per result"
+)]
 pub enum Event {
-    /// The pane became visible and must be drawn. A pane without a surface asks for one.
+    /// The pane became visible and must be drawn. A pane without a native window asks for one.
     Exposed(Pane),
     /// The pane's native window, after [`Request::AttachSurface`].
     SurfaceCreated {
@@ -69,8 +77,60 @@ pub enum Event {
         intent: FileIntent,
         paths: Vec<PathBuf>,
     },
-    /// A read finished on the loader's thread.
-    Loaded(Loaded),
+    /// An evaluation finished on the evaluator's thread.
+    Evaluated(Evaluated),
+    /// The GPU device of the generation was lost.
+    DeviceLost(u64),
+    /// The time for the attempt, after [`Request::RetryDeviceCreation`].
+    RetryDeviceCreation(u64),
+}
+
+/// What another thread, or wgpu inside a call, tells the GUI thread through the waker
+/// [`App::new`] takes. The shell dispatches it as an [`Event`].
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "moved once to the GUI thread and never stored, where a box would allocate per result"
+)]
+pub enum Notice {
+    Evaluated(Evaluated),
+    DeviceLost(u64),
+}
+
+impl From<Notice> for Event {
+    fn from(notice: Notice) -> Event {
+        match notice {
+            Notice::Evaluated(evaluated) => Event::Evaluated(evaluated),
+            Notice::DeviceLost(generation) => Event::DeviceLost(generation),
+        }
+    }
+}
+
+/// Hands a [`Notice`] to the GUI thread, from any thread.
+#[derive(Clone)]
+pub(crate) struct Waker(Arc<dyn Fn(Notice) + Send + Sync>);
+
+impl Waker {
+    pub(crate) fn wake(&self, notice: Notice) {
+        (self.0)(notice);
+    }
+}
+
+#[cfg(test)]
+impl Waker {
+    pub(crate) fn channel() -> (Waker, std::sync::mpsc::Receiver<Notice>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waker = Waker(Arc::new(move |notice| {
+            let _ = sender.send(notice);
+        }));
+        (waker, receiver)
+    }
+}
+
+impl fmt::Debug for Waker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Waker")
+    }
 }
 
 /// What the shell does for [`App::dispatch`], after it returns.
@@ -88,6 +148,18 @@ pub enum Request {
     ShowError(String),
     /// Describe under the viewer what it shows, or why it shows nothing.
     ShowViewerCaption(String),
+    /// Name in the Edit menu what undo and redo would undo and redo, and disable either with
+    /// `None`. Both start disabled.
+    ShowUndoLabels {
+        undo: Option<&'static str>,
+        redo: Option<&'static str>,
+    },
+    /// Show the text in the status bar's permanent GPU label, or hide the label with `None`.
+    /// It changes when the panes stop or start drawing, and when a GPU error is counted.
+    ShowGpuLabel(Option<String>),
+    /// Dispatch [`Event::RetryDeviceCreation`] with the attempt after the delay. An attempt not
+    /// the last one requested is ignored, so dispatching every one is safe.
+    RetryDeviceCreation { attempt: u64, after: Duration },
 }
 
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
@@ -95,9 +167,12 @@ pub enum Request {
 pub enum Command {
     /// A Reader for each file chosen, placed where the pointer is over the graph.
     ReadFiles,
+    /// An Exposure node where the pointer is over the graph, selected alone.
+    CreateExposure,
     /// A new file for the one selected Reader.
     ChangeReaderFile,
-    /// Reads the selected Readers' files again when they are next viewed, at once if they are.
+    /// Reads the selected Readers' files again, for every Reader of them, when they are next
+    /// viewed, at once if they are.
     Reload,
     Undo,
     Redo,
@@ -121,6 +196,8 @@ pub enum Key {
     G,
     H,
     Y,
+    /// Delete or Backspace: deletes the selected nodes while the pointer is over the graph.
+    Delete,
     /// A key of the digit row, by its position rather than the character it types, so that
     /// layouts that type digits with Shift, as AZERTY does, use the same keys. Alone it views
     /// the slot, with Ctrl it marks the selected node there, with Shift it frames that node.
@@ -135,7 +212,7 @@ impl Key {
             Key::G => open_ng::Key::G,
             Key::H => open_ng::Key::H,
             Key::Y => open_ng::Key::Y,
-            Key::Slot(_) => return None,
+            Key::Delete | Key::Slot(_) => return None,
         })
     }
 }
@@ -186,33 +263,62 @@ pub enum Input {
 enum Shown {
     Nothing,
     Image {
-        request: LoadRequest,
+        wanted: Wanted,
         info: ImageInfo,
-        /// Read while there was no GPU to stage its pixels for, so the viewer draws only its
-        /// outline.
-        unstaged: bool,
     },
     /// An empty frame, never an older image.
     Failed {
-        request: LoadRequest,
+        wanted: Wanted,
         error: String,
     },
 }
 
 impl Shown {
-    fn request(&self) -> Option<&LoadRequest> {
+    /// The request whose result is shown.
+    fn wanted(&self) -> Option<&Wanted> {
         match self {
             Shown::Nothing => None,
-            Shown::Image { request, .. } | Shown::Failed { request, .. } => Some(request),
+            Shown::Image { wanted, .. } | Shown::Failed { wanted, .. } => Some(wanted),
+        }
+    }
+
+    /// The image the viewer frames: none for an empty display window, which has no size to fit.
+    fn framed(&self) -> Option<&ImageInfo> {
+        match self {
+            Shown::Image { info, .. } if !is_empty(info.display_window) => Some(info),
+            Shown::Image { .. } | Shown::Nothing | Shown::Failed { .. } => None,
         }
     }
 
     fn display_window(&self) -> Option<Window> {
-        match self {
-            Shown::Image { info, .. } => Some(info.display_window),
-            Shown::Nothing | Shown::Failed { .. } => None,
-        }
+        self.framed().map(|info| info.display_window)
     }
+}
+
+/// Waited for before the first attempt after a loss, so that the shell paints the GPU label
+/// before the attempt blocks the GUI thread (a hypothesis, untested).
+const FIRST_RETRY: Duration = Duration::from_millis(100);
+/// Waited for after a failed attempt, doubling up to the longest wait.
+const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(1);
+/// The longest wait between attempts, and how long a device must work before its loss starts
+/// again from the first wait.
+const LONGEST_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether the panes have a device to draw on.
+#[derive(Debug)]
+enum Drawing {
+    /// The panes draw on a device, or none has been needed yet.
+    Ready { recovered: Option<Recovered> },
+    /// No device: the attempt numbered `attempt` makes one after `delay`. Editing continues
+    /// unseen, since the panes are not redrawn: a fallback drawn by Qt is not worth its cost.
+    Unavailable { attempt: u64, delay: Duration },
+}
+
+/// A device made after a loss: when, and after what wait.
+#[derive(Clone, Copy, Debug)]
+struct Recovered {
+    at: Instant,
+    delay: Duration,
 }
 
 #[derive(Debug)]
@@ -220,31 +326,53 @@ pub struct App {
     session: Session,
     gpu: Gpu,
     /// Nothing is delivered once the app has dropped.
-    loader: Loader,
+    worker: Worker,
+    /// What the worker was last asked for.
+    sent: Option<Wanted>,
+    /// The session's version and the viewed node when the viewer last followed them.
+    followed: Option<(u64, Option<NodeId>)>,
+    /// How many requests the worker was sent, which numbers them.
+    requests_sent: u64,
+    drawing: Drawing,
+    /// How many attempts to make a device were requested, which numbers them.
+    attempts_requested: u64,
     /// The pane under the pointer, which receives keys whichever pane has the keyboard.
     hovered: Option<Pane>,
     /// The pointer's last position over the graph pane.
     graph_pointer: Option<PhysicalPoint>,
     shown: Shown,
-    /// The read in progress for the viewer.
-    reading: Option<LoadRequest>,
+    /// The request whose image the viewer's last presented frame showed.
+    presented: Option<u64>,
     /// The viewer's caption as last requested.
     caption: String,
+    /// The Edit menu's undo and redo labels as last requested.
+    undo_labels: [Option<&'static str>; 2],
+    /// The status bar's GPU label as last requested.
+    gpu_label: Option<String>,
 }
 
 impl App {
-    /// `deliver` receives each finished read on the loader's thread, and must hand it to the GUI
-    /// thread as an [`Event::Loaded`].
-    pub fn new(deliver: impl Fn(Loaded) + Send + 'static) -> App {
+    /// `wake` receives each [`Notice`] on the thread that raised it, which may hold wgpu's locks,
+    /// and must hand it to the GUI thread to dispatch.
+    pub fn new(wake: impl Fn(Notice) + Send + Sync + 'static) -> App {
+        let waker = Waker(Arc::new(wake));
+        let deliver = waker.clone();
         App {
             session: Session::new(),
-            gpu: Gpu::new(),
-            loader: Loader::start(deliver),
+            gpu: Gpu::new(waker),
+            worker: Worker::start(move |evaluated| deliver.wake(Notice::Evaluated(evaluated))),
+            sent: None,
+            followed: None,
+            requests_sent: 0,
+            drawing: Drawing::Ready { recovered: None },
+            attempts_requested: 0,
             hovered: None,
             graph_pointer: None,
             shown: Shown::Nothing,
-            reading: None,
+            presented: None,
             caption: String::new(),
+            undo_labels: [None, None],
+            gpu_label: None,
         }
     }
 
@@ -252,39 +380,24 @@ impl App {
         &self.session
     }
 
-    pub fn has_surface(&self, pane: Pane) -> bool {
-        self.gpu.has_surface(pane)
-    }
-
-    /// Has every frame from now on record what it proves, for the shell's lifecycle check. Each
-    /// frame then waits for the GPU. Call it before the first surface is attached, so that every
-    /// surface is made readable where it allows.
-    pub fn check_frames(&mut self) {
-        self.gpu.check_frames();
-    }
-
-    /// What the pane's frames have proved since [`App::check_frames`]; `None` before it.
-    pub fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
-        self.gpu.frame_check(pane)
+    /// Edits the session as a parameter panel will, which the shell's drag check stands in for,
+    /// then follows the change as [`App::dispatch`] does. Returns the requests, and the number of
+    /// the request whose result shows the edited session.
+    pub fn edit(&mut self, edit: impl FnOnce(&mut Session)) -> (Vec<Request>, u64) {
+        edit(&mut self.session);
+        let requests = self.after_change(vec![Request::Redraw(Pane::Graph)]);
+        (requests, self.requests_sent)
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
-        let mut requests = match event {
-            Event::Exposed(pane) if !self.gpu.has_surface(pane) => {
+        let requests = match event {
+            // Not while the pane has no surface: after a loss, only the retry makes a device.
+            Event::Exposed(pane) if !self.gpu.has_window(pane) => {
                 vec![Request::AttachSurface(pane)]
             }
             Event::Exposed(pane) | Event::Draw(pane) => self.draw(pane),
             Event::SurfaceCreated { pane, window, size } => {
-                match self.gpu.attach(pane, window, size) {
-                    Ok(device) => {
-                        if let Some(device) = device {
-                            self.loader.connect(device);
-                        }
-                    }
-                    Err(error) => return vec![Request::ShowError(error)],
-                }
-                self.resize(pane, size);
-                self.draw(pane)
+                self.surface_created(pane, window, size)
             }
             Event::SurfaceDestroyed(pane) => {
                 self.gpu.detach(pane);
@@ -310,26 +423,165 @@ impl App {
                 Vec::new()
             }
             Event::FilesChosen { intent, paths } => self.files_chosen(intent, paths),
-            Event::Loaded(loaded) => self.loaded(loaded),
+            Event::Evaluated(evaluated) => self.evaluated(evaluated),
+            Event::DeviceLost(generation) => self.device_lost(generation),
+            Event::RetryDeviceCreation(attempt) => match self.drawing {
+                Drawing::Unavailable { attempt: last, .. } if attempt == last => {
+                    let mut requests = self.make_device();
+                    for pane in Pane::ALL {
+                        if self.gpu.has_surface(pane) {
+                            requests.push(Request::Redraw(pane));
+                        }
+                    }
+                    requests
+                }
+                _ => Vec::new(),
+            },
         };
-        self.follow_viewer(&mut requests);
+        self.after_change(requests)
+    }
+
+    fn surface_created(
+        &mut self,
+        pane: Pane,
+        window: NativeWindow,
+        size: PaneSize,
+    ) -> Vec<Request> {
+        if let Err(error) = self.gpu.attach(pane, window, size) {
+            return vec![Request::ShowError(error)];
+        }
+        let mut requests = Vec::new();
+        match self.drawing {
+            Drawing::Ready { .. } if !self.gpu.has_device() => {
+                requests = self.make_device();
+            }
+            Drawing::Ready { .. } => {}
+            // The new window may be what the last attempt lacked, so the next one does not wait
+            // out the backoff.
+            Drawing::Unavailable { .. } => {
+                requests.push(self.request_attempt(FIRST_RETRY));
+            }
+        }
+        self.resize(pane, size);
+        requests.extend(self.draw(pane));
         requests
     }
 
-    fn draw(&mut self, pane: Pane) -> Vec<Request> {
-        let frame = match &self.shown {
-            Shown::Image { info, .. } => Some(ViewerFrame {
-                placement: self.session.viewer().placement(info.display_window),
-                display_window: info.display_window,
-                data_window: info.data_window,
-                scale_factor: self.session.viewer().scale_factor(),
-            }),
-            Shown::Nothing | Shown::Failed { .. } => None,
+    /// Follows whatever the event or edit changed: the viewer, then the labels the shell shows.
+    fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
+        self.follow_viewer(&mut requests);
+        // The labels go first, since performing another request may dispatch again and show
+        // newer ones.
+        let undo_labels = [self.session.undo_label(), self.session.redo_label()];
+        if undo_labels != self.undo_labels {
+            self.undo_labels = undo_labels;
+            let [undo, redo] = undo_labels;
+            requests.insert(0, Request::ShowUndoLabels { undo, redo });
+        }
+        let gpu_label = self.gpu_label();
+        if gpu_label != self.gpu_label {
+            self.gpu_label.clone_from(&gpu_label);
+            requests.insert(0, Request::ShowGpuLabel(gpu_label));
+        }
+        requests
+    }
+
+    /// Whether the panes cannot draw, and how many GPU errors there were, which the status bar
+    /// shows for as long as either holds.
+    fn gpu_label(&self) -> Option<String> {
+        let unavailable = matches!(self.drawing, Drawing::Unavailable { .. });
+        let label = match (unavailable, self.gpu.errors()) {
+            (false, 0) => return None,
+            (true, 0) => GPU_UNAVAILABLE.to_owned(),
+            (false, errors) => gpu_errors(errors),
+            (true, errors) => format!("{GPU_UNAVAILABLE}. {}", gpu_errors(errors)),
         };
-        let again = self
+        Some(label)
+    }
+
+    /// Retires the lost device, which stops the panes drawing, and requests the first attempt to
+    /// replace it. A device lost before it worked for the longest wait counts as a failed
+    /// attempt, so that a device lost again at once is not rebuilt at once forever.
+    fn device_lost(&mut self, generation: u64) -> Vec<Request> {
+        if !self.gpu.retire_lost_device(generation) {
+            return Vec::new();
+        }
+        self.worker.disconnect();
+        let delay = match self.drawing {
+            Drawing::Ready {
+                recovered: Some(recovered),
+            } if recovered.at.elapsed() < LONGEST_RETRY => after_failure(recovered.delay),
+            Drawing::Ready { .. } | Drawing::Unavailable { .. } => FIRST_RETRY,
+        };
+        vec![self.request_attempt(delay)]
+    }
+
+    /// Makes a device for every pane with a native window, which the worker then stages for. On
+    /// failure, requests the next attempt. Why the first attempt failed is shown, and why a
+    /// later one did is logged, so that retrying does not churn the status bar.
+    fn make_device(&mut self) -> Vec<Request> {
+        match self.gpu.make_device() {
+            Ok(new) => {
+                self.worker.connect(new.device, new.generation);
+                let mut requests = Vec::new();
+                if !new.pane_errors.is_empty() {
+                    requests.push(Request::ShowError(new.pane_errors.join("; ")));
+                }
+                if let Drawing::Unavailable { delay, .. } = self.drawing {
+                    let at = Instant::now();
+                    self.drawing = Drawing::Ready {
+                        recovered: Some(Recovered { at, delay }),
+                    };
+                }
+                requests
+            }
+            Err(error) => match self.drawing {
+                Drawing::Ready { .. } => vec![
+                    Request::ShowError(error),
+                    self.request_attempt(RETRY_AFTER_FAILURE),
+                ],
+                Drawing::Unavailable { delay, .. } => {
+                    eprintln!("the GPU device could not be made again: {error}");
+                    vec![self.request_attempt(after_failure(delay))]
+                }
+            },
+        }
+    }
+
+    /// Requests an attempt to make a device after the delay, replacing any requested before.
+    fn request_attempt(&mut self, delay: Duration) -> Request {
+        self.attempts_requested += 1;
+        let attempt = self.attempts_requested;
+        self.drawing = Drawing::Unavailable { attempt, delay };
+        Request::RetryDeviceCreation {
+            attempt,
+            after: delay,
+        }
+    }
+
+    fn draw(&mut self, pane: Pane) -> Vec<Request> {
+        let frame = self.shown.framed().map(|info| ViewerFrame {
+            placement: self.session.viewer().placement(info.display_window),
+            display_window: info.display_window,
+            data_window: info.data_window,
+            scale_factor: self.session.viewer().scale_factor(),
+        });
+        match self
             .gpu
-            .draw(pane, self.session.graph(), self.session.graph_view(), frame);
-        redraw_if(pane, again)
+            .draw(pane, self.session.graph(), self.session.graph_view(), frame)
+        {
+            Drawn::Presented => {
+                if pane == Pane::Viewer {
+                    self.presented = match &self.shown {
+                        Shown::Image { wanted, .. } => Some(wanted.number),
+                        Shown::Nothing | Shown::Failed { .. } => None,
+                    };
+                }
+                Vec::new()
+            }
+            Drawn::Skipped => Vec::new(),
+            Drawn::Again => vec![Request::Redraw(pane)],
+        }
     }
 
     fn resize(&mut self, pane: Pane, size: PaneSize) {
@@ -413,6 +665,7 @@ impl App {
             return self.slot_key(slot, modifiers);
         }
         match (self.hovered, key.in_graph()) {
+            (Some(Pane::Graph), _) if key == Key::Delete => self.delete_selected(),
             (Some(Pane::Graph), Some(key)) => redraw_if(
                 Pane::Graph,
                 self.session.graph_input(InputEvent::KeyPressed(key)),
@@ -420,6 +673,18 @@ impl App {
             (Some(Pane::Viewer), _) => self.viewer_key(key, modifiers),
             _ => Vec::new(),
         }
+    }
+
+    fn delete_selected(&mut self) -> Vec<Request> {
+        let selection = self.session.document().selection().to_vec();
+        if selection.is_empty() {
+            return vec![Request::ShowStatus(
+                "Select nodes to delete them".to_owned(),
+            )];
+        }
+        let deleted = self.session.delete_nodes(&selection);
+        debug_assert!(deleted.is_ok(), "selected nodes exist");
+        vec![Request::Redraw(Pane::Graph)]
     }
 
     fn viewer_key(&mut self, key: Key, modifiers: Modifiers) -> Vec<Request> {
@@ -463,6 +728,14 @@ impl App {
             Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders {
                 at: self.graph_point_at_pointer(),
             })],
+            Command::CreateExposure => {
+                let kind = NodeKind::Exposure {
+                    version: ExposureVersion::CURRENT,
+                };
+                self.session
+                    .create_node(kind, self.graph_point_at_pointer());
+                vec![Request::Redraw(Pane::Graph)]
+            }
             Command::ChangeReaderFile => match self.session.document().selection() {
                 &[id] => vec![Request::ChooseFiles(FileIntent::SetReaderPath(id))],
                 _ => vec![Request::ShowStatus(
@@ -470,7 +743,8 @@ impl App {
                 )],
             },
             Command::Reload => {
-                if self.session.reload_selected() {
+                let selection = self.session.document().selection().to_vec();
+                if self.session.reload(&selection) {
                     vec![Request::Redraw(Pane::Graph)]
                 } else {
                     vec![Request::ShowStatus("Select Readers to reload".to_owned())]
@@ -546,66 +820,70 @@ impl App {
         vec![Request::Redraw(Pane::Graph)]
     }
 
-    /// Shows a finished read if the viewer still wants it. Otherwise it is dropped, which returns
-    /// its staging buffer to the loader.
-    fn loaded(&mut self, loaded: Loaded) -> Vec<Request> {
-        let Some(read) = self.reading.take_if(|reading| *reading == loaded.request) else {
+    /// Shows a finished evaluation of the node the viewer marks, even one an edit has superseded
+    /// since, so that an edit faster than evaluation keeps the viewer updating. It is not shown if
+    /// the image shown came from a later request, and how it ended is recorded only if it is
+    /// shown or failed. A failure is shown only while its key is still wanted, so that an edit in
+    /// progress never blanks the viewer. What is not shown is dropped, which returns its staging
+    /// buffer to the worker.
+    fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
+        let Evaluated { wanted, result, .. } = evaluated;
+        // Not only later: connecting the GPU delivers the request shown again, with its pixels.
+        let not_older = (self.shown.wanted()).is_none_or(|shown| wanted.number >= shown.number);
+        if self.session.viewed() != Some(wanted.node) || !not_older {
             return Vec::new();
+        }
+        // What was sent is current: the viewer follows every change before this runs.
+        let current = (self.sent.as_ref()).is_some_and(|sent| sent.key == wanted.key);
+        let graph_changed = match &result {
+            Err(ViewerError::Eval(error)) => self.session.record_failure(error.origin()),
+            // What the GPU cannot hold is the viewer's limitation, not the node's failure.
+            Ok(_) | Err(ViewerError::CannotShow(_)) => self.session.record_success(&wanted.key),
         };
-        let Loaded { request, result } = loaded;
-        let failed = result.is_err();
+        if result.is_err() && !current {
+            return redraw_if(Pane::Graph, graph_changed);
+        }
         self.shown = match result {
-            Ok(decoded) => {
-                let unstaged = decoded.pixels.is_none() && !is_empty(&decoded.info);
-                match decoded.pixels {
+            Ok(image) => {
+                match image.pixels {
                     Some(staged) => self.gpu.show_image(staged),
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
-                    request,
-                    info: decoded.info,
-                    unstaged,
+                    wanted,
+                    info: image.info,
                 }
             }
             Err(error) => {
                 self.gpu.clear_image();
                 Shown::Failed {
-                    request,
+                    wanted,
                     error: error.to_string(),
                 }
             }
         };
         let mut requests = vec![Request::Redraw(Pane::Viewer)];
-        if self.session.record_read(read, failed) {
+        if graph_changed {
             requests.push(Request::Redraw(Pane::Graph));
         }
         requests
     }
 
-    /// Keeps the viewer on what its slot leads to: reads it unless it is shown or being read,
-    /// shows nothing if the slot leads nowhere, and describes the result.
+    /// The node the viewer's slot marks, and its key.
+    fn wanted(&self) -> Option<(NodeId, ResultKey)> {
+        let node = self.session.viewed()?;
+        let key = result_key(self.session.document(), self.session.reloads(), node)?;
+        Some((node, key))
+    }
+
+    /// Keeps the viewer on what its slot marks: asks the worker for it, shows nothing if the slot
+    /// marks nothing, and describes the result.
     fn follow_viewer(&mut self, requests: &mut Vec<Request>) {
-        let wanted = match self.session.viewed() {
-            Viewed::Node(request) => Some(request),
-            Viewed::Unmarked | Viewed::Missing(_) => None,
-        };
-        if wanted.is_none() && !matches!(self.shown, Shown::Nothing) {
-            self.shown = Shown::Nothing;
-            self.gpu.clear_image();
-            requests.push(Request::Redraw(Pane::Viewer));
-        }
-        // An image read without a GPU is read again once there is one, including a read that
-        // finished just before the GPU arrived.
-        let shown = match &self.shown {
-            Shown::Image { unstaged: true, .. } if self.gpu.has_device() => None,
-            shown => shown.request(),
-        };
-        let read = wanted.filter(|wanted| Some(wanted) != shown);
-        if read != self.reading {
-            if let Some(request) = &read {
-                self.loader.request(request.clone());
-            }
-            self.reading = read;
+        // Building a key walks the viewed node's whole upstream, so not on every pointer move.
+        let followed = Some((self.session.version(), self.session.viewed()));
+        if followed != self.followed {
+            self.followed = followed;
+            self.send_wanted(requests);
         }
         let caption = self.caption();
         if caption != self.caption {
@@ -614,58 +892,123 @@ impl App {
         }
     }
 
-    fn caption(&self) -> String {
-        let slot = self.session.viewer().slot().digit();
-        let request = match self.session.viewed() {
-            // The next step, for an artist who has not found the menus yet.
-            Viewed::Unmarked if self.session.document().nodes().next().is_none() => {
-                return format!(
-                    "Slot {slot}: nothing marked. Read files with R, then mark one with Ctrl+{slot}"
-                );
-            }
-            Viewed::Unmarked => {
-                return format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node");
-            }
-            Viewed::Missing(_) => {
-                return format!("Slot {slot}: the node it marked no longer exists");
-            }
-            Viewed::Node(request) => request,
-        };
-        let name = file_name(&request.path);
-        if self.reading.as_ref() == Some(&request) {
-            return match &self.shown {
-                Shown::Image { request: shown, .. } if shown.node != request.node => format!(
-                    "Slot {slot} · {name} · reading… (showing {} until then)",
-                    file_name(&shown.path)
-                ),
-                _ => format!("Slot {slot} · {name} · reading…"),
-            };
+    fn send_wanted(&mut self, requests: &mut Vec<Request>) {
+        let wanted = self.wanted();
+        if wanted.is_none() && !matches!(self.shown, Shown::Nothing) {
+            self.shown = Shown::Nothing;
+            self.gpu.clear_image();
+            requests.push(Request::Redraw(Pane::Viewer));
         }
-        match &self.shown {
-            Shown::Image {
-                request: shown,
-                info,
-                ..
-            } if *shown == request => {
-                let window = info.display_window;
-                let mut caption = format!(
-                    "Slot {slot} · {name} · {} × {}",
-                    window.width, window.height
-                );
-                for warning in &info.warnings {
-                    caption.push_str("; ");
-                    caption.push_str(&warning.to_string());
-                }
-                caption
-            }
-            Shown::Failed {
-                request: shown,
-                error,
-            } if *shown == request => format!("Slot {slot} · {name} · {error}"),
-            // Nothing is being read once loading stops.
-            _ => format!("Slot {slot} · {name}"),
+        // Compared with what was sent, not with what is shown: a key already shown is sent again
+        // so that the worker releases what the last request retained, and stops working on it.
+        // Nothing is sent too, which releases everything.
+        let sent = (self.sent.as_ref()).map(|sent| (sent.node, &sent.key));
+        if wanted.as_ref().map(|(node, key)| (*node, key)) != sent {
+            self.requests_sent += 1;
+            let number = self.requests_sent;
+            let wanted = wanted.map(|(node, key)| Wanted { node, key, number });
+            self.worker.request(wanted.clone());
+            self.sent = wanted;
         }
     }
+
+    /// Names the viewed node from the document as it stands, then says what is shown of it and
+    /// what upstream of it is not connected. Called once the wanted key has been sent.
+    fn caption(&self) -> String {
+        let slot = self.session.viewer().slot().digit();
+        let document = self.session.document();
+        let Some(viewed) = self.session.viewed() else {
+            // The next step, for an artist who has not found the menus yet.
+            return if document.nodes().next().is_none() {
+                format!(
+                    "Slot {slot}: nothing marked. Read files with R, then mark one with Ctrl+{slot}"
+                )
+            } else {
+                format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node")
+            };
+        };
+        let node = document.node(viewed).expect("marks name existing nodes");
+        let current = match (&self.sent, self.shown.wanted()) {
+            (Some(sent), Some(shown)) => shown.key == sent.key,
+            _ => false,
+        };
+        let mut details = Vec::new();
+        match &self.shown {
+            Shown::Image { info, .. } if current => {
+                let window = info.display_window;
+                if !is_empty(window) {
+                    details.push(format!("{} × {}", window.width, window.height));
+                }
+                details.extend(info.warnings.iter().map(ToString::to_string));
+            }
+            Shown::Failed { error, .. } if current => details.push(error.clone()),
+            // The previous image stays until then.
+            _ => details.push("updating…".to_owned()),
+        }
+        for (id, input) in unconnected_inputs(document, viewed) {
+            details.push(if id == viewed {
+                format!("{} is not connected", input.label)
+            } else {
+                let upstream = document.node(id).expect("inputs name existing nodes");
+                format!("{} of {} is not connected", input.label, upstream.name())
+            });
+        }
+        if details.is_empty() {
+            details.push("empty".to_owned());
+        }
+        format!("Slot {slot} · {} · {}", node.name(), details.join("; "))
+    }
+}
+
+/// What the shell's checks read and do, which the app itself has no use for.
+#[doc(hidden)]
+impl App {
+    pub fn has_surface(&self, pane: Pane) -> bool {
+        self.gpu.has_surface(pane)
+    }
+
+    /// Has every frame from now on record what it proves, for the lifecycle check. Each frame
+    /// then waits for the GPU. Call it before the first surface is attached, so that every
+    /// surface is made readable where it allows.
+    pub fn check_frames(&mut self) {
+        self.gpu.check_frames();
+    }
+
+    /// What the pane's frames have proved since [`App::check_frames`]; `None` before it.
+    pub fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
+        self.gpu.frame_check(pane)
+    }
+
+    /// How many GPU errors this session went uncaptured. Each is a bug, logged on standard error
+    /// up to a limit, after which drawing continues.
+    pub fn gpu_errors(&self) -> u64 {
+        self.gpu.errors()
+    }
+
+    /// Destroys the GPU device for the lifecycle check. Its loss then arrives as a driver's
+    /// would, as [`Notice::DeviceLost`].
+    pub fn destroy_device(&mut self) {
+        self.gpu.destroy_device();
+    }
+
+    /// The number of the request whose image the viewer's last presented frame showed, for the
+    /// drag check.
+    pub fn presented_request(&self) -> Option<u64> {
+        self.presented
+    }
+}
+
+const GPU_UNAVAILABLE: &str = "GPU unavailable: the panes draw again once it recovers";
+
+/// Names the session's GPU errors, which are bugs, for the status bar.
+fn gpu_errors(errors: u64) -> String {
+    let noun = if errors == 1 { "error" } else { "errors" };
+    format!("{errors} GPU {noun}, logged on standard error")
+}
+
+/// The wait after a failed attempt that waited `delay`.
+fn after_failure(delay: Duration) -> Duration {
+    (delay * 2).clamp(RETRY_AFTER_FAILURE, LONGEST_RETRY)
 }
 
 fn redraw_if(pane: Pane, needed: bool) -> Vec<Request> {
@@ -676,11 +1019,8 @@ fn redraw_if(pane: Pane, needed: bool) -> Vec<Request> {
     }
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
+fn is_empty(window: Window) -> bool {
+    window.width == 0 || window.height == 0
 }
 
 #[cfg(test)]

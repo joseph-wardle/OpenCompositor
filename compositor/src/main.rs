@@ -1,21 +1,25 @@
 //! OpenCompositor's Qt shell. Qt owns the windows, docks, dialogs and event loop; the core's
 //! [`App`] owns everything else. Everything here runs on Qt's GUI thread.
 
+mod drag;
 mod keys;
 mod lifecycle;
 mod pace;
 mod pane;
 mod qt;
 
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{OnceCell, RefCell};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Instant;
 
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
-use opencompositor_core::{App, Command, Event, FileIntent, FrameCheck, Pane, Request, Slot};
+use opencompositor_core::{
+    App, Command, Event, FileIntent, FrameCheck, Notice, Pane, Request, Session, Slot,
+};
 
 use crate::qt::ffi;
 
@@ -33,12 +37,7 @@ thread_local! {
     /// Each pane's connection to Qt Wayland's `surfaceRoleDestroyed`.
     static SURFACE_WATCHES: RefCell<[Option<QMetaObjectConnectionGuard>; Pane::COUNT]> =
         RefCell::new(Default::default());
-    /// What the Undo and Redo items name, once set.
-    static UNDO_LABELS: Cell<Option<UndoLabels>> = const { Cell::new(None) };
 }
-
-/// What undo and then redo would undo and redo, if anything.
-type UndoLabels = [Option<&'static str>; 2];
 
 /// The Qt objects the shell acts on. Docks are hidden when closed, not deleted, so all of them
 /// live until the main window is destroyed after the event loop.
@@ -49,16 +48,25 @@ pub struct Widgets {
     pub panes: [*mut qt::Pane; Pane::COUNT],
     /// Under the viewer.
     pub caption: *mut ffi::QLabel,
+    /// At the status bar's right, while the GPU is unavailable or has reported errors.
+    pub gpu_label: *mut ffi::QLabel,
     pub undo: *mut ffi::QAction,
     pub redo: *mut ffi::QAction,
 }
 
+/// A scripted check of the shell, from the command line.
+enum Check {
+    Lifecycle(PathBuf),
+    Drag(PathBuf),
+}
+
 fn main() {
-    let lifecycle_check = match &std::env::args_os().skip(1).collect::<Vec<_>>()[..] {
+    let check = match &std::env::args_os().skip(1).collect::<Vec<_>>()[..] {
         [] => None,
-        [flag, image] if flag == "--lifecycle-check" => Some(PathBuf::from(image)),
+        [flag, image] if flag == "--lifecycle-check" => Some(Check::Lifecycle(image.into())),
+        [flag, image] if flag == "--drag-check" => Some(Check::Drag(image.into())),
         _ => {
-            eprintln!("usage: opencompositor [--lifecycle-check IMAGE]");
+            eprintln!("usage: opencompositor [--lifecycle-check IMAGE | --drag-check IMAGE]");
             std::process::exit(2);
         }
     };
@@ -76,12 +84,11 @@ fn main() {
     let waker = ffi::new_waker();
     // SAFETY: the waker is live. Its thread handle outlives it: queueing fails once it is deleted.
     let waker_thread = unsafe { &*waker }.qt_thread();
-    let mut app = App::new(move |loaded| {
-        waker_thread
-            .queue(move |_| dispatch(Event::Loaded(loaded)))
-            .expect("the waker outlives the app, whose loader delivers nothing once dropped");
+    let mut app = App::new(move |notice| {
+        // Fails only once the waker is deleted at exit, when nothing is left to tell.
+        let _ = waker_thread.queue(move |_| receive(notice));
     });
-    if lifecycle_check.is_some() {
+    if matches!(check, Some(Check::Lifecycle(_))) {
         app.check_frames();
     }
     APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -94,8 +101,9 @@ fn main() {
     window.pin_mut().resize(1400, 900);
     let window_ptr = window.as_mut_ptr();
     // SAFETY: the window is live; it owns the menus.
-    let [file_menu, edit_menu, viewer_menu, window_menu] = ["&File", "&Edit", "&Viewer", "&Window"]
-        .map(|title| unsafe { ffi::new_menu(window_ptr, &QString::from(title)) });
+    let [file_menu, edit_menu, node_menu, viewer_menu, window_menu] =
+        ["&File", "&Edit", "&Node", "&Viewer", "&Window"]
+            .map(|title| unsafe { ffi::new_menu(window_ptr, &QString::from(title)) });
     let mut commands = Vec::new();
     let mut add = |menu, text: &str, shortcut: &str, command| {
         let [text, shortcut] = [text, shortcut].map(QString::from);
@@ -120,6 +128,7 @@ fn main() {
     );
     let undo = add(edit_menu, "&Undo", "Ctrl+Z", Command::Undo);
     let redo = add(edit_menu, "&Redo", "Ctrl+Shift+Z", Command::Redo);
+    add(node_menu, "&Exposure", "E", Command::CreateExposure);
     // The key filter takes the digit row by position and H for the pane under the pointer, so
     // these items only name their keys, after a tab, rather than binding shortcuts.
     let slot_menus = [
@@ -171,12 +180,15 @@ fn main() {
         ffi::container(panes[Pane::Graph.index()], graph_dock);
         ffi::container_with_caption(panes[Pane::Viewer.index()], viewer_dock)
     };
+    // SAFETY: the window is live; it owns the label.
+    let gpu_label = unsafe { ffi::new_permanent_status(window_ptr) };
     WIDGETS.with(|cell| {
         cell.set(Widgets {
             window: window_ptr,
             docks,
             panes,
             caption,
+            gpu_label,
             undo,
             redo,
         })
@@ -185,13 +197,15 @@ fn main() {
     show_undo_labels([None, None]);
     keys::start();
     window.pin_mut().show();
-    if let Some(image) = lifecycle_check {
-        lifecycle::start(image);
+    match check {
+        Some(Check::Lifecycle(image)) => lifecycle::start(image),
+        Some(Check::Drag(image)) => drag::start(image),
+        None => {}
     }
     let status = ffi::exec();
 
     // The app goes before the window: its surfaces before the panes' native windows, and its
-    // requests with it, so that the events destroying the window dispatch to nothing. Its loader
+    // requests with it, so that the events destroying the window dispatch to nothing. Its worker
     // delivers nothing after it.
     drop(APP.with(|cell| cell.borrow_mut().take()));
     // SAFETY: nothing else deletes the waker. Results queued to it are dropped without running.
@@ -202,28 +216,36 @@ fn main() {
 
 /// Hands an event to the app, then does what it asks.
 pub fn dispatch(event: Event) {
-    let handled = APP.with(|cell| {
-        let mut app = cell.borrow_mut();
-        let app = app.as_mut()?;
-        let requests = app.dispatch(event);
-        let session = app.session();
-        Some((requests, [session.undo_label(), session.redo_label()]))
-    });
-    let Some((requests, labels)) = handled else {
+    let draws_viewer = matches!(event, Event::Draw(Pane::Viewer));
+    let Some(requests) = APP.with(|cell| cell.borrow_mut().as_mut().map(|app| app.dispatch(event)))
+    else {
         return;
     };
-    // Before the requests, which may dispatch again and show newer labels.
-    show_undo_labels(labels);
+    if draws_viewer {
+        drag::viewer_frame_drawn();
+    }
     for request in requests {
         perform(request);
     }
 }
 
-/// Names in the Edit menu what undo and redo would do, and disables either when there is nothing.
-fn show_undo_labels(labels: UndoLabels) {
-    if UNDO_LABELS.replace(Some(labels)) == Some(labels) {
-        return;
+/// Edits the session for the drag check, then does what the app asks. Returns the number of the
+/// request whose result shows the edited session.
+pub fn edit(edit: impl FnOnce(&mut Session)) -> u64 {
+    let (requests, request) = APP.with(|cell| {
+        let mut app = cell.borrow_mut();
+        app.as_mut()
+            .expect("the drag check edits while the app runs")
+            .edit(edit)
+    });
+    for request in requests {
+        perform(request);
     }
+    request
+}
+
+/// Names in the Edit menu what undo and redo would do, and disables either when there is nothing.
+fn show_undo_labels(labels: [Option<&str>; 2]) {
     let widgets = widgets();
     for ((action, verb), label) in [(widgets.undo, "&Undo"), (widgets.redo, "&Redo")]
         .into_iter()
@@ -281,7 +303,43 @@ pub fn perform(request: Request) {
         Request::ShowViewerCaption(text) => unsafe {
             ffi::set_caption(widgets.caption, &QString::from(&text))
         },
+        Request::ShowUndoLabels { undo, redo } => show_undo_labels([undo, redo]),
+        // SAFETY: the window owns the label, and lives as long as it.
+        Request::ShowGpuLabel(text) => unsafe {
+            let text = QString::from(text.as_deref().unwrap_or_default());
+            ffi::set_permanent_status(widgets.gpu_label, &text)
+        },
+        Request::RetryDeviceCreation { attempt, after } => {
+            let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
+            ffi::single_shot(milliseconds, retry_device_creation, attempt as usize);
+        }
     }
+}
+
+/// Dispatches a notice from another thread. Retiring a lost device blocks the GUI thread, so
+/// the lifecycle check reports how long; the drag check records each result's arrival.
+fn receive(notice: Notice) {
+    let lost = matches!(notice, Notice::DeviceLost(_));
+    let evaluated = match &notice {
+        Notice::Evaluated(evaluated) => Some((evaluated.request(), evaluated.timing)),
+        Notice::DeviceLost(_) => None,
+    };
+    let started = Instant::now();
+    dispatch(Event::from(notice));
+    if lost {
+        lifecycle::retirement_took(started.elapsed());
+    }
+    if let Some((request, timing)) = evaluated {
+        drag::delivered(request, timing, started);
+    }
+}
+
+/// Every attempt is dispatched; the app ignores all but the last. One whose timer fires after
+/// the app has dropped dispatches to nothing.
+fn retry_device_creation(attempt: usize) {
+    let started = Instant::now();
+    dispatch(Event::RetryDeviceCreation(attempt as u64));
+    lifecycle::attempt_took(started.elapsed());
 }
 
 fn path(name: &QString) -> PathBuf {
@@ -303,6 +361,25 @@ pub fn frame_check(pane: Pane) -> Option<FrameCheck> {
     APP.with(|cell| cell.borrow().as_ref()?.frame_check(pane))
 }
 
+/// Destroys the GPU device, in the lifecycle check.
+pub fn destroy_device() {
+    APP.with(|cell| {
+        if let Some(app) = cell.borrow_mut().as_mut() {
+            app.destroy_device();
+        }
+    });
+}
+
+/// How many GPU errors this session went uncaptured.
+pub fn gpu_errors() -> u64 {
+    APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))
+}
+
+/// The number of the request whose image the viewer last presented, in the drag check.
+pub fn presented_request() -> Option<u64> {
+    APP.with(|cell| cell.borrow().as_ref()?.presented_request())
+}
+
 pub fn widgets() -> Widgets {
     WIDGETS.with(|cell| *cell.get().expect("widgets are made before the event loop"))
 }
@@ -315,6 +392,8 @@ fn with_pane_window<R>(pane: Pane, use_window: impl FnOnce(Pin<&mut qt::Pane>) -
     // reference may overlap the one Qt passes to the pane's `event` further up the stack, since
     // requests are performed while dispatching its events, but `Pane` is a zero-sized opaque type:
     // neither covers memory that Rust reads or writes, and Qt reaches the window only from C++.
+    // Rust reads the pane's own state with `rust()` alone; a `rust_mut()` held across a dispatch
+    // would put a real `&mut PaneRust` under one held further up.
     use_window(unsafe { Pin::new_unchecked(&mut *window) })
 }
 

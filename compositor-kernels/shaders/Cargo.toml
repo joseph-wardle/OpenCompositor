@@ -1,0 +1,14 @@
+[package]
+name = "shaders"
+version = "0.0.0"
+description = "Compiles the kernel crate's GPU entry points to SPIR-V and writes the committed module."
+edition = "2024"
+publish = false
+
+[dependencies]
+# Pinned exactly: it builds the codegen backend for the nightly in rust-toolchain.toml, and
+# the kernel crate pins the matching spirv-std.
+spirv-builder = "=0.11.0"
+
+# Its own workspace, so the nightly-only backend never enters the stable workspace build.
+[workspace]
