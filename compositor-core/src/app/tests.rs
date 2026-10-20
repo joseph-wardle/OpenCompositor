@@ -924,7 +924,7 @@ fn a_type_chosen_without_a_current_node_goes_where_the_pointer_was() {
 }
 
 #[test]
-fn a_reader_chosen_in_the_menu_asks_for_its_files_and_goes_beside_the_current_node() {
+fn a_reader_chosen_in_the_menu_asks_for_its_files_and_goes_below_the_current_node() {
     let (mut app, _deliveries) = app();
     let exposure = create_exposure(&mut app);
     let requests = choose_in_menu(&mut app, "reader");
@@ -956,8 +956,8 @@ fn a_reader_chosen_in_the_menu_asks_for_its_files_and_goes_beside_the_current_no
         panic!("both Readers selected")
     };
     let outline = app.session().graph().node_rect(exposure.into()).unwrap();
-    assert!(document.node(first).unwrap().position.x > outline.max.x);
-    assert_eq!(document.node(first).unwrap().position.y, outline.min.y);
+    assert_eq!(document.node(first).unwrap().position.x, outline.min.x);
+    assert!(document.node(first).unwrap().position.y > outline.max.y);
     assert_eq!(app.session().undo_label(), Some("Create Reader"));
     app.dispatch(Event::Command(Command::Undo));
     assert_eq!(app.session().document().nodes().count(), 1);

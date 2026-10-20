@@ -179,7 +179,7 @@ pub enum Request {
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// A Reader for each file chosen, placed where the pointer is over the graph, or beside the
+    /// A Reader for each file chosen, placed where the pointer is over the graph, or below the
     /// current node.
     ReadFiles,
     /// A new file for the one selected Reader.
@@ -262,7 +262,7 @@ impl FileIntent {
 pub struct Anchor {
     /// The pointer over the graph, or the middle of the graph view if it was elsewhere.
     pub at: Point,
-    /// The node a new node is inserted after or placed beside: the last selected.
+    /// The node a new node is inserted after or placed below: the last selected.
     pub current: Option<NodeId>,
 }
 

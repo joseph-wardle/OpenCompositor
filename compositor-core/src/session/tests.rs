@@ -373,8 +373,8 @@ fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
     assert_eq!(
         inserted.position,
         Point {
-            x: outline.min.x,
-            y: outline.max.y + PLACEMENT_GAP,
+            x: outline.max.x + PLACEMENT_GAP,
+            y: outline.min.y,
         }
     );
     assert_eq!(inserted.input("source"), Some(reader));
@@ -393,7 +393,7 @@ fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
 }
 
 #[test]
-fn a_node_without_inputs_is_created_beside_the_current_node_unconnected() {
+fn a_node_without_inputs_is_created_below_the_current_node_unconnected() {
     let mut session = Session::new();
     let reader = create(&mut session, "a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, Point { x: 0.0, y: 100.0 });
@@ -410,8 +410,8 @@ fn a_node_without_inputs_is_created_beside_the_current_node_unconnected() {
     assert_eq!(
         session.document().node(id).unwrap().position,
         Point {
-            x: outline.max.x + PLACEMENT_GAP,
-            y: outline.min.y,
+            x: outline.min.x,
+            y: outline.max.y + PLACEMENT_GAP,
         }
     );
     assert_eq!(file(&session, id), None);
@@ -423,7 +423,7 @@ fn a_node_without_inputs_is_created_beside_the_current_node_unconnected() {
 }
 
 #[test]
-fn readers_stack_beside_the_current_node_or_at_the_point_once_it_is_gone() {
+fn readers_stack_below_the_current_node_or_at_the_point_once_it_is_gone() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     let outline = session.graph().node_rect(exposure.into()).unwrap();
@@ -431,9 +431,9 @@ fn readers_stack_beside_the_current_node_or_at_the_point_once_it_is_gone() {
 
     let changes = session.create_readers(paths(&["a.exr", "b.exr"]), at, Some(exposure));
 
-    let beside = Point {
-        x: outline.max.x + PLACEMENT_GAP,
-        y: outline.min.y,
+    let below = Point {
+        x: outline.min.x,
+        y: outline.max.y + PLACEMENT_GAP,
     };
     let positions = changes
         .nodes
@@ -442,10 +442,10 @@ fn readers_stack_beside_the_current_node_or_at_the_point_once_it_is_gone() {
     assert_eq!(
         positions.collect::<Vec<_>>(),
         [
-            beside,
+            below,
             Point {
-                y: beside.y + READER_SPACING,
-                ..beside
+                y: below.y + READER_SPACING,
+                ..below
             }
         ]
     );

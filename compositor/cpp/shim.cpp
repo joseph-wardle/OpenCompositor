@@ -403,11 +403,14 @@ CreationMenu::CreationMenu(rust::Fn<void(size_t)> chosen, QWidget *parent)
     list = new QListWidget;
     list->setFocusPolicy(Qt::NoFocus);
     list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    // The row under the pointer is current, as in a menu, so Enter chooses what is highlighted.
+    list->setMouseTracking(true);
     layout->addWidget(field);
     layout->addWidget(list);
     connect(field, &QLineEdit::textChanged, this, &CreationMenu::filter);
     connect(field, &QLineEdit::returnPressed, this, [this] { choose(list->currentItem()); });
     connect(list, &QListWidget::itemClicked, this, &CreationMenu::choose);
+    connect(list, &QListWidget::itemEntered, this, [this](QListWidgetItem *item) { list->setCurrentItem(item); });
 }
 
 void CreationMenu::open(const QStringList &labels) {

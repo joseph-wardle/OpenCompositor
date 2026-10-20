@@ -19,7 +19,7 @@ use crate::viewer::Viewer;
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
 const READER_SPACING: f32 = 70.0;
 
-/// Between a node and one created after it, below or beside it.
+/// Between a node and one created after or below it.
 const PLACEMENT_GAP: f32 = 40.0;
 
 /// One undo or redo step: the whole document from before it. Unlike an inverse record, a
@@ -276,7 +276,7 @@ impl Session {
     /// Creates a Reader for each path, stacked downwards, and selects them all. A Reader of an
     /// empty path has no file.
     ///
-    /// The stack starts beside the current node, as [`create_node`](Session::create_node) places
+    /// The stack starts below the current node, as [`create_node`](Session::create_node) places
     /// a type without inputs, or at `at` without one, or if it no longer exists.
     pub fn create_readers(
         &mut self,
@@ -285,7 +285,7 @@ impl Session {
         current: Option<NodeId>,
     ) -> Changes {
         let at = current
-            .and_then(|current| self.beside(current))
+            .and_then(|current| self.below(current))
             .unwrap_or(at);
         let mut document = self.document.clone();
         let mut created = Vec::with_capacity(paths.len());
@@ -316,8 +316,9 @@ impl Session {
     /// selects it alone.
     ///
     /// Without a current node, the node goes at `at`, unconnected. With one, it is inserted after
-    /// it, as Nuke's Tab menu inserts: placed below it, taking it on its first input and taking
-    /// over every input that took it. A type without inputs goes beside it instead, unconnected.
+    /// it, as Nuke's Tab menu inserts: placed after it in the graph's left-to-right flow, taking it
+    /// on its first input and taking over every input that took it. A type without inputs goes
+    /// below it instead, unconnected, as a second stream beside the first.
     /// Marks stay where they are.
     pub fn create_node(
         &mut self,
@@ -337,12 +338,8 @@ impl Session {
                 return Err(EditError::MissingNode(current));
             }
             if let Some(input) = node_type.kind.inputs().first() {
-                let outline = (self.graph.node_rect(current.into()))
-                    .expect("the graph presents every node the document has");
-                position = Point {
-                    x: outline.min.x,
-                    y: outline.max.y + PLACEMENT_GAP,
-                };
+                position =
+                    (self.after(current)).expect("the graph presents every node the document has");
                 for (consumer, node) in self.document.nodes() {
                     for (input, source) in node.inputs() {
                         if source == current {
@@ -361,7 +358,7 @@ impl Session {
                 });
             } else {
                 position =
-                    (self.beside(current)).expect("the graph presents every node the document has");
+                    (self.below(current)).expect("the graph presents every node the document has");
             }
         }
         let mut document = self.document.clone();
@@ -374,12 +371,23 @@ impl Session {
         Ok(self.commit(node_type.step, document))
     }
 
-    /// Where a node goes beside another, unconnected: `None` if that one does not exist.
-    fn beside(&self, node: NodeId) -> Option<Point> {
+    /// Where a node taking another on its input goes: to its right, as the graph reads left to
+    /// right. `None` if that one does not exist.
+    fn after(&self, node: NodeId) -> Option<Point> {
         let outline = self.graph.node_rect(node.into())?;
         Some(Point {
             x: outline.max.x + PLACEMENT_GAP,
             y: outline.min.y,
+        })
+    }
+
+    /// Where an unconnected node goes beside another: below it. `None` if that one does not
+    /// exist.
+    fn below(&self, node: NodeId) -> Option<Point> {
+        let outline = self.graph.node_rect(node.into())?;
+        Some(Point {
+            x: outline.min.x,
+            y: outline.max.y + PLACEMENT_GAP,
         })
     }
 
