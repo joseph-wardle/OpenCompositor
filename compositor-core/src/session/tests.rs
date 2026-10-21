@@ -1303,7 +1303,13 @@ fn a_wire_dragged_to_a_free_slot_connects_that_slot() {
     assert_eq!(
         judge(session.document(), &edit(0)),
         Verdict::Refuse {
-            reason: Some(ConnectionError::UnknownSlot.to_string())
+            reason: Some(
+                ConnectionError::UnknownSlot {
+                    input: "layer",
+                    slot: 0,
+                }
+                .to_string()
+            )
         }
     );
 }

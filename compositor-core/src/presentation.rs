@@ -231,7 +231,8 @@ pub(crate) fn assignments(
         let node = document
             .node(consumer)
             .ok_or(ConnectionError::MissingNode(consumer))?;
-        let input = input_at(&node.kind, pin.pin).ok_or(ConnectionError::UnknownInput)?;
+        let input = input_at(&node.kind, pin.pin)
+            .ok_or_else(|| ConnectionError::UnknownInput(format!("pin {}", pin.pin.0)))?;
         Ok((consumer, input))
     };
     let mut sources = BTreeMap::new();

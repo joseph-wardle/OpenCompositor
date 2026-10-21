@@ -86,7 +86,7 @@ fn refused_edits_name_their_reason() {
                 input: "mask".into(),
                 source: Some(NodeId(0)),
             }],
-            ConnectionError::UnknownInput,
+            ConnectionError::UnknownInput("mask".to_owned()),
         ),
         (
             vec![Assignment {
@@ -94,7 +94,7 @@ fn refused_edits_name_their_reason() {
                 input: "source".into(),
                 source: Some(NodeId(1)),
             }],
-            ConnectionError::UnknownInput,
+            ConnectionError::UnknownInput("source".to_owned()),
         ),
         (vec![connect(1, 1)], ConnectionError::SelfConnection),
         (vec![connect(3, 1)], ConnectionError::Cycle),
@@ -240,12 +240,13 @@ fn a_repeating_input_takes_a_wire_per_slot_and_each_slot_stays_where_it_is() {
 #[test]
 fn an_input_has_only_the_slots_its_kind_declares() {
     let document = document_with_merge();
+    let unknown_slot = |input, slot| ConnectionError::UnknownSlot { input, slot };
     let refusals = [
-        ("background", 1, ConnectionError::UnknownSlot),
-        ("layer", 0, ConnectionError::UnknownSlot),
-        ("layer", MAX_SLOTS + 1, ConnectionError::UnknownSlot),
-        ("mask", 1, ConnectionError::UnknownInput),
-        ("mask", 0, ConnectionError::UnknownInput),
+        ("background", 1, unknown_slot("background", 1)),
+        ("layer", 0, unknown_slot("layer", 0)),
+        ("layer", MAX_SLOTS + 1, unknown_slot("layer", MAX_SLOTS + 1)),
+        ("mask", 1, ConnectionError::UnknownInput("mask".to_owned())),
+        ("mask", 0, ConnectionError::UnknownInput("mask".to_owned())),
     ];
     for (input, slot, reason) in refusals {
         let assignment = Assignment {

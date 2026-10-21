@@ -617,14 +617,17 @@ impl Document {
 fn declared(kind: &NodeKind, slot: InputSlot<'_>) -> Result<InputSlot<'static>, ConnectionError> {
     let input = (kind.inputs().iter())
         .find(|input| input.name == slot.input)
-        .ok_or(ConnectionError::UnknownInput)?;
+        .ok_or_else(|| ConnectionError::UnknownInput(slot.input.to_owned()))?;
     let has_slot = if input.repeating {
         (1..=MAX_SLOTS).contains(&slot.slot)
     } else {
         slot.slot == 0
     };
     if !has_slot {
-        return Err(ConnectionError::UnknownSlot);
+        return Err(ConnectionError::UnknownSlot {
+            input: input.name,
+            slot: slot.slot,
+        });
     }
     Ok(InputSlot {
         input: input.name,
@@ -646,11 +649,14 @@ pub struct Assignment<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionError {
     MissingNode(NodeId),
-    /// The node's type has no input of that name.
-    UnknownInput,
+    /// The node's type has no input of that name, or no input at that pin.
+    UnknownInput(String),
     /// The input has no such slot: one that does not repeat has only slot 0, a repeating one
     /// slots 1 to [`MAX_SLOTS`].
-    UnknownSlot,
+    UnknownSlot {
+        input: &'static str,
+        slot: u32,
+    },
     SelfConnection,
     /// One edit gave an input two sources.
     InputAssignedTwice,
@@ -661,8 +667,10 @@ impl fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConnectionError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
-            ConnectionError::UnknownInput => write!(f, "no such input"),
-            ConnectionError::UnknownSlot => write!(f, "no such slot of the input"),
+            ConnectionError::UnknownInput(input) => write!(f, "no such input: {input}"),
+            ConnectionError::UnknownSlot { input, slot } => {
+                write!(f, "the input {input} has no slot {slot}")
+            }
             ConnectionError::SelfConnection => write!(f, "a node cannot take its own image"),
             ConnectionError::InputAssignedTwice => write!(f, "an input takes one wire"),
             ConnectionError::Cycle => write!(f, "the connection would make a cycle"),
