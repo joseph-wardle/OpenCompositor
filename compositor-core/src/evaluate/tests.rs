@@ -675,6 +675,15 @@ fn merge_composes_offset_layers_over_the_base_within_their_union() {
     assert_eq!(values(&half, 1, 1), [1.0, 0.625, 0.1875, 1.0]);
     assert_eq!(values(&half, 2, 2), [0.25, 0.25, 0.0, 0.25]);
     assert_eq!(values(&half, 2, 0), [0.0; 4]);
+
+    // One file by two branches warns once.
+    let diamond = evaluator
+        .compute(&merge_key(1.0), &[&layer, &base, &layer], &mut Vec::new())
+        .unwrap();
+    assert_eq!(
+        diamond.warnings(),
+        [Warning::PixelAspect(2.0), Warning::IccProfile]
+    );
 }
 
 #[test]

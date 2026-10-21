@@ -132,8 +132,8 @@ fn over_samples(layer: [&[f32]; 4], dst: [&mut [f32]; 4]) {
         .all(|&n| n == len),
         "over's planes differ in length"
     );
-    // Alpha composes as the colours do, from the layer's own alpha; it is written last, since
-    // the colours read it.
+    // Alpha composes as the colours do: the layer's alpha is the sample composed and the
+    // coverage both.
     for (d, (&l, &a)) in dr.iter_mut().zip(lr.iter().zip(la)) {
         *d = kernels::over(*d, l, a);
     }

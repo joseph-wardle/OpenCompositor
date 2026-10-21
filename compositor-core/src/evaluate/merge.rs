@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::evaluate::{EvalError, NODE_BYTES_CAP, Pool, ResultKey, output_plane};
-use crate::image::{Image, Window};
+use crate::image::{Image, Warning, Window};
 use crate::kernels::cpu::{self, Level};
 
 /// Merge's image from its connected inputs: the background if connected, then the layers in
@@ -81,10 +81,13 @@ pub(super) fn merge(
             }
         }
     });
-    let warnings = inputs
-        .iter()
-        .flat_map(|input| input.warnings().iter().cloned())
-        .collect();
+    // Each once: a diamond brings one file's warnings by every branch.
+    let mut warnings: Vec<Warning> = Vec::new();
+    for warning in inputs.iter().flat_map(|input| input.warnings()) {
+        if !warnings.contains(warning) {
+            warnings.push(warning.clone());
+        }
+    }
     Ok(Image::new(base.display_window(), window, outputs, warnings))
 }
 
