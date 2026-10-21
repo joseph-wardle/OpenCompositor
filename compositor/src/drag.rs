@@ -1,24 +1,25 @@
-//! `--drag-check IMAGE`: drags a parameter panel slider with synthetic mouse events, a press at
-//! the groove's start, a move one pixel along it each refresh of the viewer's screen, and a
-//! release at its end, on each chain in turn: Stops on Reader → Exposure of IMAGE, then Mix on
-//! Reader → Merge with IMAGE as the background and as one layer. It reports how the viewer kept
-//! up with each. The worker evaluates the latest request and discards the rest, so an edit's
-//! latency ends at the first viewer frame submitted that samples a result from its request or a
-//! later one: a superseded edit is answered by the frame showing a newer value, as the artist
-//! sees it. For each chain the check reports the latencies over every edit, the final edit's
-//! own, how many edits' own values were shown, how long the GUI thread took to dispatch each
-//! mouse event from the slider to the requests performed, the stages of the worker's path for
-//! the edits whose result it delivered, and the process's resident memory. Then it checks that
+//! `--drag-check IMAGE [CHAIN]`: drags a parameter panel slider with synthetic mouse events, a
+//! press at the groove's start, a move one pixel along it each refresh of the viewer's screen,
+//! and a release at its end, on a chain: `exposure`, Stops on Reader → Exposure of IMAGE, or
+//! `merge`, Mix on Reader → Merge with IMAGE as the background and as one layer. Without CHAIN
+//! it runs each chain in a child process of its own and fails if any failed. It reports how the
+//! viewer kept up with each. The worker evaluates the latest request and discards the rest, so
+//! an edit's latency ends at the first viewer frame submitted that samples a result from its
+//! request or a later one: a superseded edit is answered by the frame showing a newer value, as
+//! the artist sees it. For each chain the check reports the latencies over every edit, the final
+//! edit's own, how many edits' own values were shown, how long the GUI thread took to dispatch
+//! each mouse event from the slider to the requests performed, the stages of the worker's path
+//! for the edits whose result it delivered, and the process's resident memory. Then it checks that
 //! the drag undoes as one step and that a drag cancelled with Escape leaves the value as it was.
-//! It exits 0 if those held and every chain's latencies' p95 and final edit met the budget, and
-//! 1 otherwise.
+//! It exits 0 if those held and the chain's latencies' p95 and final edit met the budget, and 1
+//! otherwise.
 //!
 //! Run it in a release build on the workstation, and twice, since the first run's shader and
 //! file caches are cold. A frame counts when the GUI thread submits it, not when the display
 //! shows it, which needs the display.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cxx_qt_lib::QString;
@@ -43,12 +44,20 @@ const LONGEST_WAIT: Duration = Duration::from_secs(60);
 
 /// A chain the check drags a slider on, from its Reader to the node whose panel has the slider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Chain {
+pub enum Chain {
     Exposure,
     Merge,
 }
 
+/// The chains, in the order the check runs them.
+const CHAINS: [Chain; 2] = [Chain::Exposure, Chain::Merge];
+
 impl Chain {
+    /// The chain named on the command line by its node type.
+    pub fn from_name(name: &str) -> Option<Chain> {
+        CHAINS.into_iter().find(|chain| chain.type_name() == name)
+    }
+
     /// The node type after the Reader, which the chain is named for.
     fn type_name(self) -> &'static str {
         match self {
@@ -66,14 +75,9 @@ impl Chain {
     }
 }
 
-/// The chains in the order the check runs them.
-const CHAINS: [Chain; 2] = [Chain::Exposure, Chain::Merge];
-
 struct Check {
     image: PathBuf,
-    /// The chain being dragged, and those still to run.
     chain: Chain,
-    pending: Vec<Chain>,
     /// The chain's nodes: the Reader and the node whose slider is dragged.
     nodes: Vec<NodeId>,
     /// The request marking the chain's node made, which the viewer must show before the drag.
@@ -86,8 +90,6 @@ struct Check {
     edits: Vec<Edit>,
     /// How long each mouse event took the GUI thread.
     dispatches: Vec<Duration>,
-    /// What failed on the chains run so far.
-    failures: Vec<String>,
 }
 
 struct Edit {
@@ -107,15 +109,43 @@ thread_local! {
     static CHECK: RefCell<Option<Check>> = const { RefCell::new(None) };
 }
 
-pub fn start(image: PathBuf) {
-    let mut pending = CHAINS.to_vec();
-    pending.reverse();
-    let chain = pending.pop().expect("at least one chain");
+/// Runs every chain, each as a child process of this binary dragging that chain alone, and
+/// exits: 1 if any child did not exit 0, else 0. One process per chain because a chain run after
+/// another in the same process showed its f16 conversion several times slower, whichever chain
+/// it was; the hypothesis is that the staging buffer, recreated for the second chain, lands in a
+/// slower heap. Either way the chains are only comparable from equal starts.
+pub fn run_chains(image: &Path) -> ! {
+    let binary = std::env::current_exe().expect("the binary knows its own path");
+    let mut failed = false;
+    for chain in CHAINS {
+        let status = std::process::Command::new(&binary)
+            .arg("--drag-check")
+            .arg(image)
+            .arg(chain.type_name())
+            .status();
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!("drag check ({chain:?}): exited with {status}");
+                failed = true;
+            }
+            Err(error) => {
+                eprintln!(
+                    "drag check ({chain:?}): could not run {}: {error}",
+                    binary.display()
+                );
+                failed = true;
+            }
+        }
+    }
+    std::process::exit(i32::from(failed))
+}
+
+pub fn start(image: PathBuf, chain: Chain) {
     CHECK.with(|cell| {
         *cell.borrow_mut() = Some(Check {
             image,
             chain,
-            pending,
             nodes: Vec::new(),
             marked: 0,
             slider: std::ptr::null_mut(),
@@ -123,7 +153,6 @@ pub fn start(image: PathBuf) {
             period: 0,
             edits: Vec::new(),
             dispatches: Vec::new(),
-            failures: Vec::new(),
         })
     });
     ffi::single_shot(1000, setup, 0);
@@ -361,10 +390,9 @@ fn caption() -> String {
     String::from(&unsafe { ffi::label_text(crate::widgets().caption) })
 }
 
-/// Prints what the chain's drag showed, then runs the next chain, or exits: 1 with any failure
-/// on any chain, else 0.
+/// Prints what the chain's drag showed and exits: 1 with any failure, else 0.
 fn report(mut failures: Vec<String>) {
-    let mut check = CHECK
+    let check = CHECK
         .with(|cell| cell.borrow_mut().take())
         .expect("the check has started");
     let name = format!("drag check ({:?})", check.chain);
@@ -474,23 +502,7 @@ fn report(mut failures: Vec<String>) {
     for failure in &failures {
         eprintln!("{name} failed: {failure}");
     }
-    check.failures.extend(failures);
-    let Some(next) = check.pending.pop() else {
-        return ffi::exit(i32::from(!check.failures.is_empty()));
-    };
-    // The next chain starts from an empty document, as the first did.
-    let nodes = std::mem::take(&mut check.nodes);
-    crate::edit(|session| {
-        session
-            .delete_nodes(&nodes)
-            .expect("the chain's nodes exist")
-    });
-    check.chain = next;
-    check.slider = std::ptr::null_mut();
-    check.edits.clear();
-    check.dispatches.clear();
-    CHECK.with(|cell| *cell.borrow_mut() = Some(check));
-    ffi::single_shot(1000, setup, 0);
+    ffi::exit(i32::from(!failures.is_empty()));
 }
 
 /// The value at the quantile of sorted durations, or zero of none.
