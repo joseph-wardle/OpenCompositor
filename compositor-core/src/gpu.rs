@@ -1100,7 +1100,7 @@ mod tests {
         let path = fixtures::directory("staged").join("white.png");
         fixtures::write_png(&path, 1, 1, png::ColorType::Rgba, &[255; 4]);
         let mut session = Session::new();
-        let changes = session.create_readers(vec![path], open_ng::Point::default());
+        let changes = session.create_readers(vec![path], open_ng::Point::default(), None);
         let node = *changes.nodes.first().expect("one Reader");
         let key = result_key(session.document(), session.reloads(), node).expect("a key");
         let (delivered, deliveries) = mpsc::channel();

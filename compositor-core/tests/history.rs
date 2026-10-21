@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 use open_ng::{Point, Response};
-use opencompositor_core::{ExposureVersion, NodeId, NodeKind, Session, Value};
+use opencompositor_core::{NodeId, Session, Value};
 
 struct Counting;
 
@@ -63,7 +63,7 @@ fn session_of(readers: usize, path_length: usize) -> Session {
     let paths = (0..readers)
         .map(|index| PathBuf::from(format!("{index:0>path_length$}.exr")))
         .collect();
-    session.create_readers(paths, Point { x: 0.0, y: 0.0 });
+    session.create_readers(paths, Point { x: 0.0, y: 0.0 }, None);
     session
 }
 
@@ -79,12 +79,9 @@ const STEP_CEILING: isize = 16 * 1024;
 fn assert_retains_its_node_and_map_path(what: &str, edit: impl Fn(&mut Session, Edited)) {
     let [small, large] = [100, 10_000].map(|readers| {
         let mut session = session_of(readers, 16);
-        let changes = session.create_node(
-            NodeKind::Exposure {
-                version: ExposureVersion::CURRENT,
-            },
-            Point { x: 0.0, y: 0.0 },
-        );
+        let changes = session
+            .create_node("exposure", Point { x: 0.0, y: 0.0 }, None)
+            .unwrap();
         let exposure = *changes.nodes.first().expect("one node created");
         let readers: Vec<_> = (session.document().nodes())
             .map(|(id, _)| id)
@@ -115,7 +112,7 @@ fn a_value_edit_retains_its_node_and_map_path_alone() {
         session.begin_edit(edited.exposure, "Set Stops").unwrap();
         for stops in 1..=100 {
             session
-                .set_value("stops", Value::Float(stops as f64 / 10.0))
+                .edit_value("stops", Value::Float(stops as f64 / 10.0))
                 .unwrap();
         }
         session.finish_edit();

@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 
 use open_ng::Point;
 use opencompositor_core::{
-    Channel, EvalError, Evaluator, ExposureVersion, Image, NodeId, NodeKind, ReadError, Session,
-    Value, result_key,
+    Channel, EvalError, Evaluator, Image, NodeId, ReadError, Session, Value, result_key,
 };
 
 /// A directory of this test's own, emptied first.
@@ -30,7 +29,7 @@ fn write_png(path: &Path, code: u8) {
 }
 
 fn reader(session: &mut Session, path: PathBuf) -> NodeId {
-    let changes = session.create_readers(vec![path], Point { x: 0.0, y: 0.0 });
+    let changes = session.create_readers(vec![path], Point { x: 0.0, y: 0.0 }, None);
     *changes.nodes.first().unwrap()
 }
 
@@ -47,12 +46,9 @@ fn pixel(image: &Image) -> [f32; 4] {
 }
 
 fn create_exposure(session: &mut Session) -> NodeId {
-    let changes = session.create_node(
-        NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        },
-        Point { x: 0.0, y: 0.0 },
-    );
+    let changes = session
+        .create_node("exposure", Point { x: 0.0, y: 0.0 }, None)
+        .unwrap();
     *changes.nodes.first().unwrap()
 }
 
@@ -69,7 +65,9 @@ fn a_reader_evaluates_to_the_file_it_points_at() {
     let image = evaluate(&mut evaluator, &session, id).unwrap();
     assert_eq!(pixel(&image), [1.0; 4]);
 
-    session.set_reader_path(id, black).unwrap();
+    session
+        .set_value(id, "file", Value::File(black.into()))
+        .unwrap();
     let image = evaluate(&mut evaluator, &session, id).unwrap();
     assert_eq!(pixel(&image), [0.0, 0.0, 0.0, 1.0]);
 }
@@ -113,7 +111,7 @@ fn an_exposure_node_scales_its_source_by_its_stops() {
     session.connect(exposure, "source", source).unwrap();
     session.begin_edit(exposure, "Stops").unwrap();
     for (stops, expected) in [(1.0, 2.0), (-2.0, 0.25)] {
-        session.set_value("stops", Value::Float(stops)).unwrap();
+        session.edit_value("stops", Value::Float(stops)).unwrap();
         let image = evaluate(&mut evaluator, &session, exposure).unwrap();
         assert_eq!(pixel(&image), [expected, expected, expected, 1.0]);
     }

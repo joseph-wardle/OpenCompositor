@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::document::{Document, ExposureVersion, Node, NodeId, NodeKind};
+use crate::document::{Document, ExposureVersion, Node, NodeId, NodeKind, ReaderVersion};
 use crate::image::{Image, zeroed_plane};
 use crate::kernels::cpu::{self, Level};
-use crate::parameter::{Value, resolve};
+use crate::parameter::resolve;
 use crate::read::{ReadError, read_image};
 
 /// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
@@ -37,7 +37,7 @@ impl Reloads {
 }
 
 /// Everything that decides a node's image: each node on its upstream chain with its kind,
-/// version and resolved values, its inputs in declaration order, and for a Reader its path and
+/// version and resolved values, its inputs in declaration order, and for a Reader with a file
 /// that path's reload count. Within one evaluator, equal keys name the same image.
 ///
 /// Node IDs, positions and selection are outside it, so equal nodes have equal keys and moving
@@ -74,7 +74,9 @@ impl ResultKey {
 #[derive(Debug, PartialEq, Eq)]
 enum Recipe {
     Reader {
-        path: Arc<Path>,
+        version: ReaderVersion,
+        /// `None` while the Reader has no file, and the reload count 0.
+        path: Option<Arc<Path>>,
         reload: u64,
     },
     Exposure {
@@ -101,7 +103,12 @@ impl Recipe {
     fn with_inputs(&self, inputs: &[&ResultKey]) -> Recipe {
         let mut inputs = inputs.iter().map(|&key| key.clone());
         match self {
-            Recipe::Reader { path, reload } => Recipe::Reader {
+            Recipe::Reader {
+                version,
+                path,
+                reload,
+            } => Recipe::Reader {
+                version: *version,
                 path: path.clone(),
                 reload: *reload,
             },
@@ -126,12 +133,17 @@ impl Recipe {
         };
         match (self, other) {
             (
-                Recipe::Reader { path, reload },
                 Recipe::Reader {
+                    version,
+                    path,
+                    reload,
+                },
+                Recipe::Reader {
+                    version: other_version,
                     path: other_path,
                     reload: other_reload,
                 },
-            ) => path == other_path && reload == other_reload,
+            ) => version == other_version && path == other_path && reload == other_reload,
             (
                 Recipe::Exposure {
                     version,
@@ -203,12 +215,16 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
         Some(key.clone())
     };
     match &node.kind {
-        NodeKind::Reader { path } => Recipe::Reader {
-            path: path.clone(),
-            reload: reloads.count(path),
-        },
+        NodeKind::Reader { version } => {
+            let path = resolve(node).file("file").cloned();
+            Recipe::Reader {
+                version: *version,
+                reload: path.as_deref().map_or(0, |path| reloads.count(path)),
+                path,
+            }
+        }
         NodeKind::Exposure { version } => {
-            let Value::Float(stops) = resolve(node).get("stops").expect("Exposure has Stops");
+            let stops = resolve(node).float("stops").expect("Exposure has Stops");
             Recipe::Exposure {
                 version: *version,
                 stops: stops.to_bits(),
@@ -469,7 +485,10 @@ impl Evaluator {
         released: &mut Vec<Arc<[f32]>>,
     ) -> Result<Image, EvalError> {
         let operation = || match &*key.0 {
-            Recipe::Reader { path, .. } => read_image(path).map_err(|error| EvalError::Read {
+            Recipe::Reader { path: None, .. } => Ok(Image::empty()),
+            Recipe::Reader {
+                path: Some(path), ..
+            } => read_image(path).map_err(|error| EvalError::Read {
                 origin: key.clone(),
                 error,
             }),
@@ -694,7 +713,10 @@ impl EvalError {
 impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &*self.origin().0 {
-            Recipe::Reader { path, .. } => write!(f, "{}: ", path.display())?,
+            Recipe::Reader {
+                path: Some(path), ..
+            } => write!(f, "{}: ", path.display())?,
+            Recipe::Reader { path: None, .. } => write!(f, "Reader: ")?,
             Recipe::Exposure { .. } => write!(f, "Exposure: ")?,
         }
         match self {

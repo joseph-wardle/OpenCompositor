@@ -8,15 +8,19 @@ use std::sync::Arc;
 use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 
 use crate::document::{
-    Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, Slot,
+    Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, ReaderVersion, Slot,
+    node_types,
 };
 use crate::evaluate::{Reloads, ResultKey, result_keys};
-use crate::parameter::{Value, ValueError};
+use crate::parameter::{Value, ValueError, describe, resolve};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
 const READER_SPACING: f32 = 70.0;
+
+/// Between a node and one created after or below it.
+const PLACEMENT_GAP: f32 = 40.0;
 
 /// One undo or redo step: the whole document from before it. Unlike an inverse record, a
 /// snapshot cannot forget to restore a field.
@@ -43,10 +47,10 @@ pub enum EditError {
     /// The target no longer exists, such as a dialog's node removed by an undo while the dialog
     /// was open.
     MissingNode(NodeId),
-    /// The node is of a type the edit does not apply to.
-    WrongKind(NodeId),
-    /// Values change only between beginning and finishing an edit.
+    /// A change to the edited node's values came with no edit in progress.
     NoEditInProgress,
+    /// No node type has the name.
+    UnknownType(String),
     InvalidValue {
         node: NodeId,
         parameter: String,
@@ -59,8 +63,8 @@ impl fmt::Display for EditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EditError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
-            EditError::WrongKind(id) => write!(f, "node {} has no such setting", id.0),
             EditError::NoEditInProgress => write!(f, "no edit is in progress"),
+            EditError::UnknownType(name) => write!(f, "no node type is named \"{name}\""),
             EditError::InvalidValue {
                 node,
                 parameter,
@@ -97,10 +101,12 @@ struct Failures {
 /// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
 /// before returning the [`Changes`] it made. An edit that changes nothing records no step.
 ///
-/// Parameter values change through an edit in progress: [`begin_edit`](Session::begin_edit),
-/// any number of value changes, then [`finish_edit`](Session::finish_edit) to record them as one
-/// step or [`cancel_edit`](Session::cancel_edit) to restore the document from the beginning. A
-/// one-shot change is a begin, one change and a finish.
+/// A parameter value changes in one step through [`set_value`](Session::set_value) or
+/// [`reset_value`](Session::reset_value), or continuously through an edit in progress:
+/// [`begin_edit`](Session::begin_edit), any number of [`edit_value`](Session::edit_value) and
+/// [`edit_reset`](Session::edit_reset), then [`finish_edit`](Session::finish_edit) to record them
+/// as one step or [`cancel_edit`](Session::cancel_edit) to restore the document from the
+/// beginning.
 #[derive(Debug)]
 pub struct Session {
     document: Document,
@@ -211,13 +217,10 @@ impl Session {
     }
 
     /// Makes every Reader of each given Reader's file read it again the next time it is viewed.
-    /// Returns whether any of the nodes is a Reader.
+    /// Returns whether any of the nodes is a Reader with a file.
     pub fn reload(&mut self, nodes: &[NodeId]) -> bool {
         let paths: BTreeSet<Arc<Path>> = (nodes.iter())
-            .filter_map(|&id| match &self.document.node(id)?.kind {
-                NodeKind::Reader { path } => Some(path.clone()),
-                NodeKind::Exposure { .. } => None,
-            })
+            .filter_map(|&id| resolve(self.document.node(id)?).file("file").cloned())
             .collect();
         for path in &paths {
             self.reloads.reload(path.clone());
@@ -270,20 +273,36 @@ impl Session {
         self.redo.last().map(|step| step.label)
     }
 
-    /// Creates a Reader for each path, stacked downwards from `at`, and selects them all.
-    pub fn create_readers(&mut self, paths: Vec<PathBuf>, at: Point) -> Changes {
+    /// Creates a Reader for each path, stacked downwards, and selects them all. A Reader of an
+    /// empty path has no file.
+    ///
+    /// The stack starts below the current node, as [`create_node`](Session::create_node) places
+    /// a type without inputs, or at `at` without one, or if it no longer exists.
+    pub fn create_readers(
+        &mut self,
+        paths: Vec<PathBuf>,
+        at: Point,
+        current: Option<NodeId>,
+    ) -> Changes {
+        let at = current
+            .and_then(|current| self.below(current))
+            .unwrap_or(at);
         let mut document = self.document.clone();
         let mut created = Vec::with_capacity(paths.len());
         for (row, path) in paths.into_iter().enumerate() {
             let id = NodeId(self.next_id);
             self.next_id += 1;
-            let node = Node::new(
-                NodeKind::Reader { path: path.into() },
+            let mut node = Node::new(
+                NodeKind::Reader {
+                    version: ReaderVersion::CURRENT,
+                },
                 Point {
                     x: at.x,
                     y: at.y + row as f32 * READER_SPACING,
                 },
             );
+            // Refused only for an empty path, which leaves the file absent.
+            node.set_value("file", Value::File(path.into())).ok();
             document.nodes.insert(id, Arc::new(node));
             created.push(id);
         }
@@ -293,34 +312,110 @@ impl Session {
         self.commit("Create Reader", document)
     }
 
-    /// Creates a node of a kind at `at` and selects it alone.
-    pub fn create_node(&mut self, kind: NodeKind, at: Point) -> Changes {
-        let label = match kind {
-            NodeKind::Reader { .. } => "Create Reader",
-            NodeKind::Exposure { .. } => "Create Exposure",
-        };
+    /// Creates a node of the type named `type_name`, one of [`node_types`], as one step, and
+    /// selects it alone.
+    ///
+    /// Without a current node, the node goes at `at`, unconnected. With one, it is inserted after
+    /// it, as Nuke's Tab menu inserts: placed after it in the graph's left-to-right flow, taking it
+    /// on its first input and taking over every input that took it. A type without inputs goes
+    /// below it instead, unconnected, as a second stream beside the first. What the inserted node
+    /// feeds moves right if it would sit underneath it. Marks stay where they are.
+    pub fn create_node(
+        &mut self,
+        type_name: &str,
+        at: Point,
+        current: Option<NodeId>,
+    ) -> Result<Changes, EditError> {
+        let node_type = node_types()
+            .iter()
+            .find(|node_type| node_type.name == type_name)
+            .ok_or_else(|| EditError::UnknownType(type_name.to_owned()))?;
         let id = NodeId(self.next_id);
-        self.next_id += 1;
+        let mut position = at;
+        let mut assignments = Vec::new();
+        if let Some(current) = current {
+            if self.document.node(current).is_none() {
+                return Err(EditError::MissingNode(current));
+            }
+            if let Some(input) = node_type.kind.inputs().first() {
+                position =
+                    (self.after(current)).expect("the graph presents every node the document has");
+                for (consumer, node) in self.document.nodes() {
+                    for (input, source) in node.inputs() {
+                        if source == current {
+                            assignments.push(Assignment {
+                                consumer,
+                                input,
+                                source: Some(id),
+                            });
+                        }
+                    }
+                }
+                assignments.push(Assignment {
+                    consumer: id,
+                    input: input.name,
+                    source: Some(current),
+                });
+            } else {
+                position =
+                    (self.below(current)).expect("the graph presents every node the document has");
+            }
+        }
         let mut document = self.document.clone();
-        document.nodes.insert(id, Arc::new(Node::new(kind, at)));
+        let node = Node::new(node_type.kind.clone(), position);
+        document.nodes.insert(id, Arc::new(node));
+        let mut document = (document.assign_inputs(&assignments))
+            .expect("a new node takes over existing wires without a cycle");
         document.selection = [id].into();
-        self.commit(label, document)
+        self.next_id += 1;
+        let mut changes = self.commit(node_type.step, document);
+        if !assignments.is_empty() {
+            changes.extend(self.make_room_after(id));
+        }
+        Ok(changes)
     }
 
-    /// Points a Reader at another file. It keeps its ID, position, marks and selection.
-    pub fn set_reader_path(&mut self, id: NodeId, path: PathBuf) -> Result<Changes, EditError> {
-        let mut document = self.document.clone();
-        let node = document
-            .nodes
-            .get_mut(&id)
-            .ok_or(EditError::MissingNode(id))?;
-        let NodeKind::Reader { path: current } = &node.kind else {
-            return Err(EditError::WrongKind(id));
-        };
-        if **current != *path {
-            Arc::make_mut(node).kind = NodeKind::Reader { path: path.into() };
+    /// Moves everything the node feeds right, keeping its layout, if the node landed on a node it
+    /// feeds, just far enough to clear it. The move joins the step that created the node, which
+    /// must be the last one: its width is known only once the graph presents it.
+    fn make_room_after(&mut self, node: NodeId) -> Changes {
+        let outline = (self.graph.node_rect(node.into()))
+            .expect("the graph presents every node the document has");
+        let overlap = (self.document.nodes())
+            .filter(|(_, consumer)| consumer.inputs().any(|(_, source)| source == node))
+            .filter_map(|(consumer, _)| self.graph.node_rect(consumer.into()))
+            .filter(|consumer| consumer.intersects(&outline))
+            .map(|consumer| outline.max.x + PLACEMENT_GAP - consumer.min.x)
+            .fold(0.0, f32::max);
+        if overlap <= 0.0 {
+            return Changes::default();
         }
-        Ok(self.commit("Set Reader Path", document))
+        let mut document = self.document.clone();
+        for id in self.document.downstream_of(node) {
+            let moved = document.nodes.get_mut(&id).expect("downstream nodes exist");
+            Arc::make_mut(moved).position.x += overlap;
+        }
+        self.swap_in(document)
+    }
+
+    /// Where a node taking another on its input goes: to its right, as the graph reads left to
+    /// right. `None` if that one does not exist.
+    fn after(&self, node: NodeId) -> Option<Point> {
+        let outline = self.graph.node_rect(node.into())?;
+        Some(Point {
+            x: outline.max.x + PLACEMENT_GAP,
+            y: outline.min.y,
+        })
+    }
+
+    /// Where an unconnected node goes beside another: below it. `None` if that one does not
+    /// exist.
+    fn below(&self, node: NodeId) -> Option<Point> {
+        let outline = self.graph.node_rect(node.into())?;
+        Some(Point {
+            x: outline.min.x,
+            y: outline.max.y + PLACEMENT_GAP,
+        })
     }
 
     /// Marks a node in a slot, replacing what the slot marked, or clears the slot.
@@ -449,34 +544,65 @@ impl Session {
 
     /// Sets a value of the edited node in the live document, recording no step yet. A value equal
     /// to the default stays set.
-    pub fn set_value(&mut self, parameter: &str, value: Value) -> Result<Changes, EditError> {
-        self.edit_value(parameter, |node| node.set_value(parameter, value))
+    pub fn edit_value(&mut self, parameter: &str, value: Value) -> Result<Changes, EditError> {
+        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
+        let (document, _) =
+            self.with_value(id, parameter, |node| node.set_value(parameter, value))?;
+        Ok(self.swap_in(document))
     }
 
     /// Removes a value of the edited node in the live document, so it reads as its default.
-    pub fn reset_value(&mut self, parameter: &str) -> Result<Changes, EditError> {
-        self.edit_value(parameter, |node| node.reset(parameter))
+    pub fn edit_reset(&mut self, parameter: &str) -> Result<Changes, EditError> {
+        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
+        let (document, _) = self.with_value(id, parameter, |node| node.reset(parameter))?;
+        Ok(self.swap_in(document))
     }
 
-    fn edit_value(
+    /// Sets a node's value as one step named after the parameter, as a typed value does. A value
+    /// equal to the default stays set.
+    pub fn set_value(
         &mut self,
+        node: NodeId,
+        parameter: &str,
+        value: Value,
+    ) -> Result<Changes, EditError> {
+        let (document, label) =
+            self.with_value(node, parameter, |edited| edited.set_value(parameter, value))?;
+        Ok(self.commit(label, document))
+    }
+
+    /// Removes a node's value as one step, so it reads as its default.
+    pub fn reset_value(&mut self, node: NodeId, parameter: &str) -> Result<Changes, EditError> {
+        let (document, _) = self.with_value(node, parameter, |edited| edited.reset(parameter))?;
+        Ok(self.commit("Reset", document))
+    }
+
+    /// The document with one node's values edited, and the edited parameter's label.
+    fn with_value(
+        &self,
+        id: NodeId,
         parameter: &str,
         edit: impl FnOnce(&mut Node) -> Result<(), ValueError>,
-    ) -> Result<Changes, EditError> {
-        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
-        let mut document = self.document.clone();
-        // Every recorded edit, undo and redo ends the edit first, so its node still exists.
-        let node = document.nodes.get_mut(&id).expect("the edited node exists");
-        let mut edited = Node::clone(node);
-        edit(&mut edited).map_err(|error| EditError::InvalidValue {
+    ) -> Result<(Document, &'static str), EditError> {
+        let invalid = |error| EditError::InvalidValue {
             node: id,
             parameter: parameter.to_owned(),
             error,
-        })?;
+        };
+        let mut document = self.document.clone();
+        let node = document
+            .nodes
+            .get_mut(&id)
+            .ok_or(EditError::MissingNode(id))?;
+        let label = describe(node.kind.parameters(), parameter)
+            .map_err(invalid)?
+            .label;
+        let mut edited = Node::clone(node);
+        edit(&mut edited).map_err(invalid)?;
         if edited != **node {
             *node = Arc::new(edited);
         }
-        Ok(self.swap_in(document))
+        Ok((document, label))
     }
 
     /// Records the edit in progress as one step, unless it changed nothing.
@@ -543,8 +669,8 @@ impl Session {
     ///
     /// Every change to which nodes exist comes through here, or through undo and redo, which
     /// cancel the edit first; `swap_in` carries only the selection and the edit in progress. So
-    /// the node an edit in progress changes always exists, which its `expect`s rely on. A new way
-    /// to replace the document must keep that.
+    /// an edit in progress never outlives its node. A new way to replace the document must keep
+    /// that.
     fn commit(&mut self, label: &'static str, after: Document) -> Changes {
         let changes = self.document.changes_to(&after);
         if changes.is_empty() {
@@ -562,8 +688,8 @@ impl Session {
         changes
     }
 
-    /// Swaps in a document without recording a step: a change of selection, or of the edit in
-    /// progress.
+    /// Swaps in a document without recording a step: a change of selection, of the edit in
+    /// progress, or one that joins the step just recorded.
     fn swap_in(&mut self, after: Document) -> Changes {
         let changes = self.document.changes_to(&after);
         if !changes.is_empty() {

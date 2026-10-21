@@ -20,15 +20,18 @@ fn paths(names: &[&str]) -> Vec<PathBuf> {
 }
 
 fn create(session: &mut Session, name: &str, at: Point) -> NodeId {
-    let changes = session.create_readers(paths(&[name]), at);
+    let changes = session.create_readers(paths(&[name]), at, None);
     *changes.nodes.first().expect("one node created")
 }
 
-fn reader_path(session: &Session, id: NodeId) -> &Path {
-    match &session.document().node(id).expect("the node exists").kind {
-        NodeKind::Reader { path } => path,
-        kind => panic!("{kind:?} is not a Reader"),
-    }
+fn set_file(session: &mut Session, id: NodeId, name: &str) -> Result<Changes, EditError> {
+    session.set_value(id, "file", Value::File(Path::new(name).into()))
+}
+
+fn file(session: &Session, id: NodeId) -> Option<Arc<Path>> {
+    resolve(session.document().node(id).expect("the node exists"))
+        .file("file")
+        .cloned()
 }
 
 fn slot(digit: u8) -> Slot {
@@ -86,15 +89,15 @@ fn a_node_created_after_an_undo_gets_a_new_id() {
 fn a_new_edit_clears_redo() {
     let mut session = Session::new();
     let reader = create(&mut session, "a.exr", ORIGIN);
-    session.set_reader_path(reader, "b.exr".into()).unwrap();
+    set_file(&mut session, reader, "b.exr").unwrap();
     session.undo();
-    assert_eq!(session.redo_label(), Some("Set Reader Path"));
+    assert_eq!(session.redo_label(), Some("File"));
 
     session.set_mark(slot(1), Some(reader)).unwrap();
 
     assert_eq!(session.redo_label(), None);
     assert!(session.redo().is_empty());
-    assert_eq!(reader_path(&session, reader), Path::new("a.exr"));
+    assert_eq!(file(&session, reader).as_deref(), Some(Path::new("a.exr")));
     assert_presented(&session);
 }
 
@@ -174,7 +177,7 @@ fn undo_skips_clicks_that_only_select() {
 #[test]
 fn the_graph_matches_the_document_after_every_step() {
     let mut session = Session::new();
-    let readers = session.create_readers(paths(&["a.exr", "b.png", "c.exr"]), ORIGIN);
+    let readers = session.create_readers(paths(&["a.exr", "b.png", "c.exr"]), ORIGIN, None);
     assert_presented(&session);
     let [a, b, c] = [0, 1, 2].map(|i| *readers.nodes.iter().nth(i).unwrap());
     assert_eq!(session.document().selection(), [a, b, c]);
@@ -183,7 +186,7 @@ fn the_graph_matches_the_document_after_every_step() {
         &|s| s.set_mark(slot(1), Some(a)).unwrap(),
         &|s| s.set_mark(slot(2), Some(a)).unwrap(),
         &|s| s.set_mark(slot(1), Some(c)).unwrap(),
-        &|s| s.set_reader_path(b, "d.exr".into()).unwrap(),
+        &|s| set_file(s, b, "d.exr").unwrap(),
         &|s| {
             s.apply_response(&Response {
                 positions: vec![(c.into(), Point { x: 10.0, y: 10.0 })],
@@ -225,12 +228,12 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
 
     let unchanged = |changes: Changes| assert!(changes.is_empty());
     type Edit<'a> = (&'a str, &'a dyn Fn(&mut Session));
-    let edits: [Edit; 8] = [
+    let edits: [Edit; 9] = [
         ("an empty create", &|s| {
-            unchanged(s.create_readers(Vec::new(), ORIGIN));
+            unchanged(s.create_readers(Vec::new(), ORIGIN, None));
         }),
-        ("the same path", &|s| {
-            unchanged(s.set_reader_path(reader, "a.exr".into()).unwrap());
+        ("the same file", &|s| {
+            unchanged(set_file(s, reader, "a.exr").unwrap());
         }),
         ("the same mark", &|s| {
             unchanged(s.set_mark(slot(3), Some(reader)).unwrap());
@@ -249,9 +252,12 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
         }),
         ("a value set then reset", &|s| {
             s.begin_edit(connected, "Set Stops").unwrap();
-            s.set_value("stops", Value::Float(1.0)).unwrap();
-            s.reset_value("stops").unwrap();
+            s.edit_value("stops", Value::Float(1.0)).unwrap();
+            s.edit_reset("stops").unwrap();
             s.finish_edit();
+        }),
+        ("a reset of an unset value", &|s| {
+            unchanged(s.reset_value(unconnected, "stops").unwrap());
         }),
         // Selection changes the document, but is not a step.
         ("a deselection", &|s| {
@@ -274,15 +280,13 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
 }
 
 #[test]
-fn repathing_keeps_the_node_its_position_and_its_marks() {
+fn a_new_file_keeps_the_node_its_position_and_its_marks() {
     let mut session = Session::new();
     let at = Point { x: 30.0, y: -40.0 };
     let reader = create(&mut session, "plates/a.exr", at);
     session.set_mark(slot(4), Some(reader)).unwrap();
 
-    let changes = session
-        .set_reader_path(reader, "plates/b.exr".into())
-        .unwrap();
+    let changes = set_file(&mut session, reader, "plates/b.exr").unwrap();
 
     assert_eq!(changes.nodes.iter().copied().collect::<Vec<_>>(), [reader]);
     assert!(!changes.selection);
@@ -301,8 +305,12 @@ fn edits_to_a_node_an_undo_removed_are_refused() {
     session.undo();
 
     let missing = Err(EditError::MissingNode(reader));
-    assert_eq!(session.set_reader_path(reader, "b.exr".into()), missing);
+    assert_eq!(set_file(&mut session, reader, "b.exr"), missing);
     assert_eq!(session.set_mark(slot(0), Some(reader)), missing);
+    assert_eq!(
+        session.set_value(reader, "stops", Value::Float(1.0)),
+        missing
+    );
     assert_eq!(session.redo_label(), Some("Create Reader"));
 
     let stale = Response {
@@ -319,15 +327,15 @@ fn an_exposure_node_is_created_selected_and_undoable() {
     let mut session = Session::new();
     let reader = create(&mut session, "a.exr", ORIGIN);
     let at = Point { x: 0.0, y: 100.0 };
-    let exposure = NodeKind::Exposure {
-        version: ExposureVersion::CURRENT,
-    };
 
-    let changes = session.create_node(exposure.clone(), at);
+    let changes = session.create_node("exposure", at, None).unwrap();
 
     let id = *changes.nodes.first().expect("one node created");
     assert!(changes.selection);
     assert_eq!(session.document().selection(), [id]);
+    let exposure = NodeKind::Exposure {
+        version: ExposureVersion::CURRENT,
+    };
     assert_eq!(session.document().node(id), Some(&Node::new(exposure, at)));
     assert_eq!(session.graph().node(id.into()).unwrap().title, "Exposure");
     assert_eq!(session.undo_label(), Some("Create Exposure"));
@@ -340,23 +348,221 @@ fn an_exposure_node_is_created_selected_and_undoable() {
 }
 
 #[test]
-fn an_exposure_node_has_no_reader_path() {
+fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
     let mut session = Session::new();
-    let changes = session.create_node(
-        NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        },
-        ORIGIN,
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let consumers = [0.0, 200.0].map(|x| {
+        let id = create_exposure(&mut session, Point { x, y: 300.0 });
+        session.connect(id, "source", reader).unwrap();
+        id
+    });
+    session.set_mark(slot(1), Some(reader)).unwrap();
+    let before = session.document().clone();
+    let steps = session.undo.len();
+
+    let changes = session.create_node("exposure", ORIGIN, Some(reader));
+
+    let id = *changes
+        .unwrap()
+        .nodes
+        .last()
+        .expect("the newest ID is created");
+    let document = session.document();
+    let inserted = document.node(id).unwrap();
+    let outline = session.graph().node_rect(reader.into()).unwrap();
+    assert_eq!(
+        inserted.position,
+        Point {
+            x: outline.max.x + PLACEMENT_GAP,
+            y: outline.min.y,
+        }
     );
-    let id = *changes.nodes.first().expect("one node created");
+    assert_eq!(inserted.input("source"), Some(reader));
+    for consumer in consumers {
+        assert_eq!(document.node(consumer).unwrap().input("source"), Some(id));
+    }
+    assert_eq!(document.selection(), [id]);
+    assert_eq!(document.mark(slot(1)), Some(reader));
+    assert_eq!(session.undo.len(), steps + 1);
+    assert_eq!(session.undo_label(), Some("Create Exposure"));
+    assert_presented(&session);
+
+    session.undo();
+    assert!(session.document().changes_to(&before).is_empty());
+    assert_presented(&session);
+}
+
+#[test]
+fn an_inserted_node_pushes_what_it_feeds_right_when_it_lands_on_it() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let outline = session.graph().node_rect(reader.into()).unwrap();
+    let first = create_exposure(
+        &mut session,
+        Point {
+            x: outline.max.x + PLACEMENT_GAP,
+            y: 0.0,
+        },
+    );
+    let second = create_exposure(&mut session, Point { x: 600.0, y: 0.0 });
+    let unrelated = create_exposure(&mut session, Point { x: 600.0, y: 300.0 });
+    session.connect(first, "source", reader).unwrap();
+    session.connect(second, "source", first).unwrap();
+    let before = session.document().clone();
+    let steps = session.undo.len();
+
+    let changes = session.create_node("exposure", ORIGIN, Some(reader));
+
+    let id = *changes.unwrap().nodes.last().unwrap();
+    let inserted = session.graph().node_rect(id.into()).unwrap();
+    let pushed = session.graph().node_rect(first.into()).unwrap();
+    assert_eq!(pushed.min.x, inserted.max.x + PLACEMENT_GAP);
+    let position = |id| session.document().node(id).unwrap().position;
+    let moved = pushed.min.x - before.node(first).unwrap().position.x;
+    assert_eq!(position(second).x, 600.0 + moved);
+    assert_eq!(position(unrelated).x, 600.0);
+    assert_eq!(position(reader), ORIGIN);
+    assert_eq!(session.undo.len(), steps + 1);
+    assert_presented(&session);
+
+    let after = session.document().clone();
+    session.undo();
+    assert!(session.document().changes_to(&before).is_empty());
+    session.redo();
+    assert!(session.document().changes_to(&after).is_empty());
+    assert_presented(&session);
+}
+
+#[test]
+fn a_node_without_inputs_is_created_below_the_current_node_unconnected() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let exposure = create_exposure(&mut session, Point { x: 0.0, y: 100.0 });
+    session.connect(exposure, "source", reader).unwrap();
+
+    let changes = session.create_node("reader", ORIGIN, Some(exposure));
+
+    let id = *changes
+        .unwrap()
+        .nodes
+        .last()
+        .expect("the newest ID is created");
+    let outline = session.graph().node_rect(exposure.into()).unwrap();
+    assert_eq!(
+        session.document().node(id).unwrap().position,
+        Point {
+            x: outline.min.x,
+            y: outline.max.y + PLACEMENT_GAP,
+        }
+    );
+    assert_eq!(file(&session, id), None);
+    let exposure = session.document().node(exposure).unwrap();
+    assert_eq!(exposure.input("source"), Some(reader));
+    assert_eq!(session.document().selection(), [id]);
+    assert_eq!(session.undo_label(), Some("Create Reader"));
+    assert_presented(&session);
+}
+
+#[test]
+fn readers_stack_below_the_current_node_or_at_the_point_once_it_is_gone() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+    let outline = session.graph().node_rect(exposure.into()).unwrap();
+    let at = Point { x: 500.0, y: 500.0 };
+
+    let changes = session.create_readers(paths(&["a.exr", "b.exr"]), at, Some(exposure));
+
+    let below = Point {
+        x: outline.min.x,
+        y: outline.max.y + PLACEMENT_GAP,
+    };
+    let positions = changes
+        .nodes
+        .iter()
+        .map(|&id| session.document().node(id).unwrap().position);
+    assert_eq!(
+        positions.collect::<Vec<_>>(),
+        [
+            below,
+            Point {
+                y: below.y + READER_SPACING,
+                ..below
+            }
+        ]
+    );
+
+    session.delete_nodes(&[exposure]).unwrap();
+    let changes = session.create_readers(paths(&["c.exr"]), at, Some(exposure));
+    let id = *changes.nodes.first().unwrap();
+    assert_eq!(session.document().node(id).unwrap().position, at);
+}
+
+#[test]
+fn creating_by_an_unknown_type_or_after_a_missing_node_changes_nothing() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    session.delete_nodes(&[reader]).unwrap();
+    let steps = session.undo.len();
+
+    assert_eq!(
+        session.create_node("Exposure", ORIGIN, None),
+        Err(EditError::UnknownType("Exposure".to_owned()))
+    );
+    assert_eq!(
+        session.create_node("exposure", ORIGIN, Some(reader)),
+        Err(EditError::MissingNode(reader))
+    );
+    assert_eq!(session.document().nodes().count(), 0);
+    assert_eq!(session.undo.len(), steps);
+}
+
+#[test]
+fn every_node_type_is_created_by_its_name() {
+    let mut session = Session::new();
+    for node_type in node_types() {
+        let changes = session.create_node(node_type.name, ORIGIN, None).unwrap();
+        let id = *changes.nodes.first().expect("one node created");
+        assert_eq!(session.document().node(id).unwrap().kind, node_type.kind);
+        assert_eq!(session.undo_label(), Some(node_type.step));
+    }
+}
+
+#[test]
+fn an_exposure_node_has_no_file() {
+    let mut session = Session::new();
+    let id = create_exposure(&mut session, ORIGIN);
     session.set_mark(slot(1), Some(id)).unwrap();
 
     assert_eq!(session.viewed(), Some(id));
     assert_eq!(
-        session.set_reader_path(id, "a.exr".into()),
-        Err(EditError::WrongKind(id))
+        set_file(&mut session, id, "a.exr"),
+        Err(EditError::InvalidValue {
+            node: id,
+            parameter: "file".to_owned(),
+            error: ValueError::UnknownParameter,
+        })
     );
     assert_eq!(session.undo_label(), Some("Mark"));
+}
+
+#[test]
+fn a_reader_without_a_file_is_named_for_its_kind_and_reloads_nothing() {
+    let mut session = Session::new();
+    let created = session.create_node("reader", ORIGIN, None).unwrap();
+    let empty = create(&mut session, "", ORIGIN);
+    for id in [*created.nodes.first().unwrap(), empty] {
+        assert_eq!(file(&session, id), None);
+        assert_eq!(session.graph().node(id.into()).unwrap().title, "Reader");
+        assert!(!session.reload(&[id]));
+    }
+    assert_eq!(
+        set_file(&mut session, empty, ""),
+        Err(EditError::InvalidValue {
+            node: empty,
+            parameter: "file".to_owned(),
+            error: ValueError::EmptyPath,
+        })
+    );
 }
 
 #[test]
@@ -401,7 +607,7 @@ fn a_node_shows_a_failure_while_its_current_key_failed() {
 
     // An edit downstream leaves the Reader's key, and its failure, as they were.
     session.begin_edit(exposure, "Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
     session.finish_edit();
     assert_eq!(failing(&session), [reader, twin]);
 
@@ -424,17 +630,14 @@ fn a_node_shows_a_failure_while_its_current_key_failed() {
 }
 
 fn create_exposure(session: &mut Session, at: Point) -> NodeId {
-    let changes = session.create_node(
-        NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        },
-        at,
-    );
+    let changes = session.create_node("exposure", at, None).unwrap();
     *changes.nodes.first().expect("one node created")
 }
 
 fn stops(session: &Session, id: NodeId) -> Option<Value> {
-    resolve(session.document().node(id).expect("the node exists")).get("stops")
+    resolve(session.document().node(id).expect("the node exists"))
+        .get("stops")
+        .cloned()
 }
 
 #[test]
@@ -445,7 +648,7 @@ fn a_drag_shows_each_value_and_records_one_step() {
 
     session.begin_edit(exposure, "Set Stops").unwrap();
     for value in [0.5, 1.0, 1.5] {
-        let changes = session.set_value("stops", Value::Float(value)).unwrap();
+        let changes = session.edit_value("stops", Value::Float(value)).unwrap();
         assert_eq!(
             changes.nodes.iter().copied().collect::<Vec<_>>(),
             [exposure]
@@ -477,12 +680,12 @@ fn cancelling_restores_the_document_from_the_beginning() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(2.0)).unwrap();
+    session.edit_value("stops", Value::Float(2.0)).unwrap();
     session.finish_edit();
     let steps = session.undo.len();
 
     session.begin_edit(exposure, "Reset Stops").unwrap();
-    session.reset_value("stops").unwrap();
+    session.edit_reset("stops").unwrap();
     assert_eq!(stops(&session, exposure), Some(Value::Float(0.0)));
     let changes = session.cancel_edit();
 
@@ -498,7 +701,7 @@ fn undo_during_an_edit_cancels_it_then_undoes() {
     let reader = create(&mut session, "a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, Point { x: 0.0, y: 100.0 });
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
 
     let changes = session.undo();
 
@@ -518,7 +721,7 @@ fn another_edit_finishes_the_edit_in_progress_as_its_own_step() {
     let exposure = create_exposure(&mut session, ORIGIN);
     let reader = create(&mut session, "a.exr", Point { x: 0.0, y: 100.0 });
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
 
     let moved = Point { x: 40.0, y: 100.0 };
     let changes = session.apply_response(&Response {
@@ -561,7 +764,7 @@ fn selecting_leaves_the_edit_in_progress_running() {
         ..Response::default()
     });
     // The edit belongs to its node, not to the selection.
-    session.set_value("stops", Value::Float(-1.0)).unwrap();
+    session.edit_value("stops", Value::Float(-1.0)).unwrap();
     session.finish_edit();
 
     assert_eq!(session.document().selection(), [reader]);
@@ -574,17 +777,17 @@ fn refused_values_leave_the_edit_and_document_unchanged() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     assert_eq!(
-        session.set_value("stops", Value::Float(1.0)),
+        session.edit_value("stops", Value::Float(1.0)),
         Err(EditError::NoEditInProgress)
     );
     assert_eq!(
-        session.reset_value("stops"),
+        session.edit_reset("stops"),
         Err(EditError::NoEditInProgress)
     );
 
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
-    let refused = session.set_value("stops", Value::Float(f64::NAN));
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
+    let refused = session.edit_value("stops", Value::Float(f64::NAN));
 
     assert_eq!(
         refused,
@@ -611,8 +814,8 @@ fn a_reader_has_no_values_to_edit() {
         parameter: "stops".to_owned(),
         error: ValueError::UnknownParameter,
     });
-    assert_eq!(session.set_value("stops", Value::Float(1.0)), unknown);
-    assert_eq!(session.reset_value("stops"), unknown);
+    assert_eq!(session.edit_value("stops", Value::Float(1.0)), unknown);
+    assert_eq!(session.edit_reset("stops"), unknown);
     session.finish_edit();
 
     assert!(before.changes_to(session.document()).is_empty());
@@ -629,6 +832,74 @@ fn an_edit_begins_only_on_an_existing_node() {
         Err(EditError::MissingNode(exposure))
     );
     assert_eq!(session.editing(), None);
+}
+
+#[test]
+fn a_set_or_reset_is_one_step_named_for_it() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+
+    let changes = session
+        .set_value(exposure, "stops", Value::Float(1.5))
+        .unwrap();
+    assert_eq!(
+        changes.nodes.iter().copied().collect::<Vec<_>>(),
+        [exposure]
+    );
+    assert_eq!(session.undo_label(), Some("Stops"));
+    session.reset_value(exposure, "stops").unwrap();
+    assert_eq!(session.undo_label(), Some("Reset"));
+    assert_eq!(stops(&session, exposure), Some(Value::Float(0.0)));
+
+    session.undo();
+    assert_eq!(stops(&session, exposure), Some(Value::Float(1.5)));
+    session.undo();
+    assert_eq!(stops(&session, exposure), Some(Value::Float(0.0)));
+    assert_eq!(session.undo_label(), Some("Create Exposure"));
+    assert_presented(&session);
+}
+
+#[test]
+fn a_set_finishes_the_edit_in_progress_as_its_own_step() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+    session.begin_edit(exposure, "Set Stops").unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
+
+    session
+        .set_value(exposure, "stops", Value::Float(2.0))
+        .unwrap();
+
+    assert_eq!(session.editing(), None);
+    assert_eq!(session.undo_label(), Some("Stops"));
+    session.undo();
+    assert_eq!(stops(&session, exposure), Some(Value::Float(1.0)));
+    assert_eq!(session.undo_label(), Some("Set Stops"));
+}
+
+#[test]
+fn a_refused_set_leaves_the_document_and_history_unchanged() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+    let steps = session.undo.len();
+
+    assert_eq!(
+        session.set_value(exposure, "stops", Value::Float(65.0)),
+        Err(EditError::InvalidValue {
+            node: exposure,
+            parameter: "stops".to_owned(),
+            error: ValueError::OutOfLimits(-64.0..=64.0),
+        })
+    );
+    assert!(matches!(
+        session.reset_value(exposure, "gain"),
+        Err(EditError::InvalidValue {
+            error: ValueError::UnknownParameter,
+            ..
+        })
+    ));
+    assert_eq!(session.undo.len(), steps);
+    assert_eq!(stops(&session, exposure), Some(Value::Float(0.0)));
 }
 
 fn source_of(session: &Session, consumer: NodeId) -> Option<NodeId> {
@@ -735,7 +1006,7 @@ fn deleting_the_edited_node_records_its_edit_as_its_own_step() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     session.begin_edit(exposure, "Set Stops").unwrap();
-    session.set_value("stops", Value::Float(1.0)).unwrap();
+    session.edit_value("stops", Value::Float(1.0)).unwrap();
 
     session.delete_nodes(&[exposure]).unwrap();
     assert_eq!(session.editing(), None);

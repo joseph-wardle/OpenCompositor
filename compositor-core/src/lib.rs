@@ -12,6 +12,7 @@ mod image;
 // The GPU half is used by the worker once it dispatches; until then only the tests do.
 #[cfg_attr(not(test), expect(dead_code))]
 mod kernels;
+mod panel;
 mod parameter;
 mod presentation;
 mod read;
@@ -27,14 +28,15 @@ pub mod bench {
     pub use crate::kernels::cpu::{Level, exposure};
 }
 
-pub use app::{App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
+pub use app::{Anchor, App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
 pub use document::{
-    Assignment, Changes, ConnectionError, Document, ExposureVersion, Node, NodeId, NodeInput,
-    NodeKind, Slot, unconnected_inputs,
+    Assignment, Changes, ConnectionError, Document, ExposureVersion, Missing, Node, NodeId,
+    NodeInput, NodeKind, NodeType, ReaderVersion, Slot, missing, node_types,
 };
 pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Warning, Window};
+pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,
 };

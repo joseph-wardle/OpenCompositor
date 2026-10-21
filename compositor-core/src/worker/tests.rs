@@ -15,7 +15,7 @@ use crate::session::Session;
 /// The key of a Reader of the path.
 fn key(path: impl Into<PathBuf>) -> ResultKey {
     let mut session = Session::new();
-    let changes = session.create_readers(vec![path.into()], Point::default());
+    let changes = session.create_readers(vec![path.into()], Point::default(), None);
     let id = *changes.nodes.first().unwrap();
     result_key(session.document(), session.reloads(), id).unwrap()
 }

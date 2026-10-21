@@ -1,9 +1,10 @@
 use open_ng::Point;
 
 use super::*;
-use crate::document::Assignment;
+use crate::document::{Assignment, ReaderVersion};
 use crate::fixtures::{self, directory};
 use crate::image::{Channel, Window};
+use crate::parameter::Value;
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 
@@ -11,12 +12,15 @@ const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 const DEEP_CHAIN: u64 = 10_000;
 
 fn reader(path: impl AsRef<Path>) -> Node {
-    Node::new(
+    let mut node = Node::new(
         NodeKind::Reader {
-            path: path.as_ref().into(),
+            version: ReaderVersion::V1,
         },
         ORIGIN,
-    )
+    );
+    node.set_value("file", Value::File(path.as_ref().into()))
+        .unwrap();
+    node
 }
 
 fn exposure(stops: Option<f64>) -> Node {
@@ -241,12 +245,21 @@ fn exposure_keeps_a_grey_image_one_plane() {
 }
 
 #[test]
-fn an_unconnected_input_gives_the_empty_image() {
+fn an_unconnected_input_or_a_reader_without_a_file_gives_the_empty_image() {
+    let without_file = Node::new(
+        NodeKind::Reader {
+            version: ReaderVersion::V1,
+        },
+        ORIGIN,
+    );
+    let documents = [chain([exposure(Some(3.0))]), chain([without_file])];
     let mut evaluator = Evaluator::new();
-    let image = run(&mut evaluator, &key(&chain([exposure(Some(3.0))]), 1)).unwrap();
-    assert_eq!(image.display_window().width, 0);
-    assert_eq!(image.data_window().height, 0);
-    assert!(image.plane(Channel::R).is_empty());
+    for document in documents {
+        let image = run(&mut evaluator, &key(&document, 1)).unwrap();
+        assert_eq!(image.display_window().width, 0);
+        assert_eq!(image.data_window().height, 0);
+        assert!(image.plane(Channel::R).is_empty());
+    }
 }
 
 #[test]

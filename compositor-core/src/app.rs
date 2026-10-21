@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{ExposureVersion, NodeId, NodeKind, Slot, unconnected_inputs};
+use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{ResultKey, result_key};
 use crate::gpu::{Drawn, FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
+use crate::panel::Panel;
+use crate::parameter::Value;
 use crate::session::Session;
 use crate::worker::{Evaluated, ViewerError, Wanted, Worker};
 
@@ -69,6 +71,12 @@ pub enum Event {
     /// A key released anywhere in the window, so that no key is left held.
     KeyReleased(Key),
     Command(Command),
+    /// The type chosen in the menu a [`Request::ShowCreationMenu`] opened, by its name in
+    /// [`node_types`](crate::node_types). A Reader asks for its files first.
+    NodeTypeChosen {
+        type_name: &'static str,
+        anchor: Anchor,
+    },
     /// The pane's gesture can no longer expect its button's release, as when the pane lost the
     /// keyboard to another pane or a dialog, or the window lost it to another application.
     FocusLost(Pane),
@@ -154,6 +162,12 @@ pub enum Request {
         undo: Option<&'static str>,
         redo: Option<&'static str>,
     },
+    /// Open the node creation menu at the pointer, then dispatch [`Event::NodeTypeChosen`] with
+    /// the anchor if a type is chosen.
+    ShowCreationMenu(Anchor),
+    /// Show the node's parameters in the parameter panel, or that no node is selected with
+    /// `None`. The panel starts empty.
+    ShowPanel(Option<Panel>),
     /// Show the text in the status bar's permanent GPU label, or hide the label with `None`.
     /// It changes when the panes stop or start drawing, and when a GPU error is counted.
     ShowGpuLabel(Option<String>),
@@ -165,12 +179,14 @@ pub enum Request {
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// A Reader for each file chosen, placed where the pointer is over the graph.
+    /// A Reader for each file chosen, placed where the pointer is over the graph, or below the
+    /// current node.
     ReadFiles,
-    /// An Exposure node where the pointer is over the graph, selected alone.
-    CreateExposure,
-    /// A new file for the one selected Reader.
-    ChangeReaderFile,
+    /// Keeps the parameter panel on the node it shows, whatever is selected, until unpinned or
+    /// the node is deleted.
+    PinPanel,
+    /// Has the parameter panel show the current node, the last selected, again.
+    UnpinPanel,
     /// Reads the selected Readers' files again, for every Reader of them, when they are next
     /// viewed, at once if they are.
     Reload,
@@ -198,6 +214,8 @@ pub enum Key {
     Y,
     /// Delete or Backspace: deletes the selected nodes while the pointer is over the graph.
     Delete,
+    /// Opens the node creation menu while the pointer is over the graph.
+    Tab,
     /// A key of the digit row, by its position rather than the character it types, so that
     /// layouts that type digits with Shift, as AZERTY does, use the same keys. Alone it views
     /// the slot, with Ctrl it marks the selected node there, with Shift it frames that node.
@@ -212,7 +230,7 @@ impl Key {
             Key::G => open_ng::Key::G,
             Key::H => open_ng::Key::H,
             Key::Y => open_ng::Key::Y,
-            Key::Delete | Key::Slot(_) => return None,
+            Key::Delete | Key::Tab | Key::Slot(_) => return None,
         })
     }
 }
@@ -221,17 +239,29 @@ impl Key {
 /// it is open, so the choice is checked again when it arrives.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FileIntent {
-    /// A Reader for each file, stacked downwards from a graph point.
-    CreateReaders {
-        at: Point,
+    /// A Reader for each file, stacked downwards from the anchor.
+    CreateReaders(Anchor),
+    /// The first file chosen for a node's file parameter.
+    SetFile {
+        node: NodeId,
+        parameter: &'static str,
     },
-    SetReaderPath(NodeId),
 }
 
 impl FileIntent {
     pub fn allows_several(self) -> bool {
-        matches!(self, FileIntent::CreateReaders { .. })
+        matches!(self, FileIntent::CreateReaders(_))
     }
+}
+
+/// Where a new node goes, as it was when the artist asked for it, so that a menu or dialog taking
+/// the keyboard and pointer in between changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Anchor {
+    /// The pointer over the graph, or the middle of the graph view if it was elsewhere.
+    pub at: Point,
+    /// The node a new node is inserted after or placed below: the last selected.
+    pub current: Option<NodeId>,
 }
 
 /// Pointer input to a pane, in physical pixels from its top-left.
@@ -349,6 +379,12 @@ pub struct App {
     undo_labels: [Option<&'static str>; 2],
     /// The status bar's GPU label as last requested.
     gpu_label: Option<String>,
+    /// The node the parameter panel stays on instead of the current node.
+    pinned: Option<NodeId>,
+    /// The session's version and the pin when the panel last followed them.
+    panel_followed: Option<(u64, Option<NodeId>)>,
+    /// The parameter panel as last requested.
+    panel: Option<Panel>,
 }
 
 impl App {
@@ -373,6 +409,9 @@ impl App {
             caption: String::new(),
             undo_labels: [None, None],
             gpu_label: None,
+            pinned: None,
+            panel_followed: None,
+            panel: None,
         }
     }
 
@@ -380,13 +419,18 @@ impl App {
         &self.session
     }
 
-    /// Edits the session as a parameter panel will, which the shell's drag check stands in for,
-    /// then follows the change as [`App::dispatch`] does. Returns the requests, and the number of
-    /// the request whose result shows the edited session.
-    pub fn edit(&mut self, edit: impl FnOnce(&mut Session)) -> (Vec<Request>, u64) {
-        edit(&mut self.session);
+    /// Edits the session, as the parameter panel does, then follows the change as
+    /// [`App::dispatch`] does. Returns the requests, and what the edit returned.
+    pub fn edit<R>(&mut self, edit: impl FnOnce(&mut Session) -> R) -> (Vec<Request>, R) {
+        let edited = edit(&mut self.session);
         let requests = self.after_change(vec![Request::Redraw(Pane::Graph)]);
-        (requests, self.requests_sent)
+        (requests, edited)
+    }
+
+    /// The number of the latest request to the worker, whose result shows the session as it is,
+    /// for the drag check.
+    pub fn latest_request(&self) -> u64 {
+        self.requests_sent
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
@@ -412,6 +456,7 @@ impl App {
             Event::KeyPressed { key, modifiers } => self.key_pressed(key, modifiers),
             Event::KeyReleased(key) => self.key_released(key),
             Event::Command(command) => self.command(command),
+            Event::NodeTypeChosen { type_name, anchor } => self.node_type_chosen(type_name, anchor),
             // Another pane's focus loss can arrive after a press has given the graph the
             // keyboard, so it must not cancel the gesture that press began.
             Event::FocusLost(Pane::Graph) => {
@@ -467,11 +512,13 @@ impl App {
         requests
     }
 
-    /// Follows whatever the event or edit changed: the viewer, then the labels the shell shows.
+    /// Follows whatever the event or edit changed: the viewer, then the panel and the labels the
+    /// shell shows.
     fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
         self.follow_viewer(&mut requests);
-        // The labels go first, since performing another request may dispatch again and show
-        // newer ones.
+        // These go first, since performing another request may dispatch again and show newer
+        // ones.
+        self.follow_panel(&mut requests);
         let undo_labels = [self.session.undo_label(), self.session.redo_label()];
         if undo_labels != self.undo_labels {
             self.undo_labels = undo_labels;
@@ -484,6 +531,38 @@ impl App {
             requests.insert(0, Request::ShowGpuLabel(gpu_label));
         }
         requests
+    }
+
+    /// Keeps the panel on the pinned node, or the current node: shows it when it changed. A pin
+    /// on a deleted node is dropped, so undoing the delete does not pin it again.
+    fn follow_panel(&mut self, requests: &mut Vec<Request>) {
+        let document = self.session.document();
+        if self
+            .pinned
+            .is_some_and(|pinned| document.node(pinned).is_none())
+        {
+            self.pinned = None;
+        }
+        // Building the panel clones the node's values, so not on every pointer move.
+        let followed = Some((self.session.version(), self.pinned));
+        if followed == self.panel_followed {
+            return;
+        }
+        self.panel_followed = followed;
+        let panel = match self.pinned {
+            Some(pinned) => Panel::of(document, pinned, true),
+            None => (document.selection().last())
+                .and_then(|&current| Panel::of(document, current, false)),
+        };
+        if panel != self.panel {
+            self.panel.clone_from(&panel);
+            requests.insert(0, Request::ShowPanel(panel));
+        }
+    }
+
+    /// The parameter panel as last shown.
+    pub fn panel(&self) -> Option<&Panel> {
+        self.panel.as_ref()
     }
 
     /// Whether the panes cannot draw, and how many GPU errors there were, which the status bar
@@ -666,6 +745,9 @@ impl App {
         }
         match (self.hovered, key.in_graph()) {
             (Some(Pane::Graph), _) if key == Key::Delete => self.delete_selected(),
+            (Some(Pane::Graph), _) if key == Key::Tab => {
+                vec![Request::ShowCreationMenu(self.anchor())]
+            }
             (Some(Pane::Graph), Some(key)) => redraw_if(
                 Pane::Graph,
                 self.session.graph_input(InputEvent::KeyPressed(key)),
@@ -725,23 +807,20 @@ impl App {
 
     fn command(&mut self, command: Command) -> Vec<Request> {
         match command {
-            Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders {
-                at: self.graph_point_at_pointer(),
-            })],
-            Command::CreateExposure => {
-                let kind = NodeKind::Exposure {
-                    version: ExposureVersion::CURRENT,
-                };
-                self.session
-                    .create_node(kind, self.graph_point_at_pointer());
-                vec![Request::Redraw(Pane::Graph)]
-            }
-            Command::ChangeReaderFile => match self.session.document().selection() {
-                &[id] => vec![Request::ChooseFiles(FileIntent::SetReaderPath(id))],
-                _ => vec![Request::ShowStatus(
-                    "Select one Reader to change its file".to_owned(),
-                )],
+            Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders(
+                self.anchor(),
+            ))],
+            Command::PinPanel => match &self.panel {
+                Some(panel) => {
+                    self.pinned = Some(panel.node);
+                    Vec::new()
+                }
+                None => vec![Request::ShowStatus("Select a node to pin it".to_owned())],
             },
+            Command::UnpinPanel => {
+                self.pinned = None;
+                Vec::new()
+            }
             Command::Reload => {
                 let selection = self.session.document().selection().to_vec();
                 if self.session.reload(&selection) {
@@ -790,15 +869,31 @@ impl App {
         }
     }
 
-    /// Where the pointer is over the graph, or the middle of the graph view if it is elsewhere.
-    fn graph_point_at_pointer(&self) -> Point {
+    fn anchor(&self) -> Anchor {
         let view = self.session.graph_view();
         let viewport = view.viewport();
         let pointer = self.graph_pointer.unwrap_or(PhysicalPoint {
             x: viewport.width as f32 / 2.0,
             y: viewport.height as f32 / 2.0,
         });
-        view.to_graph(pointer)
+        Anchor {
+            at: view.to_graph(pointer),
+            current: self.session.document().selection().last().copied(),
+        }
+    }
+
+    fn node_type_chosen(&mut self, type_name: &'static str, anchor: Anchor) -> Vec<Request> {
+        // A Reader without a file is no use to the artist, so the dialog comes first, and
+        // cancelling it creates nothing.
+        if type_name == "reader" {
+            return vec![Request::ChooseFiles(FileIntent::CreateReaders(anchor))];
+        }
+        match (self.session).create_node(type_name, anchor.at, anchor.current) {
+            Ok(_) => vec![Request::Redraw(Pane::Graph)],
+            Err(error) => vec![Request::ShowStatus(format!(
+                "Cannot create the node: {error}"
+            ))],
+        }
     }
 
     fn files_chosen(&mut self, intent: FileIntent, paths: Vec<PathBuf>) -> Vec<Request> {
@@ -806,11 +901,12 @@ impl App {
             return Vec::new();
         };
         match intent {
-            FileIntent::CreateReaders { at } => {
-                self.session.create_readers(paths, at);
+            FileIntent::CreateReaders(Anchor { at, current }) => {
+                self.session.create_readers(paths, at, current);
             }
-            FileIntent::SetReaderPath(node) => {
-                if let Err(error) = self.session.set_reader_path(node, first) {
+            FileIntent::SetFile { node, parameter } => {
+                let file = Value::File(first.into());
+                if let Err(error) = self.session.set_value(node, parameter, file) {
                     return vec![Request::ShowStatus(format!(
                         "Cannot change the file: {error}"
                     ))];
@@ -945,12 +1041,16 @@ impl App {
             // The previous image stays until then.
             _ => details.push("updating…".to_owned()),
         }
-        for (id, input) in unconnected_inputs(document, viewed) {
+        for (id, what) in missing(document, viewed) {
+            let (label, lack) = match what {
+                Missing::Input(input) => (input.label, "is not connected"),
+                Missing::File(parameter) => (parameter.label, "is not set"),
+            };
             details.push(if id == viewed {
-                format!("{} is not connected", input.label)
+                format!("{label} {lack}")
             } else {
                 let upstream = document.node(id).expect("inputs name existing nodes");
-                format!("{} of {} is not connected", input.label, upstream.name())
+                format!("{label} of {} {lack}", upstream.name())
             });
         }
         if details.is_empty() {
