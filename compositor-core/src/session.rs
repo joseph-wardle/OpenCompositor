@@ -353,7 +353,7 @@ impl Session {
                 }
                 assignments.push(Assignment {
                     consumer: id,
-                    input: input.name.into(),
+                    input: input.first_slot(),
                     source: Some(current),
                 });
             } else {

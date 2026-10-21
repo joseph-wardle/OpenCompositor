@@ -155,8 +155,19 @@ pub struct NodeInput {
     /// Whether the input is a series of slots, each taking an image, rather than one image.
     pub repeating: bool,
     /// Whether the node reports the input as missing while it takes no image, rather than making
-    /// do without it.
+    /// do without it. Never set on a repeating input: no node type asks for at least one slot.
     pub required: bool,
+}
+
+impl NodeInput {
+    /// The slot a wire takes when the input is named alone: the one slot of an input that does
+    /// not repeat, or a repeating input's first.
+    pub fn first_slot(&self) -> InputSlot<'static> {
+        InputSlot {
+            input: self.name,
+            slot: u32::from(self.repeating),
+        }
+    }
 }
 
 /// Where a wire enters a node: an input, and for a repeating input which of its slots.
@@ -278,6 +289,23 @@ const MERGE_V1_INPUTS: &[NodeInput] = &[
     },
 ];
 
+const _: () = {
+    let tables = [EXPOSURE_V1_INPUTS, MERGE_V1_INPUTS];
+    let mut table = 0;
+    while table < tables.len() {
+        let mut index = 0;
+        while index < tables[table].len() {
+            let input = &tables[table][index];
+            assert!(
+                !(input.repeating && input.required),
+                "a repeating input is never required"
+            );
+            index += 1;
+        }
+        table += 1;
+    }
+};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub kind: NodeKind,
@@ -389,7 +417,7 @@ pub fn missing(document: &Document, node: NodeId) -> Vec<(NodeId, Missing)> {
             }
         }
         for input in current.kind.inputs() {
-            if input.required && current.input(input.name).is_none() {
+            if input.required && current.input(input.first_slot()).is_none() {
                 missing.push((id, Missing::Input(input)));
             }
         }
