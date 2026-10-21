@@ -717,6 +717,33 @@ fn a_base_alone_or_mix_zero_is_the_base_shared_and_nothing_connected_is_empty() 
     assert!(empty.display_window().is_empty());
 }
 
+/// A Mix the kernel would receive as 0 or 1 is that special case, whatever its f64 value: the
+/// products by zero that the cases avoid are the kernel's, in f32.
+#[test]
+fn mix_is_special_cased_as_the_kernel_receives_it() {
+    let evaluator = Evaluator::new();
+    let one = window(0, 0, 1, 1);
+    let base = flat(one, one, [f32::INFINITY, 1.0, 1.0, 1.0], Vec::new());
+    let layer = flat(one, one, [0.5, 0.5, 0.5, 0.5], Vec::new());
+    let compute = |mix| {
+        evaluator
+            .compute(&merge_key(mix), &[&base, &layer], &mut Vec::new())
+            .unwrap()
+    };
+
+    let nearly_one = compute(1.0 - 1e-10);
+    assert_eq!(
+        values(&nearly_one, 0, 0),
+        [f32::INFINITY, 1.0, 1.0, 1.0],
+        "the stack as composed, not dissolved against the base"
+    );
+    let nearly_zero = compute(1e-50);
+    assert!(Arc::ptr_eq(
+        nearly_zero.plane(Channel::R),
+        base.plane(Channel::R)
+    ));
+}
+
 /// Merge through the pool's chunking at every width across a SIMD tail, the layer offset by one
 /// pixel from the base so that the union has rows and columns of each alone and of both: every
 /// output sample is the shared functions' bit for bit, and every one is written, since the

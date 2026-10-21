@@ -19,14 +19,15 @@ pub(super) fn merge(
     pool: &Pool,
     key: &ResultKey,
     inputs: &[&Image],
-    mix: f64,
+    mix: f32,
     released: &mut Vec<Arc<[f32]>>,
 ) -> Result<Image, EvalError> {
     let Some((base, layers)) = inputs.split_first() else {
         return Ok(Image::empty());
     };
     // The base alone, or Mix 0, is the base: special cases, since the kernel's products by zero
-    // would turn an infinite operand into NaN where the artist asked for the base unchanged.
+    // would turn an infinite operand into NaN where the artist asked for the base unchanged. Mix
+    // is compared as the kernel receives it, so a Mix within f32 rounding of 0 or 1 is the case.
     if layers.is_empty() || mix == 0.0 {
         return Ok((*base).clone());
     }
@@ -47,7 +48,7 @@ pub(super) fn merge(
     }
     // Mix 1 is the stack as composed: the kernel's product by zero would make NaN of an
     // infinite base.
-    let mix = (mix != 1.0).then_some(mix as f32);
+    let mix = (mix != 1.0).then_some(mix);
     let width = window.width as usize;
     let mut outputs: [Arc<[f32]>; 4] =
         [(); 4].map(|()| output_plane(released, window.area() as usize));

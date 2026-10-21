@@ -579,7 +579,8 @@ impl Evaluator {
                 ))
             }
             Recipe::Merge { mix, .. } => {
-                merge::merge(&self.pool, key, inputs, f64::from_bits(*mix), released)
+                let mix = f64::from_bits(*mix) as f32;
+                merge::merge(&self.pool, key, inputs, mix, released)
             }
         };
         // Operations write only their own outputs, so a panic leaves nothing half done, and the
