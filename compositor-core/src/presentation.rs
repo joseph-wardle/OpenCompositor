@@ -7,11 +7,14 @@ use open_ng::{
     Verdict,
 };
 
-use crate::document::{Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind};
+use crate::document::{
+    Assignment, Changes, ConnectionError, Document, InputSlot, MAX_SLOTS, Node, NodeId, NodeKind,
+};
 
-/// Every node's one output. An input's pin is its declaration index plus one, so pins are
-/// derived from the node's version and never stored: a version that reorders or removes inputs
-/// would need pins of its own that are never reused.
+/// Every node's one output. An input's pin is derived from its declaration index and, for a
+/// repeating input, its slot, so pins are never stored and a slot's pin is its own for the
+/// node's life: a version that reorders or removes inputs would need pins of its own that are
+/// never reused.
 const OUTPUT_PIN: PinId = PinId(0);
 
 const READER_COLOR: Color = Color {
@@ -23,6 +26,11 @@ const EXPOSURE_COLOR: Color = Color {
     r: 90,
     g: 130,
     b: 80,
+};
+const MERGE_COLOR: Color = Color {
+    r: 150,
+    g: 105,
+    b: 60,
 };
 const FAILED_COLOR: Color = Color {
     r: 160,
@@ -120,6 +128,7 @@ pub(crate) fn record(
     let color = match node.kind {
         NodeKind::Reader { .. } => READER_COLOR,
         NodeKind::Exposure { .. } => EXPOSURE_COLOR,
+        NodeKind::Merge { .. } => MERGE_COLOR,
     };
     // Slot numbers go in the title, and a failure in the colour, until OpenNG has badges.
     // Nothing shows an evaluation in progress: the title would widen the node while it lasted, and the
@@ -144,43 +153,59 @@ pub(crate) fn record(
             label: "Image".to_owned(),
             direction: Direction::Output,
         })
-        .chain(
-            node.kind
-                .inputs()
-                .iter()
-                .enumerate()
-                .map(|(index, input)| Pin {
-                    id: input_pin(index),
-                    label: input.label.to_owned(),
-                    direction: Direction::Input,
-                }),
-        )
+        .chain(input_pins(node))
         .map(Row::Pin)
         .collect(),
     }
 }
 
-fn input_pin(index: usize) -> PinId {
-    PinId(index as u64 + 1)
+/// The node's input pins: one per input, and for a repeating input one per slot up to the last
+/// connected one, empty slots included, then one free slot, while there is one.
+fn input_pins(node: &Node) -> impl Iterator<Item = Pin> {
+    (node.kind.inputs().iter().enumerate()).flat_map(|(index, input)| {
+        let slots = if input.repeating {
+            let last = node.slots(input.name).last().map_or(0, |(slot, _)| slot);
+            1..=last.saturating_add(1).min(MAX_SLOTS)
+        } else {
+            0..=0
+        };
+        slots.map(move |slot| Pin {
+            id: input_pin(index, slot),
+            label: InputSlot {
+                input: input.label,
+                slot,
+            }
+            .to_string(),
+            direction: Direction::Input,
+        })
+    })
 }
 
-/// The name of the input a pin shows on a node of this kind.
-fn input_named(kind: &NodeKind, pin: PinId) -> Option<&'static str> {
-    let index = usize::try_from(pin.0.checked_sub(1)?).ok()?;
-    Some(kind.inputs().get(index)?.name)
+fn input_pin(index: usize, slot: u32) -> PinId {
+    PinId(u64::from(slot) << 32 | (index as u64 + 1))
+}
+
+/// The input and slot a pin shows on a node of this kind, named as the kind declares the input.
+/// Whether the input has the slot is the document's to say.
+fn input_at(kind: &NodeKind, pin: PinId) -> Option<InputSlot<'static>> {
+    let index = usize::try_from((pin.0 & u64::from(u32::MAX)).checked_sub(1)?).ok()?;
+    Some(InputSlot {
+        input: kind.inputs().get(index)?.name,
+        slot: (pin.0 >> 32) as u32,
+    })
 }
 
 /// The wires a node's connected inputs show.
 pub(crate) fn wires_into(id: NodeId, node: &Node) -> impl Iterator<Item = Connection> {
     node.inputs()
-        .map(move |(name, source)| wire(id, &node.kind, name, source))
+        .map(move |(input, source)| wire(id, &node.kind, input, source))
 }
 
-fn wire(consumer: NodeId, kind: &NodeKind, input: &str, source: NodeId) -> Connection {
+fn wire(consumer: NodeId, kind: &NodeKind, input: InputSlot<'_>, source: NodeId) -> Connection {
     let index = kind
         .inputs()
         .iter()
-        .position(|declared| declared.name == input)
+        .position(|declared| declared.name == input.input)
         .expect("a connected input is declared");
     Connection {
         from: PinRef {
@@ -189,7 +214,7 @@ fn wire(consumer: NodeId, kind: &NodeKind, input: &str, source: NodeId) -> Conne
         },
         to: PinRef {
             node: consumer.into(),
-            pin: input_pin(index),
+            pin: input_pin(index, input.slot),
         },
     }
 }
@@ -206,8 +231,8 @@ pub(crate) fn assignments(
         let node = document
             .node(consumer)
             .ok_or(ConnectionError::MissingNode(consumer))?;
-        let name = input_named(&node.kind, pin.pin).ok_or(ConnectionError::UnknownInput)?;
-        Ok((consumer, name))
+        let input = input_at(&node.kind, pin.pin).ok_or(ConnectionError::UnknownInput)?;
+        Ok((consumer, input))
     };
     let mut sources = BTreeMap::new();
     for wire in &edit.remove {

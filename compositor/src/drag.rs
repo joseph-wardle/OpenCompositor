@@ -1,15 +1,17 @@
-//! `--drag-check IMAGE`: drags the parameter panel's Stops slider on a Reader → Exposure chain of
-//! IMAGE with synthetic mouse events: a press at the groove's start, a move one pixel along it each
-//! refresh of the viewer's screen, and a release at its end. It reports how the viewer kept up. The
-//! worker evaluates the latest request and discards the rest, so an edit's latency ends at the
-//! first viewer frame submitted that samples a result from its request or a later one: a
-//! superseded edit is answered by the frame showing a newer value, as the artist sees it. The check
-//! reports the latencies over every edit, the final edit's own, how many edits' own values were
-//! shown, how long the GUI thread took to dispatch each mouse event from the slider to the requests
-//! performed, the stages of the worker's path for the edits whose result it delivered, and the
-//! process's resident memory. Then it checks that the drag undoes as one step and that a drag
-//! cancelled with Escape leaves the value as it was. It exits 0 if those held and the latencies'
-//! p95 and the final edit's met the budget, and 1 otherwise.
+//! `--drag-check IMAGE`: drags a parameter panel slider with synthetic mouse events, a press at
+//! the groove's start, a move one pixel along it each refresh of the viewer's screen, and a
+//! release at its end, on each chain in turn: Stops on Reader → Exposure of IMAGE, then Mix on
+//! Reader → Merge with IMAGE as the background and as one layer. It reports how the viewer kept
+//! up with each. The worker evaluates the latest request and discards the rest, so an edit's
+//! latency ends at the first viewer frame submitted that samples a result from its request or a
+//! later one: a superseded edit is answered by the frame showing a newer value, as the artist
+//! sees it. For each chain the check reports the latencies over every edit, the final edit's
+//! own, how many edits' own values were shown, how long the GUI thread took to dispatch each
+//! mouse event from the slider to the requests performed, the stages of the worker's path for
+//! the edits whose result it delivered, and the process's resident memory. Then it checks that
+//! the drag undoes as one step and that a drag cancelled with Escape leaves the value as it was.
+//! It exits 0 if those held and every chain's latencies' p95 and final edit met the budget, and
+//! 1 otherwise.
 //!
 //! Run it in a release build on the workstation, and twice, since the first run's shader and
 //! file caches are cold. A frame counts when the GUI thread submits it, not when the display
@@ -39,10 +41,44 @@ const BUDGET: Duration = Duration::from_millis(50);
 const POLL: Duration = Duration::from_millis(100);
 const LONGEST_WAIT: Duration = Duration::from_secs(60);
 
+/// A chain the check drags a slider on, from its Reader to the node whose panel has the slider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Chain {
+    Exposure,
+    Merge,
+}
+
+impl Chain {
+    /// The node type after the Reader, which the chain is named for.
+    fn type_name(self) -> &'static str {
+        match self {
+            Chain::Exposure => "exposure",
+            Chain::Merge => "merge",
+        }
+    }
+
+    /// The parameter dragged, and its label, which names the edit's step.
+    fn parameter(self) -> (&'static str, &'static str) {
+        match self {
+            Chain::Exposure => ("stops", "Stops"),
+            Chain::Merge => ("mix", "Mix"),
+        }
+    }
+}
+
+/// The chains in the order the check runs them.
+const CHAINS: [Chain; 2] = [Chain::Exposure, Chain::Merge];
+
 struct Check {
     image: PathBuf,
-    exposure: Option<NodeId>,
-    /// The panel's Stops slider, and how many pixels its drag covers.
+    /// The chain being dragged, and those still to run.
+    chain: Chain,
+    pending: Vec<Chain>,
+    /// The chain's nodes: the Reader and the node whose slider is dragged.
+    nodes: Vec<NodeId>,
+    /// The request marking the chain's node made, which the viewer must show before the drag.
+    marked: u64,
+    /// The panel's slider, and how many pixels its drag covers.
     slider: *mut ffi::QSlider,
     span: i32,
     /// Between moves: the viewer's refresh period, to Qt's millisecond timers.
@@ -50,6 +86,8 @@ struct Check {
     edits: Vec<Edit>,
     /// How long each mouse event took the GUI thread.
     dispatches: Vec<Duration>,
+    /// What failed on the chains run so far.
+    failures: Vec<String>,
 }
 
 struct Edit {
@@ -70,15 +108,22 @@ thread_local! {
 }
 
 pub fn start(image: PathBuf) {
+    let mut pending = CHAINS.to_vec();
+    pending.reverse();
+    let chain = pending.pop().expect("at least one chain");
     CHECK.with(|cell| {
         *cell.borrow_mut() = Some(Check {
             image,
-            exposure: None,
+            chain,
+            pending,
+            nodes: Vec::new(),
+            marked: 0,
             slider: std::ptr::null_mut(),
             span: 0,
             period: 0,
             edits: Vec::new(),
             dispatches: Vec::new(),
+            failures: Vec::new(),
         })
     });
     ffi::single_shot(1000, setup, 0);
@@ -130,22 +175,31 @@ fn poll_in(tries: usize) -> i32 {
     POLL.as_millis() as i32 * tries as i32
 }
 
-/// Makes the chain, which selects the Exposure for the panel, and marks it in the viewer's slot,
-/// which asks the worker for it.
+/// Makes the chain, which selects its last node for the panel, and marks that node in the
+/// viewer's slot, which asks the worker for it.
 fn setup(_: usize) {
-    let image = with(|check| check.image.clone());
-    let exposure = crate::edit(|session| {
+    let (image, chain) = with(|check| (check.image.clone(), check.chain));
+    let nodes = crate::edit(|session| {
         let reader = created(session.create_readers(vec![image], Point::default(), None));
         let node = created(
-            (session.create_node("exposure", Point::default(), Some(reader)))
-                .expect("Exposure is a node type and the Reader exists"),
+            (session.create_node(chain.type_name(), Point::default(), Some(reader)))
+                .expect("the type exists and the Reader exists"),
         );
+        if chain == Chain::Merge {
+            session
+                .connect(node, ("layer", 1), reader)
+                .expect("a Merge takes a layer");
+        }
         session
             .set_mark(Slot::new(1).expect("1 is a slot"), Some(node))
             .expect("the node exists");
-        node
+        vec![reader, node]
     });
-    with(|check| check.exposure = Some(exposure));
+    let marked = crate::latest_request();
+    with(|check| {
+        check.nodes = nodes;
+        check.marked = marked;
+    });
     ffi::single_shot(poll_in(1), wait_for_image, 1);
 }
 
@@ -155,7 +209,8 @@ fn created(changes: Changes) -> NodeId {
 }
 
 fn wait_for_image(tries: usize) {
-    if crate::presented_request().is_some() {
+    let marked = with(|check| check.marked);
+    if crate::presented_request().is_some_and(|shown| shown >= marked) {
         begin();
     } else if POLL * tries as u32 >= LONGEST_WAIT {
         report(vec![format!(
@@ -169,11 +224,12 @@ fn wait_for_image(tries: usize) {
 
 /// Presses the slider at the start of its groove and schedules the first move a refresh away.
 fn begin() {
+    let (parameter, label) = with(|check| check.chain.parameter());
     // SAFETY: the panel lives as long as its dock, until the main window is destroyed after the
     // event loop; the slider until the panel shows another node, which nothing selects here.
-    let slider = unsafe { ffi::panel_slider(crate::widgets().panel, &QString::from("stops")) };
+    let slider = unsafe { ffi::panel_slider(crate::widgets().panel, &QString::from(parameter)) };
     if slider.is_null() {
-        return report(vec!["the panel shows no Stops slider".to_owned()]);
+        return report(vec![format!("the panel shows no {label} slider")]);
     }
     // SAFETY: as above.
     let span = unsafe { ffi::slider_span(slider) };
@@ -246,19 +302,21 @@ fn wait_for_final(tries: usize) {
 /// Checks that the drag was one step, which one undo removes, and that a drag cancelled with
 /// Escape changes nothing. Returns the failures.
 fn check_steps() -> Vec<String> {
-    let (exposure, slider, span) =
-        with(|check| (check.exposure.expect("set up"), check.slider, check.span));
+    let (node, slider, span, (parameter, label)) = with(|check| {
+        let node = *check.nodes.last().expect("set up");
+        (node, check.slider, check.span, check.chain.parameter())
+    });
     let state = || {
         crate::read_app(|app| {
             let session = app.session();
-            let stops = (session.document().node(exposure))
-                .and_then(|node| node.authored_value("stops").cloned());
-            (stops, session.undo_label(), session.editing().is_some())
+            let value = (session.document().node(node))
+                .and_then(|node| node.authored_value(parameter).cloned());
+            (value, session.undo_label(), session.editing().is_some())
         })
     };
     let mut failures = Vec::new();
     let dragged = state();
-    if dragged.1 != Some("Stops") || dragged.2 {
+    if dragged.1 != Some(label) || dragged.2 {
         failures.push(format!(
             "after the release, undo would undo {:?}, with an edit in progress: {}",
             dragged.1, dragged.2
@@ -282,15 +340,17 @@ fn check_steps() -> Vec<String> {
     let cancelled = state();
     if moved == dragged.0 || cancelled != dragged {
         failures.push(format!(
-            "a drag cancelled with Escape moved Stops from {:?} to {moved:?} and left {:?}, then \
-             undo would undo {:?}, with an edit in progress: {}",
+            "a drag cancelled with Escape moved {label} from {:?} to {moved:?} and left {:?}, \
+             then undo would undo {:?}, with an edit in progress: {}",
             dragged.0, cancelled.0, cancelled.1, cancelled.2
         ));
     }
     crate::dispatch(Event::Command(Command::Undo));
     let undone = state().0;
     if undone.is_some() {
-        failures.push(format!("one undo after the drag left Stops at {undone:?}"));
+        failures.push(format!(
+            "one undo after the drag left {label} at {undone:?}"
+        ));
     }
     failures
 }
@@ -301,11 +361,13 @@ fn caption() -> String {
     String::from(&unsafe { ffi::label_text(crate::widgets().caption) })
 }
 
-/// Prints what the drag showed and exits: 1 with any failure, else 0.
+/// Prints what the chain's drag showed, then runs the next chain, or exits: 1 with any failure
+/// on any chain, else 0.
 fn report(mut failures: Vec<String>) {
-    let check = CHECK
+    let mut check = CHECK
         .with(|cell| cell.borrow_mut().take())
         .expect("the check has started");
+    let name = format!("drag check ({:?})", check.chain);
     let edits = &check.edits;
     let latency = |edit: &Edit| Some(edit.framed? - edit.at);
     // Every edit once the final one is framed, since that frame answers them all.
@@ -320,10 +382,10 @@ fn report(mut failures: Vec<String>) {
     spacing.sort();
     let mut dispatches = check.dispatches.clone();
     dispatches.sort();
-    eprintln!("drag check: {}", caption());
+    eprintln!("{name}: {}", caption());
     if let (Some(first), Some(last)) = (edits.first(), edits.last()) {
         eprintln!(
-            "drag check: {} edits {:.1?} apart (asked {} ms) over {:.1?}",
+            "{name}: {} edits {:.1?} apart (asked {} ms) over {:.1?}",
             edits.len(),
             percentile(&spacing, 0.5),
             check.period,
@@ -331,7 +393,7 @@ fn report(mut failures: Vec<String>) {
         );
     }
     eprintln!(
-        "drag check: {} mouse events over {} pixels took the GUI thread p50 {:.1?}, p95 {:.1?}, max {:.1?}",
+        "{name}: {} mouse events over {} pixels took the GUI thread p50 {:.1?}, p95 {:.1?}, max {:.1?}",
         dispatches.len(),
         check.span,
         percentile(&dispatches, 0.5),
@@ -339,7 +401,7 @@ fn report(mut failures: Vec<String>) {
         percentile(&dispatches, 1.0),
     );
     eprintln!(
-        "drag check: edit → frame p50 {:.1?}, p95 {:.1?}, max {:.1?}; the final edit {}; {} of {} edits' own values were shown",
+        "{name}: edit → frame p50 {:.1?}, p95 {:.1?}, max {:.1?}; the final edit {}; {} of {} edits' own values were shown",
         percentile(&latencies, 0.5),
         percentile(&latencies, 0.95),
         percentile(&latencies, 1.0),
@@ -391,11 +453,11 @@ fn report(mut failures: Vec<String>) {
         })
         .collect();
     eprintln!(
-        "drag check: stage medians of the {} edits whose result was delivered: {}",
+        "{name}: stage medians of the {} edits whose result was delivered: {}",
         delivered.len(),
         medians.join(", ")
     );
-    eprintln!("drag check: resident memory {}", resident_memory());
+    eprintln!("{name}: resident memory {}", resident_memory());
     if let Some(final_latency) = final_latency {
         let p95 = percentile(&latencies, 0.95);
         if p95 > BUDGET {
@@ -410,9 +472,25 @@ fn report(mut failures: Vec<String>) {
         }
     }
     for failure in &failures {
-        eprintln!("drag check failed: {failure}");
+        eprintln!("{name} failed: {failure}");
     }
-    ffi::exit(i32::from(!failures.is_empty()));
+    check.failures.extend(failures);
+    let Some(next) = check.pending.pop() else {
+        return ffi::exit(i32::from(!check.failures.is_empty()));
+    };
+    // The next chain starts from an empty document, as the first did.
+    let nodes = std::mem::take(&mut check.nodes);
+    crate::edit(|session| {
+        session
+            .delete_nodes(&nodes)
+            .expect("the chain's nodes exist")
+    });
+    check.chain = next;
+    check.slider = std::ptr::null_mut();
+    check.edits.clear();
+    check.dispatches.clear();
+    CHECK.with(|cell| *cell.borrow_mut() = Some(check));
+    ffi::single_shot(1000, setup, 0);
 }
 
 /// The value at the quantile of sorted durations, or zero of none.

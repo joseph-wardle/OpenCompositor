@@ -1111,3 +1111,18 @@ fn a_pinned_panel_stays_on_its_node_until_unpinned_or_the_node_is_deleted() {
     let panel = app.panel.as_ref().unwrap();
     assert_eq!((panel.node, panel.pinned), (exposure, false));
 }
+
+#[test]
+fn a_viewed_merge_with_nothing_connected_is_empty_and_misses_nothing() {
+    let (mut app, _deliveries) = app();
+    let changes = (app.session)
+        .create_node("merge", Point::default(), None)
+        .unwrap();
+    let merge = *changes.nodes.first().unwrap();
+    app.session
+        .set_mark(Slot::new(1).unwrap(), Some(merge))
+        .unwrap();
+    app.dispatch(Event::Draw(Pane::Viewer));
+    app.dispatch(read(&sent(&app), 0, 0));
+    assert_eq!(app.caption, "Slot 1 · Merge · empty");
+}

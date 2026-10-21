@@ -54,6 +54,9 @@ pub enum NodeKind {
     /// Multiplies R, G and B by two to the power of its Stops and leaves A. On premultiplied
     /// pixels that equals unpremultiplying, scaling and premultiplying again.
     Exposure { version: ExposureVersion },
+    /// Composes its layers over its background, each layer in slot order over the result so far,
+    /// then dissolves that stack by its Mix against the base, the lowest connected input.
+    Merge { version: MergeVersion },
 }
 
 impl NodeKind {
@@ -66,6 +69,9 @@ impl NodeKind {
             NodeKind::Exposure {
                 version: ExposureVersion::V1,
             } => EXPOSURE_V1,
+            NodeKind::Merge {
+                version: MergeVersion::V1,
+            } => MERGE_V1,
         }
     }
 
@@ -74,6 +80,7 @@ impl NodeKind {
         match self {
             NodeKind::Reader { .. } => "Reader",
             NodeKind::Exposure { .. } => "Exposure",
+            NodeKind::Merge { .. } => "Merge",
         }
     }
 
@@ -84,6 +91,9 @@ impl NodeKind {
             NodeKind::Exposure {
                 version: ExposureVersion::V1,
             } => EXPOSURE_V1_INPUTS,
+            NodeKind::Merge {
+                version: MergeVersion::V1,
+            } => MERGE_V1_INPUTS,
         }
     }
 }
@@ -114,6 +124,13 @@ const NODE_TYPES: &[NodeType] = &[
             version: ExposureVersion::CURRENT,
         },
     },
+    NodeType {
+        name: "merge",
+        step: "Create Merge",
+        kind: NodeKind::Merge {
+            version: MergeVersion::CURRENT,
+        },
+    },
 ];
 
 impl NodeType {
@@ -127,13 +144,55 @@ pub fn node_types() -> &'static [NodeType] {
     NODE_TYPES
 }
 
-/// One image a node type takes, from another node's output.
+/// One image a node type takes, from another node's output, or for a repeating input a numbered
+/// series of them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeInput {
     /// Unchanged across labels: connections and scripts address it. Renaming or removing an
     /// input, or changing what it means, makes a new version of its node type.
     pub name: &'static str,
     pub label: &'static str,
+    /// Whether the input is a series of slots, each taking an image, rather than one image.
+    pub repeating: bool,
+    /// Whether the node reports the input as missing while it takes no image, rather than making
+    /// do without it.
+    pub required: bool,
+}
+
+/// Where a wire enters a node: an input, and for a repeating input which of its slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InputSlot<'a> {
+    /// The input's name.
+    pub input: &'a str,
+    /// 0 for an input that does not repeat. A repeating input's slots count from 1, as they are
+    /// labelled, up to [`MAX_SLOTS`]; a slot keeps its number for the node's life, whatever the
+    /// slots below it take, so a wire into it never moves.
+    pub slot: u32,
+}
+
+/// The most slots a repeating input has. A stack this deep is beyond any hand-built graph, and a
+/// script's mistaken slot number is refused before the node shows a row for every slot below it.
+pub const MAX_SLOTS: u32 = 256;
+
+impl<'a> From<&'a str> for InputSlot<'a> {
+    fn from(input: &'a str) -> InputSlot<'a> {
+        InputSlot { input, slot: 0 }
+    }
+}
+
+impl<'a> From<(&'a str, u32)> for InputSlot<'a> {
+    fn from((input, slot): (&'a str, u32)) -> InputSlot<'a> {
+        InputSlot { input, slot }
+    }
+}
+
+impl fmt::Display for InputSlot<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.slot {
+            0 => f.write_str(self.input),
+            slot => write!(f, "{} {slot}", self.input),
+        }
+    }
 }
 
 /// The parameter descriptions a Reader node was created with, as [`ExposureVersion`] is for
@@ -178,7 +237,46 @@ const EXPOSURE_V1: &[Parameter] = &[Parameter {
 const EXPOSURE_V1_INPUTS: &[NodeInput] = &[NodeInput {
     name: "source",
     label: "Source",
+    repeating: false,
+    required: true,
 }];
+
+/// The parameter and input descriptions a Merge node was created with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MergeVersion {
+    V1,
+}
+
+impl MergeVersion {
+    pub const CURRENT: MergeVersion = MergeVersion::V1;
+}
+
+const MERGE_V1: &[Parameter] = &[Parameter {
+    name: "mix",
+    label: "Mix",
+    kind: ParameterKind::Float(FloatParameter {
+        default: 1.0,
+        slider: 0.0..=1.0,
+        limits: 0.0..=1.0,
+    }),
+}];
+
+// Neither is required: the base is the lowest connected input, whichever that is, and nothing
+// connected gives the empty image.
+const MERGE_V1_INPUTS: &[NodeInput] = &[
+    NodeInput {
+        name: "background",
+        label: "Background",
+        repeating: false,
+        required: false,
+    },
+    NodeInput {
+        name: "layer",
+        label: "Layer",
+        repeating: true,
+        required: false,
+    },
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
@@ -188,9 +286,9 @@ pub struct Node {
     /// Only the values the artist set, each valid for its parameter. An absent value reads as its
     /// version's default, so a changed default never alters what was authored.
     authored: BTreeMap<&'static str, Value>,
-    /// Only the connected inputs, each naming the node whose output it takes. An unconnected
-    /// input is legal and reports itself when evaluated.
-    inputs: BTreeMap<&'static str, NodeId>,
+    /// Only the connected inputs, each naming the node whose output it takes, in input order and
+    /// then slot order. An unconnected input is legal and reports itself when evaluated.
+    inputs: BTreeMap<InputSlot<'static>, NodeId>,
 }
 
 impl Node {
@@ -212,18 +310,30 @@ impl Node {
                     .into_owned(),
                 None => self.kind.label().to_owned(),
             },
-            NodeKind::Exposure { .. } => self.kind.label().to_owned(),
+            NodeKind::Exposure { .. } | NodeKind::Merge { .. } => self.kind.label().to_owned(),
         }
     }
 
     /// The node an input takes its image from, if the input is connected.
-    pub fn input(&self, name: &str) -> Option<NodeId> {
-        self.inputs.get(name).copied()
+    pub fn input<'a>(&self, input: impl Into<InputSlot<'a>>) -> Option<NodeId> {
+        self.inputs.get(&input.into()).copied()
     }
 
-    /// Each connected input with the node it takes its image from, by input name.
-    pub fn inputs(&self) -> impl Iterator<Item = (&'static str, NodeId)> {
-        self.inputs.iter().map(|(&name, &source)| (name, source))
+    /// Each connected input with the node it takes its image from, in input order and then slot
+    /// order.
+    pub fn inputs(&self) -> impl Iterator<Item = (InputSlot<'static>, NodeId)> {
+        self.inputs.iter().map(|(&input, &source)| (input, source))
+    }
+
+    /// The connected slots of a repeating input with their sources, in slot order. Only a
+    /// repeating input has slots, so for any other input this is empty.
+    pub fn slots<'s>(&'s self, input: &'s str) -> impl Iterator<Item = (u32, NodeId)> + 's {
+        let from = InputSlot { input, slot: 1 };
+        let to = InputSlot {
+            input,
+            slot: MAX_SLOTS,
+        };
+        (self.inputs.range(from..=to)).map(|(slot, &source)| (slot.slot, source))
     }
 
     /// The value the artist set for a parameter, if they set one.
@@ -260,7 +370,8 @@ pub enum Missing {
 /// inputs, each in declaration order, and each upstream node once, without recursion. Empty if
 /// the document has no such node.
 ///
-/// What is missing gives the empty image, so this, not the image, says what is incomplete.
+/// What is missing gives the empty image, so this, not the image, says what is incomplete. An
+/// input a node makes do without, such as a Merge's slots, is never missing.
 pub fn missing(document: &Document, node: NodeId) -> Vec<(NodeId, Missing)> {
     let mut missing = Vec::new();
     let mut visited = BTreeSet::new();
@@ -277,14 +388,13 @@ pub fn missing(document: &Document, node: NodeId) -> Vec<(NodeId, Missing)> {
                 missing.push((id, Missing::File(parameter)));
             }
         }
-        let mut sources = Vec::new();
         for input in current.kind.inputs() {
-            match current.input(input.name) {
-                Some(source) => sources.push(source),
-                None => missing.push((id, Missing::Input(input))),
+            if input.required && current.input(input.name).is_none() {
+                missing.push((id, Missing::Input(input)));
             }
         }
         // Reversed, so that the first input's chain is visited first.
+        let sources: Vec<NodeId> = current.inputs().map(|(_, source)| source).collect();
         pending.extend(sources.into_iter().rev());
     }
     missing
@@ -332,8 +442,8 @@ impl Document {
     }
 
     /// This document with every assignment applied, refused whole if any assignment names a
-    /// missing node or an input its node does not declare, or if the result connects a node to
-    /// itself or has a cycle.
+    /// missing node or an input or slot its node does not have, or if the result connects a node
+    /// to itself or has a cycle.
     ///
     /// Only the result is judged, so a batch can move a wire that would form a cycle while the
     /// wire it replaces is still in place. An assignment that changes nothing keeps its node
@@ -345,12 +455,7 @@ impl Document {
             let consumer = self
                 .node(assignment.consumer)
                 .ok_or(ConnectionError::MissingNode(assignment.consumer))?;
-            let input = consumer
-                .kind
-                .inputs()
-                .iter()
-                .find(|input| input.name == assignment.input)
-                .ok_or(ConnectionError::UnknownInput)?;
+            let input = declared(&consumer.kind, assignment.input)?;
             if let Some(source) = assignment.source {
                 if !self.nodes.contains_key(&source) {
                     return Err(ConnectionError::MissingNode(source));
@@ -359,10 +464,10 @@ impl Document {
                     return Err(ConnectionError::SelfConnection);
                 }
             }
-            if !assigned.insert((assignment.consumer, input.name)) {
+            if !assigned.insert((assignment.consumer, input)) {
                 return Err(ConnectionError::InputAssignedTwice);
             }
-            if consumer.input(input.name) == assignment.source {
+            if consumer.input(input) == assignment.source {
                 continue;
             }
             let node = document
@@ -371,8 +476,8 @@ impl Document {
                 .expect("the consumer was found above");
             let node = Arc::make_mut(node);
             match assignment.source {
-                Some(source) => node.inputs.insert(input.name, source),
-                None => node.inputs.remove(input.name),
+                Some(source) => node.inputs.insert(input, source),
+                None => node.inputs.remove(&input),
             };
         }
         for assignment in assignments {
@@ -479,11 +584,31 @@ impl Document {
     }
 }
 
+/// The slot as the consumer's kind declares it, with the declaration's own name, or why the
+/// kind has no such slot.
+fn declared(kind: &NodeKind, slot: InputSlot<'_>) -> Result<InputSlot<'static>, ConnectionError> {
+    let input = (kind.inputs().iter())
+        .find(|input| input.name == slot.input)
+        .ok_or(ConnectionError::UnknownInput)?;
+    let has_slot = if input.repeating {
+        (1..=MAX_SLOTS).contains(&slot.slot)
+    } else {
+        slot.slot == 0
+    };
+    if !has_slot {
+        return Err(ConnectionError::UnknownSlot);
+    }
+    Ok(InputSlot {
+        input: input.name,
+        slot: slot.slot,
+    })
+}
+
 /// One input connected to a source, or disconnected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Assignment<'a> {
     pub consumer: NodeId,
-    pub input: &'a str,
+    pub input: InputSlot<'a>,
     /// The node whose output the input takes, or `None` to disconnect it. A node has one output
     /// for now; naming outputs would make this a node and an output name.
     pub source: Option<NodeId>,
@@ -495,6 +620,9 @@ pub enum ConnectionError {
     MissingNode(NodeId),
     /// The node's type has no input of that name.
     UnknownInput,
+    /// The input has no such slot: one that does not repeat has only slot 0, a repeating one
+    /// slots 1 to [`MAX_SLOTS`].
+    UnknownSlot,
     SelfConnection,
     /// One edit gave an input two sources.
     InputAssignedTwice,
@@ -506,6 +634,7 @@ impl fmt::Display for ConnectionError {
         match self {
             ConnectionError::MissingNode(id) => write!(f, "node {} no longer exists", id.0),
             ConnectionError::UnknownInput => write!(f, "no such input"),
+            ConnectionError::UnknownSlot => write!(f, "no such slot of the input"),
             ConnectionError::SelfConnection => write!(f, "a node cannot take its own image"),
             ConnectionError::InputAssignedTwice => write!(f, "an input takes one wire"),
             ConnectionError::Cycle => write!(f, "the connection would make a cycle"),

@@ -315,7 +315,7 @@ impl Shown {
     /// The image the viewer frames: none for an empty display window, which has no size to fit.
     fn framed(&self) -> Option<&ImageInfo> {
         match self {
-            Shown::Image { info, .. } if !is_empty(info.display_window) => Some(info),
+            Shown::Image { info, .. } if !info.display_window.is_empty() => Some(info),
             Shown::Image { .. } | Shown::Nothing | Shown::Failed { .. } => None,
         }
     }
@@ -1032,7 +1032,7 @@ impl App {
         match &self.shown {
             Shown::Image { info, .. } if current => {
                 let window = info.display_window;
-                if !is_empty(window) {
+                if !window.is_empty() {
                     details.push(format!("{} × {}", window.width, window.height));
                 }
                 details.extend(info.warnings.iter().map(ToString::to_string));
@@ -1117,10 +1117,6 @@ fn redraw_if(pane: Pane, needed: bool) -> Vec<Request> {
     } else {
         Vec::new()
     }
-}
-
-fn is_empty(window: Window) -> bool {
-    window.width == 0 || window.height == 0
 }
 
 #[cfg(test)]

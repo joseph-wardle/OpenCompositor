@@ -1649,6 +1649,7 @@ dependencies = [
 name = "opencompositor-kernels"
 version = "0.0.0"
 dependencies = [
+ "libm",
  "spirv-std",
 ]
 
