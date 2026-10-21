@@ -106,7 +106,7 @@ fn main() {
         let [r, g, b, a] = &mut stack[..] else {
             unreachable!("four planes");
         };
-        pool.fill_planes([r, g, b, a], WIDTH, |level, first_row, chunk| {
+        pool.fill_rows([r, g, b, a], WIDTH, |level, first_row, chunk| {
             let rows = first_row * WIDTH..first_row * WIDTH + chunk[0].len();
             over(level, layer_planes.map(|plane| &plane[rows.clone()]), chunk);
         });
@@ -115,7 +115,7 @@ fn main() {
         let [r, g, b, a] = &mut stack[..] else {
             unreachable!("four planes");
         };
-        pool.fill_planes([r, g, b, a], WIDTH, |level, first_row, chunk| {
+        pool.fill_rows([r, g, b, a], WIDTH, |level, first_row, chunk| {
             let rows = first_row * WIDTH..first_row * WIDTH + chunk[0].len();
             mix(
                 level,

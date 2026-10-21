@@ -720,7 +720,7 @@ fn convert_rows(
     out: &mut [f16],
     halves_per_row: usize,
 ) {
-    pool.fill_rows(out, halves_per_row, |first_row, rows| {
+    pool.fill_rows([out], halves_per_row, |_, first_row, [rows]| {
         // A row is interleaved where it stays in cache, then converted in one call, which only
         // writes to `out` and uses the CPU's f16 instructions where it has them.
         let mut interleaved = vec![[0.0; 4]; width];

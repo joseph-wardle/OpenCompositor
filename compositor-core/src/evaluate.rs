@@ -649,52 +649,41 @@ impl Pool {
         kernel: impl Fn(Level, &[f32], &mut [f32]) + Sync,
     ) {
         assert_eq!(src.len(), dst.len(), "the planes have one length");
-        // An empty plane has no chunks, whichever of its sides is zero.
-        let chunk = (CHUNK_ROWS * width).max(1);
-        let level = self.level;
-        self.threads.install(|| {
-            (dst.par_chunks_mut(chunk).zip(src.par_chunks(chunk)))
-                .for_each(|(dst, src)| kernel(level, src, dst));
+        self.fill_rows([dst], width, |level, first_row, [dst]| {
+            kernel(level, &src[first_row * width..][..dst.len()], dst);
         });
     }
 
-    /// Runs `fill` over `out`, rows of `row_len` elements, a chunk of rows at a time over the
-    /// threads. `fill` is given the index of the chunk's first row and the chunk.
-    pub(crate) fn fill_rows<T: Send>(
+    /// Runs `fill` over planes of rows `row_len` elements long and one length, a chunk of rows
+    /// at a time over the threads, the same rows of every plane together. `fill` is given the
+    /// level, the index of the chunk's first row and the chunk of each plane.
+    pub fn fill_rows<T: Send, const N: usize>(
         &self,
-        out: &mut [T],
+        planes: [&mut [T]; N],
         row_len: usize,
-        fill: impl Fn(usize, &mut [T]) + Sync,
+        fill: impl Fn(Level, usize, [&mut [T]; N]) + Sync,
     ) {
-        let chunk = (CHUNK_ROWS * row_len).max(1);
-        self.threads.install(|| {
-            (out.par_chunks_mut(chunk).enumerate())
-                .for_each(|(index, rows)| fill(index * CHUNK_ROWS, rows));
-        });
-    }
-
-    /// Runs `fill` over four planes of `row_len` columns and one length, a chunk of rows at a
-    /// time over the threads, the same rows of every plane together. `fill` is given the level,
-    /// the index of the chunk's first row and the chunk of each plane.
-    pub fn fill_planes(
-        &self,
-        planes: [&mut [f32]; 4],
-        row_len: usize,
-        fill: impl Fn(Level, usize, [&mut [f32]; 4]) + Sync,
-    ) {
-        let [r, g, b, a] = planes;
+        let Some(len) = planes.first().map(|plane| plane.len()) else {
+            return;
+        };
         assert!(
-            r.len() == g.len() && r.len() == b.len() && r.len() == a.len(),
+            planes.iter().all(|plane| plane.len() == len),
             "the planes have one length"
         );
+        // An empty plane has no chunks, whichever of its sides is zero.
         let chunk = (CHUNK_ROWS * row_len).max(1);
+        let mut splits = planes.map(|plane| plane.chunks_mut(chunk));
+        let chunks: Vec<[&mut [T]; N]> = (0..len.div_ceil(chunk))
+            .map(|_| {
+                splits
+                    .each_mut()
+                    .map(|split| split.next().expect("one length"))
+            })
+            .collect();
         let level = self.level;
         self.threads.install(|| {
-            let chunks = (r.par_chunks_mut(chunk).zip(g.par_chunks_mut(chunk)))
-                .zip(b.par_chunks_mut(chunk).zip(a.par_chunks_mut(chunk)));
-            chunks.enumerate().for_each(|(index, ((r, g), (b, a)))| {
-                fill(level, index * CHUNK_ROWS, [r, g, b, a]);
-            });
+            (chunks.into_par_iter().enumerate())
+                .for_each(|(index, chunk)| fill(level, index * CHUNK_ROWS, chunk));
         });
     }
 }

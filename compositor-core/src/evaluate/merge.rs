@@ -62,7 +62,7 @@ pub(super) fn merge(
     let planes = outputs
         .each_mut()
         .map(|plane| Arc::get_mut(plane).expect("nothing else holds an output plane"));
-    pool.fill_planes(planes, width, |level, first_row, mut chunk| {
+    pool.fill_rows(planes, width, |level, first_row, mut chunk| {
         let rows = chunk[0].len() / width.max(1);
         for (index, y) in (first_row..first_row + rows).enumerate() {
             let columns = index * width..(index + 1) * width;
