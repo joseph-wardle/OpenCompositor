@@ -355,7 +355,10 @@ impl Node {
 
     /// The connected slots of a repeating input with their sources, in slot order. Only a
     /// repeating input has slots, so for any other input this is empty.
-    pub fn slots<'s>(&'s self, input: &'s str) -> impl Iterator<Item = (u32, NodeId)> + 's {
+    pub fn slots<'s>(
+        &'s self,
+        input: &'s str,
+    ) -> impl DoubleEndedIterator<Item = (u32, NodeId)> + 's {
         let from = InputSlot { input, slot: 1 };
         let to = InputSlot {
             input,

@@ -164,7 +164,7 @@ pub(crate) fn record(
 fn input_pins(node: &Node) -> impl Iterator<Item = Pin> {
     (node.kind.inputs().iter().enumerate()).flat_map(|(index, input)| {
         let slots = if input.repeating {
-            let last = node.slots(input.name).last().map_or(0, |(slot, _)| slot);
+            let last = (node.slots(input.name).next_back()).map_or(0, |(slot, _)| slot);
             1..=last.saturating_add(1).min(MAX_SLOTS)
         } else {
             0..=0

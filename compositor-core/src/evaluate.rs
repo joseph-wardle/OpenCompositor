@@ -104,14 +104,15 @@ enum Recipe {
 
 impl Recipe {
     /// The keys of the connected inputs, in declaration order and then slot order.
-    fn inputs(&self) -> Vec<&ResultKey> {
-        match self {
-            Recipe::Reader { .. } => Vec::new(),
-            Recipe::Exposure { source, .. } => source.iter().collect(),
+    fn inputs(&self) -> impl Iterator<Item = &ResultKey> {
+        let (first, rest): (Option<&ResultKey>, &[ResultKey]) = match self {
+            Recipe::Reader { .. } => (None, &[]),
+            Recipe::Exposure { source, .. } => (source.as_ref(), &[]),
             Recipe::Merge {
                 background, layers, ..
-            } => background.iter().chain(layers).collect(),
-        }
+            } => (background.as_ref(), layers),
+        };
+        first.into_iter().chain(rest)
     }
 
     /// This recipe with other keys for its connected inputs, in declaration order.
@@ -463,10 +464,10 @@ impl Evaluator {
             }
             if !entered {
                 pending.push((current, true));
-                pending.extend(current.0.inputs().into_iter().map(|input| (input, false)));
+                pending.extend(current.0.inputs().map(|input| (input, false)));
                 continue;
             }
-            let inputs: Vec<usize> = (current.0.inputs().into_iter())
+            let inputs: Vec<usize> = (current.0.inputs())
                 .map(|input| placed[&Arc::as_ptr(&input.0)])
                 .collect();
             let input_keys: Vec<&ResultKey> = inputs.iter().map(|&i| &steps[i].key).collect();
@@ -476,8 +477,8 @@ impl Evaluator {
                 continue;
             }
             let retained = (self.retained.iter()).find(|retained| retained.key.0.same_as(&recipe));
-            let unchanged = (current.0.inputs().into_iter().zip(&input_keys))
-                .all(|(a, b)| Arc::ptr_eq(&a.0, &b.0));
+            let unchanged =
+                (current.0.inputs().zip(&input_keys)).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0));
             let key = match retained {
                 Some(retained) => retained.key.clone(),
                 None if unchanged => current.clone(),
