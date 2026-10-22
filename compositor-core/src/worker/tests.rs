@@ -292,7 +292,7 @@ fn alternating_large_and_small_images_keeps_one_staging_buffer() {
             }
         }
     }
-    assert_eq!(replacements, [eight_k]);
+    assert_eq!(replacements, [eight_k + eight_k / 4]);
 
     // A run of small images gives the memory back.
     for _ in 0..IMAGES_BEFORE_SHRINKING {

@@ -621,10 +621,10 @@ fn stage(
     }))
 }
 
-/// When the worker replaces its staging buffer. It grows to fit any larger image, and shrinks
-/// only after several images in a row would fit in half of it, so that one large image does not
-/// hold its memory for the rest of the session, and alternating large and small images does not
-/// make a buffer for each.
+/// When the worker replaces its staging buffer. It grows to fit any larger image with a
+/// quarter to spare, and shrinks only after several images in a row would fit in half of it, so
+/// that one large image does not hold its memory for the rest of the session, and alternating
+/// large and small images does not make a buffer for each.
 #[derive(Debug, Default)]
 struct StagingSizing {
     images_fitting_half: u32,
@@ -646,7 +646,12 @@ impl StagingSizing {
         } else {
             self.images_fitting_half = 0;
         }
-        if current < needed || self.images_fitting_half == IMAGES_BEFORE_SHRINKING {
+        if current < needed {
+            self.images_fitting_half = 0;
+            // Dragging Blur's Size up grows the data window a little each edit; growing to fit
+            // exactly would replace the buffer, and wait on the GPU for it, every time.
+            Some(fitted + fitted / 4)
+        } else if self.images_fitting_half == IMAGES_BEFORE_SHRINKING {
             self.images_fitting_half = 0;
             Some(fitted)
         } else {
