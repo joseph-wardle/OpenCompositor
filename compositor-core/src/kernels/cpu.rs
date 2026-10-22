@@ -165,6 +165,10 @@ fn mix_samples(base: [&[f32]; 4], dst: [&mut [f32]; 4], mix: f32) {
     }
 }
 
+// Used by the Blur node once it dispatches; until then only the tests do.
+#[cfg_attr(not(test), expect(dead_code))]
+mod blur;
+
 #[cfg(test)]
 mod tests {
     use super::*;

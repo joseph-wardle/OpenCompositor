@@ -15,6 +15,8 @@
 pub struct BoxPass {
     half_width: f64,
     tmax: u32,
+    /// The sum of every tap's overlap as f32 holds it, the weights' normaliser.
+    sum: f64,
 }
 
 impl BoxPass {
@@ -32,7 +34,15 @@ impl BoxPass {
         } else {
             whole
         };
-        BoxPass { half_width, tmax }
+        let mut pass = BoxPass {
+            half_width,
+            tmax,
+            sum: 0.0,
+        };
+        pass.sum = (1..=tmax).fold(f64::from(pass.overlap(0)), |sum, tap| {
+            sum + 2.0 * f64::from(pass.overlap(tap))
+        });
+        pass
     }
 
     /// The outermost tap each side of the centre with a positive weight.
@@ -49,18 +59,31 @@ impl BoxPass {
 
     /// The weights of taps `0..=tmax`: each the tap's overlap with the box, divided by the sum
     /// of every tap's overlap as f32 holds it, so that the `2 tmax + 1` weights sum to 1 within
-    /// f32 rounding and a flat image stays flat. Every weight is positive and normal.
+    /// f32 rounding and a flat image stays flat. Every weight is positive and normal. Every tap
+    /// but the outermost has [`BoxPass::inner_weight`], and the outermost
+    /// [`BoxPass::edge_weight`].
     pub fn weights(self) -> impl Iterator<Item = f32> {
-        let sum = (1..=self.tmax).fold(f64::from(self.overlap(0)), |sum, tap| {
-            sum + 2.0 * f64::from(self.overlap(tap))
-        });
-        (0..=self.tmax).map(move |tap| {
-            if self.tmax == 0 {
-                1.0
-            } else {
-                (f64::from(self.overlap(tap)) / sum) as f32
-            }
-        })
+        (0..=self.tmax).map(move |tap| self.weight(tap))
+    }
+
+    /// The weight of every tap inside the outermost: those pixels lie wholly in the box. With
+    /// no tap inside, this is the centre's weight, 1.
+    pub fn inner_weight(self) -> f32 {
+        self.weight(0)
+    }
+
+    /// The weight of the outermost tap each side, the pixel the box ends in: the fraction of
+    /// it the box covers, over the sum. The centre's own weight, 1, when it is the only tap.
+    pub fn edge_weight(self) -> f32 {
+        self.weight(self.tmax)
+    }
+
+    fn weight(self, tap: u32) -> f32 {
+        if self.tmax == 0 {
+            1.0
+        } else {
+            (f64::from(self.overlap(tap)) / self.sum) as f32
+        }
     }
 
     /// The overlap of a tap's pixel with the box, exact in f64 and rounded once.
@@ -132,6 +155,22 @@ mod tests {
         // Negative and NaN sizes, which the parameter never gives, are the centre pixel.
         assert_eq!(weights(-2.0), [1.0]);
         assert_eq!(weights(f64::NAN), [1.0]);
+    }
+
+    #[test]
+    fn inner_and_edge_weights_are_the_taps() {
+        for size in [0.0, 1.5, 3.0, 4.5, 6.0, 31.4, 100.0, 4096.0] {
+            let pass = BoxPass::new(size);
+            let weights = weights(size);
+            let t = pass.tmax() as usize;
+            assert!(
+                weights[..t].iter().all(|w| *w == pass.inner_weight()),
+                "size {size}"
+            );
+            assert_eq!(weights[t], pass.edge_weight(), "size {size}");
+        }
+        assert_eq!(BoxPass::new(1.0).inner_weight(), 1.0);
+        assert_eq!(BoxPass::new(1.0).edge_weight(), 1.0);
     }
 
     #[test]
