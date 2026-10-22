@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,13 +11,15 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::document::{
-    Document, ExposureVersion, InputSlot, MergeVersion, Node, NodeId, NodeKind, ReaderVersion,
+    BlurVersion, Document, ExposureVersion, InputSlot, MergeVersion, Node, NodeId, NodeKind,
+    ReaderVersion,
 };
 use crate::image::{Image, Oversize, Window, zeroed_plane};
 use crate::kernels::cpu::{self, Level};
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image};
 
+mod blur;
 mod merge;
 
 /// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
@@ -100,6 +103,12 @@ enum Recipe {
         /// changes nothing, so which slots they occupy is not part of the key.
         layers: Vec<ResultKey>,
     },
+    Blur {
+        version: BlurVersion,
+        /// The resolved value's bits, as Exposure's `stops`.
+        size: u64,
+        source: Option<ResultKey>,
+    },
 }
 
 impl Recipe {
@@ -111,6 +120,7 @@ impl Recipe {
             Recipe::Merge {
                 background, layers, ..
             } => (background.as_ref(), layers),
+            Recipe::Blur { source, .. } => (source.as_ref(), &[]),
         };
         first.into_iter().chain(rest)
     }
@@ -150,6 +160,15 @@ impl Recipe {
                     .iter()
                     .map(|_| inputs.next().expect("one key per connected layer"))
                     .collect(),
+            },
+            Recipe::Blur {
+                version,
+                size,
+                source,
+            } => Recipe::Blur {
+                version: *version,
+                size: *size,
+                source: source.as_ref().and_then(|_| inputs.next()),
             },
         }
     }
@@ -208,8 +227,26 @@ impl Recipe {
                     && layers.len() == other_layers.len()
                     && (layers.iter().zip(other_layers)).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0))
             }
+            (
+                Recipe::Blur {
+                    version,
+                    size,
+                    source,
+                },
+                Recipe::Blur {
+                    version: other_version,
+                    size: other_size,
+                    source: other_source,
+                },
+            ) => version == other_version && size == other_size && same_input(source, other_source),
             // Listed by kind, so that a new kind cannot fall through as never equal.
-            (Recipe::Reader { .. } | Recipe::Exposure { .. } | Recipe::Merge { .. }, _) => false,
+            (
+                Recipe::Reader { .. }
+                | Recipe::Exposure { .. }
+                | Recipe::Merge { .. }
+                | Recipe::Blur { .. },
+                _,
+            ) => false,
         }
     }
 }
@@ -294,6 +331,14 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
                     .collect(),
             }
         }
+        NodeKind::Blur { version } => {
+            let size = resolve(node).float("size").expect("Blur has Size");
+            Recipe::Blur {
+                version: *version,
+                size: size.to_bits(),
+                source: input("source".into()),
+            }
+        }
     }
 }
 
@@ -366,18 +411,19 @@ impl Evaluator {
         }
     }
 
-    /// The image a key names, its failure, or `None` if `stop` returned true before it was done.
-    ///
-    /// `stop` is asked before each node is computed; nothing stops during an operation. Nodes
-    /// completed before stopping stay retained until the next request.
     pub(crate) fn pool(&self) -> &Pool {
         &self.pool
     }
 
+    /// The image a key names, its failure, or `None` if `stop` returned true before it was done.
+    ///
+    /// `stop` is asked before each node is computed, and by an operation long enough to matter
+    /// before each chunk of its work, from the pool's threads. Nodes completed before stopping
+    /// stay retained until the next request.
     pub fn evaluate(
         &mut self,
         key: &ResultKey,
-        stop: impl Fn() -> bool,
+        stop: impl Fn() -> bool + Sync,
     ) -> Option<Result<Image, EvalError>> {
         let steps = self.plan(key);
         // Planes for this request's outputs; whatever it does not take drops with it. Nothing is
@@ -413,8 +459,9 @@ impl Evaluator {
             let inputs: Vec<&Image> = (step.inputs.iter())
                 .map(|&input| images[input].as_ref().expect("inputs come first"))
                 .collect();
-            let image = match self.compute(&step.key, &inputs, &mut released) {
-                Ok(image) => image,
+            let image = match self.compute(&step.key, &inputs, &mut released, &stop) {
+                Ok(Some(image)) => image,
+                Ok(None) => return None,
                 Err(error) => return Some(Err(error)),
             };
             // Keeping a result only with its inputs means no retained result outlives what it was
@@ -548,41 +595,47 @@ fn distinct_bytes<'a>(planes: impl Iterator<Item = &'a Arc<[f32]>>) -> u64 {
 impl Evaluator {
     /// Computes one node's image from the images of its connected inputs, in declaration order
     /// and then slot order, with its output planes taken from `released` while one of the right
-    /// length is there.
+    /// length is there. `None` if `stop` ended the operation part way, which only one long enough
+    /// to ask does.
     fn compute(
         &self,
         key: &ResultKey,
         inputs: &[&Image],
         released: &mut Vec<Arc<[f32]>>,
-    ) -> Result<Image, EvalError> {
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<Image>, EvalError> {
+        // An unconnected input takes the empty image.
+        let empty = Image::empty();
+        let image_of = |source: &Option<ResultKey>| match source {
+            Some(_) => inputs[0],
+            None => &empty,
+        };
         let operation = || match &*key.0 {
-            Recipe::Reader { path: None, .. } => Ok(Image::empty()),
+            Recipe::Reader { path: None, .. } => Ok(Some(Image::empty())),
             Recipe::Reader {
                 path: Some(path), ..
-            } => read_image(path).map_err(|error| EvalError::Read {
+            } => read_image(path).map(Some).map_err(|error| EvalError::Read {
                 origin: key.clone(),
                 error,
             }),
-            Recipe::Exposure { stops, source, .. } => {
-                let empty;
-                let source = match source {
-                    Some(_) => inputs[0],
-                    None => {
-                        empty = Image::empty();
-                        &empty
-                    }
-                };
-                Ok(exposure(
-                    &self.pool,
-                    source,
-                    f64::from_bits(*stops),
-                    released,
-                ))
-            }
+            Recipe::Exposure { stops, source, .. } => Ok(Some(exposure(
+                &self.pool,
+                image_of(source),
+                f64::from_bits(*stops),
+                released,
+            ))),
             Recipe::Merge { mix, .. } => {
                 let mix = f64::from_bits(*mix) as f32;
-                merge::merge(&self.pool, key, inputs, mix, released)
+                merge::merge(&self.pool, key, inputs, mix, released).map(Some)
             }
+            Recipe::Blur { size, source, .. } => blur::blur(
+                &self.pool,
+                key,
+                image_of(source),
+                f64::from_bits(*size),
+                released,
+                stop,
+            ),
         };
         // Operations write only their own outputs, so a panic leaves nothing half done, and the
         // node fails instead of ending the worker. The panic hook has already reported it. A
@@ -664,6 +717,28 @@ impl Pool {
         row_len: usize,
         fill: impl Fn(Level, usize, [&mut [T]; N]) + Sync,
     ) {
+        self.fill_rows_with(
+            planes,
+            row_len,
+            CHUNK_ROWS,
+            || (),
+            |(), level, first, chunk| {
+                fill(level, first, chunk);
+            },
+        );
+    }
+
+    /// As [`Pool::fill_rows`], with chunks of `rows` rows and a value of `init`'s for each
+    /// thread's run of chunks, which `fill` is given first: a kernel's temporaries, made once
+    /// per thread rather than per chunk.
+    pub fn fill_rows_with<T: Send, S, const N: usize>(
+        &self,
+        planes: [&mut [T]; N],
+        row_len: usize,
+        rows: usize,
+        init: impl Fn() -> S + Sync,
+        fill: impl Fn(&mut S, Level, usize, [&mut [T]; N]) + Sync,
+    ) {
         let Some(len) = planes.first().map(|plane| plane.len()) else {
             return;
         };
@@ -671,8 +746,9 @@ impl Pool {
             planes.iter().all(|plane| plane.len() == len),
             "the planes have one length"
         );
+        assert!(rows > 0, "a chunk has rows");
         // An empty plane has no chunks, whichever of its sides is zero.
-        let chunk = (CHUNK_ROWS * row_len).max(1);
+        let chunk = (rows * row_len).max(1);
         let mut splits = planes.map(|plane| plane.chunks_mut(chunk));
         let chunks: Vec<[&mut [T]; N]> = (0..len.div_ceil(chunk))
             .map(|_| {
@@ -683,9 +759,93 @@ impl Pool {
             .collect();
         let level = self.level;
         self.threads.install(|| {
-            (chunks.into_par_iter().enumerate())
-                .for_each(|(index, chunk)| fill(level, index * CHUNK_ROWS, chunk));
+            (chunks.into_par_iter().enumerate()).for_each_init(&init, |state, (index, chunk)| {
+                fill(state, level, index * rows, chunk);
+            });
         });
+    }
+
+    /// Runs `fill` over a plane of rows `width` samples long, a band of `band` columns at a
+    /// time over the threads, each band written through its [`Columns`] while the other bands
+    /// are. `fill` is given a value of `init`'s for its thread, as [`Pool::fill_rows_with`]
+    /// does, the level and the band; the last band is narrower where `band` does not divide
+    /// `width`.
+    pub fn fill_columns<S>(
+        &self,
+        plane: &mut [f32],
+        width: usize,
+        band: usize,
+        init: impl Fn() -> S + Sync,
+        fill: impl Fn(&mut S, Level, Columns<'_>) + Sync,
+    ) {
+        assert!(band > 0, "a band has columns");
+        let height = plane.len().checked_div(width).unwrap_or(0);
+        assert_eq!(plane.len(), width * height, "whole rows");
+        if height == 0 {
+            return;
+        }
+        let shared = SharedPlane {
+            start: plane.as_mut_ptr(),
+            len: plane.len(),
+        };
+        let level = self.level;
+        self.threads.install(|| {
+            (0..width.div_ceil(band))
+                .into_par_iter()
+                .for_each_init(&init, |state, index| {
+                    let columns = index * band..((index + 1) * band).min(width);
+                    let band = Columns {
+                        plane: &shared,
+                        width,
+                        columns,
+                    };
+                    fill(state, level, band);
+                });
+        });
+    }
+}
+
+/// A plane that [`Pool::fill_columns`] has several threads write at once, each through the
+/// [`Columns`] of its own band.
+#[derive(Debug)]
+struct SharedPlane {
+    start: *mut f32,
+    len: usize,
+}
+
+// SAFETY: the threads write through `Columns`, whose bands are disjoint, so no two write one
+// sample, and nothing reads the plane until `fill_columns` returns it.
+unsafe impl Sync for SharedPlane {}
+
+/// A band of a plane's columns for one thread to write, row by row, while other threads write
+/// the other bands.
+#[derive(Debug)]
+pub struct Columns<'a> {
+    plane: &'a SharedPlane,
+    width: usize,
+    columns: Range<usize>,
+}
+
+impl Columns<'_> {
+    /// The columns of the band.
+    pub fn columns(&self) -> Range<usize> {
+        self.columns.clone()
+    }
+
+    /// Writes the band's samples of row `y`, one per column.
+    pub fn write_row(&mut self, y: usize, samples: &[f32]) {
+        assert_eq!(samples.len(), self.columns.len(), "one sample per column");
+        assert!(y < self.plane.len / self.width, "a row of the plane");
+        let start = y * self.width + self.columns.start;
+        // SAFETY: row `y` is within the plane, so its columns of this band are too, and no other
+        // `Columns` has them; the plane is `fill_columns`'s to write while any exists.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                samples.as_ptr(),
+                self.plane.start.add(start),
+                samples.len(),
+            );
+        }
     }
 }
 
@@ -823,6 +983,7 @@ impl fmt::Display for EvalError {
             Recipe::Reader { path: None, .. } => write!(f, "Reader: ")?,
             Recipe::Exposure { .. } => write!(f, "Exposure: ")?,
             Recipe::Merge { .. } => write!(f, "Merge: ")?,
+            Recipe::Blur { .. } => write!(f, "Blur: ")?,
         }
         match self {
             EvalError::Read { error, .. } => error.fmt(f),
