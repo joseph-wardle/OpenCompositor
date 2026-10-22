@@ -11,6 +11,10 @@
 #[cfg(not(target_arch = "spirv"))]
 extern crate std;
 
+mod blur;
+
+pub use blur::BoxPass;
+
 /// `a * b + c` with one rounding: std's `mul_add` on the host, and on SPIR-V libm's `fmaf`,
 /// which rust-gpu lowers to the GLSL `Fma` instruction. The host result is always fused, so the
 /// CPU definition is one sequence of roundings at every level; a GPU driver may still split
