@@ -145,8 +145,8 @@ fn blur_plane(
 
 /// A thread's temporaries for the columns: the kernel's, the band gathered from the scratch
 /// plane's rows and the band's results.
-#[derive(Default)]
-struct BandScratch {
+#[derive(Debug, Default)]
+pub struct BandScratch {
     kernel: BoxScratch,
     gathered: Vec<f32>,
     results: Vec<f32>,
@@ -154,7 +154,7 @@ struct BandScratch {
 
 /// One band's passes: its columns gathered from the `height` rows of `scratch`, `stride` samples
 /// long, the kernel over the band, and its results written to the output's rows.
-fn band_passes(
+pub fn band_passes(
     level: Level,
     pass: BoxPass,
     scratch: &[f32],

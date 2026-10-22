@@ -6,7 +6,7 @@ use std::fmt;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rayon::prelude::*;
 
@@ -19,7 +19,7 @@ use crate::kernels::cpu::{self, Level};
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image};
 
-mod blur;
+pub(crate) mod blur;
 mod merge;
 
 /// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
@@ -731,7 +731,7 @@ impl Pool {
     /// As [`Pool::fill_rows`], with chunks of `rows` rows and a value of `init`'s for each
     /// thread's run of chunks, which `fill` is given first: a kernel's temporaries, made once
     /// per thread rather than per chunk.
-    pub fn fill_rows_with<T: Send, S, const N: usize>(
+    pub fn fill_rows_with<T: Send, S: Send, const N: usize>(
         &self,
         planes: [&mut [T]; N],
         row_len: usize,
@@ -758,9 +758,10 @@ impl Pool {
             })
             .collect();
         let level = self.level;
+        let states = ThreadStates::new(self.threads());
         self.threads.install(|| {
-            (chunks.into_par_iter().enumerate()).for_each_init(&init, |state, (index, chunk)| {
-                fill(state, level, index * rows, chunk);
+            (chunks.into_par_iter().enumerate()).for_each(|(index, chunk)| {
+                states.with(&init, |state| fill(state, level, index * rows, chunk));
             });
         });
     }
@@ -770,7 +771,7 @@ impl Pool {
     /// are. `fill` is given a value of `init`'s for its thread, as [`Pool::fill_rows_with`]
     /// does, the level and the band; the last band is narrower where `band` does not divide
     /// `width`.
-    pub fn fill_columns<S>(
+    pub fn fill_columns<S: Send>(
         &self,
         plane: &mut [f32],
         width: usize,
@@ -789,19 +790,46 @@ impl Pool {
             len: plane.len(),
         };
         let level = self.level;
+        let states = ThreadStates::new(self.threads());
         self.threads.install(|| {
-            (0..width.div_ceil(band))
-                .into_par_iter()
-                .for_each_init(&init, |state, index| {
-                    let columns = index * band..((index + 1) * band).min(width);
-                    let band = Columns {
-                        plane: &shared,
-                        width,
-                        columns,
-                    };
-                    fill(state, level, band);
-                });
+            (0..width.div_ceil(band)).into_par_iter().for_each(|index| {
+                let columns = index * band..((index + 1) * band).min(width);
+                let band = Columns {
+                    plane: &shared,
+                    width,
+                    columns,
+                };
+                states.with(&init, |state| fill(state, level, band));
+            });
         });
+    }
+}
+
+/// A kernel's temporaries for each of the pool's threads, made when the thread first takes a
+/// chunk. Rayon's `for_each_init` makes a value per job, and its jobs split down to single
+/// chunks as the threads steal, so that is a value per chunk: for Blur, a megabyte of scratch
+/// allocated, faulted in and freed per chunk by sixteen threads at once, which nearly doubled
+/// the passes' time over a 4K plane on the workstation.
+struct ThreadStates<S> {
+    states: Vec<Mutex<Option<S>>>,
+}
+
+impl<S: Send> ThreadStates<S> {
+    fn new(threads: usize) -> ThreadStates<S> {
+        ThreadStates {
+            states: (0..threads).map(|_| Mutex::new(None)).collect(),
+        }
+    }
+
+    /// Runs `use_state` on this thread's value, made with `init` if it has none yet.
+    fn with(&self, init: &(impl Fn() -> S + Sync), use_state: impl FnOnce(&mut S)) {
+        let index = rayon::current_thread_index().expect("a job runs on a pool thread");
+        // Only this thread locks its slot, and a kernel that panicked leaves scratch no one
+        // reads.
+        let mut slot = self.states[index]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        use_state(slot.get_or_insert_with(init));
     }
 }
 

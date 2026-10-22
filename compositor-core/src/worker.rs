@@ -10,7 +10,7 @@ use half::f16;
 use crate::document::NodeId;
 use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, Pool, ResultKey};
 use crate::gpu::wait_for_device;
-use crate::image::ImageInfo;
+use crate::image::{ImageInfo, Window};
 
 /// The staging buffer's first size, a DCI 4K image, and its least.
 const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
@@ -43,6 +43,11 @@ impl Evaluated {
     /// The number of the request this answers.
     pub fn request(&self) -> u64 {
         self.wanted.number
+    }
+
+    /// The image's data window, or `None` for a failure.
+    pub fn data_window(&self) -> Option<Window> {
+        Some(self.result.as_ref().ok()?.info.data_window)
     }
 }
 

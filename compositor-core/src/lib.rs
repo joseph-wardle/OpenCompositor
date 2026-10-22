@@ -24,8 +24,11 @@ mod worker;
 /// place the pool and the CPU kernels are reachable from outside; nothing else is public here.
 #[doc(hidden)]
 pub mod bench {
-    pub use crate::evaluate::Pool;
-    pub use crate::kernels::cpu::{Level, exposure, mix, over};
+    pub use crate::evaluate::blur::{BandScratch, band_passes};
+    pub use crate::evaluate::{Columns, Pool};
+    pub use crate::kernels::cpu::{
+        BLUR_BAND, BLUR_ROWS, BoxScratch, Level, blur_band, blur_rows, exposure, mix, over,
+    };
 }
 
 pub use app::{Anchor, App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};

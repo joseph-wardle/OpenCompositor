@@ -1,18 +1,20 @@
 //! `--drag-check IMAGE [CHAIN]`: drags a parameter panel slider with synthetic mouse events, a
 //! press at the groove's start, a move one pixel along it each refresh of the viewer's screen,
-//! and a release at its end, on a chain: `exposure`, Stops on Reader → Exposure of IMAGE, or
-//! `merge`, Mix on Reader → Merge with IMAGE as the background and as one layer. Without CHAIN
-//! it runs each chain in a child process of its own and fails if any failed. It reports how the
-//! viewer kept up with each. The worker evaluates the latest request and discards the rest, so
-//! an edit's latency ends at the first viewer frame submitted that samples a result from its
-//! request or a later one: a superseded edit is answered by the frame showing a newer value, as
-//! the artist sees it. For each chain the check reports the latencies over every edit, the final
-//! edit's own, how many edits' own values were shown, how long the GUI thread took to dispatch
-//! each mouse event from the slider to the requests performed, the stages of the worker's path
-//! for the edits whose result it delivered, and the process's resident memory. Then it checks that
-//! the drag undoes as one step and that a drag cancelled with Escape leaves the value as it was.
-//! It exits 0 if those held and the chain's latencies' p95 and final edit met the budget, and 1
-//! otherwise.
+//! and a release at its end, on a chain: `exposure`, Stops on Reader → Exposure of IMAGE,
+//! `merge`, Mix on Reader → Merge with IMAGE as the background and as one layer, or `blur`, Size
+//! on Reader → Blur of IMAGE. Without CHAIN it runs each chain in a child process of its own and
+//! fails if any failed. It reports how the viewer kept up with each. The worker evaluates the
+//! latest request and discards the rest, so an edit's latency ends at the first viewer frame
+//! submitted that samples a result from its request or a later one: a superseded edit is
+//! answered by the frame showing a newer value, as the artist sees it. For each chain the check
+//! reports the latencies over every edit, the final edit's own, how many edits' own values were
+//! shown, how long the GUI thread took to dispatch each mouse event from the slider to the
+//! requests performed, the stages of the worker's path for the edits whose result it delivered,
+//! the same stages for the delivered edits whose data window differed from the one delivered
+//! before, which Blur's growing reach makes of some edits, and the process's resident memory.
+//! Then it checks that the drag undoes as one step and that a drag cancelled with Escape leaves
+//! the value as it was. It exits 0 if those held and the chain's latencies' p95 and final edit
+//! met the budget, and 1 otherwise.
 //!
 //! Run it in a release build on the workstation, and twice, since the first run's shader and
 //! file caches are cold. A frame counts when the GUI thread submits it, not when the display
@@ -24,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use cxx_qt_lib::QString;
 use open_ng::Point;
-use opencompositor_core::{Changes, Command, Event, NodeId, Pane, Slot, Timing};
+use opencompositor_core::{Changes, Command, Event, NodeId, Pane, Slot, Timing, Window};
 
 use crate::qt::ffi;
 
@@ -47,10 +49,11 @@ const LONGEST_WAIT: Duration = Duration::from_secs(60);
 pub enum Chain {
     Exposure,
     Merge,
+    Blur,
 }
 
 /// The chains, in the order the check runs them.
-const CHAINS: [Chain; 2] = [Chain::Exposure, Chain::Merge];
+const CHAINS: [Chain; 3] = [Chain::Exposure, Chain::Merge, Chain::Blur];
 
 impl Chain {
     /// The chain named on the command line by its node type.
@@ -63,6 +66,7 @@ impl Chain {
         match self {
             Chain::Exposure => "exposure",
             Chain::Merge => "merge",
+            Chain::Blur => "blur",
         }
     }
 
@@ -71,6 +75,7 @@ impl Chain {
         match self {
             Chain::Exposure => ("stops", "Stops"),
             Chain::Merge => ("mix", "Mix"),
+            Chain::Blur => ("size", "Size"),
         }
     }
 }
@@ -96,9 +101,9 @@ struct Edit {
     /// The worker's request for it.
     request: u64,
     at: Instant,
-    /// When its result arrived on the GUI thread, with the worker's record; `None` if the worker
-    /// discarded it.
-    delivered: Option<(Instant, Timing)>,
+    /// When its result arrived on the GUI thread, with the worker's record and the image's data
+    /// window, `None` for a failure; `None` if the worker discarded it.
+    delivered: Option<(Instant, Timing, Option<Window>)>,
     /// When the first viewer frame sampling its result, or a later one, was submitted.
     framed: Option<Instant>,
     /// Whether a frame sampled its own result.
@@ -160,8 +165,8 @@ pub fn start(image: PathBuf, chain: Chain) {
 
 /// Records a result's arrival on the GUI thread, if the drag check is running and an edit asked
 /// for it.
-pub fn delivered(request: u64, timing: Timing, at: Instant) {
-    with_edit(request, |edit| edit.delivered = Some((at, timing)));
+pub fn delivered(request: u64, timing: Timing, window: Option<Window>, at: Instant) {
+    with_edit(request, |edit| edit.delivered = Some((at, timing, window)));
 }
 
 /// Records the viewer's last presented frame as the first for every edit its result answers,
@@ -263,7 +268,7 @@ fn begin() {
     // SAFETY: as above.
     let span = unsafe { ffi::slider_span(slider) };
     if span < 1 {
-        return report(vec![format!("the Stops slider spans {span} pixels")]);
+        return report(vec![format!("the {label} slider spans {span} pixels")]);
     }
     let refresh =
         crate::with_pane_window(Pane::Viewer, |window| crate::pace::refresh_period(&window));
@@ -462,28 +467,48 @@ fn report(mut failures: Vec<String>) {
         }),
         ("frame", |edit, _, received| Some(edit.framed? - received)),
     ];
-    let delivered: Vec<(&Edit, Instant, Timing)> = edits
+    let delivered: Vec<(&Edit, Instant, Timing, Option<Window>)> = edits
         .iter()
         .filter_map(|edit| {
-            let (received, timing) = edit.delivered?;
-            Some((edit, received, timing))
+            let (received, timing, window) = edit.delivered?;
+            Some((edit, received, timing, window))
         })
         .collect();
-    let medians: Vec<String> = stages
-        .iter()
-        .map(|(name, stage)| {
-            let mut values: Vec<Duration> = delivered
-                .iter()
-                .filter_map(|(edit, received, timing)| stage(edit, timing, *received))
-                .collect();
-            values.sort();
-            format!("{name} {:.1?}", percentile(&values, 0.5))
-        })
-        .collect();
+    let medians = |selected: &dyn Fn(usize) -> bool| -> String {
+        let medians: Vec<String> = stages
+            .iter()
+            .map(|(name, stage)| {
+                let mut values: Vec<Duration> = delivered
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| selected(*index))
+                    .filter_map(|(_, (edit, received, timing, _))| stage(edit, timing, *received))
+                    .collect();
+                values.sort();
+                format!("{name} {:.1?}", percentile(&values, 0.5))
+            })
+            .collect();
+        medians.join(", ")
+    };
     eprintln!(
         "{name}: stage medians of the {} edits whose result was delivered: {}",
         delivered.len(),
-        medians.join(", ")
+        medians(&|_| true)
+    );
+    // Blur's reach grows every few units of Size, and with it the data window, so those edits'
+    // planes miss the free list's exact lengths and the staging buffer may be remade.
+    let changed: Vec<bool> = delivered
+        .iter()
+        .scan(None, |previous, (_, _, _, window)| {
+            let changed = previous.is_some_and(|previous| window.is_some_and(|w| w != previous));
+            *previous = window.or(*previous);
+            Some(changed)
+        })
+        .collect();
+    let changes = changed.iter().filter(|&&changed| changed).count();
+    eprintln!(
+        "{name}: stage medians of the {changes} of them whose data window changed: {}",
+        medians(&|index| changed[index])
     );
     eprintln!("{name}: resident memory {}", resident_memory());
     if let Some(final_latency) = final_latency {
