@@ -86,6 +86,9 @@ pub const EXPOSURE_ENTRY: &str = "gpu::exposure";
 /// Over's entry point in [`SPIRV`].
 pub const OVER_ENTRY: &str = "gpu::over";
 
+/// The box pass's entry point in [`SPIRV`].
+pub const BOX_PASS_ENTRY: &str = "gpu::box_pass";
+
 /// The entry points' workgroup is this many invocations on each side; their `threads` must say
 /// the same, since the host dispatches `ceil(width / WORKGROUP)` by `ceil(height / WORKGROUP)`.
 pub const WORKGROUP: u32 = 16;
@@ -161,13 +164,65 @@ impl OverParams {
 
 const _: () = assert!(size_of::<OverParams>() == 8);
 
-/// The GPU entry points, one invocation per texel of one plane.
+/// The axis a box pass sums along.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Axis {
+    /// Each row over itself: the output is `2 tmax` texels wider than the input.
+    Rows = 0,
+    /// Each column over itself: the output is `2 tmax` texels taller.
+    Columns = 1,
+}
+
+/// A box pass's dispatch parameters, as the entry point reads them from its uniform buffer:
+/// the output's size, the axis as [`Axis`]'s discriminant, and the pass's outermost tap and
+/// two weights as [`BoxPass`] holds them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct BoxPassParams {
+    pub width: u32,
+    pub height: u32,
+    pub axis: u32,
+    pub tmax: u32,
+    pub inner_weight: f32,
+    pub edge_weight: f32,
+}
+
+impl BoxPassParams {
+    /// The parameters of `pass` along `axis` into an output `width` by `height`.
+    pub fn new(pass: BoxPass, axis: Axis, width: u32, height: u32) -> BoxPassParams {
+        BoxPassParams {
+            width,
+            height,
+            axis: axis as u32,
+            tmax: pass.tmax(),
+            inner_weight: pass.inner_weight(),
+            edge_weight: pass.edge_weight(),
+        }
+    }
+
+    /// The uniform buffer's contents.
+    pub fn bytes(self) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        bytes[0..4].copy_from_slice(&self.width.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&self.height.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&self.axis.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&self.tmax.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&self.inner_weight.to_ne_bytes());
+        bytes[20..24].copy_from_slice(&self.edge_weight.to_ne_bytes());
+        bytes
+    }
+}
+
+const _: () = assert!(size_of::<BoxPassParams>() == 24);
+
+/// The GPU entry points, one invocation per texel of one output plane.
 #[cfg(target_arch = "spirv")]
 pub mod gpu {
     use spirv_std::glam::{IVec2, UVec3, Vec4};
     use spirv_std::{Image, spirv};
 
-    use crate::{ExposureParams, OverParams};
+    use crate::{BoxPassParams, ExposureParams, OverParams};
 
     type Input = Image!(2D, type = f32, sampled);
     type Output = Image!(2D, format = r32f, sampled = false);
@@ -213,6 +268,57 @@ pub mod gpu {
         let alpha: Vec4 = alpha.fetch(at);
         // SAFETY: as for `exposure`: `at` is inside every texture, and the output is R32Float.
         unsafe { output.write(at, crate::over(background.x, layer.x, alpha.x)) };
+    }
+
+    /// One of Blur's box passes along the params' axis over one plane: each output texel is
+    /// the weighted sum of the `2 tmax + 1` input texels centred on it, the input being `2
+    /// tmax` texels shorter along the axis than the output and transparent black beyond its
+    /// ends, as the CPU's passes read it. A tap outside the input is skipped rather than
+    /// fetched: a fetch outside a texture is defined only under robust image access, and a
+    /// zero's product would add nothing.
+    ///
+    /// The sum is one f32 accumulator through the taps in order, each a fused multiply-add,
+    /// so its distance from the definition's f64 sum grows with the tap count; the readback
+    /// test records the factor across sizes. The weights' normalisation keeps every partial
+    /// sum within the largest input magnitude, so finite inputs sum finite. The taps are a
+    /// loop, not straight-line, since their count is the size's; its cost is the GPU step's.
+    #[spirv(compute(threads(16, 16)))] // WORKGROUP
+    pub fn box_pass(
+        #[spirv(global_invocation_id)] id: UVec3,
+        #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &BoxPassParams,
+        #[spirv(descriptor_set = 0, binding = 1)] input: &Input,
+        #[spirv(descriptor_set = 0, binding = 2)] output: &Output,
+    ) {
+        if id.x >= params.width || id.y >= params.height {
+            return;
+        }
+        let at = IVec2::new(id.x as i32, id.y as i32);
+        let (step, position, extent) = if params.axis == 0 {
+            (IVec2::X, at.x, params.width)
+        } else {
+            (IVec2::Y, at.y, params.height)
+        };
+        let t = params.tmax as i32;
+        let length = extent as i32 - 2 * t;
+        let taps = 2 * t + 1;
+        let mut sum = 0.0f32;
+        for k in 0..taps {
+            // Tap `k` of the window is input texel `position - 2 t + k` along the axis.
+            let i = position - 2 * t + k;
+            if i < 0 || i >= length {
+                continue;
+            }
+            let weight = if k == 0 || k == taps - 1 {
+                params.edge_weight
+            } else {
+                params.inner_weight
+            };
+            let texel: Vec4 = input.fetch(at + step * (k - 2 * t));
+            sum = crate::mul_add(weight, texel.x, sum);
+        }
+        // SAFETY: `at` is inside the output, which the host sizes to the params' width and
+        // height, and the output is R32Float.
+        unsafe { output.write(at, crate::flush(sum)) };
     }
 }
 
