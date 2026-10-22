@@ -1207,3 +1207,131 @@ fn a_gesture_is_decided_again_when_applied() {
     assert!(session.apply_response(&both).is_empty());
     assert_eq!(session.undo.len(), steps);
 }
+
+fn create_merge(session: &mut Session, at: Point) -> NodeId {
+    let changes = session.create_node("merge", at, None).unwrap();
+    *changes.nodes.first().unwrap()
+}
+
+/// The labels of a node's pins, from the top.
+fn pin_labels(session: &Session, id: NodeId) -> Vec<String> {
+    (session.graph().node(id.into()).unwrap().pins())
+        .map(|pin| pin.label.clone())
+        .collect()
+}
+
+#[test]
+fn a_merge_shows_one_free_layer_slot_after_its_last_connected_one() {
+    let mut session = Session::new();
+    let a = create(&mut session, "a.exr", ORIGIN);
+    let b = create(&mut session, "b.exr", ORIGIN);
+    let merge = create_merge(&mut session, ORIGIN);
+    assert_eq!(
+        pin_labels(&session, merge),
+        ["Image", "Background", "Layer 1"]
+    );
+
+    session.connect(merge, ("layer", 1), a).unwrap();
+    assert_eq!(
+        pin_labels(&session, merge),
+        ["Image", "Background", "Layer 1", "Layer 2"]
+    );
+    session.connect(merge, ("layer", 2), b).unwrap();
+    assert_eq!(
+        pin_labels(&session, merge),
+        ["Image", "Background", "Layer 1", "Layer 2", "Layer 3"]
+    );
+    assert_presented(&session);
+
+    // Disconnecting the lower slot leaves the higher one's row and wire where they were.
+    let b_wire = (session.graph().connections().iter())
+        .find(|wire| wire.from.node == b.into())
+        .copied()
+        .unwrap();
+    session.disconnect(merge, ("layer", 1)).unwrap();
+    assert_eq!(
+        pin_labels(&session, merge),
+        ["Image", "Background", "Layer 1", "Layer 2", "Layer 3"]
+    );
+    assert!(session.graph().contains_connection(b_wire));
+    assert_presented(&session);
+
+    session.disconnect(merge, ("layer", 2)).unwrap();
+    assert_eq!(
+        pin_labels(&session, merge),
+        ["Image", "Background", "Layer 1"]
+    );
+    assert_presented(&session);
+}
+
+#[test]
+fn a_wire_dragged_to_a_free_slot_connects_that_slot() {
+    let mut session = Session::new();
+    let a = create(&mut session, "a.exr", ORIGIN);
+    let merge = create_merge(&mut session, ORIGIN);
+    // The layer input is the second declared, and its slot is the pin's high half.
+    let to_slot = |slot: u32| Connection {
+        from: PinRef {
+            node: a.into(),
+            pin: PinId(0),
+        },
+        to: PinRef {
+            node: merge.into(),
+            pin: PinId(u64::from(slot) << 32 | 2),
+        },
+    };
+    let edit = |slot| ConnectionEdit {
+        remove: Vec::new(),
+        add: vec![to_slot(slot)],
+    };
+
+    assert_eq!(
+        judge(session.document(), &edit(1)),
+        Verdict::Accept {
+            displaced: Vec::new()
+        }
+    );
+    session.apply_response(&wiring(&[], &[to_slot(1)]));
+    assert_eq!(
+        session.document().node(merge).unwrap().input(("layer", 1)),
+        Some(a)
+    );
+    assert_eq!(session.undo_label(), Some("Connect"));
+    assert_presented(&session);
+
+    // A slot the input does not have is refused as connect refuses it.
+    assert_eq!(
+        judge(session.document(), &edit(0)),
+        Verdict::Refuse {
+            reason: Some(
+                ConnectionError::UnknownSlot {
+                    input: "layer",
+                    slot: 0,
+                }
+                .to_string()
+            )
+        }
+    );
+}
+
+#[test]
+fn a_merge_inserted_after_the_current_node_takes_it_as_its_background() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let exposure = create_exposure(&mut session, Point { x: 200.0, y: 0.0 });
+    session.connect(exposure, "source", reader).unwrap();
+
+    let changes = session.create_node("merge", ORIGIN, Some(reader)).unwrap();
+
+    let document = session.document();
+    let merge = (changes.nodes.iter().copied())
+        .find(|&id| matches!(document.node(id).unwrap().kind, NodeKind::Merge { .. }))
+        .unwrap();
+    assert_eq!(
+        document.node(merge).unwrap().input("background"),
+        Some(reader)
+    );
+    assert_eq!(source_of(&session, exposure), Some(merge));
+    assert_eq!(session.undo_label(), Some("Create Merge"));
+    assert_presented(&session);
+}

@@ -1,13 +1,14 @@
-//! Exposure's CPU throughput on this machine, as `cargo bench -p opencompositor-core` runs it:
-//! the kernel alone on one thread, the evaluator's pool over its chunking with reused and with
-//! fresh outputs, and a copy of the same planes through the same pool and chunking, the
-//! reference a pointwise kernel is held to. It runs on the workstation before each PR to `main`,
-//! never in CI: the gate is a fraction of the copy measured in the same run, so it holds on any
-//! machine and never blesses a number.
+//! The CPU kernels' throughput on this machine, as `cargo bench -p opencompositor-core` runs
+//! it. Exposure: the kernel alone on one thread, the evaluator's pool over its chunking with
+//! reused and with fresh outputs, and a copy of the same planes through the same pool and
+//! chunking, the reference a pointwise kernel is held to. Merge's over and mix: each in place
+//! over four planes through the pool, held to the copy by the bytes each moves. It runs on the
+//! workstation before each PR to `main`, never in CI: each gate is a fraction of the copy
+//! measured in the same run, so it holds on any machine and never blesses a number.
 
 use std::time::{Duration, Instant};
 
-use opencompositor_core::bench::{Pool, exposure};
+use opencompositor_core::bench::{Pool, exposure, mix, over};
 
 /// A 4K plate. Its three colour planes go through; alpha is shared unchanged, so neither
 /// Exposure nor the copy touches one.
@@ -91,7 +92,55 @@ fn main() {
     let ratio = copy.as_secs_f64() / reused.as_secs_f64();
     let verdict = if ratio >= GATE { "pass" } else { "FAIL" };
     println!("  Exposure at {ratio:.2} of the copy's throughput, gate {GATE}: {verdict}");
-    if ratio < GATE {
+    let mut failed = ratio < GATE;
+
+    // Merge's kernels, in place over four planes: over reads the layer's four planes and the
+    // four it writes, and mix the base's four and the four it writes, so each moves twelve
+    // planes' bytes where the copy moves two per plane.
+    let layer: Vec<Vec<f32>> = (11..=14).map(|seed| plate(seed, area)).collect();
+    let base: Vec<Vec<f32>> = (21..=24).map(|seed| plate(seed, area)).collect();
+    let mut stack: Vec<Vec<f32>> = base.clone();
+    let layer_planes: [&[f32]; 4] = [&layer[0], &layer[1], &layer[2], &layer[3]];
+    let base_planes: [&[f32]; 4] = [&base[0], &base[1], &base[2], &base[3]];
+    let over_pool = median(|| {
+        let [r, g, b, a] = &mut stack[..] else {
+            unreachable!("four planes");
+        };
+        pool.fill_rows([r, g, b, a], WIDTH, |level, first_row, chunk| {
+            let rows = first_row * WIDTH..first_row * WIDTH + chunk[0].len();
+            over(level, layer_planes.map(|plane| &plane[rows.clone()]), chunk);
+        });
+    });
+    let mix_pool = median(|| {
+        let [r, g, b, a] = &mut stack[..] else {
+            unreachable!("four planes");
+        };
+        pool.fill_rows([r, g, b, a], WIDTH, |level, first_row, chunk| {
+            let rows = first_row * WIDTH..first_row * WIDTH + chunk[0].len();
+            mix(
+                level,
+                base_planes.map(|plane| &plane[rows.clone()]),
+                chunk,
+                0.5,
+            );
+        });
+    });
+    let copy_throughput = bytes / copy.as_secs_f64() / 1e9;
+    let merge_bytes = (12 * area * size_of::<f32>()) as f64;
+    println!("Merge on {WIDTH}x{HEIGHT} RGBA, in place over four planes, median of {RUNS} runs");
+    for (what, time) in [("over, pool", over_pool), ("mix, pool", mix_pool)] {
+        let ms = time.as_secs_f64() * 1e3;
+        let throughput = merge_bytes / time.as_secs_f64() / 1e9;
+        println!("  {what:<26}{ms:>8.2} ms{throughput:>8.1} GB/s");
+        let ratio = throughput / copy_throughput;
+        let verdict = if ratio >= GATE { "pass" } else { "FAIL" };
+        let (name, _) = what.split_once(',').expect("a name before the comma");
+        println!(
+            "  {name} at {ratio:.2} of the copy's throughput by bytes moved, gate {GATE}: {verdict}"
+        );
+        failed |= ratio < GATE;
+    }
+    if failed {
         std::process::exit(1);
     }
 }

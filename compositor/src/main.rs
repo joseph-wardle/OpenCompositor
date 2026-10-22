@@ -60,18 +60,28 @@ pub struct Widgets {
 /// A scripted check of the shell, from the command line.
 enum Check {
     Lifecycle(PathBuf),
-    Drag(PathBuf),
+    Drag(PathBuf, drag::Chain),
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "usage: opencompositor [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge]]"
+    );
+    std::process::exit(2)
 }
 
 fn main() {
     let check = match &std::env::args_os().skip(1).collect::<Vec<_>>()[..] {
         [] => None,
         [flag, image] if flag == "--lifecycle-check" => Some(Check::Lifecycle(image.into())),
-        [flag, image] if flag == "--drag-check" => Some(Check::Drag(image.into())),
-        _ => {
-            eprintln!("usage: opencompositor [--lifecycle-check IMAGE | --drag-check IMAGE]");
-            std::process::exit(2);
+        [flag, image] if flag == "--drag-check" => drag::run_chains(image.as_ref()),
+        [flag, image, name] if flag == "--drag-check" => {
+            match name.to_str().and_then(drag::Chain::from_name) {
+                Some(chain) => Some(Check::Drag(image.into(), chain)),
+                None => usage(),
+            }
         }
+        _ => usage(),
     };
     // The shim calls Qt's private API, which has no ABI guarantee across Qt releases, while the
     // dynamic loader accepts any Qt exporting the unversioned Qt_6_PRIVATE_API symbols.
@@ -219,7 +229,7 @@ fn main() {
     window.pin_mut().show();
     match check {
         Some(Check::Lifecycle(image)) => lifecycle::start(image),
-        Some(Check::Drag(image)) => drag::start(image),
+        Some(Check::Drag(image, chain)) => drag::start(image, chain),
         None => {}
     }
     let status = ffi::exec();

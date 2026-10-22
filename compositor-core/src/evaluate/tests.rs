@@ -3,7 +3,7 @@ use open_ng::Point;
 use super::*;
 use crate::document::{Assignment, ReaderVersion};
 use crate::fixtures::{self, directory};
-use crate::image::{Channel, Window};
+use crate::image::{Channel, Warning, Window};
 use crate::parameter::Value;
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
@@ -56,6 +56,40 @@ fn write(path: &Path, color: png::ColorType, data: &[u8]) {
     fixtures::write_png(path, 2, 1, color, data);
 }
 
+fn merge(mix: Option<f64>) -> Node {
+    let mut node = Node::new(
+        NodeKind::Merge {
+            version: MergeVersion::V1,
+        },
+        ORIGIN,
+    );
+    if let Some(mix) = mix {
+        node.set_value("mix", Value::Float(mix)).unwrap();
+    }
+    node
+}
+
+/// A document of these nodes, with IDs from 1, and these wires, each a consumer, its input and
+/// the source.
+fn graph(
+    nodes: impl IntoIterator<Item = Node>,
+    wires: &[(u64, InputSlot<'static>, u64)],
+) -> Document {
+    let mut document = Document::default();
+    for (id, node) in (1..).map(NodeId).zip(nodes) {
+        document.nodes.insert(id, Arc::new(node));
+    }
+    let assignments: Vec<Assignment> = wires
+        .iter()
+        .map(|&(consumer, input, source)| Assignment {
+            consumer: NodeId(consumer),
+            input,
+            source: Some(NodeId(source)),
+        })
+        .collect();
+    document.assign_inputs(&assignments).unwrap()
+}
+
 /// A document of these nodes, with IDs from 1, each Exposure taking the image of the node before
 /// it.
 fn chain(nodes: impl IntoIterator<Item = Node>) -> Document {
@@ -66,7 +100,7 @@ fn chain(nodes: impl IntoIterator<Item = Node>) -> Document {
         if let (NodeKind::Exposure { .. }, Some(source)) = (&node.kind, previous) {
             assignments.push(Assignment {
                 consumer: id,
-                input: "source",
+                input: "source".into(),
                 source: Some(source),
             });
         }
@@ -93,6 +127,23 @@ fn image(width: u32, height: u32, planes: [Arc<[f32]>; 4]) -> Image {
         height,
     };
     Image::new(window, window, planes, Vec::new())
+}
+
+fn window(x: i32, y: i32, width: u32, height: u32) -> Window {
+    Window {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+/// An image of one value per channel over a data window, with its own display window and
+/// warnings.
+fn flat(display: Window, data: Window, values: [f32; 4], warnings: Vec<Warning>) -> Image {
+    let len = data.area() as usize;
+    let planes = values.map(|value| std::iter::repeat_n(value, len).collect());
+    Image::new(display, data, planes, warnings)
 }
 
 /// `len` finite values of both signs, from tiny to huge, different for each `seed`.
@@ -551,4 +602,310 @@ fn a_deep_chain_evaluates_without_recursion() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn merge_keys_name_the_connected_layers_in_slot_order() {
+    let nodes = |mix| [reader("a.exr"), reader("b.exr"), merge(mix)];
+    let slot = |slot| ("layer", slot).into();
+    let slots_1_and_2 = graph(nodes(None), &[(3, slot(1), 1), (3, slot(2), 2)]);
+    let slots_1_and_3 = graph(nodes(None), &[(3, slot(1), 1), (3, slot(3), 2)]);
+    let reversed = graph(nodes(None), &[(3, slot(1), 2), (3, slot(2), 1)]);
+    let as_background = graph(nodes(None), &[(3, "background".into(), 1), (3, slot(1), 2)]);
+    let mixed = graph(nodes(Some(0.5)), &[(3, slot(1), 1), (3, slot(2), 2)]);
+    let full = graph(nodes(Some(1.0)), &[(3, slot(1), 1), (3, slot(2), 2)]);
+
+    // An empty slot composes as the empty image, so where the layers sit is not in the key.
+    assert_eq!(key(&slots_1_and_2, 3), key(&slots_1_and_3, 3));
+    assert_eq!(key(&slots_1_and_2, 3), key(&full, 3));
+    assert_ne!(key(&slots_1_and_2, 3), key(&reversed, 3));
+    assert_ne!(key(&slots_1_and_2, 3), key(&as_background, 3));
+    assert_ne!(key(&slots_1_and_2, 3), key(&mixed, 3));
+}
+
+/// The key of a Merge of a background and one layer at `mix`, for computing from given images.
+fn merge_key(mix: f64) -> ResultKey {
+    let document = graph(
+        [reader("a.png"), reader("b.png"), merge(Some(mix))],
+        &[(3, "background".into(), 1), (3, ("layer", 1).into(), 2)],
+    );
+    key(&document, 3)
+}
+
+fn values(image: &Image, x: i32, y: i32) -> [f32; 4] {
+    Channel::ALL.map(|channel| image.value(channel, x, y))
+}
+
+#[test]
+fn merge_composes_offset_layers_over_the_base_within_their_union() {
+    let evaluator = Evaluator::new();
+    let base = flat(
+        window(0, 0, 4, 4),
+        window(0, 0, 2, 2),
+        [1.0, 0.5, 0.25, 1.0],
+        vec![Warning::IccProfile],
+    );
+    let layer = flat(
+        window(10, 10, 1, 1),
+        window(1, 1, 2, 2),
+        [0.5, 0.5, 0.0, 0.5],
+        vec![Warning::PixelAspect(2.0)],
+    );
+
+    let full = evaluator
+        .compute(&merge_key(1.0), &[&base, &layer], &mut Vec::new())
+        .unwrap();
+
+    assert_eq!(full.display_window(), base.display_window());
+    assert_eq!(full.data_window(), window(0, 0, 3, 3));
+    assert_eq!(values(&full, 0, 0), [1.0, 0.5, 0.25, 1.0]);
+    assert_eq!(values(&full, 1, 1), [1.0, 0.75, 0.125, 1.0]);
+    assert_eq!(values(&full, 2, 2), [0.5, 0.5, 0.0, 0.5]);
+    assert_eq!(values(&full, 2, 0), [0.0; 4]);
+    assert_eq!(
+        full.warnings(),
+        [Warning::IccProfile, Warning::PixelAspect(2.0)]
+    );
+
+    let half = evaluator
+        .compute(&merge_key(0.5), &[&base, &layer], &mut Vec::new())
+        .unwrap();
+
+    assert_eq!(values(&half, 0, 0), [1.0, 0.5, 0.25, 1.0]);
+    assert_eq!(values(&half, 1, 1), [1.0, 0.625, 0.1875, 1.0]);
+    assert_eq!(values(&half, 2, 2), [0.25, 0.25, 0.0, 0.25]);
+    assert_eq!(values(&half, 2, 0), [0.0; 4]);
+
+    // One file by two branches warns once.
+    let diamond = evaluator
+        .compute(&merge_key(1.0), &[&layer, &base, &layer], &mut Vec::new())
+        .unwrap();
+    assert_eq!(
+        diamond.warnings(),
+        [Warning::PixelAspect(2.0), Warning::IccProfile]
+    );
+}
+
+#[test]
+fn a_base_alone_or_mix_zero_is_the_base_shared_and_nothing_connected_is_empty() {
+    let evaluator = Evaluator::new();
+    let base = flat(
+        window(0, 0, 4, 4),
+        window(1, 1, 2, 2),
+        [1.0, 0.5, 0.25, 1.0],
+        Vec::new(),
+    );
+    let layer = flat(
+        window(0, 0, 1, 1),
+        window(5, 5, 2, 2),
+        [0.5, 0.5, 0.0, 0.5],
+        Vec::new(),
+    );
+    let shares_base = |image: &Image| {
+        assert_eq!(image.data_window(), base.data_window());
+        assert_eq!(image.display_window(), base.display_window());
+        for channel in Channel::ALL {
+            assert!(Arc::ptr_eq(image.plane(channel), base.plane(channel)));
+        }
+    };
+
+    let alone = evaluator
+        .compute(&merge_key(1.0), &[&base], &mut Vec::new())
+        .unwrap();
+    shares_base(&alone);
+    let zero = evaluator
+        .compute(&merge_key(0.0), &[&base, &layer], &mut Vec::new())
+        .unwrap();
+    shares_base(&zero);
+
+    let unconnected = key(&graph([merge(None)], &[]), 1);
+    let empty = evaluator
+        .compute(&unconnected, &[], &mut Vec::new())
+        .unwrap();
+    assert!(empty.data_window().is_empty());
+    assert!(empty.display_window().is_empty());
+}
+
+/// A Mix the kernel would receive as 0 or 1 is that special case, whatever its f64 value: the
+/// products by zero that the cases avoid are the kernel's, in f32.
+#[test]
+fn mix_is_special_cased_as_the_kernel_receives_it() {
+    let evaluator = Evaluator::new();
+    let one = window(0, 0, 1, 1);
+    let base = flat(one, one, [f32::INFINITY, 1.0, 1.0, 1.0], Vec::new());
+    let layer = flat(one, one, [0.5, 0.5, 0.5, 0.5], Vec::new());
+    let compute = |mix| {
+        evaluator
+            .compute(&merge_key(mix), &[&base, &layer], &mut Vec::new())
+            .unwrap()
+    };
+
+    let nearly_one = compute(1.0 - 1e-10);
+    assert_eq!(
+        values(&nearly_one, 0, 0),
+        [f32::INFINITY, 1.0, 1.0, 1.0],
+        "the stack as composed, not dissolved against the base"
+    );
+    let nearly_zero = compute(1e-50);
+    assert!(Arc::ptr_eq(
+        nearly_zero.plane(Channel::R),
+        base.plane(Channel::R)
+    ));
+}
+
+/// Merge through the pool's chunking at every width across a SIMD tail, the layer offset by one
+/// pixel from the base so that the union has rows and columns of each alone and of both: every
+/// output sample is the shared functions' bit for bit, and every one is written, since the
+/// outputs start as NaN and the inputs are finite.
+#[test]
+fn merge_on_the_pool_writes_every_sample_as_the_shared_functions_do() {
+    let evaluator = Evaluator::new();
+    let mix = merge_key(0.3);
+    for height in [1, 7, 8, 9, 17] {
+        for width in 1..=33 {
+            let len = (width * height) as usize;
+            let make = |x, y, seed| {
+                let data = window(x, y, width, height);
+                let planes = [1, 2, 3, 4].map(|c| finite_plane(len, c * 64 + width + seed));
+                Image::new(window(0, 0, 1, 1), data, planes, Vec::new())
+            };
+            let base = make(0, 0, 0);
+            let layer = make(1, 1, 1000);
+            let union = window(0, 0, width + 1, height + 1);
+            let nans =
+                || -> Arc<[f32]> { std::iter::repeat_n(f32::NAN, union.area() as usize).collect() };
+            let mut released = vec![nans(), nans(), nans(), nans()];
+
+            let output = evaluator
+                .compute(&mix, &[&base, &layer], &mut released)
+                .unwrap();
+
+            assert_eq!(output.data_window(), union);
+            assert!(
+                released.is_empty(),
+                "{width}x{height} left a released plane unused"
+            );
+            for y in 0..union.height as i32 {
+                for x in 0..union.width as i32 {
+                    let alpha = layer.value(Channel::A, x, y);
+                    for channel in Channel::ALL {
+                        let b = base.value(channel, x, y);
+                        let l = layer.value(channel, x, y);
+                        let over = opencompositor_kernels::over(b, l, alpha);
+                        let expected = opencompositor_kernels::mix(b, over, 0.3);
+                        assert_eq!(
+                            output.value(channel, x, y).to_bits(),
+                            expected.to_bits(),
+                            "{width}x{height} {channel:?} at {x}, {y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_merge_too_large_for_an_image_or_the_cap_fails_before_allocating() {
+    let evaluator = Evaluator::new();
+    let key = merge_key(1.0);
+    let pixel = |x, y| flat(window(0, 0, 1, 1), window(x, y, 1, 1), [1.0; 4], Vec::new());
+
+    let far_apart = evaluator
+        .compute(
+            &key,
+            &[&pixel(i32::MIN, 0), &pixel(i32::MAX, 0)],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&far_apart, EvalError::Oversize { origin, oversize }
+            if *origin == key && *oversize == Oversize { width: 1 << 32, height: 1 }),
+        "{far_apart:?}"
+    );
+    assert_eq!(
+        far_apart.to_string(),
+        "Merge: the data window would be 4294967296 × 1 pixels, more than an image can hold"
+    );
+
+    let over_cap = evaluator
+        .compute(&key, &[&pixel(0, 0), &pixel(20000, 20000)], &mut Vec::new())
+        .unwrap_err();
+    let bytes = 20001 * 20001 * 16;
+    assert!(
+        matches!(&over_cap, EvalError::OverCap { origin, window, bytes: needed }
+            if *origin == key && *window == self::window(0, 0, 20001, 20001) && *needed == bytes),
+        "{over_cap:?}"
+    );
+    assert_eq!(
+        over_cap.to_string(),
+        "Merge: needs 6104 MiB of planes for a 20001 × 20001 data window, over the 1024 MiB limit"
+    );
+}
+
+/// The addresses of every plane.
+fn plane_addresses(image: &Image) -> BTreeSet<usize> {
+    image.planes().iter().map(plane_address).collect()
+}
+
+/// One Reader through two Exposures into a Merge. Editing the layer's Exposure recomputes it and
+/// the Merge, nothing else: the file is not read again, the background's planes stay where they
+/// are, and the new results take the released planes of the old. Viewing the background then
+/// returns it retained and releases the rest.
+#[test]
+fn editing_one_branch_of_a_diamond_recomputes_only_that_branch_and_reuses_its_planes() {
+    let path = directory("diamond").join("image.png");
+    write_png(&path, 255);
+    let diamond = |stops: f64| {
+        graph(
+            [
+                reader(&path),
+                exposure(Some(1.0)),
+                exposure(Some(stops)),
+                merge(Some(0.5)),
+            ],
+            &[
+                (2, "source".into(), 1),
+                (3, "source".into(), 1),
+                (4, "background".into(), 2),
+                (4, ("layer", 1).into(), 3),
+            ],
+        )
+    };
+    let mut evaluator = Evaluator::new();
+    let retained = |evaluator: &Evaluator, key: &ResultKey| -> Image {
+        (evaluator.retained.iter())
+            .find(|retained| retained.key == *key)
+            .unwrap_or_else(|| panic!("{key:?} is retained"))
+            .image
+            .clone()
+    };
+
+    let first = run(&mut evaluator, &key(&diamond(2.0), 4)).unwrap();
+    assert_eq!(red(&first), 3.0);
+    assert_eq!(evaluator.retained.len(), 4);
+    let background = plane_addresses(&retained(&evaluator, &key(&diamond(2.0), 2)));
+    let mut old = colour_addresses(&retained(&evaluator, &key(&diamond(2.0), 3)));
+    old.extend(plane_addresses(&first));
+    assert_eq!(old.len(), 7);
+    drop(first);
+
+    // A re-read would see black.
+    write_png(&path, 0);
+    let second = run(&mut evaluator, &key(&diamond(3.0), 4)).unwrap();
+
+    assert_eq!(red(&second), 5.0);
+    assert_eq!(evaluator.retained.len(), 4);
+    assert_eq!(
+        plane_addresses(&retained(&evaluator, &key(&diamond(3.0), 2))),
+        background
+    );
+    let mut new = colour_addresses(&retained(&evaluator, &key(&diamond(3.0), 3)));
+    new.extend(plane_addresses(&second));
+    assert_eq!(new, old);
+
+    let viewed = run(&mut evaluator, &key(&diamond(3.0), 2)).unwrap();
+    assert_eq!(red(&viewed), 2.0);
+    assert_eq!(plane_addresses(&viewed), background);
+    assert_eq!(evaluator.retained.len(), 2);
 }

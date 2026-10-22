@@ -9,11 +9,15 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::document::{Document, ExposureVersion, Node, NodeId, NodeKind, ReaderVersion};
-use crate::image::{Image, zeroed_plane};
+use crate::document::{
+    Document, ExposureVersion, InputSlot, MergeVersion, Node, NodeId, NodeKind, ReaderVersion,
+};
+use crate::image::{Image, Oversize, Window, zeroed_plane};
 use crate::kernels::cpu::{self, Level};
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image};
+
+mod merge;
 
 /// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
 /// undoable.
@@ -87,16 +91,28 @@ enum Recipe {
         /// `None` while the input is unconnected.
         source: Option<ResultKey>,
     },
+    Merge {
+        version: MergeVersion,
+        /// The resolved value's bits, as Exposure's `stops`.
+        mix: u64,
+        background: Option<ResultKey>,
+        /// The connected layers in slot order. An empty slot composes as the empty image, which
+        /// changes nothing, so which slots they occupy is not part of the key.
+        layers: Vec<ResultKey>,
+    },
 }
 
 impl Recipe {
-    /// The keys of the connected inputs, in declaration order.
+    /// The keys of the connected inputs, in declaration order and then slot order.
     fn inputs(&self) -> impl Iterator<Item = &ResultKey> {
-        match self {
-            Recipe::Reader { .. } => None,
-            Recipe::Exposure { source, .. } => source.as_ref(),
-        }
-        .into_iter()
+        let (first, rest): (Option<&ResultKey>, &[ResultKey]) = match self {
+            Recipe::Reader { .. } => (None, &[]),
+            Recipe::Exposure { source, .. } => (source.as_ref(), &[]),
+            Recipe::Merge {
+                background, layers, ..
+            } => (background.as_ref(), layers),
+        };
+        first.into_iter().chain(rest)
     }
 
     /// This recipe with other keys for its connected inputs, in declaration order.
@@ -120,6 +136,20 @@ impl Recipe {
                 version: *version,
                 stops: *stops,
                 source: source.as_ref().and_then(|_| inputs.next()),
+            },
+            Recipe::Merge {
+                version,
+                mix,
+                background,
+                layers,
+            } => Recipe::Merge {
+                version: *version,
+                mix: *mix,
+                background: background.as_ref().and_then(|_| inputs.next()),
+                layers: layers
+                    .iter()
+                    .map(|_| inputs.next().expect("one key per connected layer"))
+                    .collect(),
             },
         }
     }
@@ -158,8 +188,28 @@ impl Recipe {
             ) => {
                 version == other_version && stops == other_stops && same_input(source, other_source)
             }
+            (
+                Recipe::Merge {
+                    version,
+                    mix,
+                    background,
+                    layers,
+                },
+                Recipe::Merge {
+                    version: other_version,
+                    mix: other_mix,
+                    background: other_background,
+                    layers: other_layers,
+                },
+            ) => {
+                version == other_version
+                    && mix == other_mix
+                    && same_input(background, other_background)
+                    && layers.len() == other_layers.len()
+                    && (layers.iter().zip(other_layers)).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0))
+            }
             // Listed by kind, so that a new kind cannot fall through as never equal.
-            (Recipe::Reader { .. } | Recipe::Exposure { .. }, _) => false,
+            (Recipe::Reader { .. } | Recipe::Exposure { .. } | Recipe::Merge { .. }, _) => false,
         }
     }
 }
@@ -193,8 +243,7 @@ fn keys(
     while let Some(&id) = pending.last() {
         let current = document.node(id).expect("inputs name existing nodes");
         if entered.insert(id) {
-            let inputs = current.kind.inputs().iter();
-            let sources = inputs.filter_map(|input| current.input(input.name));
+            let sources = current.inputs().map(|(_, source)| source);
             pending.extend(sources.filter(|source| !entered.contains(source)));
             continue;
         }
@@ -209,11 +258,13 @@ fn keys(
 
 /// A node's recipe, from the keys of its inputs.
 fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -> Recipe {
-    let input = |name: &str| {
-        let source = node.input(name)?;
-        let key = built.get(&source).expect("the document has no cycles");
-        Some(key.clone())
+    let key_of = |source: NodeId| -> ResultKey {
+        built
+            .get(&source)
+            .expect("the document has no cycles")
+            .clone()
     };
+    let input = |input: InputSlot<'_>| node.input(input).map(key_of);
     match &node.kind {
         NodeKind::Reader { version } => {
             let path = resolve(node).file("file").cloned();
@@ -228,7 +279,19 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
             Recipe::Exposure {
                 version: *version,
                 stops: stops.to_bits(),
-                source: input("source"),
+                source: input("source".into()),
+            }
+        }
+        NodeKind::Merge { version } => {
+            let mix = resolve(node).float("mix").expect("Merge has Mix");
+            Recipe::Merge {
+                version: *version,
+                mix: mix.to_bits(),
+                background: input("background".into()),
+                layers: node
+                    .slots("layer")
+                    .map(|(_, source)| key_of(source))
+                    .collect(),
             }
         }
     }
@@ -240,6 +303,13 @@ pub(crate) const DEEP_STACK: usize = 64 << 20;
 
 /// The most bytes of planes an evaluator retains. Provisional, until a budget sets it.
 const RETAINED_BYTES_CAP: u64 = 4 << 30;
+
+/// The most bytes one node may allocate for its outputs and scratch, checked from its windows
+/// before anything is allocated: two layers far apart union to a data window of gigabytes, and
+/// an allocation that fails aborts the process. Provisional, until bounded-memory evaluation.
+/// It bounds no total: a request's inputs, the retained results, the viewer's copy and the
+/// staging buffer coexist with it.
+const NODE_BYTES_CAP: u64 = 1 << 30;
 
 /// Computes images from their keys on the CPU, retaining results by key for the requests after.
 ///
@@ -476,8 +546,9 @@ fn distinct_bytes<'a>(planes: impl Iterator<Item = &'a Arc<[f32]>>) -> u64 {
 }
 
 impl Evaluator {
-    /// Computes one node's image from the images of its connected inputs, in declaration order,
-    /// with its output planes taken from `released` while one of the right length is there.
+    /// Computes one node's image from the images of its connected inputs, in declaration order
+    /// and then slot order, with its output planes taken from `released` while one of the right
+    /// length is there.
     fn compute(
         &self,
         key: &ResultKey,
@@ -507,6 +578,10 @@ impl Evaluator {
                     f64::from_bits(*stops),
                     released,
                 ))
+            }
+            Recipe::Merge { mix, .. } => {
+                let mix = f64::from_bits(*mix) as f32;
+                merge::merge(&self.pool, key, inputs, mix, released)
             }
         };
         // Operations write only their own outputs, so a panic leaves nothing half done, and the
@@ -575,27 +650,41 @@ impl Pool {
         kernel: impl Fn(Level, &[f32], &mut [f32]) + Sync,
     ) {
         assert_eq!(src.len(), dst.len(), "the planes have one length");
-        // An empty plane has no chunks, whichever of its sides is zero.
-        let chunk = (CHUNK_ROWS * width).max(1);
-        let level = self.level;
-        self.threads.install(|| {
-            (dst.par_chunks_mut(chunk).zip(src.par_chunks(chunk)))
-                .for_each(|(dst, src)| kernel(level, src, dst));
+        self.fill_rows([dst], width, |level, first_row, [dst]| {
+            kernel(level, &src[first_row * width..][..dst.len()], dst);
         });
     }
 
-    /// Runs `fill` over `out`, rows of `row_len` elements, a chunk of rows at a time over the
-    /// threads. `fill` is given the index of the chunk's first row and the chunk.
-    pub(crate) fn fill_rows<T: Send>(
+    /// Runs `fill` over planes of rows `row_len` elements long and one length, a chunk of rows
+    /// at a time over the threads, the same rows of every plane together. `fill` is given the
+    /// level, the index of the chunk's first row and the chunk of each plane.
+    pub fn fill_rows<T: Send, const N: usize>(
         &self,
-        out: &mut [T],
+        planes: [&mut [T]; N],
         row_len: usize,
-        fill: impl Fn(usize, &mut [T]) + Sync,
+        fill: impl Fn(Level, usize, [&mut [T]; N]) + Sync,
     ) {
+        let Some(len) = planes.first().map(|plane| plane.len()) else {
+            return;
+        };
+        assert!(
+            planes.iter().all(|plane| plane.len() == len),
+            "the planes have one length"
+        );
+        // An empty plane has no chunks, whichever of its sides is zero.
         let chunk = (CHUNK_ROWS * row_len).max(1);
+        let mut splits = planes.map(|plane| plane.chunks_mut(chunk));
+        let chunks: Vec<[&mut [T]; N]> = (0..len.div_ceil(chunk))
+            .map(|_| {
+                splits
+                    .each_mut()
+                    .map(|split| split.next().expect("one length"))
+            })
+            .collect();
+        let level = self.level;
         self.threads.install(|| {
-            (out.par_chunks_mut(chunk).enumerate())
-                .for_each(|(index, rows)| fill(index * CHUNK_ROWS, rows));
+            (chunks.into_par_iter().enumerate())
+                .for_each(|(index, chunk)| fill(level, index * CHUNK_ROWS, chunk));
         });
     }
 }
@@ -700,12 +789,27 @@ pub enum EvalError {
     Panicked {
         origin: ResultKey,
     },
+    /// The data window would have a side beyond what an image can hold.
+    Oversize {
+        origin: ResultKey,
+        oversize: Oversize,
+    },
+    /// The node's outputs and scratch would be over the cap on what one node allocates.
+    OverCap {
+        origin: ResultKey,
+        /// The data window they were for.
+        window: Window,
+        bytes: u64,
+    },
 }
 
 impl EvalError {
     pub fn origin(&self) -> &ResultKey {
         match self {
-            EvalError::Read { origin, .. } | EvalError::Panicked { origin } => origin,
+            EvalError::Read { origin, .. }
+            | EvalError::Panicked { origin }
+            | EvalError::Oversize { origin, .. }
+            | EvalError::OverCap { origin, .. } => origin,
         }
     }
 }
@@ -718,10 +822,20 @@ impl fmt::Display for EvalError {
             } => write!(f, "{}: ", path.display())?,
             Recipe::Reader { path: None, .. } => write!(f, "Reader: ")?,
             Recipe::Exposure { .. } => write!(f, "Exposure: ")?,
+            Recipe::Merge { .. } => write!(f, "Merge: ")?,
         }
         match self {
             EvalError::Read { error, .. } => error.fmt(f),
             EvalError::Panicked { .. } => write!(f, "the operation panicked"),
+            EvalError::Oversize { oversize, .. } => oversize.fmt(f),
+            EvalError::OverCap { window, bytes, .. } => write!(
+                f,
+                "needs {} MiB of planes for a {} × {} data window, over the {} MiB limit",
+                bytes >> 20,
+                window.width,
+                window.height,
+                NODE_BYTES_CAP >> 20
+            ),
         }
     }
 }
@@ -730,7 +844,9 @@ impl std::error::Error for EvalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             EvalError::Read { error, .. } => Some(error),
-            EvalError::Panicked { .. } => None,
+            EvalError::Panicked { .. } | EvalError::Oversize { .. } | EvalError::OverCap { .. } => {
+                None
+            }
         }
     }
 }

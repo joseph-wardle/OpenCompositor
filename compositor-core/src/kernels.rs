@@ -4,120 +4,131 @@
 //!
 //! A dispatch records into the caller's encoder and never submits, so one submission can carry
 //! an evaluation's dispatches and copies together. Nothing here uploads or reads back: the tests
-//! do, as test support until the worker stages the GPU's inputs.
+//! do, as test support until the worker stages the GPU's inputs. Over has no production dispatch
+//! yet: its entry point establishes that naga accepts the module and that the numbers land
+//! within its bound, ahead of the GPU step.
 
 use std::fmt;
 
-use opencompositor_kernels::{EXPOSURE_ENTRY, ExposureParams, SPIRV, WORKGROUP};
+use opencompositor_kernels::{
+    EXPOSURE_ENTRY, ExposureParams, OVER_ENTRY, OverParams, SPIRV, WORKGROUP,
+};
 
 pub(crate) mod cpu;
 
 /// The format of every plane texture.
 pub(crate) const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
-/// Exposure's pipeline on one device, made once per device.
+/// A pointwise entry point's pipeline on one device, made once per device: a uniform of
+/// parameters, its input planes read as textures, and one plane written as a storage texture,
+/// bound in that order as the kernel crate declares them.
 #[derive(Debug)]
-pub(crate) struct Exposure {
+struct Pointwise {
     device: wgpu::Device,
+    label: &'static str,
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
+    params_size: u64,
 }
 
-impl Exposure {
-    /// Makes the pipeline, which naga validates; the entry point's bindings are declared here
-    /// in the order the kernel crate gives them.
-    pub(crate) fn new(device: &wgpu::Device) -> Exposure {
+impl Pointwise {
+    /// Makes the pipeline, which naga validates, for an entry point reading `inputs` planes.
+    fn new(
+        device: &wgpu::Device,
+        label: &'static str,
+        entry: &str,
+        inputs: u32,
+        params_size: u64,
+    ) -> Pointwise {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kernels"),
             source: wgpu::util::make_spirv(SPIRV),
         });
+        let mut entries = vec![wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(params_size),
+            },
+            count: None,
+        }];
+        entries.extend((1..=inputs).map(|binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }));
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: inputs + 1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::StorageTexture {
+                // rust-gpu declares a storage image readable and writable, and naga holds the
+                // layout to the same; R32Float may be bound read-write without any feature.
+                access: wgpu::StorageTextureAccess::ReadWrite,
+                format: PLANE_FORMAT,
+                view_dimension: wgpu::TextureViewDimension::D2,
+            },
+            count: None,
+        });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("exposure"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(PARAMS_SIZE),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        // rust-gpu declares a storage image readable and writable, and naga
-                        // holds the layout to the same; R32Float may be bound read-write without
-                        // any feature.
-                        access: wgpu::StorageTextureAccess::ReadWrite,
-                        format: PLANE_FORMAT,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
+            label: Some(label),
+            entries: &entries,
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("exposure"),
+            label: Some(label),
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("exposure"),
+            label: Some(label),
             layout: Some(&pipeline_layout),
             module: &module,
-            entry_point: Some(EXPOSURE_ENTRY),
+            entry_point: Some(entry),
             compilation_options: Default::default(),
             cache: None,
         });
-        Exposure {
+        Pointwise {
             device: device.clone(),
+            label,
             layout,
             pipeline,
+            params_size,
         }
     }
 
-    /// Records Exposure by `gain` over `input` into `output`, two planes of one size, into the
-    /// encoder. Workgroups cover the planes rounded up to whole ones; the entry point skips the
-    /// invocations past the edge.
+    /// Records the entry point with `params` over `inputs` into `output`, planes of one size,
+    /// into the encoder. Workgroups cover the planes rounded up to whole ones; the entry point
+    /// skips the invocations past the edge.
     ///
     /// The planes are checked here rather than left to wgpu, whose validation error would count
     /// as a bug on the device.
-    pub(crate) fn dispatch(
+    fn dispatch(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        input: &wgpu::Texture,
+        params: &[u8],
+        inputs: &[&wgpu::Texture],
         output: &wgpu::Texture,
-        gain: f32,
     ) -> Result<(), PlaneError> {
-        check_plane(Role::Input, input, wgpu::TextureUsages::TEXTURE_BINDING)?;
-        check_plane(Role::Output, output, wgpu::TextureUsages::STORAGE_BINDING)?;
-        if input.size() != output.size() {
-            return Err(PlaneError::Size {
-                input: input.size(),
-                output: output.size(),
-            });
+        assert_eq!(params.len() as u64, self.params_size, "the params' bytes");
+        for &input in inputs {
+            check_plane(Role::Input, input, wgpu::TextureUsages::TEXTURE_BINDING)?;
+            if input.size() != output.size() {
+                return Err(PlaneError::Size {
+                    input: input.size(),
+                    output: output.size(),
+                });
+            }
         }
-        let params = ExposureParams {
-            width: input.width(),
-            height: input.height(),
-            gain,
-        };
+        check_plane(Role::Output, output, wgpu::TextureUsages::STORAGE_BINDING)?;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("exposure params"),
-            size: PARAMS_SIZE,
+            label: Some(self.label),
+            size: self.params_size,
             usage: wgpu::BufferUsages::UNIFORM,
             mapped_at_creation: true,
         });
@@ -126,47 +137,104 @@ impl Exposure {
             .get_mapped_range_mut()
             .expect("a buffer mapped at creation")
             .slice(..)
-            .copy_from_slice(&params.bytes());
+            .copy_from_slice(params);
         buffer.unmap();
+        let views: Vec<wgpu::TextureView> = (inputs.iter().chain([&output]))
+            .map(|texture| texture.create_view(&Default::default()))
+            .collect();
+        let mut entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }];
+        entries.extend(
+            (views.iter().enumerate()).map(|(index, view)| wgpu::BindGroupEntry {
+                binding: index as u32 + 1,
+                resource: wgpu::BindingResource::TextureView(view),
+            }),
+        );
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("exposure"),
+            label: Some(self.label),
             layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(
-                        &input.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(
-                        &output.create_view(&Default::default()),
-                    ),
-                },
-            ],
+            entries: &entries,
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("exposure"),
+            label: Some(self.label),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(
-            params.width.div_ceil(WORKGROUP),
-            params.height.div_ceil(WORKGROUP),
+            output.width().div_ceil(WORKGROUP),
+            output.height().div_ceil(WORKGROUP),
             1,
         );
         Ok(())
     }
 }
 
-/// The parameter struct's bytes, as `ExposureParams::bytes` lays them out.
-const PARAMS_SIZE: u64 = size_of::<ExposureParams>() as u64;
+/// Exposure's pipeline on one device.
+#[derive(Debug)]
+pub(crate) struct Exposure(Pointwise);
+
+impl Exposure {
+    pub(crate) fn new(device: &wgpu::Device) -> Exposure {
+        let params_size = size_of::<ExposureParams>() as u64;
+        Exposure(Pointwise::new(
+            device,
+            "exposure",
+            EXPOSURE_ENTRY,
+            1,
+            params_size,
+        ))
+    }
+
+    /// Records Exposure by `gain` over `input` into `output`, two planes of one size, into the
+    /// encoder.
+    pub(crate) fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &wgpu::Texture,
+        output: &wgpu::Texture,
+        gain: f32,
+    ) -> Result<(), PlaneError> {
+        let params = ExposureParams {
+            width: output.width(),
+            height: output.height(),
+            gain,
+        };
+        self.0.dispatch(encoder, &params.bytes(), &[input], output)
+    }
+}
+
+/// Over's pipeline on one device.
+#[derive(Debug)]
+pub(crate) struct Over(Pointwise);
+
+impl Over {
+    pub(crate) fn new(device: &wgpu::Device) -> Over {
+        let params_size = size_of::<OverParams>() as u64;
+        Over(Pointwise::new(device, "over", OVER_ENTRY, 3, params_size))
+    }
+
+    /// Records one plane of `layer` over the same plane of `background`, with the layer's
+    /// `alpha` plane, into `output`, four planes of one size, into the encoder. For the alpha
+    /// plane itself, `layer` is `alpha`.
+    pub(crate) fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        background: &wgpu::Texture,
+        layer: &wgpu::Texture,
+        alpha: &wgpu::Texture,
+        output: &wgpu::Texture,
+    ) -> Result<(), PlaneError> {
+        let params = OverParams {
+            width: output.width(),
+            height: output.height(),
+        };
+        let inputs = [background, layer, alpha];
+        self.0.dispatch(encoder, &params.bytes(), &inputs, output)
+    }
+}
 
 fn check_plane(
     role: Role,
@@ -206,7 +274,7 @@ pub(crate) enum PlaneError {
         role: Role,
         missing: wgpu::TextureUsages,
     },
-    /// The output is not the input's size.
+    /// The output is not an input's size.
     Size {
         input: wgpu::Extent3d,
         output: wgpu::Extent3d,
@@ -381,8 +449,10 @@ mod tests {
     use crate::gpu::{noop_device, noop_parts};
 
     #[test]
-    fn the_module_and_pipeline_validate_without_a_gpu() {
-        Exposure::new(&noop_device(None));
+    fn the_module_and_pipelines_validate_without_a_gpu() {
+        let device = noop_device(None);
+        Exposure::new(&device);
+        Over::new(&device);
     }
 
     #[test]
@@ -500,5 +570,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Alphas for the GPU over test: the usual range, beyond it, and the non-finite classes.
+    fn alphas(count: usize) -> Vec<f32> {
+        const ALPHAS: [f32; 9] = [
+            0.0,
+            0.5,
+            1.0,
+            0.25,
+            -0.75,
+            1.5,
+            f32::NAN,
+            f32::INFINITY,
+            2.0e-20,
+        ];
+        (0..count)
+            .map(|i| ALPHAS[(i * 7 + i / 9) % ALPHAS.len()])
+            .collect()
+    }
+
+    /// Over on the GPU against the CPU definition, within 1 ULP where the result is not a
+    /// cancellation, since a driver that splits the fused multiply-add rounds twice; where the
+    /// product and the layer cancel, within the ULP of what was summed. Non-finite results agree
+    /// by class.
+    #[test]
+    fn over_on_the_gpu_is_within_a_ulp_of_the_cpu_definition() {
+        let (device, queue) = headless::device();
+        let over = Over::new(&device);
+        let mut worst = 0;
+        for (width, height) in SIZES {
+            let count = (width * height) as usize;
+            let background = texels(count);
+            let mut layer = texels(count);
+            layer.rotate_left(1);
+            let alpha = alphas(count);
+            let planes = [&background, &layer, &alpha]
+                .map(|texels| headless::upload(&device, &queue, width, height, texels));
+            let [background_plane, layer_plane, alpha_plane] = &planes;
+            let output = headless::output(&device, width, height);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            over.dispatch(
+                &mut encoder,
+                background_plane,
+                layer_plane,
+                alpha_plane,
+                &output,
+            )
+            .expect("four planes of one size");
+            queue.submit([encoder.finish()]);
+            let result = headless::readback(&device, &queue, &output);
+            assert_eq!(result.len(), count);
+            for (i, &actual) in result.iter().enumerate() {
+                let (b, l, a) = (background[i], layer[i], alpha[i]);
+                let expected = opencompositor_kernels::over(b, l, a);
+                let what = format!("{width}x{height} texel {i}: {l:?} at {a:?} over {b:?}");
+                if !expected.is_finite() {
+                    assert_eq!(
+                        ulp_distance(actual, expected),
+                        0,
+                        "{what} gave {actual:?}, not {expected:?}"
+                    );
+                    continue;
+                }
+                let product = f64::from(b) * f64::from(1.0 - a);
+                let summed = product.abs() + f64::from(l).abs();
+                if summed <= 4.0 * f64::from(expected).abs() {
+                    let distance = ulp_distance(actual, expected);
+                    assert!(
+                        distance <= 1,
+                        "{what} gave {actual:?}, {distance} ULP from {expected:?}"
+                    );
+                    worst = worst.max(distance);
+                } else {
+                    let summed_ulp = f64::from(summed as f32).abs() * f64::from(f32::EPSILON);
+                    let difference = (f64::from(actual) - f64::from(expected)).abs();
+                    assert!(
+                        difference <= summed_ulp,
+                        "{what} gave {actual:?}, not {expected:?}, with {summed} summed"
+                    );
+                }
+            }
+        }
+        println!("over on the GPU: at worst {worst} ULP from the CPU");
     }
 }

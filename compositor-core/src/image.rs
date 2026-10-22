@@ -24,6 +24,79 @@ impl Window {
         (left..left + i64::from(self.width)).contains(&x)
             && (bottom..bottom + i64::from(self.height)).contains(&y)
     }
+
+    /// Whether the window has no pixels.
+    pub fn is_empty(self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    /// How many pixels the window has.
+    pub fn area(self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
+    }
+
+    /// The smallest window holding both, or the other alone where one is empty, whatever its
+    /// corner. Fails where a side of the result would not fit, as when two windows lie far apart.
+    pub fn union(self, other: Window) -> Result<Window, Oversize> {
+        if self.is_empty() {
+            return Ok(other);
+        }
+        if other.is_empty() {
+            return Ok(self);
+        }
+        let span = |x: i32, width: u32| (i64::from(x), i64::from(x) + i64::from(width));
+        let (left, right) = span(self.x, self.width);
+        let (other_left, other_right) = span(other.x, other.width);
+        let (bottom, top) = span(self.y, self.height);
+        let (other_bottom, other_top) = span(other.y, other.height);
+        let (left, bottom) = (left.min(other_left), bottom.min(other_bottom));
+        let (width, height) = (right.max(other_right) - left, top.max(other_top) - bottom);
+        match (u32::try_from(width), u32::try_from(height)) {
+            (Ok(width), Ok(height)) => Ok(Window {
+                // The least of two corners is one of them.
+                x: left as i32,
+                y: bottom as i32,
+                width,
+                height,
+            }),
+            _ => Err(Oversize { width, height }),
+        }
+    }
+
+    /// Where this window's bottom-left pixel lies in the storage of a window that contains it:
+    /// its column and row from that window's bottom-left. An empty window lies at the origin,
+    /// wherever its corner is.
+    pub(crate) fn offset_in(self, outer: Window) -> (usize, usize) {
+        if self.is_empty() {
+            return (0, 0);
+        }
+        debug_assert!(
+            outer.contains(self.x, self.y) && outer.union(self).is_ok_and(|union| union == outer),
+            "{self:?} lies inside {outer:?}"
+        );
+        (
+            (i64::from(self.x) - i64::from(outer.x)) as usize,
+            (i64::from(self.y) - i64::from(outer.y)) as usize,
+        )
+    }
+}
+
+/// A window with a side beyond what an image can hold, as a union of windows far apart would
+/// have: its sides, computed without wrapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Oversize {
+    pub width: i64,
+    pub height: i64,
+}
+
+impl fmt::Display for Oversize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the data window would be {} × {} pixels, more than an image can hold",
+            self.width, self.height
+        )
+    }
 }
 
 /// One of an image's channels. Only R, G, B and A exist until a workflow needs more.

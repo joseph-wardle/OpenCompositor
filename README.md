@@ -12,7 +12,7 @@ OpenNG has a first working step: views of a shared graph with selection, moving,
 OpenCompositor has a Qt window with a node graph and an image viewer:
 
 - **Tab** over the graph opens a menu of node types at the pointer; type to filter it, and **Enter** or a click creates the node, inserted to the right of the selected one. Choosing Reader asks for its files first.
-- The node types are Reader and Exposure, which multiplies R, G and B by two to the power of its Stops.
+- The node types are Reader, Exposure, which multiplies R, G and B by two to the power of its Stops, and Merge, which composes its layers over its background with premultiplied over and dissolves the result against the base by its Mix. Connecting a Merge's last Layer input adds another, and a layer keeps its input whatever is connected below it.
 - **R** reads EXR and PNG files into Reader nodes at the pointer, or below the selected node. *File ▸ Reload the Selected Readers* reads them again.
 - The **Parameters** panel shows the selected node's parameters: drag a slider or type a value, right-click to reset one, **Browse…** to choose a file, and **Pin** to keep the panel on that node.
 - **Ctrl+digit** marks the selected node in a viewer slot, the **digit** views that slot, and **Shift+digit** frames its node in the graph. Digits are read by their position on the keyboard, so the top row works whatever the layout.
@@ -53,7 +53,7 @@ The window must run against the Qt it was built with, and refuses to start other
 
 `cargo run -p opencompositor -- --lifecycle-check IMAGE` docks, floats, tabs and closes the panes, reads `IMAGE` with a dialog open, creates an Exposure from the creation menu and moves its slider from a script, destroys the GPU device, and exits non-zero if a pane lost its surface or stopped drawing or the new device did not draw. Run it after upgrading Qt, since the window uses Qt's private Wayland API.
 
-`cargo run --release -p opencompositor -- --drag-check IMAGE` drags Exposure's Stops over a Reader of `IMAGE` with synthetic mouse events, and exits non-zero if the viewer missed the 50 ms budget or the drag did not undo as one step.
+`cargo run --release -p opencompositor -- --drag-check IMAGE` drags Exposure's Stops over a Reader of `IMAGE`, then Merge's Mix with `IMAGE` as the background and as a layer, with synthetic mouse events, each chain in its own process, and exits non-zero if the viewer missed the 50 ms budget on either or a drag did not undo as one step. `--drag-check IMAGE merge` runs one chain.
 
 ## License
 

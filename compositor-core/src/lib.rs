@@ -25,17 +25,18 @@ mod worker;
 #[doc(hidden)]
 pub mod bench {
     pub use crate::evaluate::Pool;
-    pub use crate::kernels::cpu::{Level, exposure};
+    pub use crate::kernels::cpu::{Level, exposure, mix, over};
 }
 
 pub use app::{Anchor, App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
 pub use document::{
-    Assignment, Changes, ConnectionError, Document, ExposureVersion, Missing, Node, NodeId,
-    NodeInput, NodeKind, NodeType, ReaderVersion, Slot, missing, node_types,
+    Assignment, Changes, ConnectionError, Document, ExposureVersion, InputSlot, MAX_SLOTS,
+    MergeVersion, Missing, Node, NodeId, NodeInput, NodeKind, NodeType, ReaderVersion, Slot,
+    missing, node_types,
 };
 pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};
-pub use image::{Channel, Chromaticities, Image, ImageInfo, Warning, Window};
+pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Warning, Window};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,

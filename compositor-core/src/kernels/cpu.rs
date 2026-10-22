@@ -56,47 +56,113 @@ impl Level {
     }
 }
 
-/// Exposure by `gain` from `src` into `dst`, two slices of one length: each sample of `dst`
-/// becomes [`kernels::exposure`] of the sample at the same index in `src`.
-pub fn exposure(level: Level, src: &[f32], dst: &mut [f32], gain: f32) {
-    assert_eq!(src.len(), dst.len(), "Exposure's slices differ in length");
-    match level.0 {
-        Kind::Baseline => exposure_baseline(src, dst, gain),
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: `level` came from `Level::detect` on this machine, which found every feature
-        // the wrapper enables.
-        Kind::V3 => unsafe { exposure_v3(src, dst, gain) },
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: as above.
-        Kind::V4 => unsafe { exposure_v4(src, dst, gain) },
-    }
+/// Defines an operation at a level: `$name` takes the level and the arguments and runs
+/// `$body`, an `#[inline(always)]` function of the same arguments, in the wrapper that enables
+/// the level's features, so the body vectorises once per level.
+///
+/// The feature lists are x86-64-v3 and v4 as the psABI defines them, and `Level::detect` checks
+/// the same lists.
+macro_rules! at_levels {
+    ($(#[$doc:meta])* $name:ident => $body:ident($($arg:ident: $ty:ty),* $(,)?)) => {
+        $(#[$doc])*
+        pub fn $name(level: Level, $($arg: $ty),*) {
+            #[cfg(target_arch = "x86_64")]
+            #[target_feature(enable = "avx2,fma,bmi1,bmi2,lzcnt,movbe,f16c")]
+            fn v3($($arg: $ty),*) {
+                $body($($arg),*);
+            }
+            #[cfg(target_arch = "x86_64")]
+            #[target_feature(
+                enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,avx2,fma,bmi1,bmi2,lzcnt,movbe,f16c"
+            )]
+            fn v4($($arg: $ty),*) {
+                $body($($arg),*);
+            }
+            match level.0 {
+                Kind::Baseline => $body($($arg),*),
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: `level` came from `Level::detect` on this machine, which found every
+                // feature the wrapper enables.
+                Kind::V3 => unsafe { v3($($arg),*) },
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: as above.
+                Kind::V4 => unsafe { v4($($arg),*) },
+            }
+        }
+    };
+}
+
+at_levels! {
+    /// Exposure by `gain` from `src` into `dst`, two slices of one length: each sample of `dst`
+    /// becomes [`kernels::exposure`] of the sample at the same index in `src`.
+    exposure => exposure_samples(src: &[f32], dst: &mut [f32], gain: f32)
 }
 
 #[inline(always)]
 fn exposure_samples(src: &[f32], dst: &mut [f32], gain: f32) {
+    assert_eq!(src.len(), dst.len(), "Exposure's slices differ in length");
     for (d, &s) in dst.iter_mut().zip(src) {
         *d = kernels::exposure(s, gain);
     }
 }
 
-fn exposure_baseline(src: &[f32], dst: &mut [f32], gain: f32) {
-    exposure_samples(src, dst, gain);
+at_levels! {
+    /// A layer over the background in `dst`, in place: each sample of each plane of `dst`
+    /// becomes [`kernels::over`] of itself, the layer's sample at the same index and the
+    /// layer's alpha there. The planes are R, G, B and A, all of one length.
+    over => over_samples(layer: [&[f32]; 4], dst: [&mut [f32]; 4])
 }
 
-// The feature lists are x86-64-v3 and v4 as the psABI defines them, and `Level::detect` checks
-// the same lists.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma,bmi1,bmi2,lzcnt,movbe,f16c")]
-fn exposure_v3(src: &[f32], dst: &mut [f32], gain: f32) {
-    exposure_samples(src, dst, gain);
+#[inline(always)]
+fn over_samples(layer: [&[f32]; 4], dst: [&mut [f32]; 4]) {
+    let [lr, lg, lb, la] = layer;
+    let [dr, dg, db, da] = dst;
+    let len = la.len();
+    assert!(
+        [
+            lr.len(),
+            lg.len(),
+            lb.len(),
+            dr.len(),
+            dg.len(),
+            db.len(),
+            da.len()
+        ]
+        .iter()
+        .all(|&n| n == len),
+        "over's planes differ in length"
+    );
+    // Alpha composes as the colours do: the layer's alpha is the sample composed and the
+    // coverage both.
+    for (d, (&l, &a)) in dr.iter_mut().zip(lr.iter().zip(la)) {
+        *d = kernels::over(*d, l, a);
+    }
+    for (d, (&l, &a)) in dg.iter_mut().zip(lg.iter().zip(la)) {
+        *d = kernels::over(*d, l, a);
+    }
+    for (d, (&l, &a)) in db.iter_mut().zip(lb.iter().zip(la)) {
+        *d = kernels::over(*d, l, a);
+    }
+    for (d, &a) in da.iter_mut().zip(la) {
+        *d = kernels::over(*d, a, a);
+    }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(
-    enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,avx2,fma,bmi1,bmi2,lzcnt,movbe,f16c"
-)]
-fn exposure_v4(src: &[f32], dst: &mut [f32], gain: f32) {
-    exposure_samples(src, dst, gain);
+at_levels! {
+    /// The stack in `dst` dissolved against `base` by `mix`, in place: each sample of each plane
+    /// of `dst` becomes [`kernels::mix`] of the base's sample at the same index, itself and
+    /// `mix`. The planes are R, G, B and A, all of one length.
+    mix => mix_samples(base: [&[f32]; 4], dst: [&mut [f32]; 4], mix: f32)
+}
+
+#[inline(always)]
+fn mix_samples(base: [&[f32]; 4], dst: [&mut [f32]; 4], mix: f32) {
+    for (base, dst) in base.into_iter().zip(dst) {
+        assert_eq!(base.len(), dst.len(), "mix's planes differ in length");
+        for (d, &b) in dst.iter_mut().zip(base) {
+            *d = kernels::mix(b, *d, mix);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,26 +232,96 @@ mod tests {
         }
     }
 
+    /// Four planes of samples at every length through `over` and then `mix`, in place, against
+    /// the kernel crate's functions bit for bit, or a skip when this machine lacks the level.
+    fn over_and_mix_match_the_kernel_crate(level: Level) {
+        let detected = Level::detect();
+        if level > detected {
+            println!("skipped {level:?}: this machine detects {detected:?}");
+            return;
+        }
+        for len in (0..=70).chain([255, 1000, 4097]) {
+            let layer: [Vec<f32>; 4] = [1, 2, 3, 4].map(|seed| samples(len + seed));
+            let background: [Vec<f32>; 4] = [5, 6, 7, 8].map(|seed| samples(len + seed));
+            let layer: [&[f32]; 4] = layer
+                .each_ref()
+                .map(|plane| &plane[seed_skip(plane, len)..]);
+            let background: [&[f32]; 4] = background
+                .each_ref()
+                .map(|plane| &plane[seed_skip(plane, len)..]);
+            let mut dst: [Vec<f32>; 4] = background.map(<[f32]>::to_vec);
+
+            over(level, layer, dst.each_mut().map(Vec::as_mut_slice));
+            for channel in 0..4 {
+                for i in 0..len {
+                    let expected =
+                        kernels::over(background[channel][i], layer[channel][i], layer[3][i]);
+                    assert_eq!(
+                        dst[channel][i].to_bits(),
+                        expected.to_bits(),
+                        "{level:?}, {len} samples: over at {i} of plane {channel}"
+                    );
+                }
+            }
+
+            let composed: [Vec<f32>; 4] = dst.clone();
+            mix(
+                level,
+                background,
+                dst.each_mut().map(Vec::as_mut_slice),
+                0.3,
+            );
+            for channel in 0..4 {
+                for i in 0..len {
+                    let expected = kernels::mix(background[channel][i], composed[channel][i], 0.3);
+                    assert_eq!(
+                        dst[channel][i].to_bits(),
+                        expected.to_bits(),
+                        "{level:?}, {len} samples: mix at {i} of plane {channel}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where a plane of `len + seed` samples starts, so that planes of one length differ.
+    fn seed_skip(plane: &[f32], len: usize) -> usize {
+        plane.len() - len
+    }
+
     #[test]
     fn baseline_matches_the_kernel_crate() {
         exposure_matches_the_kernel_crate(Level(Kind::Baseline));
+        over_and_mix_match_the_kernel_crate(Level(Kind::Baseline));
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn v3_matches_the_kernel_crate() {
         exposure_matches_the_kernel_crate(Level(Kind::V3));
+        over_and_mix_match_the_kernel_crate(Level(Kind::V3));
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn v4_matches_the_kernel_crate() {
         exposure_matches_the_kernel_crate(Level(Kind::V4));
+        over_and_mix_match_the_kernel_crate(Level(Kind::V4));
     }
 
     #[test]
     #[should_panic(expected = "differ in length")]
     fn slices_of_different_lengths_are_refused() {
         exposure(Level::detect(), &[1.0; 8], &mut [0.0; 7], 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "differ in length")]
+    fn planes_of_different_lengths_are_refused() {
+        let layer = [1.0; 8];
+        let mut short = [0.0; 7];
+        let mut dst = [[0.0; 8]; 3];
+        let [r, g, b] = &mut dst;
+        over(Level::detect(), [&layer; 4], [r, g, b, &mut short]);
     }
 }

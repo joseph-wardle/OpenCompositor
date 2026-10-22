@@ -8,8 +8,8 @@ use std::sync::Arc;
 use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 
 use crate::document::{
-    Assignment, Changes, ConnectionError, Document, Node, NodeId, NodeKind, ReaderVersion, Slot,
-    node_types,
+    Assignment, Changes, ConnectionError, Document, InputSlot, Node, NodeId, NodeKind,
+    ReaderVersion, Slot, node_types,
 };
 use crate::evaluate::{Reloads, ResultKey, result_keys};
 use crate::parameter::{Value, ValueError, describe, resolve};
@@ -353,7 +353,7 @@ impl Session {
                 }
                 assignments.push(Assignment {
                     consumer: id,
-                    input: input.name,
+                    input: input.first_slot(),
                     source: Some(current),
                 });
             } else {
@@ -449,25 +449,30 @@ impl Session {
         Ok(self.commit("Delete", document))
     }
 
-    /// Connects a node's input to the output of `source`, replacing what the input took.
-    pub fn connect(
+    /// Connects a node's input, named or with its slot, to the output of `source`, replacing
+    /// what the input took.
+    pub fn connect<'a>(
         &mut self,
         consumer: NodeId,
-        input: &str,
+        input: impl Into<InputSlot<'a>>,
         source: NodeId,
     ) -> Result<Changes, EditError> {
         self.assign_inputs(&[Assignment {
             consumer,
-            input,
+            input: input.into(),
             source: Some(source),
         }])
     }
 
-    /// Disconnects a node's input.
-    pub fn disconnect(&mut self, consumer: NodeId, input: &str) -> Result<Changes, EditError> {
+    /// Disconnects a node's input, named or with its slot.
+    pub fn disconnect<'a>(
+        &mut self,
+        consumer: NodeId,
+        input: impl Into<InputSlot<'a>>,
+    ) -> Result<Changes, EditError> {
         self.assign_inputs(&[Assignment {
             consumer,
-            input,
+            input: input.into(),
             source: None,
         }])
     }
