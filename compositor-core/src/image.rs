@@ -1,6 +1,7 @@
 //! Images as evaluation produces them, with what the artist should know about their files.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// A rectangle of whole pixels in image coordinates: y up, so `(x, y)` is the bottom-left pixel.
@@ -35,6 +36,12 @@ impl Window {
         u64::from(self.width) * u64::from(self.height)
     }
 
+    /// The bytes `planes` planes of `f32` over the window take. Saturates rather than wraps
+    /// where that is beyond a `u64`, which no cap on an allocation admits.
+    pub fn plane_bytes(self, planes: u64) -> u64 {
+        (self.area().saturating_mul(planes)).saturating_mul(size_of::<f32>() as u64)
+    }
+
     /// The smallest window holding both, or the other alone where one is empty, whatever its
     /// corner. Fails where a side of the result would not fit, as when two windows lie far apart.
     pub fn union(self, other: Window) -> Result<Window, Oversize> {
@@ -44,58 +51,166 @@ impl Window {
         if other.is_empty() {
             return Ok(self);
         }
-        let span = |x: i32, width: u32| (i64::from(x), i64::from(x) + i64::from(width));
-        let (left, right) = span(self.x, self.width);
-        let (other_left, other_right) = span(other.x, other.width);
-        let (bottom, top) = span(self.y, self.height);
-        let (other_bottom, other_top) = span(other.y, other.height);
-        let (left, bottom) = (left.min(other_left), bottom.min(other_bottom));
-        let (width, height) = (right.max(other_right) - left, top.max(other_top) - bottom);
-        match (u32::try_from(width), u32::try_from(height)) {
-            (Ok(width), Ok(height)) => Ok(Window {
-                // The least of two corners is one of them.
-                x: left as i32,
-                y: bottom as i32,
+        let (x, y) = self.sides();
+        let (other_x, other_y) = other.sides();
+        Window::from_sides(
+            x.start.min(other_x.start)..x.end.max(other_x.end),
+            y.start.min(other_y.start)..y.end.max(other_y.end),
+        )
+    }
+
+    /// The pixels in both. Where they share none, an empty window at the greater of their
+    /// bottom-left corners.
+    pub fn intersection(self, other: Window) -> Window {
+        let (x, y) = self.sides();
+        let (other_x, other_y) = other.sides();
+        let (left, bottom) = (x.start.max(other_x.start), y.start.max(other_y.start));
+        let (right, top) = (x.end.min(other_x.end), y.end.min(other_y.end));
+        Window {
+            // The greater of two corners is one of them.
+            x: left as i32,
+            y: bottom as i32,
+            width: (right - left).max(0) as u32,
+            height: (top - bottom).max(0) as u32,
+        }
+    }
+
+    /// This window with `reach` more pixels on every side; an empty window stays empty. Fails
+    /// where the result would not fit.
+    pub fn grow(self, reach: u32) -> Result<Window, Oversize> {
+        if self.is_empty() {
+            return Ok(self);
+        }
+        let reach = i64::from(reach);
+        let (x, y) = self.sides();
+        Window::from_sides(
+            x.start - reach..x.end + reach,
+            y.start - reach..y.end + reach,
+        )
+    }
+
+    /// The columns and rows the window spans, in i64 so that no arithmetic on them wraps: a
+    /// corner is within `i32` and a side within `u32`, so a side's end is below 2³³.
+    fn sides(self) -> (Range<i64>, Range<i64>) {
+        let span = |x: i32, width: u32| i64::from(x)..i64::from(x) + i64::from(width);
+        (span(self.x, self.width), span(self.y, self.height))
+    }
+
+    /// The window with these sides, or why it does not fit.
+    fn from_sides(x: Range<i64>, y: Range<i64>) -> Result<Window, Oversize> {
+        let oversize = Oversize {
+            x: x.start,
+            y: y.start,
+            width: x.end - x.start,
+            height: y.end - y.start,
+        };
+        match (
+            i32::try_from(x.start),
+            i32::try_from(y.start),
+            u32::try_from(oversize.width),
+            u32::try_from(oversize.height),
+        ) {
+            (Ok(x), Ok(y), Ok(width), Ok(height)) => Ok(Window {
+                x,
+                y,
                 width,
                 height,
             }),
-            _ => Err(Oversize { width, height }),
+            _ => Err(oversize),
         }
-    }
-
-    /// Where this window's bottom-left pixel lies in the storage of a window that contains it:
-    /// its column and row from that window's bottom-left. An empty window lies at the origin,
-    /// wherever its corner is.
-    pub(crate) fn offset_in(self, outer: Window) -> (usize, usize) {
-        if self.is_empty() {
-            return (0, 0);
-        }
-        debug_assert!(
-            outer.contains(self.x, self.y) && outer.union(self).is_ok_and(|union| union == outer),
-            "{self:?} lies inside {outer:?}"
-        );
-        (
-            (i64::from(self.x) - i64::from(outer.x)) as usize,
-            (i64::from(self.y) - i64::from(outer.y)) as usize,
-        )
     }
 }
 
-/// A window with a side beyond what an image can hold, as a union of windows far apart would
-/// have: its sides, computed without wrapping.
+/// A window that image coordinates cannot hold: a side beyond what an image can hold, as a union
+/// of windows far apart would have, or a corner beyond `i32`, as growing a window at the edge of
+/// the coordinates would. Its corner and sides, computed without wrapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Oversize {
+    pub x: i64,
+    pub y: i64,
     pub width: i64,
     pub height: i64,
 }
 
 impl fmt::Display for Oversize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the data window would be {} × {} pixels, more than an image can hold",
-            self.width, self.height
-        )
+        if u32::try_from(self.width).is_err() || u32::try_from(self.height).is_err() {
+            write!(
+                f,
+                "the data window would be {} × {} pixels, more than an image can hold",
+                self.width, self.height
+            )
+        } else {
+            write!(
+                f,
+                "the data window would start at ({}, {}), beyond image coordinates",
+                self.x, self.y
+            )
+        }
+    }
+}
+
+/// Where a plane's window overlaps another window's storage, row by row: for each row of the
+/// outer window, which of the plane's samples lie in it and at which of its columns. Rows and
+/// columns outside the plane's window are where an image is transparent black.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Overlap {
+    /// The plane's window.
+    inner: Window,
+    /// The pixels in both windows.
+    shared: Window,
+    /// The shared pixels' bottom-left from each window's bottom-left.
+    inner_offset: (usize, usize),
+    outer_offset: (usize, usize),
+}
+
+impl Overlap {
+    /// Of a plane over `inner` with the storage of `outer`.
+    pub(crate) fn of(inner: Window, outer: Window) -> Overlap {
+        let shared = inner.intersection(outer);
+        if shared.is_empty() {
+            // Sharing columns but no rows, or rows but no columns, is sharing no pixels.
+            return Overlap {
+                inner,
+                shared: Window {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                inner_offset: (0, 0),
+                outer_offset: (0, 0),
+            };
+        }
+        // The shared window lies in both, so its corner is at or above theirs.
+        let offset = |window: Window| {
+            (
+                (i64::from(shared.x) - i64::from(window.x)) as usize,
+                (i64::from(shared.y) - i64::from(window.y)) as usize,
+            )
+        };
+        Overlap {
+            inner,
+            shared,
+            inner_offset: offset(inner),
+            outer_offset: offset(outer),
+        }
+    }
+
+    /// The columns of an outer row that the plane's samples cover, in every row that has any.
+    pub(crate) fn columns(&self) -> Range<usize> {
+        self.outer_offset.0..self.outer_offset.0 + self.shared.width as usize
+    }
+
+    /// At the outer window's row `y`, counted from its bottom: the range of the plane holding
+    /// the samples in that row and [`Overlap::columns`], or `None` where the plane has none.
+    pub(crate) fn row(&self, y: usize) -> Option<(Range<usize>, Range<usize>)> {
+        let row = y.checked_sub(self.outer_offset.1)?;
+        if row >= self.shared.height as usize {
+            return None;
+        }
+        let start = (row + self.inner_offset.1) * self.inner.width as usize + self.inner_offset.0;
+        Some((start..start + self.shared.width as usize, self.columns()))
     }
 }
 
@@ -357,3 +472,6 @@ impl fmt::Display for Warning {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

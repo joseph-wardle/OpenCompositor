@@ -820,7 +820,8 @@ fn a_merge_too_large_for_an_image_or_the_cap_fails_before_allocating() {
         .unwrap_err();
     assert!(
         matches!(&far_apart, EvalError::Oversize { origin, oversize }
-            if *origin == key && *oversize == Oversize { width: 1 << 32, height: 1 }),
+            if *origin == key
+                && *oversize == Oversize { x: i64::from(i32::MIN), y: 0, width: 1 << 32, height: 1 }),
         "{far_apart:?}"
     );
     assert_eq!(
