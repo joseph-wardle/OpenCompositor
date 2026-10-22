@@ -196,7 +196,7 @@ fn every_colour_type_expands_to_rgba() {
     assert_eq!(rgba(&image, 0, 0), [0.2, 0.2, 0.2, 0.2]);
     let [r, g, b] = [Channel::R, Channel::G, Channel::B].map(|channel| image.plane(channel));
     assert!(
-        Arc::ptr_eq(r, g) && Arc::ptr_eq(g, b),
+        Plane::ptr_eq(r, g) && Plane::ptr_eq(g, b),
         "grey is one plane, shared"
     );
 

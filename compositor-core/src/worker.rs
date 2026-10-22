@@ -10,7 +10,7 @@ use half::f16;
 use crate::document::NodeId;
 use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, Pool, ResultKey};
 use crate::gpu::wait_for_device;
-use crate::image::{ImageInfo, Window};
+use crate::image::{ImageInfo, Plane, Window};
 
 /// The staging buffer's first size, a DCI 4K image, and its least.
 const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
@@ -523,7 +523,7 @@ fn evaluate(
 fn stage(
     finishing: &Finishing,
     info: &ImageInfo,
-    planes: [Arc<[f32]>; 4],
+    planes: [Plane; 4],
     pool: &Pool,
     sizing: &mut StagingSizing,
     timing: &mut StagingTiming,

@@ -39,7 +39,7 @@ pub use document::{
 };
 pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};
-pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Warning, Window};
+pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,

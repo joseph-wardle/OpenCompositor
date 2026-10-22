@@ -1,7 +1,7 @@
 //! Images as evaluation produces them, with what the artist should know about their files.
 
 use std::fmt;
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 
 /// A rectangle of whole pixels in image coordinates: y up, so `(x, y)` is the bottom-left pixel.
@@ -252,7 +252,7 @@ pub struct Image {
     display_window: Window,
     data_window: Window,
     /// In `Channel::ALL`'s order.
-    planes: [Arc<[f32]>; 4],
+    planes: [Plane; 4],
     warnings: Vec<Warning>,
 }
 
@@ -261,7 +261,7 @@ impl Image {
     pub(crate) fn new(
         display_window: Window,
         data_window: Window,
-        planes: [Arc<[f32]>; 4],
+        planes: [Plane; 4],
         warnings: Vec<Warning>,
     ) -> Image {
         check_planes(&planes, data_window);
@@ -281,7 +281,7 @@ impl Image {
             width: 0,
             height: 0,
         };
-        let plane: Arc<[f32]> = Arc::new([]);
+        let plane = Plane::from(Vec::new());
         Image {
             display_window: window,
             data_window: window,
@@ -291,7 +291,7 @@ impl Image {
     }
 
     /// This image with other values over the same data window, in `Channel::ALL`'s order.
-    pub(crate) fn with_planes(&self, planes: [Arc<[f32]>; 4]) -> Image {
+    pub(crate) fn with_planes(&self, planes: [Plane; 4]) -> Image {
         check_planes(&planes, self.data_window);
         Image {
             display_window: self.display_window,
@@ -302,7 +302,7 @@ impl Image {
     }
 
     /// Every channel's plane, in `Channel::ALL`'s order.
-    pub(crate) fn planes(&self) -> &[Arc<[f32]>; 4] {
+    pub(crate) fn planes(&self) -> &[Plane; 4] {
         &self.planes
     }
 
@@ -315,7 +315,7 @@ impl Image {
     }
 
     /// The channel's values over the data window, bottom row first.
-    pub fn plane(&self, channel: Channel) -> &Arc<[f32]> {
+    pub fn plane(&self, channel: Channel) -> &Plane {
         &self.planes[channel as usize]
     }
 
@@ -337,7 +337,7 @@ impl Image {
     }
 
     /// The image without its planes, and the planes in `Channel::ALL`'s order.
-    pub(crate) fn into_parts(self) -> (ImageInfo, [Arc<[f32]>; 4]) {
+    pub(crate) fn into_parts(self) -> (ImageInfo, [Plane; 4]) {
         let info = ImageInfo {
             display_window: self.display_window,
             data_window: self.data_window,
@@ -351,7 +351,7 @@ impl Image {
 /// second is checked only in debug builds, as it reads every plane. A subnormal input is what a
 /// GPU in flush-to-zero mode zeroes and the CPU would scale to a normal result, so whatever fills
 /// a plane flushes as it writes rather than leaving it to the consumer.
-fn check_planes(planes: &[Arc<[f32]>; 4], data_window: Window) {
+fn check_planes(planes: &[Plane; 4], data_window: Window) {
     let area = data_window.width as usize * data_window.height as usize;
     assert!(
         planes.iter().all(|plane| plane.len() == area),
@@ -365,11 +365,90 @@ fn check_planes(planes: &[Arc<[f32]>; 4], data_window: Window) {
     );
 }
 
-/// A plane of `len` zeros for a reader or an operation to fill before anything else shares it.
-pub(crate) fn zeroed_plane(len: usize) -> Arc<[f32]> {
-    // SAFETY: all zero bits are the f32 0.0. Zeroed memory comes from the allocator already
-    // cleared, where a safe fill would write every value once more before the reader does.
-    unsafe { Arc::new_zeroed_slice(len).assume_init() }
+/// A channel's values over a data window, bottom row first, read as a slice. Its storage may
+/// be longer than the window: an operation reuses a released plane for a window up to its
+/// storage's length, so that a window grown a little each edit, as dragging Blur's Size grows
+/// it, does not make every plane anew.
+#[derive(Clone, Debug)]
+pub struct Plane {
+    storage: Arc<[f32]>,
+    len: usize,
+}
+
+impl Plane {
+    /// A plane of `len` zeros over storage of `capacity`, for a reader or an operation to fill
+    /// before anything else shares it.
+    pub(crate) fn zeroed(len: usize, capacity: usize) -> Plane {
+        assert!(len <= capacity, "a plane's values fit its storage");
+        // SAFETY: all zero bits are the f32 0.0. Zeroed memory comes from the allocator already
+        // cleared, where a safe fill would write every value once more before the reader does.
+        let storage = unsafe { Arc::new_zeroed_slice(capacity).assume_init() };
+        Plane { storage, len }
+    }
+
+    /// The values to write, while nothing else shares the plane.
+    pub(crate) fn get_mut(&mut self) -> Option<&mut [f32]> {
+        Arc::get_mut(&mut self.storage).map(|storage| &mut storage[..self.len])
+    }
+
+    /// The plane over the first `len` values of its storage, the rest as they were.
+    pub(crate) fn resized(self, len: usize) -> Plane {
+        assert!(len <= self.capacity(), "a plane's values fit its storage");
+        Plane { len, ..self }
+    }
+
+    /// The values its storage holds, including those past the window.
+    pub(crate) fn capacity(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// Whether nothing but this plane holds its storage.
+    pub(crate) fn is_unshared(&self) -> bool {
+        Arc::strong_count(&self.storage) == 1 && Arc::weak_count(&self.storage) == 0
+    }
+
+    /// Whether two planes are the same storage, as channels and images that share one are.
+    pub fn ptr_eq(a: &Plane, b: &Plane) -> bool {
+        Arc::ptr_eq(&a.storage, &b.storage)
+    }
+
+    /// The storage's address, which stays its own while a plane holds it.
+    pub(crate) fn address(&self) -> usize {
+        Arc::as_ptr(&self.storage).cast::<f32>().addr()
+    }
+}
+
+impl Deref for Plane {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        &self.storage[..self.len]
+    }
+}
+
+impl PartialEq for Plane {
+    fn eq(&self, other: &Plane) -> bool {
+        **self == **other
+    }
+}
+
+impl FromIterator<f32> for Plane {
+    fn from_iter<I: IntoIterator<Item = f32>>(values: I) -> Plane {
+        let storage: Arc<[f32]> = values.into_iter().collect();
+        Plane {
+            len: storage.len(),
+            storage,
+        }
+    }
+}
+
+impl From<Vec<f32>> for Plane {
+    fn from(values: Vec<f32>) -> Plane {
+        Plane {
+            len: values.len(),
+            storage: values.into(),
+        }
+    }
 }
 
 /// What the viewer keeps of an image once its pixels are on the GPU.

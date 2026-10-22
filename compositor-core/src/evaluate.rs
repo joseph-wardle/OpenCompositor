@@ -14,7 +14,7 @@ use crate::document::{
     BlurVersion, Document, ExposureVersion, InputSlot, MergeVersion, Node, NodeId, NodeKind,
     ReaderVersion,
 };
-use crate::image::{Image, Oversize, Window, zeroed_plane};
+use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::{self, Level};
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image};
@@ -470,10 +470,9 @@ impl Evaluator {
                 // A result's planes are new or its inputs', which are counted already.
                 let held: Vec<usize> = (inputs.iter())
                     .flat_map(|input| input.planes())
-                    .map(plane_address)
+                    .map(Plane::address)
                     .collect();
-                let own =
-                    (image.planes().iter()).filter(|plane| !held.contains(&plane_address(plane)));
+                let own = (image.planes().iter()).filter(|plane| !held.contains(&plane.address()));
                 let added = distinct_bytes(own);
                 if retained_bytes + added <= self.cap {
                     retained_bytes += added;
@@ -548,7 +547,7 @@ impl Evaluator {
 
     /// Releases every retained result the request does not contain, and returns the released
     /// planes nothing else holds, for the request's outputs.
-    fn release_except(&mut self, steps: &[Step]) -> Vec<Arc<[f32]>> {
+    fn release_except(&mut self, steps: &[Step]) -> Vec<Plane> {
         let requested: BTreeSet<*const Recipe> =
             steps.iter().map(|step| Arc::as_ptr(&step.key.0)).collect();
         let mut released = Vec::new();
@@ -559,9 +558,7 @@ impl Evaluator {
             }
             let (_, planes) = retained.image.into_parts();
             // A plane shared by two channels is unheld once at the last of them.
-            let unheld = planes
-                .into_iter()
-                .filter(|plane| Arc::strong_count(plane) == 1 && Arc::weak_count(plane) == 0);
+            let unheld = planes.into_iter().filter(Plane::is_unshared);
             released.extend(unheld);
         }
         released
@@ -578,17 +575,12 @@ impl Evaluator {
     }
 }
 
-/// A plane's address, which stays its own while a retained image holds it.
-fn plane_address(plane: &Arc<[f32]>) -> usize {
-    Arc::as_ptr(plane).cast::<f32>().addr()
-}
-
-/// The bytes of the planes, each counted once however often it appears.
-fn distinct_bytes<'a>(planes: impl Iterator<Item = &'a Arc<[f32]>>) -> u64 {
+/// The bytes of the planes' storage, each counted once however often it appears.
+fn distinct_bytes<'a>(planes: impl Iterator<Item = &'a Plane>) -> u64 {
     let mut counted = BTreeSet::new();
     planes
-        .filter(|plane| counted.insert(plane_address(plane)))
-        .map(|plane| std::mem::size_of_val::<[f32]>(plane) as u64)
+        .filter(|plane| counted.insert(plane.address()))
+        .map(|plane| (plane.capacity() * size_of::<f32>()) as u64)
         .sum()
 }
 
@@ -601,7 +593,7 @@ impl Evaluator {
         &self,
         key: &ResultKey,
         inputs: &[&Image],
-        released: &mut Vec<Arc<[f32]>>,
+        released: &mut Vec<Plane>,
         stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<Image>, EvalError> {
         // An unconnected input takes the empty image.
@@ -920,27 +912,39 @@ fn cpus_in(list: &str) -> Option<Vec<usize>> {
     Some(cpus)
 }
 
-/// A plane of `len` for an output: one of `released` if any has the length, else a new one.
-/// Touching a new plane costs more than Exposure over it (page faults, then unmapping when it
-/// drops), which is what reusing released planes saves.
-fn output_plane(released: &mut Vec<Arc<[f32]>>, len: usize) -> Arc<[f32]> {
-    match released.iter().position(|plane| plane.len() == len) {
-        Some(index) => released.swap_remove(index),
-        None => zeroed_plane(len),
+/// A plane of `len` for an output: the one of `released` whose storage holds `len` most
+/// closely, with up to half again to spare, else a new one. Touching a new plane costs more than
+/// Exposure over it, and more than Blur over it when the columns pass is first to (page faults,
+/// then unmapping when it drops), which is what reusing released planes saves.
+///
+/// A new plane gets a quarter to spare when a released one fell short of `len` by less than
+/// that: the window grew a little, as dragging Blur's Size grows it, so the next edits' fit.
+/// Half to spare on reuse lets that storage serve the drag back down as well.
+fn output_plane(released: &mut Vec<Plane>, len: usize) -> Plane {
+    let closest = (released.iter().enumerate())
+        .filter(|(_, plane)| (len..=len + len / 2).contains(&plane.capacity()))
+        .min_by_key(|(_, plane)| plane.capacity())
+        .map(|(index, _)| index);
+    if let Some(index) = closest {
+        return released.swap_remove(index).resized(len);
     }
+    let grew = (released.iter()).any(|plane| (len - len / 4..len).contains(&plane.capacity()));
+    Plane::zeroed(len, if grew { len + len / 4 } else { len })
 }
 
 /// Multiplies R, G and B by two to the power of `stops` and shares A, each colour plane through
 /// the shared function, Exposure's definition for both devices. Inputs are never written: an
 /// output is a plane from `released` or a new one, and A is the input's.
-fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Arc<[f32]>>) -> Image {
+fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Plane>) -> Image {
     // Exact for whole stops, and far inside f32's range at the limits.
     let gain = stops.exp2() as f32;
     let width = image.data_window().width as usize;
     let [r, g, b, a] = image.planes();
-    let mut scaled = |plane: &Arc<[f32]>| -> Arc<[f32]> {
+    let mut scaled = |plane: &Plane| -> Plane {
         let mut output = output_plane(released, plane.len());
-        let dst = Arc::get_mut(&mut output).expect("nothing else holds an output plane");
+        let dst = output
+            .get_mut()
+            .expect("nothing else holds an output plane");
         pool.run(width, plane, dst, |level, src, dst| {
             cpu::exposure(level, src, dst, gain);
         });
@@ -948,14 +952,14 @@ fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Arc<[f32]
     };
     // A grey image's colour planes are one plane, and stay one.
     let red = scaled(r);
-    let green = if Arc::ptr_eq(g, r) {
+    let green = if Plane::ptr_eq(g, r) {
         red.clone()
     } else {
         scaled(g)
     };
-    let blue = if Arc::ptr_eq(b, r) {
+    let blue = if Plane::ptr_eq(b, r) {
         red.clone()
-    } else if Arc::ptr_eq(b, g) {
+    } else if Plane::ptr_eq(b, g) {
         green.clone()
     } else {
         scaled(b)

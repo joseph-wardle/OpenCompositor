@@ -1,7 +1,6 @@
 //! PNG through the `png` crate.
 
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
-use std::sync::Arc;
 
 use ::png::{
     BitDepth, ColorType, Decoder, DecodingError, ScaledFloat, SourceChromaticities, Transformations,
@@ -9,7 +8,7 @@ use ::png::{
 use opencompositor_kernels::flush;
 
 use super::{ReadError, Refusal, check_size};
-use crate::image::{Chromaticities, Image, Warning, Window, zeroed_plane};
+use crate::image::{Chromaticities, Image, Plane, Warning, Window};
 
 /// `gAMA`'s value for sRGB, which approximates sRGB's curve with a pure power.
 const SRGB_GAMMA: f32 = 1.0 / 2.2;
@@ -261,7 +260,7 @@ fn premultiplied_linear(
     color_type: ColorType,
     bit_depth: BitDepth,
     decoding: Decoding,
-) -> [Arc<[f32]>; 4] {
+) -> [Plane; 4] {
     let sixteen = bit_depth == BitDepth::Sixteen;
     let max = if sixteen { u16::MAX } else { u8::MAX.into() };
     // One decode per code value rather than per sample.
@@ -276,8 +275,8 @@ fn premultiplied_linear(
     let colours = if channels < 3 { 1 } else { 3 };
     let pixel_size = channels * if sixteen { 2 } else { 1 };
     let area = samples.len() / pixel_size;
-    let mut colour: Vec<Arc<[f32]>> = (0..colours).map(|_| zeroed_plane(area)).collect();
-    let mut alpha = zeroed_plane(area);
+    let mut colour: Vec<Plane> = (0..colours).map(|_| Plane::zeroed(area, area)).collect();
+    let mut alpha = Plane::zeroed(area, area);
     // A row is decoded where it stays in cache, a buffer for each channel, then copied out.
     let mut decoded = [(); 4].map(|_| vec![0.0; width]);
     // PNG stores rows top first; planes start at the bottom.
@@ -304,15 +303,15 @@ fn premultiplied_linear(
         }
         let planes = colour.iter_mut().chain([&mut alpha]);
         for (plane, channel) in planes.zip([0, 1, 2].into_iter().take(colours).chain([3])) {
-            let plane = Arc::get_mut(plane).expect("not yet shared");
+            let plane = plane.get_mut().expect("not yet shared");
             plane[start..start + width].copy_from_slice(&decoded[channel]);
         }
     }
-    match <[Arc<[f32]>; 3]>::try_from(colour) {
+    match <[Plane; 3]>::try_from(colour) {
         Ok([r, g, b]) => [r, g, b, alpha],
         Err(mut grey) => {
             let grey = grey.pop().expect("one grey plane");
-            [Arc::clone(&grey), Arc::clone(&grey), grey, alpha]
+            [grey.clone(), grey.clone(), grey, alpha]
         }
     }
 }

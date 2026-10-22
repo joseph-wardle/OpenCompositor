@@ -135,7 +135,7 @@ fn key(document: &Document, id: u64) -> ResultKey {
 }
 
 /// An image of these planes over `width` × `height`, as a reader would make it.
-fn image(width: u32, height: u32, planes: [Arc<[f32]>; 4]) -> Image {
+fn image(width: u32, height: u32, planes: [Plane; 4]) -> Image {
     let window = Window {
         x: 0,
         y: 0,
@@ -163,7 +163,7 @@ fn flat(display: Window, data: Window, values: [f32; 4], warnings: Vec<Warning>)
 }
 
 /// `len` finite values of both signs, from tiny to huge, different for each `seed`.
-fn finite_plane(len: usize, seed: u32) -> Arc<[f32]> {
+fn finite_plane(len: usize, seed: u32) -> Plane {
     let mut state = seed.wrapping_mul(2_654_435_761) | 1;
     (0..len)
         .map(|_| {
@@ -266,7 +266,7 @@ impl Evaluator {
         &self,
         key: &ResultKey,
         inputs: &[&Image],
-        released: &mut Vec<Arc<[f32]>>,
+        released: &mut Vec<Plane>,
     ) -> Result<Image, EvalError> {
         self.compute(key, inputs, released, &|| false)
             .map(|image| image.expect("nothing stops it"))
@@ -297,7 +297,7 @@ fn exposure_scales_colour_and_shares_alpha() {
         let expected: Vec<f32> = read.plane(channel).iter().map(|v| v * 0.25).collect();
         assert_eq!(**exposed.plane(channel), *expected);
     }
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         read.plane(Channel::A),
         exposed.plane(Channel::A)
     ));
@@ -313,11 +313,11 @@ fn exposure_keeps_a_grey_image_one_plane() {
 
     let image = run(&mut evaluator, &exposed).unwrap();
 
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         image.plane(Channel::R),
         image.plane(Channel::G)
     ));
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         image.plane(Channel::R),
         image.plane(Channel::B)
     ));
@@ -487,7 +487,7 @@ fn exposure_on_the_pool_writes_every_sample_as_the_shared_function_does() {
                 height,
                 [1, 2, 3, 4].map(|c| finite_plane(len, c * 64 + width)),
             );
-            let nans = || -> Arc<[f32]> { std::iter::repeat_n(f32::NAN, len).collect() };
+            let nans = || -> Plane { std::iter::repeat_n(f32::NAN, len).collect() };
             let mut released = vec![nans(), nans(), nans()];
 
             let output = evaluator
@@ -509,7 +509,7 @@ fn exposure_on_the_pool_writes_every_sample_as_the_shared_function_does() {
                 released.is_empty(),
                 "{width}x{height} left a released plane unused"
             );
-            assert!(Arc::ptr_eq(
+            assert!(Plane::ptr_eq(
                 output.plane(Channel::A),
                 input.plane(Channel::A)
             ));
@@ -530,17 +530,17 @@ fn exposure_never_writes_its_input_even_where_alpha_is_a_colour_plane() {
         .compute_unstopped(&exposure, &[&input], &mut Vec::new())
         .unwrap();
 
-    assert!(Arc::ptr_eq(output.plane(Channel::A), &plane));
+    assert!(Plane::ptr_eq(output.plane(Channel::A), &plane));
     assert_eq!(
         plane.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
         before
     );
-    assert!(!Arc::ptr_eq(output.plane(Channel::R), &plane));
-    assert!(Arc::ptr_eq(
+    assert!(!Plane::ptr_eq(output.plane(Channel::R), &plane));
+    assert!(Plane::ptr_eq(
         output.plane(Channel::R),
         output.plane(Channel::G)
     ));
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         output.plane(Channel::R),
         output.plane(Channel::B)
     ));
@@ -550,7 +550,7 @@ fn exposure_never_writes_its_input_even_where_alpha_is_a_colour_plane() {
 /// The addresses of the R, G and B planes.
 fn colour_addresses(image: &Image) -> BTreeSet<usize> {
     [Channel::R, Channel::G, Channel::B]
-        .map(|channel| plane_address(image.plane(channel)))
+        .map(|channel| image.plane(channel).address())
         .into()
 }
 
@@ -731,7 +731,7 @@ fn a_base_alone_or_mix_zero_is_the_base_shared_and_nothing_connected_is_empty() 
         assert_eq!(image.data_window(), base.data_window());
         assert_eq!(image.display_window(), base.display_window());
         for channel in Channel::ALL {
-            assert!(Arc::ptr_eq(image.plane(channel), base.plane(channel)));
+            assert!(Plane::ptr_eq(image.plane(channel), base.plane(channel)));
         }
     };
 
@@ -773,7 +773,7 @@ fn mix_is_special_cased_as_the_kernel_receives_it() {
         "the stack as composed, not dissolved against the base"
     );
     let nearly_zero = compute(1e-50);
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         nearly_zero.plane(Channel::R),
         base.plane(Channel::R)
     ));
@@ -799,7 +799,7 @@ fn merge_on_the_pool_writes_every_sample_as_the_shared_functions_do() {
             let layer = make(1, 1, 1000);
             let union = window(0, 0, width + 1, height + 1);
             let nans =
-                || -> Arc<[f32]> { std::iter::repeat_n(f32::NAN, union.area() as usize).collect() };
+                || -> Plane { std::iter::repeat_n(f32::NAN, union.area() as usize).collect() };
             let mut released = vec![nans(), nans(), nans(), nans()];
 
             let output = evaluator
@@ -872,7 +872,7 @@ fn a_merge_too_large_for_an_image_or_the_cap_fails_before_allocating() {
 
 /// The addresses of every plane.
 fn plane_addresses(image: &Image) -> BTreeSet<usize> {
-    image.planes().iter().map(plane_address).collect()
+    image.planes().iter().map(Plane::address).collect()
 }
 
 /// One Reader through two branches into a Merge, an Exposure as the background and an Exposure
@@ -1076,7 +1076,7 @@ fn blur_source(width: u32, height: u32) -> Image {
     Image::new(
         window(0, 0, 8, 8),
         window(-3, 5, width, height),
-        planes.map(Arc::from),
+        planes.map(Plane::from),
         vec![Warning::IccProfile],
     )
 }
@@ -1096,8 +1096,8 @@ fn blur_on_the_pool_matches_the_composed_kernel_and_writes_every_sample() {
             let reach = pass.reach();
             let grown = source.data_window().grow(reach).unwrap();
             let scratch_len = ((width + 2 * reach) * height) as usize;
-            let nans = |len: usize| -> Arc<[f32]> { std::iter::repeat_n(f32::NAN, len).collect() };
-            let mut released: Vec<Arc<[f32]>> = (0..4)
+            let nans = |len: usize| -> Plane { std::iter::repeat_n(f32::NAN, len).collect() };
+            let mut released: Vec<Plane> = (0..4)
                 .map(|_| nans(grown.area() as usize))
                 .chain([nans(scratch_len)])
                 .collect();
@@ -1117,6 +1117,33 @@ fn blur_on_the_pool_matches_the_composed_kernel_and_writes_every_sample() {
     }
 }
 
+/// A window grown a little each edit, as dragging Blur's Size up grows it, makes one plane with
+/// a quarter to spare, which serves the rest of the drag up and back down; storage with more
+/// than half to spare is left for one that fits it better.
+#[test]
+fn a_window_grown_a_little_reuses_one_plane_up_and_back_down() {
+    let first = output_plane(&mut Vec::new(), 1000);
+    assert_eq!(first.capacity(), 1000);
+
+    let mut released = vec![first];
+    let grown = output_plane(&mut released, 1100);
+    assert_eq!((grown.len(), grown.capacity()), (1100, 1375));
+    let address = grown.address();
+
+    let mut released = vec![grown];
+    for len in [1200, 1375, 1300, 1000, 917] {
+        let plane = output_plane(&mut released, len);
+        assert_eq!((plane.len(), plane.address()), (len, address), "{len}");
+        released.push(plane);
+    }
+    let smaller = output_plane(&mut released, 916);
+    assert_eq!((smaller.capacity(), released.len()), (916, 1));
+
+    // A plane far smaller than the window is no sign of a drag.
+    let mut released = vec![Plane::zeroed(500, 500)];
+    assert_eq!(output_plane(&mut released, 1000).capacity(), 1000);
+}
+
 #[test]
 fn a_blur_whose_reach_is_zero_shares_its_source_and_takes_no_planes() {
     let evaluator = Evaluator::new();
@@ -1128,7 +1155,7 @@ fn a_blur_whose_reach_is_zero_shares_its_source_and_takes_no_planes() {
             .unwrap();
         assert_eq!(output.data_window(), source.data_window());
         for channel in Channel::ALL {
-            assert!(Arc::ptr_eq(output.plane(channel), source.plane(channel)));
+            assert!(Plane::ptr_eq(output.plane(channel), source.plane(channel)));
         }
         assert_eq!(released.len(), 1);
     }
@@ -1149,15 +1176,15 @@ fn blur_keeps_a_grey_image_one_plane() {
         .compute_unstopped(&blur_key(3.0), &[&source], &mut Vec::new())
         .unwrap();
 
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         output.plane(Channel::R),
         output.plane(Channel::G)
     ));
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         output.plane(Channel::R),
         output.plane(Channel::B)
     ));
-    assert!(!Arc::ptr_eq(
+    assert!(!Plane::ptr_eq(
         output.plane(Channel::R),
         output.plane(Channel::A)
     ));

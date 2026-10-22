@@ -1,13 +1,12 @@
 //! Blur on the CPU: each plane's three box passes along its rows into a scratch plane, then
 //! along the scratch plane's columns into the output, which the reach grows on every side.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use opencompositor_kernels::BoxPass;
 
 use crate::evaluate::{Columns, EvalError, NODE_BYTES_CAP, Pool, ResultKey, output_plane};
-use crate::image::{Image, Window};
+use crate::image::{Image, Plane, Window};
 use crate::kernels::cpu::{self, BLUR_BAND, BLUR_ROWS, BoxScratch, Level};
 
 /// Blur's image: its source blurred by `size`, every channel through the same passes, over the
@@ -22,7 +21,7 @@ pub(super) fn blur(
     key: &ResultKey,
     source: &Image,
     size: f64,
-    released: &mut Vec<Arc<[f32]>>,
+    released: &mut Vec<Plane>,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Option<Image>, EvalError> {
     let pass = BoxPass::new(size);
@@ -51,11 +50,11 @@ pub(super) fn blur(
     }
     let mut scratch = output_plane(released, scratch_window.area() as usize);
     let skipped = AtomicBool::new(false);
-    let mut outputs: Vec<Arc<[f32]>> = Vec::with_capacity(4);
+    let mut outputs: Vec<Plane> = Vec::with_capacity(4);
     for (index, plane) in source.planes().iter().enumerate() {
         // A plane two channels share, as a grey image's colour planes are, is blurred once.
         let shared = (source.planes()[..index].iter())
-            .position(|earlier| Arc::ptr_eq(earlier, plane))
+            .position(|earlier| Plane::ptr_eq(earlier, plane))
             .map(|earlier| outputs[earlier].clone());
         let output = match shared {
             Some(output) => output,
@@ -63,8 +62,10 @@ pub(super) fn blur(
                 let mut output = output_plane(released, window.area() as usize);
                 let planes = Planes {
                     src: plane,
-                    scratch: Arc::get_mut(&mut scratch).expect("nothing else holds the scratch"),
-                    dst: Arc::get_mut(&mut output).expect("nothing else holds an output plane"),
+                    scratch: scratch.get_mut().expect("nothing else holds the scratch"),
+                    dst: output
+                        .get_mut()
+                        .expect("nothing else holds an output plane"),
                 };
                 blur_plane(pool, pass, input, planes, stop, &skipped);
                 output
@@ -77,7 +78,7 @@ pub(super) fn blur(
         outputs.push(output);
     }
     released.push(scratch);
-    let outputs: [Arc<[f32]>; 4] = outputs.try_into().expect("four planes");
+    let outputs: [Plane; 4] = outputs.try_into().expect("four planes");
     Ok(Some(Image::new(
         source.display_window(),
         window,
