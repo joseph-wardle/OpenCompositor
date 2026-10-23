@@ -157,6 +157,36 @@ mod tests {
         assert_eq!(weights(f64::NAN), [1.0]);
     }
 
+    /// The weights against the box drawn again from intervals: each pixel's overlap is the
+    /// length of its intersection with the box, over every pixel near it, normalised in f64.
+    /// The weights round three times, the overlaps, their sum and the quotient, each within
+    /// half a unit.
+    #[test]
+    fn weights_are_each_pixels_share_of_the_box() {
+        let sizes = (1..=40960).map(|tenths| f64::from(tenths) / 10.0);
+        for size in sizes.chain([1.5 + 1e-9, 4.5 + 1e-9, 4096.0 - 1e-9]) {
+            let half_width = size / 3.0;
+            let overlap =
+                |tap: f64| ((tap + 0.5).min(half_width) - (tap - 0.5).max(-half_width)).max(0.0);
+            let beyond = half_width.ceil() + 1.0;
+            let total: f64 = (-beyond as i64..=beyond as i64)
+                .map(|tap| overlap(tap as f64))
+                .sum();
+            let expected: Vec<f64> = (0..)
+                .map(|tap| overlap(f64::from(tap)) / total)
+                .take_while(|share| *share > 0.0)
+                .collect();
+            let actual = weights(size);
+            assert_eq!(actual.len(), expected.len(), "size {size}");
+            for (tap, (&weight, &share)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (f64::from(weight) - share).abs() <= 1.5 * f64::from(f32::EPSILON) * share,
+                    "size {size}, tap {tap}: {weight} for {share}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn inner_and_edge_weights_are_the_taps() {
         for size in [0.0, 1.5, 3.0, 4.5, 6.0, 31.4, 100.0, 4096.0] {

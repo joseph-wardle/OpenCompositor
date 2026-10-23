@@ -320,7 +320,7 @@ const BLUR_V1: &[Parameter] = &[Parameter {
     name: "size",
     label: "Size",
     kind: ParameterKind::Float(FloatParameter {
-        // A new Blur changes nothing until its size is set, as Nuke's does.
+        // A new Blur changes nothing until its size is set.
         default: 0.0,
         slider: 0.0..=100.0,
         limits: 0.0..=4096.0,

@@ -767,9 +767,10 @@ mod tests {
         (sum, magnitude)
     }
 
-    /// The GPU's K for a box pass: the quality ceiling, under which the result is
-    /// indistinguishable at half precision. The test prints the factor the adapter needed.
-    const BOX_PASS_K: f64 = 8192.0;
+    /// The GPU's K for a box pass: under three times the 96 that the RTX 4070 Ti SUPER and
+    /// llvmpipe needed, so that a change in how the shader sums shows here. The test prints
+    /// the factor the adapter needed.
+    const BOX_PASS_K: f64 = 256.0;
 
     /// One box pass on the GPU, along each axis, against the definition's f64 sum, within
     /// `BOX_PASS_K` times 2⁻²⁴ of the sum over the magnitudes plus one `MIN_POSITIVE`, at sizes

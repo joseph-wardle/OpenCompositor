@@ -182,8 +182,9 @@ fn padded<const L: usize>(pad: &mut Vec<f32>, n: usize, t: usize) -> &mut [f32] 
 }
 
 /// One pass: output `o` is the weighted sum of the window `z[o ..= o + 2 tmax]`, the inner
-/// weight on every tap but the two ends. The arithmetic is f64 adds and products of an f32
-/// sample by an f32 weight, which are exact; one order at every level, so the result is too.
+/// weight on every tap but the two ends. The arithmetic is in f64: products of an f32 sample
+/// by an f32 weight, which are exact, and adds, which round far below the f32 the pass stores.
+/// The order is the same at every SIMD level, so the result is too.
 #[inline(always)]
 fn window_sums<const L: usize>(pass: BoxPass, z: &[f32], out: &mut [f32], suffixes: &mut Vec<f64>) {
     match pass.tmax() {
