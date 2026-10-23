@@ -38,9 +38,20 @@ pub(super) fn blur(
         width: window.width,
         ..input
     };
-    let bytes = window
-        .plane_bytes(4)
-        .saturating_add(scratch_window.plane_bytes(1));
+    let len = window.area() as usize;
+    // A quarter to spare, as dragging Size grows the window a little every few units.
+    let capacity = len + len / 4;
+    // A plane two channels share, as a grey image's colour planes are, is blurred once.
+    let holders = (source.planes().each_ref())
+        .map(|plane| (source.planes().iter()).position(|other| Plane::ptr_eq(other, plane)));
+    let holders = holders.map(|holder| holder.expect("one of the planes"));
+    let distinct = (holders.iter().enumerate())
+        .filter(|&(index, &holder)| holder == index)
+        .count();
+    let bytes = (capacity as u64 * 4)
+        .saturating_mul(distinct as u64)
+        .saturating_add(scratch_window.plane_bytes(1))
+        .saturating_add((pool.threads() as u64).saturating_mul(thread_scratch_bytes(pass, input)));
     if bytes > NODE_BYTES_CAP {
         return Err(EvalError::OverCap {
             origin: key.clone(),
@@ -48,43 +59,46 @@ pub(super) fn blur(
             bytes,
         });
     }
-    let mut scratch = output_plane(released, scratch_window.area() as usize);
+    // The outputs before the scratch plane, which would otherwise take a released output's
+    // storage and leave one output to be made anew every edit.
+    let mut blurred: [Option<Plane>; 4] = std::array::from_fn(|index| {
+        (holders[index] == index).then(|| output_plane(released, len, capacity))
+    });
+    let scratch_len = scratch_window.area() as usize;
+    let mut scratch = output_plane(released, scratch_len, scratch_len);
     let skipped = AtomicBool::new(false);
-    let mut outputs: Vec<Plane> = Vec::with_capacity(4);
-    for (index, plane) in source.planes().iter().enumerate() {
-        // A plane two channels share, as a grey image's colour planes are, is blurred once.
-        let shared = (source.planes()[..index].iter())
-            .position(|earlier| Plane::ptr_eq(earlier, plane))
-            .map(|earlier| outputs[earlier].clone());
-        let output = match shared {
-            Some(output) => output,
-            None => {
-                let mut output = output_plane(released, window.area() as usize);
-                let planes = Planes {
-                    src: plane,
-                    scratch: scratch.get_mut().expect("nothing else holds the scratch"),
-                    dst: output
-                        .get_mut()
-                        .expect("nothing else holds an output plane"),
-                };
-                blur_plane(pool, pass, input, planes, stop, &skipped);
-                output
-            }
+    for (plane, output) in source.planes().iter().zip(&mut blurred) {
+        let Some(output) = output else { continue };
+        let planes = Planes {
+            src: plane,
+            scratch: scratch.get_mut().expect("nothing else holds the scratch"),
+            dst: output
+                .get_mut()
+                .expect("nothing else holds an output plane"),
         };
+        blur_plane(pool, pass, input, planes, stop, &skipped);
         if skipped.load(Ordering::Relaxed) {
             released.push(scratch);
             return Ok(None);
         }
-        outputs.push(output);
     }
     released.push(scratch);
-    let outputs: [Plane; 4] = outputs.try_into().expect("four planes");
+    let outputs = holders.map(|holder| blurred[holder].clone().expect("a blurred plane"));
     Ok(Some(Image::new(
         source.display_window(),
         window,
         outputs,
         source.warnings().to_vec(),
     )))
+}
+
+/// The most bytes one thread's temporaries hold over `input`: the rows pass's, or the columns
+/// pass's with the band gathered and its results.
+pub(super) fn thread_scratch_bytes(pass: BoxPass, input: Window) -> u64 {
+    let (width, height) = (input.width as usize, input.height as usize);
+    let grown = height as u64 + 2 * u64::from(pass.reach());
+    let band = (height as u64 + grown) * BLUR_BAND as u64 * 4;
+    cpu::box_scratch_bytes(pass, width).max(cpu::box_scratch_bytes(pass, height) + band)
 }
 
 /// One plane's source over the input window, the scratch plane of the grown width and the

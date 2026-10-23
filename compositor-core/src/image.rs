@@ -369,7 +369,7 @@ fn check_planes(planes: &[Plane; 4], data_window: Window) {
 /// be longer than the window: an operation reuses a released plane for a window up to its
 /// storage's length, so that a window grown a little each edit, as dragging Blur's Size grows
 /// it, does not make every plane anew.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Plane {
     storage: Arc<[f32]>,
     len: usize,
@@ -402,11 +402,6 @@ impl Plane {
         self.storage.len()
     }
 
-    /// Whether nothing but this plane holds its storage.
-    pub(crate) fn is_unshared(&self) -> bool {
-        Arc::strong_count(&self.storage) == 1 && Arc::weak_count(&self.storage) == 0
-    }
-
     /// Whether two planes are the same storage, as channels and images that share one are.
     pub fn ptr_eq(a: &Plane, b: &Plane) -> bool {
         Arc::ptr_eq(&a.storage, &b.storage)
@@ -423,6 +418,13 @@ impl Deref for Plane {
 
     fn deref(&self) -> &[f32] {
         &self.storage[..self.len]
+    }
+}
+
+/// The values over the window, as equality compares them; the storage past it is not the plane's.
+impl fmt::Debug for Plane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
     }
 }
 

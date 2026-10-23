@@ -349,9 +349,10 @@ pub(crate) const DEEP_STACK: usize = 64 << 20;
 /// The most bytes of planes an evaluator retains. Provisional, until a budget sets it.
 const RETAINED_BYTES_CAP: u64 = 4 << 30;
 
-/// The most bytes one node may allocate for its outputs and scratch, checked from its windows
-/// before anything is allocated: two layers far apart union to a data window of gigabytes, and
-/// an allocation that fails aborts the process. Provisional, until bounded-memory evaluation.
+/// The most bytes one node may allocate for its outputs, their spare storage and its scratch,
+/// each thread's included, checked from its windows before anything is allocated: two layers
+/// far apart union to a data window of gigabytes, and an allocation that fails aborts the
+/// process. Provisional, until bounded-memory evaluation.
 /// It bounds no total: a request's inputs, the retained results, the viewer's copy and the
 /// staging buffer coexist with it.
 const NODE_BYTES_CAP: u64 = 1 << 30;
@@ -558,7 +559,8 @@ impl Evaluator {
             }
             let (_, planes) = retained.image.into_parts();
             // A plane shared by two channels is unheld once at the last of them.
-            let unheld = planes.into_iter().filter(Plane::is_unshared);
+            let unheld = (planes.into_iter())
+                .filter_map(|mut plane| plane.get_mut().is_some().then_some(plane));
             released.extend(unheld);
         }
         released
@@ -913,23 +915,20 @@ fn cpus_in(list: &str) -> Option<Vec<usize>> {
 }
 
 /// A plane of `len` for an output: the one of `released` whose storage holds `len` most
-/// closely, with up to half again to spare, else a new one. Touching a new plane costs more than
-/// Exposure over it, and more than Blur over it when the columns pass is first to (page faults,
-/// then unmapping when it drops), which is what reusing released planes saves.
-///
-/// A new plane gets a quarter to spare when a released one fell short of `len` by less than
-/// that: the window grew a little, as dragging Blur's Size grows it, so the next edits' fit.
-/// Half to spare on reuse lets that storage serve the drag back down as well.
-fn output_plane(released: &mut Vec<Plane>, len: usize) -> Plane {
+/// closely, with up to half again to spare, else a new one with storage of `capacity`. Touching
+/// a new plane costs more than Exposure over it, and more than Blur over it when the columns
+/// pass is first to (page faults, then unmapping when it drops), which is what reusing released
+/// planes saves. Half to spare on reuse lets storage made for a window that grew serve the drag
+/// back down as well.
+fn output_plane(released: &mut Vec<Plane>, len: usize, capacity: usize) -> Plane {
     let closest = (released.iter().enumerate())
         .filter(|(_, plane)| (len..=len + len / 2).contains(&plane.capacity()))
         .min_by_key(|(_, plane)| plane.capacity())
         .map(|(index, _)| index);
-    if let Some(index) = closest {
-        return released.swap_remove(index).resized(len);
+    match closest {
+        Some(index) => released.swap_remove(index).resized(len),
+        None => Plane::zeroed(len, capacity),
     }
-    let grew = (released.iter()).any(|plane| (len - len / 4..len).contains(&plane.capacity()));
-    Plane::zeroed(len, if grew { len + len / 4 } else { len })
 }
 
 /// Multiplies R, G and B by two to the power of `stops` and shares A, each colour plane through
@@ -941,7 +940,8 @@ fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Plane>) -
     let width = image.data_window().width as usize;
     let [r, g, b, a] = image.planes();
     let mut scaled = |plane: &Plane| -> Plane {
-        let mut output = output_plane(released, plane.len());
+        // As roomy as its input, so that below a Blur whose Size is dragged it grows as rarely.
+        let mut output = output_plane(released, plane.len(), plane.capacity());
         let dst = output
             .get_mut()
             .expect("nothing else holds an output plane");
@@ -1023,7 +1023,7 @@ impl fmt::Display for EvalError {
             EvalError::Oversize { oversize, .. } => oversize.fmt(f),
             EvalError::OverCap { window, bytes, .. } => write!(
                 f,
-                "needs {} MiB of planes for a {} × {} data window, over the {} MiB limit",
+                "needs {} MiB of memory for a {} × {} data window, over the {} MiB limit",
                 bytes >> 20,
                 window.width,
                 window.height,

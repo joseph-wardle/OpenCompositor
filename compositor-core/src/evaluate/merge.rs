@@ -49,7 +49,8 @@ pub(super) fn merge(
     // infinite base.
     let mix = (mix != 1.0).then_some(mix);
     let width = window.width as usize;
-    let mut outputs: [Plane; 4] = [(); 4].map(|()| output_plane(released, window.area() as usize));
+    let len = window.area() as usize;
+    let mut outputs: [Plane; 4] = [(); 4].map(|()| output_plane(released, len, len));
     let base_placed = Overlap::of(base.data_window(), window);
     let layers_placed: Vec<Overlap> = layers
         .iter()

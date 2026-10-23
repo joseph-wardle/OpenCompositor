@@ -286,7 +286,7 @@ fn alternating_large_and_small_images_keeps_one_staging_buffer() {
 
     for _ in 0..10 {
         for needed in [uhd, eight_k] {
-            if let Some(size) = sizing.replacement(current, needed) {
+            if let Some(size) = sizing.replacement(current, needed, u64::MAX) {
                 replacements.push(size);
                 current = size;
             }
@@ -296,11 +296,26 @@ fn alternating_large_and_small_images_keeps_one_staging_buffer() {
 
     // A run of small images gives the memory back.
     for _ in 0..IMAGES_BEFORE_SHRINKING {
-        if let Some(size) = sizing.replacement(current, uhd) {
+        if let Some(size) = sizing.replacement(current, uhd, u64::MAX) {
             current = size;
         }
     }
     assert_eq!(current, staging_size(first_width, first_height));
+}
+
+/// The quarter to spare stops at the GPU's largest buffer, as long as the image fits in it.
+#[test]
+fn a_growing_staging_buffer_stays_within_the_gpus_limit() {
+    let uhd = staging_size(3840, 2160);
+    let eight_k = staging_size(8192, 4320);
+    let mut sizing = StagingSizing::default();
+    assert_eq!(sizing.first(uhd, uhd), uhd);
+    assert_eq!(sizing.replacement(uhd, eight_k, eight_k), Some(eight_k));
+    let grown = eight_k + 1;
+    assert_eq!(
+        sizing.replacement(eight_k, grown, u64::MAX),
+        Some(grown + grown / 4)
+    );
 }
 
 #[test]

@@ -866,7 +866,7 @@ fn a_merge_too_large_for_an_image_or_the_cap_fails_before_allocating() {
     );
     assert_eq!(
         over_cap.to_string(),
-        "Merge: needs 6104 MiB of planes for a 20001 × 20001 data window, over the 1024 MiB limit"
+        "Merge: needs 6104 MiB of memory for a 20001 × 20001 data window, over the 1024 MiB limit"
     );
 }
 
@@ -1117,31 +1117,31 @@ fn blur_on_the_pool_matches_the_composed_kernel_and_writes_every_sample() {
     }
 }
 
-/// A window grown a little each edit, as dragging Blur's Size up grows it, makes one plane with
-/// a quarter to spare, which serves the rest of the drag up and back down; storage with more
-/// than half to spare is left for one that fits it better.
+/// Dragging Blur's Size grows its window a little every few units. Its first output planes have
+/// a quarter to spare and serve the drag up and back down, each edit taking the planes the last
+/// one released: the scratch plane, taken after the outputs, never takes one of them.
 #[test]
-fn a_window_grown_a_little_reuses_one_plane_up_and_back_down() {
-    let first = output_plane(&mut Vec::new(), 1000);
-    assert_eq!(first.capacity(), 1000);
-
-    let mut released = vec![first];
-    let grown = output_plane(&mut released, 1100);
-    assert_eq!((grown.len(), grown.capacity()), (1100, 1375));
-    let address = grown.address();
-
-    let mut released = vec![grown];
-    for len in [1200, 1375, 1300, 1000, 917] {
-        let plane = output_plane(&mut released, len);
-        assert_eq!((plane.len(), plane.address()), (len, address), "{len}");
-        released.push(plane);
+fn dragging_blur_size_reuses_its_first_output_planes() {
+    let evaluator = Evaluator::new();
+    let source = blur_source(90, 160);
+    let addresses = |image: &Image| image.planes().each_ref().map(Plane::address);
+    let mut previous = evaluator
+        .compute_unstopped(&blur_key(10.0), &[&source], &mut Vec::new())
+        .unwrap();
+    let first = addresses(&previous);
+    for size in [10.5, 11.0, 12.5, 14.0, 13.0, 11.5, 10.0] {
+        let (_, planes) = previous.into_parts();
+        let mut released = Vec::from(planes);
+        let image = evaluator
+            .compute_unstopped(&blur_key(size), &[&source], &mut released)
+            .unwrap();
+        let mut reused = addresses(&image);
+        reused.sort_unstable();
+        let mut expected = first;
+        expected.sort_unstable();
+        assert_eq!(reused, expected, "at size {size}");
+        previous = image;
     }
-    let smaller = output_plane(&mut released, 916);
-    assert_eq!((smaller.capacity(), released.len()), (916, 1));
-
-    // A plane far smaller than the window is no sign of a drag.
-    let mut released = vec![Plane::zeroed(500, 500)];
-    assert_eq!(output_plane(&mut released, 1000).capacity(), 1000);
 }
 
 #[test]
@@ -1226,7 +1226,12 @@ fn a_blur_too_large_for_an_image_or_the_cap_fails_before_allocating() {
     let over_cap = evaluator
         .compute_unstopped(&key, &[&source], &mut Vec::new())
         .unwrap_err();
-    let bytes = 8290 * 8290 * 16 + 8290 * 100 * 4;
+    // The outputs with a quarter to spare, the scratch plane, and each thread's temporaries.
+    let len = 8290 * 8290;
+    let threads = evaluator.pool.threads() as u64;
+    let bytes = (len + len / 4) * 16
+        + 8290 * 100 * 4
+        + threads * blur::thread_scratch_bytes(BoxPass::new(4096.0), window(0, 0, 100, 100));
     assert!(
         matches!(&over_cap, EvalError::OverCap { origin, window, bytes: needed }
             if *origin == key && *window == self::window(-4095, -4095, 8290, 8290) && *needed == bytes),
@@ -1234,7 +1239,10 @@ fn a_blur_too_large_for_an_image_or_the_cap_fails_before_allocating() {
     );
     assert_eq!(
         over_cap.to_string(),
-        "Blur: needs 1051 MiB of planes for a 8290 × 8290 data window, over the 1024 MiB limit"
+        format!(
+            "Blur: needs {} MiB of memory for a 8290 × 8290 data window, over the 1024 MiB limit",
+            bytes >> 20
+        )
     );
 }
 

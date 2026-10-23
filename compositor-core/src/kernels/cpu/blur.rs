@@ -59,6 +59,16 @@ struct PassScratch {
     suffixes: Vec<f64>,
 }
 
+/// The most bytes a [`BoxScratch`] holds after [`blur_rows`] over rows of `len` samples, or
+/// [`blur_band`] over a band of columns `len` long: the rows as lanes, their results and the
+/// three padded lines, and one block's suffix sums.
+pub fn box_scratch_bytes(pass: BoxPass, len: usize) -> u64 {
+    let t = u64::from(pass.tmax());
+    let lanes = BLUR_ROWS.max(BLUR_BAND) as u64;
+    let samples = len as u64 + (len as u64 + 6 * t) + (3 * len as u64 + 18 * t);
+    lanes * (samples * 4 + 2 * t * 8)
+}
+
 #[inline(always)]
 fn blur_rows_samples(
     pass: BoxPass,
