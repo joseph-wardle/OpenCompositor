@@ -267,14 +267,16 @@ pub mod ffi {
         unsafe fn panel_slider(panel: *mut ParameterPanel, name: &QString) -> *mut QSlider;
         /// How many pixels a drag along the panel slider's groove covers.
         unsafe fn slider_span(slider: *mut QSlider) -> i32;
-        /// Sends the panel slider a left-button mouse event of the `QEvent::Type`, where the
-        /// handle sits `pixel` along its span.
+        /// Sends the panel slider's window a left-button mouse event of the `QEvent::Type`, where
+        /// the slider's handle sits `pixel` along its span, as the platform does, for the checks.
         unsafe fn drag_slider(slider: *mut QSlider, kind: i32, pixel: i32);
         /// Presses and releases the `Qt::Key` typing `text` in the window, as the platform does,
         /// for the checks.
         unsafe fn press_key(window: *mut QMainWindow, key: i32, text: &QString);
         /// Whether a popup, such as a menu, has the keyboard and pointer.
         fn popup_open() -> bool;
+        /// Whether a modal dialog blocks input to the other windows.
+        fn modal_open() -> bool;
         /// The node creation menu, which the window owns. It sends the index of the label chosen
         /// to `chosen`.
         unsafe fn new_creation_menu(

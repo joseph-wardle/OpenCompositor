@@ -284,8 +284,27 @@ fn begin() {
         check.span = span;
         check.period = period;
     });
+    if let Some(failure) = input_blocked() {
+        return report(vec![failure]);
+    }
     send(MOUSE_BUTTON_PRESS, 0);
     ffi::single_shot(period, step, 1);
+}
+
+/// Names a modal dialog or popup that would swallow the check's mouse and keys. Most likely a
+/// key typed into the check's window opened it, such as R for Read Files.
+fn input_blocked() -> Option<String> {
+    let open = if ffi::modal_open() {
+        "a modal dialog"
+    } else if ffi::popup_open() {
+        "a popup"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{open} opened during the check and would swallow its input; was a key typed into the \
+         window?"
+    ))
 }
 
 /// Sends the slider a mouse event, timing it, and records the edit if it asked for a new result.
@@ -315,6 +334,9 @@ fn send(kind: i32, pixel: i32) {
 /// slider is released.
 fn step(pixel: usize) {
     let (span, period) = with(|check| (check.span, check.period));
+    if let Some(failure) = input_blocked() {
+        return report(vec![failure]);
+    }
     let pixel = pixel as i32;
     send(MOUSE_MOVE, pixel);
     if pixel < span {
@@ -354,6 +376,9 @@ fn check_steps() -> Vec<String> {
             (value, session.undo_label(), session.editing().is_some())
         })
     };
+    if let Some(failure) = input_blocked() {
+        return vec![failure];
+    }
     let mut failures = Vec::new();
     let dragged = state();
     if dragged.1 != Some(label) || dragged.2 {
@@ -371,6 +396,10 @@ fn check_steps() -> Vec<String> {
         unsafe { ffi::drag_slider(slider, kind, pixel) };
     }
     let moved = state().0;
+    if let Some(failure) = input_blocked() {
+        failures.push(failure);
+        return failures;
+    }
     // SAFETY: as in `begin`.
     unsafe {
         let window = crate::widgets().window;

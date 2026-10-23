@@ -377,12 +377,16 @@ QDockWidget *panel_dock(ParameterPanel *panel) {
 QSlider *panel_slider(ParameterPanel *panel, const QString &name) { return panel->slider(name); }
 int slider_span(QSlider *slider) { return static_cast<ParameterSlider *>(slider)->span(); }
 void drag_slider(QSlider *slider, int type, int pixel) {
+    // To the window, as the platform delivers the mouse, so that a modal dialog or a popup
+    // blocks the drag as it blocks the checks' keys and a user's mouse.
     QPointF at = static_cast<ParameterSlider *>(slider)->point_at(pixel);
+    QWidget *window = slider->window();
+    QPointF in_window = slider->mapTo(window, at);
     auto button = type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton;
     auto buttons = type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton;
-    QMouseEvent event(QEvent::Type(type), at, slider->mapToGlobal(at), button, buttons,
-                      Qt::NoModifier);
-    QCoreApplication::sendEvent(slider, &event);
+    QMouseEvent event(QEvent::Type(type), in_window, in_window, slider->mapToGlobal(at), button,
+                      buttons, Qt::NoModifier);
+    QCoreApplication::sendEvent(window->windowHandle(), &event);
 }
 void press_key(QMainWindow *window, int key, const QString &text) {
     // To the window, as the platform delivers keys, so that the key filter sees it first. Qt
@@ -393,6 +397,7 @@ void press_key(QMainWindow *window, int key, const QString &text) {
     }
 }
 bool popup_open() { return QApplication::activePopupWidget(); }
+bool modal_open() { return QApplication::activeModalWidget(); }
 
 CreationMenu::CreationMenu(rust::Fn<void(size_t)> chosen, QWidget *parent)
     : QFrame(parent, Qt::Popup), chosen(chosen) {
