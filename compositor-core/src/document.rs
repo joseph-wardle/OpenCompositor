@@ -57,6 +57,9 @@ pub enum NodeKind {
     /// Composes its layers over its background, each layer in slot order over the result so far,
     /// then dissolves that stack by its Mix against the base, the lowest connected input.
     Merge { version: MergeVersion },
+    /// Blurs its source by its Size, a radius in pixels, every channel as it is, so that
+    /// premultiplied edges fade without an unpremultiply; the data window grows by the reach.
+    Blur { version: BlurVersion },
 }
 
 impl NodeKind {
@@ -72,6 +75,9 @@ impl NodeKind {
             NodeKind::Merge {
                 version: MergeVersion::V1,
             } => MERGE_V1,
+            NodeKind::Blur {
+                version: BlurVersion::V1,
+            } => BLUR_V1,
         }
     }
 
@@ -81,6 +87,7 @@ impl NodeKind {
             NodeKind::Reader { .. } => "Reader",
             NodeKind::Exposure { .. } => "Exposure",
             NodeKind::Merge { .. } => "Merge",
+            NodeKind::Blur { .. } => "Blur",
         }
     }
 
@@ -94,6 +101,9 @@ impl NodeKind {
             NodeKind::Merge {
                 version: MergeVersion::V1,
             } => MERGE_V1_INPUTS,
+            NodeKind::Blur {
+                version: BlurVersion::V1,
+            } => BLUR_V1_INPUTS,
         }
     }
 }
@@ -129,6 +139,13 @@ const NODE_TYPES: &[NodeType] = &[
         step: "Create Merge",
         kind: NodeKind::Merge {
             version: MergeVersion::CURRENT,
+        },
+    },
+    NodeType {
+        name: "blur",
+        step: "Create Blur",
+        kind: NodeKind::Blur {
+            version: BlurVersion::CURRENT,
         },
     },
 ];
@@ -289,8 +306,36 @@ const MERGE_V1_INPUTS: &[NodeInput] = &[
     },
 ];
 
+/// The parameter and input descriptions a Blur node was created with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlurVersion {
+    V1,
+}
+
+impl BlurVersion {
+    pub const CURRENT: BlurVersion = BlurVersion::V1;
+}
+
+const BLUR_V1: &[Parameter] = &[Parameter {
+    name: "size",
+    label: "Size",
+    kind: ParameterKind::Float(FloatParameter {
+        // A new Blur changes nothing until its size is set.
+        default: 0.0,
+        slider: 0.0..=100.0,
+        limits: 0.0..=4096.0,
+    }),
+}];
+
+const BLUR_V1_INPUTS: &[NodeInput] = &[NodeInput {
+    name: "source",
+    label: "Source",
+    repeating: false,
+    required: true,
+}];
+
 const _: () = {
-    let tables = [EXPOSURE_V1_INPUTS, MERGE_V1_INPUTS];
+    let tables = [EXPOSURE_V1_INPUTS, MERGE_V1_INPUTS, BLUR_V1_INPUTS];
     let mut table = 0;
     while table < tables.len() {
         let mut index = 0;
@@ -338,7 +383,9 @@ impl Node {
                     .into_owned(),
                 None => self.kind.label().to_owned(),
             },
-            NodeKind::Exposure { .. } | NodeKind::Merge { .. } => self.kind.label().to_owned(),
+            NodeKind::Exposure { .. } | NodeKind::Merge { .. } | NodeKind::Blur { .. } => {
+                self.kind.label().to_owned()
+            }
         }
     }
 

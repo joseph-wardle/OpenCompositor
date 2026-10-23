@@ -2,10 +2,9 @@
 //! order, and the stack dissolved against the base by Mix.
 
 use std::ops::Range;
-use std::sync::Arc;
 
 use crate::evaluate::{EvalError, NODE_BYTES_CAP, Pool, ResultKey, output_plane};
-use crate::image::{Image, Warning, Window};
+use crate::image::{Image, Overlap, Plane, Warning};
 use crate::kernels::cpu::{self, Level};
 
 /// Merge's image from its connected inputs: the background if connected, then the layers in
@@ -20,7 +19,7 @@ pub(super) fn merge(
     key: &ResultKey,
     inputs: &[&Image],
     mix: f32,
-    released: &mut Vec<Arc<[f32]>>,
+    released: &mut Vec<Plane>,
 ) -> Result<Image, EvalError> {
     let Some((base, layers)) = inputs.split_first() else {
         return Ok(Image::empty());
@@ -38,7 +37,7 @@ pub(super) fn merge(
             oversize,
         })?;
     }
-    let bytes = window.area() * (4 * size_of::<f32>()) as u64;
+    let bytes = window.plane_bytes(4);
     if bytes > NODE_BYTES_CAP {
         return Err(EvalError::OverCap {
             origin: key.clone(),
@@ -50,18 +49,18 @@ pub(super) fn merge(
     // infinite base.
     let mix = (mix != 1.0).then_some(mix);
     let width = window.width as usize;
-    let mut outputs: [Arc<[f32]>; 4] =
-        [(); 4].map(|()| output_plane(released, window.area() as usize));
-    let base_placed = Placed::new(base, window);
-    let layers_placed: Vec<Placed> = layers
+    let len = window.area() as usize;
+    let mut outputs: [Plane; 4] = [(); 4].map(|()| output_plane(released, len, len));
+    let base_placed = Overlap::of(base.data_window(), window);
+    let layers_placed: Vec<Overlap> = layers
         .iter()
-        .map(|layer| Placed::new(layer, window))
+        .map(|layer| Overlap::of(layer.data_window(), window))
         .collect();
     // The base outside its own window, for the dissolve.
     let zeros = vec![0.0f32; width];
     let planes = outputs
         .each_mut()
-        .map(|plane| Arc::get_mut(plane).expect("nothing else holds an output plane"));
+        .map(|plane| plane.get_mut().expect("nothing else holds an output plane"));
     pool.fill_rows(planes, width, |level, first_row, mut chunk| {
         let rows = chunk[0].len() / width.max(1);
         for (index, y) in (first_row..first_row + rows).enumerate() {
@@ -132,41 +131,5 @@ fn dissolve(
         };
         let dst = out.each_mut().map(|plane| &mut plane[columns.clone()]);
         cpu::mix(level, base, dst, mix);
-    }
-}
-
-/// Where an input lies in the output: its data window in the output's storage, from the
-/// output's bottom-left. An empty input lies nowhere.
-#[derive(Clone, Copy, Debug)]
-struct Placed {
-    column: usize,
-    row: usize,
-    width: usize,
-    height: usize,
-}
-
-impl Placed {
-    fn new(input: &Image, output: Window) -> Placed {
-        let window = input.data_window();
-        let (column, row) = window.offset_in(output);
-        Placed {
-            column,
-            row,
-            width: window.width as usize,
-            height: window.height as usize,
-        }
-    }
-
-    /// At output row `y`, the input's samples of that row and the output columns they cover, or
-    /// `None` where the input has no row there.
-    fn row(&self, y: usize) -> Option<(Range<usize>, Range<usize>)> {
-        let row = y.checked_sub(self.row)?;
-        if row >= self.height {
-            return None;
-        }
-        Some((
-            row * self.width..(row + 1) * self.width,
-            self.column..self.column + self.width,
-        ))
     }
 }

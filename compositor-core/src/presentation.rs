@@ -32,6 +32,11 @@ const MERGE_COLOR: Color = Color {
     g: 105,
     b: 60,
 };
+const BLUR_COLOR: Color = Color {
+    r: 100,
+    g: 90,
+    b: 140,
+};
 const FAILED_COLOR: Color = Color {
     r: 160,
     g: 60,
@@ -129,6 +134,7 @@ pub(crate) fn record(
         NodeKind::Reader { .. } => READER_COLOR,
         NodeKind::Exposure { .. } => EXPOSURE_COLOR,
         NodeKind::Merge { .. } => MERGE_COLOR,
+        NodeKind::Blur { .. } => BLUR_COLOR,
     };
     // Slot numbers go in the title, and a failure in the colour, until OpenNG has badges.
     // Nothing shows an evaluation in progress: the title would widen the node while it lasted, and the

@@ -24,19 +24,22 @@ mod worker;
 /// place the pool and the CPU kernels are reachable from outside; nothing else is public here.
 #[doc(hidden)]
 pub mod bench {
-    pub use crate::evaluate::Pool;
-    pub use crate::kernels::cpu::{Level, exposure, mix, over};
+    pub use crate::evaluate::blur::{BandScratch, band_passes};
+    pub use crate::evaluate::{Columns, Pool};
+    pub use crate::kernels::cpu::{
+        BLUR_BAND, BLUR_ROWS, BoxScratch, Level, blur_band, blur_rows, exposure, mix, over,
+    };
 }
 
 pub use app::{Anchor, App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
 pub use document::{
-    Assignment, Changes, ConnectionError, Document, ExposureVersion, InputSlot, MAX_SLOTS,
-    MergeVersion, Missing, Node, NodeId, NodeInput, NodeKind, NodeType, ReaderVersion, Slot,
-    missing, node_types,
+    Assignment, BlurVersion, Changes, ConnectionError, Document, ExposureVersion, InputSlot,
+    MAX_SLOTS, MergeVersion, Missing, Node, NodeId, NodeInput, NodeKind, NodeType, ReaderVersion,
+    Slot, missing, node_types,
 };
 pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};
-pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Warning, Window};
+pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,

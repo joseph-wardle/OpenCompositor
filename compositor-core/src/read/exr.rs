@@ -3,7 +3,7 @@
 use std::io::{BufRead, Read, Seek};
 use std::num::NonZero;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Mutex, mpsc};
 
 use ::exr::block::chunk::{Chunk, CompressedBlock};
 use ::exr::block::reader::{ChunksReader, FilteredChunksReader};
@@ -19,7 +19,7 @@ use half::slice::HalfFloatSliceExt;
 use opencompositor_kernels::flush;
 
 use super::{ReadError, Refusal, check_size, window};
-use crate::image::{Channel, Chromaticities, Image, Warning, Window, zeroed_plane};
+use crate::image::{Channel, Chromaticities, Image, Plane, Warning, Window};
 
 pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadError> {
     // Only the headers, nothing allocated for pixels yet. Unvalidated, because validation
@@ -91,10 +91,7 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
 
 /// The part's R, G, B and A at its largest resolution, in `Channel::ALL`'s order, bottom row
 /// first. A missing A reads as 1. EXR stores premultiplied colour.
-fn read_planes(
-    file: impl BufRead + Seek + Send,
-    part: usize,
-) -> Result<[Arc<[f32]>; 4], ReadError> {
+fn read_planes(file: impl BufRead + Seek + Send, part: usize) -> Result<[Plane; 4], ReadError> {
     let chunks = ::exr::block::read(file, false).map_err(decode_error)?;
     let header = &chunks.headers()[part];
     let (width, height) = (header.layer_size.width(), header.layer_size.height());
@@ -117,7 +114,7 @@ fn read_planes(
         before += channel.sample_type.bytes_per_sample();
     }
     let area = width * height;
-    let mut planes: [Arc<[f32]>; 4] = std::array::from_fn(|_| zeroed_plane(area));
+    let mut planes: [Plane; 4] = std::array::from_fn(|_| Plane::zeroed(area, area));
     if !sources
         .iter()
         .any(|&(plane, ..)| plane == Channel::A as usize)
@@ -126,7 +123,7 @@ fn read_planes(
     }
     let mut out = planes
         .each_mut()
-        .map(|plane| Arc::get_mut(plane).expect("not yet shared"));
+        .map(|plane| plane.get_mut().expect("not yet shared"));
     let chunks = chunks
         .filter_chunks(false, |_, tile, block| {
             block.layer == part && tile.is_largest_resolution_level()

@@ -10,7 +10,7 @@ use half::f16;
 use crate::document::NodeId;
 use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, Pool, ResultKey};
 use crate::gpu::wait_for_device;
-use crate::image::ImageInfo;
+use crate::image::{ImageInfo, Plane, Window};
 
 /// The staging buffer's first size, a DCI 4K image, and its least.
 const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
@@ -43,6 +43,11 @@ impl Evaluated {
     /// The number of the request this answers.
     pub fn request(&self) -> u64 {
         self.wanted.number
+    }
+
+    /// The image's data window, or `None` for a failure.
+    pub fn data_window(&self) -> Option<Window> {
+        Some(self.result.as_ref().ok()?.info.data_window)
     }
 }
 
@@ -518,7 +523,7 @@ fn evaluate(
 fn stage(
     finishing: &Finishing,
     info: &ImageInfo,
-    planes: [Arc<[f32]>; 4],
+    planes: [Plane; 4],
     pool: &Pool,
     sizing: &mut StagingSizing,
     timing: &mut StagingTiming,
@@ -552,7 +557,7 @@ fn stage(
     };
     // Until the buffer is back in `staging`, a failure drops it, leaving the slot empty.
     let buffer = match staging.buffer.take() {
-        Some(buffer) => match sizing.replacement(buffer.size(), size) {
+        Some(buffer) => match sizing.replacement(buffer.size(), size, limits.max_buffer_size) {
             None => {
                 map(finishing, device, &buffer).map_err(|error| {
                     format!("the GPU could not map its staging buffer: {error}")
@@ -565,7 +570,7 @@ fn stage(
                 staging_buffer(device, replacement)?
             }
         },
-        None => staging_buffer(device, sizing.first(size))?,
+        None => staging_buffer(device, sizing.first(size, limits.max_buffer_size))?,
     };
     timing.mapped = Some(Instant::now());
     let bytes_per_row = row_bytes(window.width);
@@ -616,10 +621,11 @@ fn stage(
     }))
 }
 
-/// When the worker replaces its staging buffer. It grows to fit any larger image, and shrinks
-/// only after several images in a row would fit in half of it, so that one large image does not
-/// hold its memory for the rest of the session, and alternating large and small images does not
-/// make a buffer for each.
+/// When the worker replaces its staging buffer. It grows to fit any larger image with a
+/// quarter to spare, and shrinks only after several images in a row would fit in half of it, so
+/// that one large image does not hold its memory for the rest of the session, and alternating
+/// large and small images does not make a buffer for each. No buffer is larger than `largest`,
+/// the GPU's limit, which the image to stage is within.
 #[derive(Debug, Default)]
 struct StagingSizing {
     images_fitting_half: u32,
@@ -627,21 +633,26 @@ struct StagingSizing {
 
 impl StagingSizing {
     /// The size of buffer to make, where there is none, to stage `needed` bytes.
-    fn first(&mut self, needed: u64) -> u64 {
+    fn first(&mut self, needed: u64, largest: u64) -> u64 {
         self.images_fitting_half = 0;
-        fitted(needed)
+        fitted(needed, largest)
     }
 
     /// The size of buffer to replace a `current`-byte one with, to stage `needed` bytes, or
     /// `None` to keep it.
-    fn replacement(&mut self, current: u64, needed: u64) -> Option<u64> {
-        let fitted = fitted(needed);
+    fn replacement(&mut self, current: u64, needed: u64, largest: u64) -> Option<u64> {
+        let fitted = fitted(needed, largest);
         if current / 2 > fitted {
             self.images_fitting_half += 1;
         } else {
             self.images_fitting_half = 0;
         }
-        if current < needed || self.images_fitting_half == IMAGES_BEFORE_SHRINKING {
+        if current < needed {
+            self.images_fitting_half = 0;
+            // Dragging Blur's Size up grows the data window a little each edit; growing to fit
+            // exactly would replace the buffer, and wait on the GPU for it, every time.
+            Some((fitted + fitted / 4).min(largest))
+        } else if self.images_fitting_half == IMAGES_BEFORE_SHRINKING {
             self.images_fitting_half = 0;
             Some(fitted)
         } else {
@@ -650,10 +661,13 @@ impl StagingSizing {
     }
 }
 
-/// The size of buffer that stages `needed` bytes, and at least a first-size image.
-fn fitted(needed: u64) -> u64 {
+/// The size of buffer that stages `needed` bytes, and at least a first-size image where the GPU
+/// allows one.
+fn fitted(needed: u64, largest: u64) -> u64 {
     let (first_width, first_height) = FIRST_STAGING_SIZE;
-    needed.max(staging_size(first_width, first_height))
+    needed
+        .max(staging_size(first_width, first_height))
+        .min(largest)
 }
 
 pub(crate) fn is_empty(info: &ImageInfo) -> bool {

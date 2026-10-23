@@ -101,7 +101,7 @@ class AbsoluteSetStyle : public QProxyStyle {
 };
 
 // A slider edited only by dragging: a press anywhere starts the drag, Escape during it cancels,
-// Ctrl+click resets, and keys and the wheel pass to the panel.
+// Ctrl+click resets, and keys and the wheel pass to the panel. During a drag no shortcut fires.
 class ParameterSlider : public QSlider {
   public:
     explicit ParameterSlider(QWidget *parent) : QSlider(Qt::Horizontal, parent) {
@@ -136,8 +136,7 @@ class ParameterSlider : public QSlider {
             return;
         }
         QSlider::mousePressEvent(event);
-        // The window's key filter takes Escape unless something grabs the keyboard.
-        if (isSliderDown()) grabKeyboard();
+        if (isSliderDown()) take_keys();
     }
     void mouseMoveEvent(QMouseEvent *event) override {
         // After a cancel the button is still held, and the handle stays put.
@@ -149,7 +148,7 @@ class ParameterSlider : public QSlider {
     }
     void mouseReleaseEvent(QMouseEvent *event) override {
         QSlider::mouseReleaseEvent(event);
-        if (!isSliderDown()) releaseKeyboard();
+        if (!isSliderDown()) release_keys();
     }
     void keyPressEvent(QKeyEvent *event) override {
         if (event->key() == Qt::Key_Escape && isSliderDown()) {
@@ -158,15 +157,31 @@ class ParameterSlider : public QSlider {
                 QSignalBlocker blocker(this);
                 setSliderDown(false);
             }
-            releaseKeyboard();
+            release_keys();
             cancelled();
             return;
         }
         event->ignore();
     }
     void wheelEvent(QWheelEvent *event) override { event->ignore(); }
+    bool eventFilter(QObject *, QEvent *event) override {
+        if (event->type() != QEvent::ShortcutOverride) return false;
+        event->accept();
+        return true;
+    }
 
   private:
+    // The window's key filter takes Escape unless something grabs the keyboard. Qt matches
+    // shortcuts before a grab redirects the key, so the slider also claims every shortcut, which
+    // would otherwise act mid-drag, as R opening a modal dialog the grab leaves deaf to keys.
+    void take_keys() {
+        grabKeyboard();
+        qApp->installEventFilter(this);
+    }
+    void release_keys() {
+        releaseKeyboard();
+        qApp->removeEventFilter(this);
+    }
     std::pair<QRect, QRect> rects() {
         QStyleOptionSlider option;
         initStyleOption(&option);
@@ -377,12 +392,16 @@ QDockWidget *panel_dock(ParameterPanel *panel) {
 QSlider *panel_slider(ParameterPanel *panel, const QString &name) { return panel->slider(name); }
 int slider_span(QSlider *slider) { return static_cast<ParameterSlider *>(slider)->span(); }
 void drag_slider(QSlider *slider, int type, int pixel) {
+    // To the window, as the platform delivers the mouse, so that a modal dialog or a popup
+    // blocks the drag as it blocks the checks' keys and a user's mouse.
     QPointF at = static_cast<ParameterSlider *>(slider)->point_at(pixel);
+    QWidget *window = slider->window();
+    QPointF in_window = slider->mapTo(window, at);
     auto button = type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton;
     auto buttons = type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton;
-    QMouseEvent event(QEvent::Type(type), at, slider->mapToGlobal(at), button, buttons,
-                      Qt::NoModifier);
-    QCoreApplication::sendEvent(slider, &event);
+    QMouseEvent event(QEvent::Type(type), in_window, in_window, slider->mapToGlobal(at), button,
+                      buttons, Qt::NoModifier);
+    QCoreApplication::sendEvent(window->windowHandle(), &event);
 }
 void press_key(QMainWindow *window, int key, const QString &text) {
     // To the window, as the platform delivers keys, so that the key filter sees it first. Qt
@@ -393,6 +412,7 @@ void press_key(QMainWindow *window, int key, const QString &text) {
     }
 }
 bool popup_open() { return QApplication::activePopupWidget(); }
+bool modal_open() { return QApplication::activeModalWidget(); }
 
 CreationMenu::CreationMenu(rust::Fn<void(size_t)> chosen, QWidget *parent)
     : QFrame(parent, Qt::Popup), chosen(chosen) {

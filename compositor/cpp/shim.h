@@ -132,6 +132,7 @@ int slider_span(QSlider *slider);
 void drag_slider(QSlider *slider, int type, int pixel);
 void press_key(QMainWindow *window, int key, const QString &text);
 bool popup_open();
+bool modal_open();
 CreationMenu *new_creation_menu(QMainWindow *window, rust::Fn<void(size_t)> chosen);
 void open_creation_menu(CreationMenu *menu, const QStringList &labels);
 void set_caption(QLabel *label, const QString &text);

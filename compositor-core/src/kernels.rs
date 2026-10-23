@@ -4,14 +4,15 @@
 //!
 //! A dispatch records into the caller's encoder and never submits, so one submission can carry
 //! an evaluation's dispatches and copies together. Nothing here uploads or reads back: the tests
-//! do, as test support until the worker stages the GPU's inputs. Over has no production dispatch
-//! yet: its entry point establishes that naga accepts the module and that the numbers land
-//! within its bound, ahead of the GPU step.
+//! do, as test support until the worker stages the GPU's inputs. Over and the box pass have no
+//! production dispatch yet: their entry points establish that naga accepts the module and that
+//! the numbers land within their bounds, ahead of the GPU step.
 
 use std::fmt;
 
 use opencompositor_kernels::{
-    EXPOSURE_ENTRY, ExposureParams, OVER_ENTRY, OverParams, SPIRV, WORKGROUP,
+    Axis, BOX_PASS_ENTRY, BoxPass, BoxPassParams, EXPOSURE_ENTRY, ExposureParams, OVER_ENTRY,
+    OverParams, SPIRV, WORKGROUP,
 };
 
 pub(crate) mod cpu;
@@ -19,11 +20,11 @@ pub(crate) mod cpu;
 /// The format of every plane texture.
 pub(crate) const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
-/// A pointwise entry point's pipeline on one device, made once per device: a uniform of
-/// parameters, its input planes read as textures, and one plane written as a storage texture,
-/// bound in that order as the kernel crate declares them.
+/// An entry point's pipeline on one device, made once per device: a uniform of parameters,
+/// its input planes read as textures, and one plane written as a storage texture, bound in
+/// that order as the kernel crate declares them.
 #[derive(Debug)]
-struct Pointwise {
+struct Pipeline {
     device: wgpu::Device,
     label: &'static str,
     layout: wgpu::BindGroupLayout,
@@ -31,7 +32,7 @@ struct Pointwise {
     params_size: u64,
 }
 
-impl Pointwise {
+impl Pipeline {
     /// Makes the pipeline, which naga validates, for an entry point reading `inputs` planes.
     fn new(
         device: &wgpu::Device,
@@ -39,7 +40,7 @@ impl Pointwise {
         entry: &str,
         inputs: u32,
         params_size: u64,
-    ) -> Pointwise {
+    ) -> Pipeline {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kernels"),
             source: wgpu::util::make_spirv(SPIRV),
@@ -93,7 +94,7 @@ impl Pointwise {
             compilation_options: Default::default(),
             cache: None,
         });
-        Pointwise {
+        Pipeline {
             device: device.clone(),
             label,
             layout,
@@ -102,9 +103,9 @@ impl Pointwise {
         }
     }
 
-    /// Records the entry point with `params` over `inputs` into `output`, planes of one size,
-    /// into the encoder. Workgroups cover the planes rounded up to whole ones; the entry point
-    /// skips the invocations past the edge.
+    /// Records the entry point with `params` over `inputs`, planes of `inputs_size`, into
+    /// `output`, into the encoder. Workgroups cover the output rounded up to whole ones; the
+    /// entry point skips the invocations past the edge.
     ///
     /// The planes are checked here rather than left to wgpu, whose validation error would count
     /// as a bug on the device.
@@ -113,15 +114,16 @@ impl Pointwise {
         encoder: &mut wgpu::CommandEncoder,
         params: &[u8],
         inputs: &[&wgpu::Texture],
+        inputs_size: wgpu::Extent3d,
         output: &wgpu::Texture,
     ) -> Result<(), PlaneError> {
         assert_eq!(params.len() as u64, self.params_size, "the params' bytes");
         for &input in inputs {
             check_plane(Role::Input, input, wgpu::TextureUsages::TEXTURE_BINDING)?;
-            if input.size() != output.size() {
+            if input.size() != inputs_size {
                 return Err(PlaneError::Size {
                     input: input.size(),
-                    output: output.size(),
+                    needed: inputs_size,
                 });
             }
         }
@@ -174,12 +176,12 @@ impl Pointwise {
 
 /// Exposure's pipeline on one device.
 #[derive(Debug)]
-pub(crate) struct Exposure(Pointwise);
+pub(crate) struct Exposure(Pipeline);
 
 impl Exposure {
     pub(crate) fn new(device: &wgpu::Device) -> Exposure {
         let params_size = size_of::<ExposureParams>() as u64;
-        Exposure(Pointwise::new(
+        Exposure(Pipeline::new(
             device,
             "exposure",
             EXPOSURE_ENTRY,
@@ -202,18 +204,19 @@ impl Exposure {
             height: output.height(),
             gain,
         };
-        self.0.dispatch(encoder, &params.bytes(), &[input], output)
+        self.0
+            .dispatch(encoder, &params.bytes(), &[input], output.size(), output)
     }
 }
 
 /// Over's pipeline on one device.
 #[derive(Debug)]
-pub(crate) struct Over(Pointwise);
+pub(crate) struct Over(Pipeline);
 
 impl Over {
     pub(crate) fn new(device: &wgpu::Device) -> Over {
         let params_size = size_of::<OverParams>() as u64;
-        Over(Pointwise::new(device, "over", OVER_ENTRY, 3, params_size))
+        Over(Pipeline::new(device, "over", OVER_ENTRY, 3, params_size))
     }
 
     /// Records one plane of `layer` over the same plane of `background`, with the layer's
@@ -232,7 +235,48 @@ impl Over {
             height: output.height(),
         };
         let inputs = [background, layer, alpha];
-        self.0.dispatch(encoder, &params.bytes(), &inputs, output)
+        self.0
+            .dispatch(encoder, &params.bytes(), &inputs, output.size(), output)
+    }
+}
+
+/// Blur's box pass on one device: one pass along one axis. Running the three passes along
+/// each axis, through planes a pass both reads and writes, is the GPU step's.
+#[derive(Debug)]
+pub(crate) struct Blur(Pipeline);
+
+impl Blur {
+    pub(crate) fn new(device: &wgpu::Device) -> Blur {
+        let params_size = size_of::<BoxPassParams>() as u64;
+        Blur(Pipeline::new(
+            device,
+            "box pass",
+            BOX_PASS_ENTRY,
+            1,
+            params_size,
+        ))
+    }
+
+    /// Records one box pass of `pass` along `axis` over `input` into `output`, which is `2
+    /// tmax` texels longer along the axis, into the encoder. An output no longer than that
+    /// has no input it could come from and is refused as a size mismatch.
+    pub(crate) fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: BoxPass,
+        axis: Axis,
+        input: &wgpu::Texture,
+        output: &wgpu::Texture,
+    ) -> Result<(), PlaneError> {
+        let params = BoxPassParams::new(pass, axis, output.width(), output.height());
+        let mut inputs_size = output.size();
+        let shorter = match axis {
+            Axis::Rows => &mut inputs_size.width,
+            Axis::Columns => &mut inputs_size.height,
+        };
+        *shorter = shorter.saturating_sub(2 * pass.tmax());
+        self.0
+            .dispatch(encoder, &params.bytes(), &[input], inputs_size, output)
     }
 }
 
@@ -274,10 +318,10 @@ pub(crate) enum PlaneError {
         role: Role,
         missing: wgpu::TextureUsages,
     },
-    /// The output is not an input's size.
+    /// An input is not the size the output needs.
     Size {
         input: wgpu::Extent3d,
-        output: wgpu::Extent3d,
+        needed: wgpu::Extent3d,
     },
 }
 
@@ -290,10 +334,10 @@ impl fmt::Display for PlaneError {
             PlaneError::Usage { role, missing } => {
                 write!(f, "the {role:?} plane was made without {missing:?}")
             }
-            PlaneError::Size { input, output } => write!(
+            PlaneError::Size { input, needed } => write!(
                 f,
-                "the output plane is {} by {}, the input {} by {}",
-                output.width, output.height, input.width, input.height
+                "the input plane is {} by {}, not the {} by {} the output needs",
+                input.width, input.height, needed.width, needed.height
             ),
         }
     }
@@ -453,6 +497,7 @@ mod tests {
         let device = noop_device(None);
         Exposure::new(&device);
         Over::new(&device);
+        Blur::new(&device);
     }
 
     #[test]
@@ -497,8 +542,30 @@ mod tests {
             exposure.dispatch(&mut encoder, &input, &smaller, 1.0),
             Err(PlaneError::Size {
                 input: input.size(),
-                output: smaller.size(),
+                needed: smaller.size(),
             })
+        );
+
+        // A box pass of one tap each side along rows needs an input two texels narrower.
+        let blur = Blur::new(&device);
+        let pass = BoxPass::new(3.0);
+        let result = blur.dispatch(&mut encoder, pass, Axis::Rows, &input, &output);
+        assert_eq!(
+            result,
+            Err(PlaneError::Size {
+                input: input.size(),
+                needed: headless::plane(&device, 2, 4, readable).size(),
+            })
+        );
+        let narrower = headless::plane(&device, 2, 4, readable);
+        assert_eq!(
+            blur.dispatch(&mut encoder, pass, Axis::Rows, &narrower, &output),
+            Ok(())
+        );
+        let shorter = headless::plane(&device, 4, 2, readable);
+        assert_eq!(
+            blur.dispatch(&mut encoder, pass, Axis::Columns, &shorter, &output),
+            Ok(())
         );
     }
 
@@ -653,5 +720,129 @@ mod tests {
             }
         }
         println!("over on the GPU: at worst {worst} ULP from the CPU");
+    }
+
+    /// A plane for the box pass: values of both signs over sixty stops on every texel but five
+    /// of the first row, which hold the non-finite classes and two spikes near the largest
+    /// magnitude, so that the widest pass still leaves most lines finite, and bounded by their
+    /// own magnitudes rather than a spike's.
+    fn blur_texels(count: usize) -> Vec<f32> {
+        const FINITE: [f32; 10] = [
+            0.0, -0.0, 1.0, -1.0, 1.0e-30, 65504.0, 2.0e-20, -7.5, 0.25, 1.0e6,
+        ];
+        (0..count)
+            .map(|i| match i {
+                1 => f32::NAN,
+                5 => f32::INFINITY,
+                9 => f32::NEG_INFINITY,
+                13 => 3.0e38,
+                17 => -3.0e38,
+                _ if i % 2 == 0 => FINITE[(i / 2) % FINITE.len()],
+                _ => {
+                    let magnitude = ((i % 800) as f32 * 0.0731 - 30.0).exp2();
+                    if i % 4 == 1 { magnitude } else { -magnitude }
+                }
+            })
+            .collect()
+    }
+
+    /// The direct sum of one pass summed in f64 at output `position` along a line of `length`
+    /// input texels read through `sample`, and the same sum over the magnitudes.
+    fn box_reference(
+        pass: BoxPass,
+        weights: &[f32],
+        position: usize,
+        length: usize,
+        sample: impl Fn(usize) -> f32,
+    ) -> (f64, f64) {
+        let t = pass.tmax() as usize;
+        let (mut sum, mut magnitude) = (0.0, 0.0);
+        // Input texel `i` is `|i + t - position|` taps from the window's centre.
+        for i in position.saturating_sub(2 * t)..(position + 1).min(length) {
+            let weight = f64::from(weights[(i + t).abs_diff(position)]);
+            let v = f64::from(sample(i));
+            sum += weight * v;
+            magnitude += weight * v.abs();
+        }
+        (sum, magnitude)
+    }
+
+    /// The GPU's K for a box pass: under three times the 96 that the RTX 4070 Ti SUPER and
+    /// llvmpipe needed, so that a change in how the shader sums shows here. The test prints
+    /// the factor the adapter needed.
+    const BOX_PASS_K: f64 = 256.0;
+
+    /// One box pass on the GPU, along each axis, against the definition's f64 sum, within
+    /// `BOX_PASS_K` times 2⁻²⁴ of the sum over the magnitudes plus one `MIN_POSITIVE`, at sizes
+    /// from one tap each side to the limit, over the usual planes and a line longer than the
+    /// widest window; non-finite results agree by class.
+    #[test]
+    fn a_box_pass_on_the_gpu_is_within_its_bound_of_the_direct_sum() {
+        let (device, queue) = headless::device();
+        let blur = Blur::new(&device);
+        let mut worst: f64 = 0.0;
+        for size in [2.0, 3.0, 10.0, 31.4, 100.0, 1000.0, 4096.0] {
+            let pass = BoxPass::new(size);
+            let t = pass.tmax();
+            let weights: Vec<f32> = pass.weights().collect();
+            for axis in [Axis::Rows, Axis::Columns] {
+                let long_line = match axis {
+                    Axis::Rows => (2800, 2),
+                    Axis::Columns => (2, 2800),
+                };
+                for (width, height) in SIZES.into_iter().chain([long_line]) {
+                    let texels = blur_texels((width * height) as usize);
+                    let input = headless::upload(&device, &queue, width, height, &texels);
+                    let (out_width, out_height) = match axis {
+                        Axis::Rows => (width + 2 * t, height),
+                        Axis::Columns => (width, height + 2 * t),
+                    };
+                    let output = headless::output(&device, out_width, out_height);
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    blur.dispatch(&mut encoder, pass, axis, &input, &output)
+                        .expect("an input shorter by the taps");
+                    queue.submit([encoder.finish()]);
+                    let result = headless::readback(&device, &queue, &output);
+                    assert_eq!(result.len(), (out_width * out_height) as usize);
+                    for (i, &actual) in result.iter().enumerate() {
+                        let (x, y) = (i % out_width as usize, i / out_width as usize);
+                        let (expected, magnitude) = match axis {
+                            Axis::Rows => box_reference(pass, &weights, x, width as usize, |i| {
+                                texels[y * width as usize + i]
+                            }),
+                            Axis::Columns => {
+                                box_reference(pass, &weights, y, height as usize, |i| {
+                                    texels[i * width as usize + x]
+                                })
+                            }
+                        };
+                        let what = || {
+                            format!(
+                                "size {size} along {axis:?} of {width}x{height} at ({x}, {y}) gave {actual:?}, not {expected:?}"
+                            )
+                        };
+                        if !expected.is_finite() {
+                            assert_eq!(ulp_distance(actual, expected as f32), 0, "{}", what());
+                            continue;
+                        }
+                        let difference = (f64::from(actual) - expected).abs();
+                        let unit = magnitude * f64::from(f32::EPSILON) / 2.0;
+                        assert!(
+                            difference <= BOX_PASS_K * unit + f64::from(f32::MIN_POSITIVE),
+                            "{}, with {magnitude} summed",
+                            what()
+                        );
+                        if unit > 0.0 {
+                            let needed = (difference - f64::from(f32::MIN_POSITIVE)) / unit;
+                            worst = worst.max(needed);
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "box pass on the GPU: K {} at most, under {BOX_PASS_K}",
+            worst.ceil()
+        );
     }
 }

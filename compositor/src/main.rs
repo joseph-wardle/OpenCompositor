@@ -65,7 +65,7 @@ enum Check {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge]]"
+        "usage: opencompositor [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur]]"
     );
     std::process::exit(2)
 }
@@ -357,7 +357,11 @@ pub fn perform(request: Request) {
 fn receive(notice: Notice) {
     let lost = matches!(notice, Notice::DeviceLost(_));
     let evaluated = match &notice {
-        Notice::Evaluated(evaluated) => Some((evaluated.request(), evaluated.timing)),
+        Notice::Evaluated(evaluated) => Some((
+            evaluated.request(),
+            evaluated.timing,
+            evaluated.data_window(),
+        )),
         Notice::DeviceLost(_) => None,
     };
     let started = Instant::now();
@@ -365,8 +369,8 @@ fn receive(notice: Notice) {
     if lost {
         lifecycle::retirement_took(started.elapsed());
     }
-    if let Some((request, timing)) = evaluated {
-        drag::delivered(request, timing, started);
+    if let Some((request, timing, window)) = evaluated {
+        drag::delivered(request, timing, window, started);
     }
 }
 

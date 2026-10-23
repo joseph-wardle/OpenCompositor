@@ -1,7 +1,10 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use open_ng::Point;
+use opencompositor_kernels::BoxPass;
 
 use super::*;
-use crate::document::{Assignment, ReaderVersion};
+use crate::document::{Assignment, BlurVersion, ReaderVersion};
 use crate::fixtures::{self, directory};
 use crate::image::{Channel, Warning, Window};
 use crate::parameter::Value;
@@ -69,6 +72,19 @@ fn merge(mix: Option<f64>) -> Node {
     node
 }
 
+fn blur(size: Option<f64>) -> Node {
+    let mut node = Node::new(
+        NodeKind::Blur {
+            version: BlurVersion::V1,
+        },
+        ORIGIN,
+    );
+    if let Some(size) = size {
+        node.set_value("size", Value::Float(size)).unwrap();
+    }
+    node
+}
+
 /// A document of these nodes, with IDs from 1, and these wires, each a consumer, its input and
 /// the source.
 fn graph(
@@ -119,7 +135,7 @@ fn key(document: &Document, id: u64) -> ResultKey {
 }
 
 /// An image of these planes over `width` × `height`, as a reader would make it.
-fn image(width: u32, height: u32, planes: [Arc<[f32]>; 4]) -> Image {
+fn image(width: u32, height: u32, planes: [Plane; 4]) -> Image {
     let window = Window {
         x: 0,
         y: 0,
@@ -147,7 +163,7 @@ fn flat(display: Window, data: Window, values: [f32; 4], warnings: Vec<Warning>)
 }
 
 /// `len` finite values of both signs, from tiny to huge, different for each `seed`.
-fn finite_plane(len: usize, seed: u32) -> Arc<[f32]> {
+fn finite_plane(len: usize, seed: u32) -> Plane {
     let mut state = seed.wrapping_mul(2_654_435_761) | 1;
     (0..len)
         .map(|_| {
@@ -244,6 +260,19 @@ fn run(evaluator: &mut Evaluator, key: &ResultKey) -> Result<Image, EvalError> {
     evaluator.evaluate(key, || false).expect("nothing stops it")
 }
 
+impl Evaluator {
+    /// One node computed from given images, with nothing stopping it.
+    fn compute_unstopped(
+        &self,
+        key: &ResultKey,
+        inputs: &[&Image],
+        released: &mut Vec<Plane>,
+    ) -> Result<Image, EvalError> {
+        self.compute(key, inputs, released, &|| false)
+            .map(|image| image.expect("nothing stops it"))
+    }
+}
+
 fn red(image: &Image) -> f32 {
     image.value(Channel::R, 0, 0)
 }
@@ -268,7 +297,7 @@ fn exposure_scales_colour_and_shares_alpha() {
         let expected: Vec<f32> = read.plane(channel).iter().map(|v| v * 0.25).collect();
         assert_eq!(**exposed.plane(channel), *expected);
     }
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         read.plane(Channel::A),
         exposed.plane(Channel::A)
     ));
@@ -284,11 +313,11 @@ fn exposure_keeps_a_grey_image_one_plane() {
 
     let image = run(&mut evaluator, &exposed).unwrap();
 
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         image.plane(Channel::R),
         image.plane(Channel::G)
     ));
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         image.plane(Channel::R),
         image.plane(Channel::B)
     ));
@@ -369,14 +398,11 @@ fn stopping_keeps_what_was_completed() {
     write_png(&path, 255);
     let mut evaluator = Evaluator::new();
     let [exposed, _] = exposure_keys(&path, [1.0, 1.0]);
-    let asked = std::cell::Cell::new(0);
-    let stop = || {
-        asked.set(asked.get() + 1);
-        asked.get() > 1
-    };
+    let asked = AtomicUsize::new(0);
+    let stop = || asked.fetch_add(1, Ordering::Relaxed) + 1 > 1;
 
     assert!(evaluator.evaluate(&exposed, stop).is_none());
-    assert_eq!(asked.get(), 2);
+    assert_eq!(asked.load(Ordering::Relaxed), 2);
 
     write_png(&path, 0);
     assert_ne!(red(&run(&mut evaluator, &exposed).unwrap()), 0.0);
@@ -440,7 +466,7 @@ fn a_panicking_operation_fails_its_node() {
     let exposure = key(&chain([reader("a.png"), exposure(None)]), 2);
     let evaluator = Evaluator::new();
     let error = evaluator
-        .compute(&exposure, &[], &mut Vec::new())
+        .compute_unstopped(&exposure, &[], &mut Vec::new())
         .unwrap_err();
     assert!(matches!(error, EvalError::Panicked { origin } if origin == exposure));
 }
@@ -461,11 +487,11 @@ fn exposure_on_the_pool_writes_every_sample_as_the_shared_function_does() {
                 height,
                 [1, 2, 3, 4].map(|c| finite_plane(len, c * 64 + width)),
             );
-            let nans = || -> Arc<[f32]> { std::iter::repeat_n(f32::NAN, len).collect() };
+            let nans = || -> Plane { std::iter::repeat_n(f32::NAN, len).collect() };
             let mut released = vec![nans(), nans(), nans()];
 
             let output = evaluator
-                .compute(&exposure, &[&input], &mut released)
+                .compute_unstopped(&exposure, &[&input], &mut released)
                 .unwrap();
 
             for channel in [Channel::R, Channel::G, Channel::B] {
@@ -483,7 +509,7 @@ fn exposure_on_the_pool_writes_every_sample_as_the_shared_function_does() {
                 released.is_empty(),
                 "{width}x{height} left a released plane unused"
             );
-            assert!(Arc::ptr_eq(
+            assert!(Plane::ptr_eq(
                 output.plane(Channel::A),
                 input.plane(Channel::A)
             ));
@@ -501,20 +527,20 @@ fn exposure_never_writes_its_input_even_where_alpha_is_a_colour_plane() {
     let exposure = key(&chain([reader("a.png"), exposure(Some(2.0))]), 2);
 
     let output = evaluator
-        .compute(&exposure, &[&input], &mut Vec::new())
+        .compute_unstopped(&exposure, &[&input], &mut Vec::new())
         .unwrap();
 
-    assert!(Arc::ptr_eq(output.plane(Channel::A), &plane));
+    assert!(Plane::ptr_eq(output.plane(Channel::A), &plane));
     assert_eq!(
         plane.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
         before
     );
-    assert!(!Arc::ptr_eq(output.plane(Channel::R), &plane));
-    assert!(Arc::ptr_eq(
+    assert!(!Plane::ptr_eq(output.plane(Channel::R), &plane));
+    assert!(Plane::ptr_eq(
         output.plane(Channel::R),
         output.plane(Channel::G)
     ));
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         output.plane(Channel::R),
         output.plane(Channel::B)
     ));
@@ -524,7 +550,7 @@ fn exposure_never_writes_its_input_even_where_alpha_is_a_colour_plane() {
 /// The addresses of the R, G and B planes.
 fn colour_addresses(image: &Image) -> BTreeSet<usize> {
     [Channel::R, Channel::G, Channel::B]
-        .map(|channel| plane_address(image.plane(channel)))
+        .map(|channel| image.plane(channel).address())
         .into()
 }
 
@@ -653,7 +679,7 @@ fn merge_composes_offset_layers_over_the_base_within_their_union() {
     );
 
     let full = evaluator
-        .compute(&merge_key(1.0), &[&base, &layer], &mut Vec::new())
+        .compute_unstopped(&merge_key(1.0), &[&base, &layer], &mut Vec::new())
         .unwrap();
 
     assert_eq!(full.display_window(), base.display_window());
@@ -668,7 +694,7 @@ fn merge_composes_offset_layers_over_the_base_within_their_union() {
     );
 
     let half = evaluator
-        .compute(&merge_key(0.5), &[&base, &layer], &mut Vec::new())
+        .compute_unstopped(&merge_key(0.5), &[&base, &layer], &mut Vec::new())
         .unwrap();
 
     assert_eq!(values(&half, 0, 0), [1.0, 0.5, 0.25, 1.0]);
@@ -678,7 +704,7 @@ fn merge_composes_offset_layers_over_the_base_within_their_union() {
 
     // One file by two branches warns once.
     let diamond = evaluator
-        .compute(&merge_key(1.0), &[&layer, &base, &layer], &mut Vec::new())
+        .compute_unstopped(&merge_key(1.0), &[&layer, &base, &layer], &mut Vec::new())
         .unwrap();
     assert_eq!(
         diamond.warnings(),
@@ -705,22 +731,22 @@ fn a_base_alone_or_mix_zero_is_the_base_shared_and_nothing_connected_is_empty() 
         assert_eq!(image.data_window(), base.data_window());
         assert_eq!(image.display_window(), base.display_window());
         for channel in Channel::ALL {
-            assert!(Arc::ptr_eq(image.plane(channel), base.plane(channel)));
+            assert!(Plane::ptr_eq(image.plane(channel), base.plane(channel)));
         }
     };
 
     let alone = evaluator
-        .compute(&merge_key(1.0), &[&base], &mut Vec::new())
+        .compute_unstopped(&merge_key(1.0), &[&base], &mut Vec::new())
         .unwrap();
     shares_base(&alone);
     let zero = evaluator
-        .compute(&merge_key(0.0), &[&base, &layer], &mut Vec::new())
+        .compute_unstopped(&merge_key(0.0), &[&base, &layer], &mut Vec::new())
         .unwrap();
     shares_base(&zero);
 
     let unconnected = key(&graph([merge(None)], &[]), 1);
     let empty = evaluator
-        .compute(&unconnected, &[], &mut Vec::new())
+        .compute_unstopped(&unconnected, &[], &mut Vec::new())
         .unwrap();
     assert!(empty.data_window().is_empty());
     assert!(empty.display_window().is_empty());
@@ -736,7 +762,7 @@ fn mix_is_special_cased_as_the_kernel_receives_it() {
     let layer = flat(one, one, [0.5, 0.5, 0.5, 0.5], Vec::new());
     let compute = |mix| {
         evaluator
-            .compute(&merge_key(mix), &[&base, &layer], &mut Vec::new())
+            .compute_unstopped(&merge_key(mix), &[&base, &layer], &mut Vec::new())
             .unwrap()
     };
 
@@ -747,7 +773,7 @@ fn mix_is_special_cased_as_the_kernel_receives_it() {
         "the stack as composed, not dissolved against the base"
     );
     let nearly_zero = compute(1e-50);
-    assert!(Arc::ptr_eq(
+    assert!(Plane::ptr_eq(
         nearly_zero.plane(Channel::R),
         base.plane(Channel::R)
     ));
@@ -773,11 +799,11 @@ fn merge_on_the_pool_writes_every_sample_as_the_shared_functions_do() {
             let layer = make(1, 1, 1000);
             let union = window(0, 0, width + 1, height + 1);
             let nans =
-                || -> Arc<[f32]> { std::iter::repeat_n(f32::NAN, union.area() as usize).collect() };
+                || -> Plane { std::iter::repeat_n(f32::NAN, union.area() as usize).collect() };
             let mut released = vec![nans(), nans(), nans(), nans()];
 
             let output = evaluator
-                .compute(&mix, &[&base, &layer], &mut released)
+                .compute_unstopped(&mix, &[&base, &layer], &mut released)
                 .unwrap();
 
             assert_eq!(output.data_window(), union);
@@ -812,7 +838,7 @@ fn a_merge_too_large_for_an_image_or_the_cap_fails_before_allocating() {
     let pixel = |x, y| flat(window(0, 0, 1, 1), window(x, y, 1, 1), [1.0; 4], Vec::new());
 
     let far_apart = evaluator
-        .compute(
+        .compute_unstopped(
             &key,
             &[&pixel(i32::MIN, 0), &pixel(i32::MAX, 0)],
             &mut Vec::new(),
@@ -820,7 +846,8 @@ fn a_merge_too_large_for_an_image_or_the_cap_fails_before_allocating() {
         .unwrap_err();
     assert!(
         matches!(&far_apart, EvalError::Oversize { origin, oversize }
-            if *origin == key && *oversize == Oversize { width: 1 << 32, height: 1 }),
+            if *origin == key
+                && *oversize == Oversize { x: i64::from(i32::MIN), y: 0, width: 1 << 32, height: 1 }),
         "{far_apart:?}"
     );
     assert_eq!(
@@ -829,7 +856,7 @@ fn a_merge_too_large_for_an_image_or_the_cap_fails_before_allocating() {
     );
 
     let over_cap = evaluator
-        .compute(&key, &[&pixel(0, 0), &pixel(20000, 20000)], &mut Vec::new())
+        .compute_unstopped(&key, &[&pixel(0, 0), &pixel(20000, 20000)], &mut Vec::new())
         .unwrap_err();
     let bytes = 20001 * 20001 * 16;
     assert!(
@@ -839,19 +866,20 @@ fn a_merge_too_large_for_an_image_or_the_cap_fails_before_allocating() {
     );
     assert_eq!(
         over_cap.to_string(),
-        "Merge: needs 6104 MiB of planes for a 20001 × 20001 data window, over the 1024 MiB limit"
+        "Merge: needs 6104 MiB of memory for a 20001 × 20001 data window, over the 1024 MiB limit"
     );
 }
 
 /// The addresses of every plane.
 fn plane_addresses(image: &Image) -> BTreeSet<usize> {
-    image.planes().iter().map(plane_address).collect()
+    image.planes().iter().map(Plane::address).collect()
 }
 
-/// One Reader through two Exposures into a Merge. Editing the layer's Exposure recomputes it and
-/// the Merge, nothing else: the file is not read again, the background's planes stay where they
-/// are, and the new results take the released planes of the old. Viewing the background then
-/// returns it retained and releases the rest.
+/// One Reader through two branches into a Merge, an Exposure as the background and an Exposure
+/// then a Blur as the layer. Editing the layer's Exposure recomputes it, the Blur and the Merge,
+/// nothing else: the file is not read again, the background's planes stay where they are, and
+/// the new results take the released planes of the old. Viewing the background then returns it
+/// retained and releases the rest.
 #[test]
 fn editing_one_branch_of_a_diamond_recomputes_only_that_branch_and_reuses_its_planes() {
     let path = directory("diamond").join("image.png");
@@ -863,15 +891,24 @@ fn editing_one_branch_of_a_diamond_recomputes_only_that_branch_and_reuses_its_pl
                 exposure(Some(1.0)),
                 exposure(Some(stops)),
                 merge(Some(0.5)),
+                blur(Some(2.0)),
             ],
             &[
                 (2, "source".into(), 1),
                 (3, "source".into(), 1),
+                (5, "source".into(), 3),
                 (4, "background".into(), 2),
-                (4, ("layer", 1).into(), 3),
+                (4, ("layer", 1).into(), 5),
             ],
         )
     };
+    // The layer's value and alpha at the origin are those of its 2 × 1 source, scaled by the
+    // blur's mass over its two pixels; over the opaque base and dissolved by half, the red is
+    // the base's 2 plus that mass times half the layer's excess over it.
+    let kernel = composed(BoxPass::new(2.0));
+    let reach = kernel.len() / 2;
+    let mass = (kernel[reach] + kernel[reach + 1]) * kernel[reach];
+    let red_at = |layer_red: f64| (2.0 + mass * (layer_red - 2.0) / 2.0) as f32;
     let mut evaluator = Evaluator::new();
     let retained = |evaluator: &Evaluator, key: &ResultKey| -> Image {
         (evaluator.retained.iter())
@@ -882,25 +919,37 @@ fn editing_one_branch_of_a_diamond_recomputes_only_that_branch_and_reuses_its_pl
     };
 
     let first = run(&mut evaluator, &key(&diamond(2.0), 4)).unwrap();
-    assert_eq!(red(&first), 3.0);
-    assert_eq!(evaluator.retained.len(), 4);
+    assert!((red(&first) - red_at(4.0)).abs() < 1e-5, "{}", red(&first));
+    assert_eq!(evaluator.retained.len(), 5);
     let background = plane_addresses(&retained(&evaluator, &key(&diamond(2.0), 2)));
     let mut old = colour_addresses(&retained(&evaluator, &key(&diamond(2.0), 3)));
+    old.extend(plane_addresses(&retained(
+        &evaluator,
+        &key(&diamond(2.0), 5),
+    )));
     old.extend(plane_addresses(&first));
-    assert_eq!(old.len(), 7);
+    assert_eq!(old.len(), 11);
     drop(first);
 
     // A re-read would see black.
     write_png(&path, 0);
     let second = run(&mut evaluator, &key(&diamond(3.0), 4)).unwrap();
 
-    assert_eq!(red(&second), 5.0);
-    assert_eq!(evaluator.retained.len(), 4);
+    assert!(
+        (red(&second) - red_at(8.0)).abs() < 1e-5,
+        "{}",
+        red(&second)
+    );
+    assert_eq!(evaluator.retained.len(), 5);
     assert_eq!(
         plane_addresses(&retained(&evaluator, &key(&diamond(3.0), 2))),
         background
     );
     let mut new = colour_addresses(&retained(&evaluator, &key(&diamond(3.0), 3)));
+    new.extend(plane_addresses(&retained(
+        &evaluator,
+        &key(&diamond(3.0), 5),
+    )));
     new.extend(plane_addresses(&second));
     assert_eq!(new, old);
 
@@ -908,4 +957,358 @@ fn editing_one_branch_of_a_diamond_recomputes_only_that_branch_and_reuses_its_pl
     assert_eq!(red(&viewed), 2.0);
     assert_eq!(plane_addresses(&viewed), background);
     assert_eq!(evaluator.retained.len(), 2);
+}
+
+#[test]
+fn blur_keys_name_the_size_and_the_source() {
+    let blurred = |size| graph([reader("a.exr"), blur(size)], &[(2, "source".into(), 1)]);
+    assert_eq!(key(&blurred(None), 2), key(&blurred(Some(0.0)), 2));
+    assert_ne!(key(&blurred(Some(1.0)), 2), key(&blurred(Some(2.0)), 2));
+    assert_ne!(key(&blurred(Some(1.0)), 2), key(&blurred(None), 2));
+    let unconnected = graph([reader("a.exr"), blur(Some(1.0))], &[]);
+    assert_ne!(key(&unconnected, 2), key(&blurred(Some(1.0)), 2));
+    assert_ne!(key(&unconnected, 2), key(&unconnected, 1));
+}
+
+/// The key of a Blur of a Reader at `size`, for computing from a given image.
+fn blur_key(size: f64) -> ResultKey {
+    let document = graph(
+        [reader("a.png"), blur(Some(size))],
+        &[(2, "source".into(), 1)],
+    );
+    key(&document, 2)
+}
+
+/// Blur's one-dimensional kernel along either axis: the three passes' weights convolved
+/// together, `2 reach + 1` long, in f64.
+fn composed(pass: BoxPass) -> Vec<f64> {
+    let t = pass.tmax() as usize;
+    let weights: Vec<f64> = pass.weights().map(f64::from).collect();
+    let line: Vec<f64> = (0..=2 * t).map(|i| weights[i.abs_diff(t)]).collect();
+    let mut kernel = vec![1.0];
+    for _ in 0..BoxPass::PASSES {
+        let mut next = vec![0.0; kernel.len() + line.len() - 1];
+        for (i, k) in kernel.iter().enumerate() {
+            for (j, l) in line.iter().enumerate() {
+                next[i + j] += k * l;
+            }
+        }
+        kernel = next;
+    }
+    kernel
+}
+
+/// What Blur's definition gives at a pixel: the composed two-dimensional kernel, the outer
+/// product of [`composed`] with itself, summed explicitly in f64 over the source, transparent
+/// black beyond its data window, and the same sum over the source's magnitudes, which bounds
+/// the error of any computation that rounds its intermediates.
+fn blur_reference(kernel: &[f64], source: &Image, channel: Channel, x: i32, y: i32) -> (f64, f64) {
+    let reach = (kernel.len() / 2) as i32;
+    let (mut result, mut magnitude) = (0.0, 0.0);
+    for (j, kj) in kernel.iter().enumerate() {
+        for (i, ki) in kernel.iter().enumerate() {
+            let value =
+                f64::from(source.value(channel, x + i as i32 - reach, y + j as i32 - reach));
+            let weight = ki * kj;
+            result += weight * value;
+            magnitude += weight * value.abs();
+        }
+    }
+    (result, magnitude)
+}
+
+/// Blur's CPU K: six f32 roundings, one per pass, each within half a unit of its result's
+/// magnitude, and the rest of the arithmetic in f64.
+const BLUR_K: f64 = 8.0;
+
+/// Every output of a Blur against its definition: a non-finite result by IEEE class, and a
+/// finite one within K units of 2⁻²⁴ times the same blur of the source's magnitudes, plus one
+/// `MIN_POSITIVE` for a flushed intermediate.
+fn assert_blur_matches_the_definition(pass: BoxPass, source: &Image, output: &Image, what: &str) {
+    let kernel = composed(pass);
+    assert_eq!(
+        output.data_window(),
+        source.data_window().grow(pass.reach()).unwrap()
+    );
+    let window = output.data_window();
+    for channel in Channel::ALL {
+        for y in window.y..window.y + window.height as i32 {
+            for x in window.x..window.x + window.width as i32 {
+                let actual = output.value(channel, x, y);
+                let (expected, magnitude) = blur_reference(&kernel, source, channel, x, y);
+                let place = format!("{what} {channel:?} at ({x}, {y}): {actual} for {expected}");
+                if expected.is_nan() || actual.is_nan() {
+                    assert!(expected.is_nan() && actual.is_nan(), "{place}");
+                } else if expected.is_infinite() || actual.is_infinite() {
+                    assert!(f64::from(actual) == expected, "{place}");
+                } else {
+                    let bound = BLUR_K * magnitude * 2f64.powi(-24) + f64::from(f32::MIN_POSITIVE);
+                    assert!(
+                        (f64::from(actual) - expected).abs() <= bound,
+                        "{place}, off by {} against {bound}",
+                        (f64::from(actual) - expected).abs()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A source over a data window away from the origin, with a display window of its own and a
+/// warning: finite values of both signs over all magnitudes in every plane, then, where the
+/// plane has the room, a spike at f32's limit with its negation beside it and a lesser one in
+/// G, an infinity of each sign in B, and a NaN in A.
+fn blur_source(width: u32, height: u32) -> Image {
+    let len = (width * height) as usize;
+    let mut planes: [Vec<f32>; 4] =
+        [1, 2, 3, 4].map(|c| finite_plane(len, c * 64 + width + height).to_vec());
+    let mut put = |plane: usize, at: usize, value: f32| {
+        if at < len {
+            planes[plane][at] = value;
+        }
+    };
+    put(1, len / 3, 3.0e38);
+    put(1, len / 3 + 1, -3.0e38);
+    put(1, len / 2, 1.0e30);
+    put(2, len / 8, f32::INFINITY);
+    put(2, 2 * len / 3, f32::NEG_INFINITY);
+    put(3, len / 4, f32::NAN);
+    Image::new(
+        window(0, 0, 8, 8),
+        window(-3, 5, width, height),
+        planes.map(Plane::from),
+        vec![Warning::IccProfile],
+    )
+}
+
+/// Blur through the pool's row chunks and column bands, at sizes with the direct and the block
+/// sums along rows and shapes on both sides of a chunk and a band: every output is the
+/// definition's within Blur's bound, with its classes, and every one is written, since the
+/// outputs and the scratch plane start as NaN. The display window and the warnings stay the
+/// source's.
+#[test]
+fn blur_on_the_pool_matches_the_composed_kernel_and_writes_every_sample() {
+    let evaluator = Evaluator::new();
+    for &(width, height) in &[(1, 1), (16, 16), (17, 17), (33, 9), (9, 33)] {
+        let source = blur_source(width, height);
+        for size in [1.6, 3.0, 10.0, 19.6, 22.5] {
+            let pass = BoxPass::new(size);
+            let reach = pass.reach();
+            let grown = source.data_window().grow(reach).unwrap();
+            let scratch_len = ((width + 2 * reach) * height) as usize;
+            let nans = |len: usize| -> Plane { std::iter::repeat_n(f32::NAN, len).collect() };
+            let mut released: Vec<Plane> = (0..4)
+                .map(|_| nans(grown.area() as usize))
+                .chain([nans(scratch_len)])
+                .collect();
+
+            let output = evaluator
+                .compute_unstopped(&blur_key(size), &[&source], &mut released)
+                .unwrap();
+
+            let what = format!("{width}x{height} at size {size}");
+            assert_blur_matches_the_definition(pass, &source, &output, &what);
+            assert_eq!(output.display_window(), source.display_window());
+            assert_eq!(output.warnings(), source.warnings());
+            // The scratch plane came back, and nothing else was left.
+            assert_eq!(released.len(), 1, "{what}");
+            assert_eq!(released[0].len(), scratch_len, "{what}");
+        }
+    }
+}
+
+/// Dragging Blur's Size grows its window a little every few units. Its first output planes have
+/// a quarter to spare and serve the drag up and back down, each edit taking the planes the last
+/// one released: the scratch plane, taken after the outputs, never takes one of them.
+#[test]
+fn dragging_blur_size_reuses_its_first_output_planes() {
+    let evaluator = Evaluator::new();
+    let source = blur_source(90, 160);
+    let addresses = |image: &Image| image.planes().each_ref().map(Plane::address);
+    let mut previous = evaluator
+        .compute_unstopped(&blur_key(10.0), &[&source], &mut Vec::new())
+        .unwrap();
+    let first = addresses(&previous);
+    for size in [10.5, 11.0, 12.5, 14.0, 13.0, 11.5, 10.0] {
+        let (_, planes) = previous.into_parts();
+        let mut released = Vec::from(planes);
+        let image = evaluator
+            .compute_unstopped(&blur_key(size), &[&source], &mut released)
+            .unwrap();
+        let mut reused = addresses(&image);
+        reused.sort_unstable();
+        let mut expected = first;
+        expected.sort_unstable();
+        assert_eq!(reused, expected, "at size {size}");
+        previous = image;
+    }
+}
+
+#[test]
+fn a_blur_whose_reach_is_zero_shares_its_source_and_takes_no_planes() {
+    let evaluator = Evaluator::new();
+    let source = blur_source(5, 4);
+    for size in [0.0, 1.0, 1.5] {
+        let mut released = vec![finite_plane(20, 1)];
+        let output = evaluator
+            .compute_unstopped(&blur_key(size), &[&source], &mut released)
+            .unwrap();
+        assert_eq!(output.data_window(), source.data_window());
+        for channel in Channel::ALL {
+            assert!(Plane::ptr_eq(output.plane(channel), source.plane(channel)));
+        }
+        assert_eq!(released.len(), 1);
+    }
+    let empty = evaluator
+        .compute_unstopped(&blur_key(10.0), &[&Image::empty()], &mut Vec::new())
+        .unwrap();
+    assert!(empty.data_window().is_empty());
+}
+
+#[test]
+fn blur_keeps_a_grey_image_one_plane() {
+    let evaluator = Evaluator::new();
+    let grey = finite_plane(12, 7);
+    let alpha = finite_plane(12, 8);
+    let source = image(4, 3, [grey.clone(), grey.clone(), grey, alpha]);
+
+    let output = evaluator
+        .compute_unstopped(&blur_key(3.0), &[&source], &mut Vec::new())
+        .unwrap();
+
+    assert!(Plane::ptr_eq(
+        output.plane(Channel::R),
+        output.plane(Channel::G)
+    ));
+    assert!(Plane::ptr_eq(
+        output.plane(Channel::R),
+        output.plane(Channel::B)
+    ));
+    assert!(!Plane::ptr_eq(
+        output.plane(Channel::R),
+        output.plane(Channel::A)
+    ));
+}
+
+#[test]
+fn a_blur_too_large_for_an_image_or_the_cap_fails_before_allocating() {
+    let evaluator = Evaluator::new();
+    let key = blur_key(4096.0);
+    let reach = BoxPass::new(4096.0).reach();
+    assert_eq!(reach, 4095);
+    let pixel = |x, y| flat(window(0, 0, 1, 1), window(x, y, 1, 1), [1.0; 4], Vec::new());
+
+    let at_the_edge = evaluator
+        .compute_unstopped(&key, &[&pixel(i32::MIN, 0)], &mut Vec::new())
+        .unwrap_err();
+    assert!(
+        matches!(&at_the_edge, EvalError::Oversize { origin, oversize }
+        if *origin == key
+            && *oversize == Oversize {
+                x: i64::from(i32::MIN) - 4095,
+                y: -4095,
+                width: 8191,
+                height: 8191
+            }),
+        "{at_the_edge:?}"
+    );
+    assert_eq!(
+        at_the_edge.to_string(),
+        "Blur: the data window would start at (-2147487743, -4095), beyond image coordinates"
+    );
+
+    let source = flat(
+        window(0, 0, 1, 1),
+        window(0, 0, 100, 100),
+        [1.0; 4],
+        Vec::new(),
+    );
+    let over_cap = evaluator
+        .compute_unstopped(&key, &[&source], &mut Vec::new())
+        .unwrap_err();
+    // The outputs with a quarter to spare, the scratch plane, and each thread's temporaries.
+    let len = 8290 * 8290;
+    let threads = evaluator.pool.threads() as u64;
+    let bytes = (len + len / 4) * 16
+        + 8290 * 100 * 4
+        + threads * blur::thread_scratch_bytes(BoxPass::new(4096.0), window(0, 0, 100, 100));
+    assert!(
+        matches!(&over_cap, EvalError::OverCap { origin, window, bytes: needed }
+            if *origin == key && *window == self::window(-4095, -4095, 8290, 8290) && *needed == bytes),
+        "{over_cap:?}"
+    );
+    assert_eq!(
+        over_cap.to_string(),
+        format!(
+            "Blur: needs {} MiB of memory for a 8290 × 8290 data window, over the 1024 MiB limit",
+            bytes >> 20
+        )
+    );
+}
+
+/// Blur asks before each chunk of rows and each band of columns, and once told to stop leaves
+/// the rest undone: the request gives nothing, and what was computed before it stays retained.
+#[test]
+fn a_stopped_blur_leaves_the_rest_undone() {
+    let evaluator = Evaluator::new();
+    let source = blur_source(40, 40);
+    let asked = AtomicUsize::new(0);
+    // The third ask stops it.
+    let stop = || asked.fetch_add(1, Ordering::Relaxed) >= 2;
+    let mut released = Vec::new();
+
+    let stopped = evaluator
+        .compute(&blur_key(3.0), &[&source], &mut released, &stop)
+        .unwrap();
+
+    assert!(stopped.is_none());
+    // Every chunk of the first plane's rows asked, and no band or later plane did.
+    assert_eq!(
+        asked.load(Ordering::Relaxed),
+        40_usize.div_ceil(cpu::BLUR_ROWS)
+    );
+    assert_eq!(released.len(), 1, "the scratch plane came back");
+
+    let path = directory("blur_stop").join("image.png");
+    write_png(&path, 255);
+    let document = graph([reader(&path), blur(Some(3.0))], &[(2, "source".into(), 1)]);
+    let mut evaluator = Evaluator::new();
+    let blurred = key(&document, 2);
+    // Asked before the Reader, before the Blur, and at its first chunk.
+    asked.store(0, Ordering::Relaxed);
+    assert!(evaluator.evaluate(&blurred, stop).is_none());
+    assert_eq!(asked.load(Ordering::Relaxed), 3);
+    assert_eq!(evaluator.retained.len(), 1);
+
+    // A re-read would see black.
+    write_png(&path, 0);
+    assert_ne!(red(&run(&mut evaluator, &blurred).unwrap()), 0.0);
+}
+
+/// The pool's column bands at every width across a band and a SIMD tail, into a plane of NaN:
+/// every sample is written by the band of its column, once.
+#[test]
+fn column_bands_write_every_sample_of_their_own_columns() {
+    let pool = Pool::new();
+    for height in [1, 3] {
+        for width in 1..=33 {
+            let mut plane = vec![f32::NAN; width * height];
+            pool.fill_columns(
+                &mut plane,
+                width,
+                16,
+                || (),
+                |(), _, mut band| {
+                    let columns = band.columns();
+                    for y in 0..height {
+                        let row: Vec<f32> =
+                            columns.clone().map(|x| (y * width + x) as f32).collect();
+                        band.write_row(y, &row);
+                    }
+                },
+            );
+            let expected: Vec<f32> = (0..width * height).map(|i| i as f32).collect();
+            assert_eq!(plane, expected, "{width}x{height}");
+        }
+    }
 }

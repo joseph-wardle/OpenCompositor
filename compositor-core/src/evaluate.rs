@@ -3,20 +3,23 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rayon::prelude::*;
 
 use crate::document::{
-    Document, ExposureVersion, InputSlot, MergeVersion, Node, NodeId, NodeKind, ReaderVersion,
+    BlurVersion, Document, ExposureVersion, InputSlot, MergeVersion, Node, NodeId, NodeKind,
+    ReaderVersion,
 };
-use crate::image::{Image, Oversize, Window, zeroed_plane};
+use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::{self, Level};
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image};
 
+pub(crate) mod blur;
 mod merge;
 
 /// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
@@ -100,6 +103,12 @@ enum Recipe {
         /// changes nothing, so which slots they occupy is not part of the key.
         layers: Vec<ResultKey>,
     },
+    Blur {
+        version: BlurVersion,
+        /// The resolved value's bits, as Exposure's `stops`.
+        size: u64,
+        source: Option<ResultKey>,
+    },
 }
 
 impl Recipe {
@@ -111,6 +120,7 @@ impl Recipe {
             Recipe::Merge {
                 background, layers, ..
             } => (background.as_ref(), layers),
+            Recipe::Blur { source, .. } => (source.as_ref(), &[]),
         };
         first.into_iter().chain(rest)
     }
@@ -150,6 +160,15 @@ impl Recipe {
                     .iter()
                     .map(|_| inputs.next().expect("one key per connected layer"))
                     .collect(),
+            },
+            Recipe::Blur {
+                version,
+                size,
+                source,
+            } => Recipe::Blur {
+                version: *version,
+                size: *size,
+                source: source.as_ref().and_then(|_| inputs.next()),
             },
         }
     }
@@ -208,8 +227,26 @@ impl Recipe {
                     && layers.len() == other_layers.len()
                     && (layers.iter().zip(other_layers)).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0))
             }
+            (
+                Recipe::Blur {
+                    version,
+                    size,
+                    source,
+                },
+                Recipe::Blur {
+                    version: other_version,
+                    size: other_size,
+                    source: other_source,
+                },
+            ) => version == other_version && size == other_size && same_input(source, other_source),
             // Listed by kind, so that a new kind cannot fall through as never equal.
-            (Recipe::Reader { .. } | Recipe::Exposure { .. } | Recipe::Merge { .. }, _) => false,
+            (
+                Recipe::Reader { .. }
+                | Recipe::Exposure { .. }
+                | Recipe::Merge { .. }
+                | Recipe::Blur { .. },
+                _,
+            ) => false,
         }
     }
 }
@@ -294,6 +331,14 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
                     .collect(),
             }
         }
+        NodeKind::Blur { version } => {
+            let size = resolve(node).float("size").expect("Blur has Size");
+            Recipe::Blur {
+                version: *version,
+                size: size.to_bits(),
+                source: input("source".into()),
+            }
+        }
     }
 }
 
@@ -304,9 +349,10 @@ pub(crate) const DEEP_STACK: usize = 64 << 20;
 /// The most bytes of planes an evaluator retains. Provisional, until a budget sets it.
 const RETAINED_BYTES_CAP: u64 = 4 << 30;
 
-/// The most bytes one node may allocate for its outputs and scratch, checked from its windows
-/// before anything is allocated: two layers far apart union to a data window of gigabytes, and
-/// an allocation that fails aborts the process. Provisional, until bounded-memory evaluation.
+/// The most bytes one node may allocate for its outputs, their spare storage and its scratch,
+/// each thread's included, checked from its windows before anything is allocated: two layers
+/// far apart union to a data window of gigabytes, and an allocation that fails aborts the
+/// process. Provisional, until bounded-memory evaluation.
 /// It bounds no total: a request's inputs, the retained results, the viewer's copy and the
 /// staging buffer coexist with it.
 const NODE_BYTES_CAP: u64 = 1 << 30;
@@ -366,18 +412,19 @@ impl Evaluator {
         }
     }
 
-    /// The image a key names, its failure, or `None` if `stop` returned true before it was done.
-    ///
-    /// `stop` is asked before each node is computed; nothing stops during an operation. Nodes
-    /// completed before stopping stay retained until the next request.
     pub(crate) fn pool(&self) -> &Pool {
         &self.pool
     }
 
+    /// The image a key names, its failure, or `None` if `stop` returned true before it was done.
+    ///
+    /// `stop` is asked before each node is computed, and by an operation long enough to matter
+    /// before each chunk of its work, from the pool's threads. Nodes completed before stopping
+    /// stay retained until the next request.
     pub fn evaluate(
         &mut self,
         key: &ResultKey,
-        stop: impl Fn() -> bool,
+        stop: impl Fn() -> bool + Sync,
     ) -> Option<Result<Image, EvalError>> {
         let steps = self.plan(key);
         // Planes for this request's outputs; whatever it does not take drops with it. Nothing is
@@ -413,8 +460,9 @@ impl Evaluator {
             let inputs: Vec<&Image> = (step.inputs.iter())
                 .map(|&input| images[input].as_ref().expect("inputs come first"))
                 .collect();
-            let image = match self.compute(&step.key, &inputs, &mut released) {
-                Ok(image) => image,
+            let image = match self.compute(&step.key, &inputs, &mut released, &stop) {
+                Ok(Some(image)) => image,
+                Ok(None) => return None,
                 Err(error) => return Some(Err(error)),
             };
             // Keeping a result only with its inputs means no retained result outlives what it was
@@ -423,10 +471,9 @@ impl Evaluator {
                 // A result's planes are new or its inputs', which are counted already.
                 let held: Vec<usize> = (inputs.iter())
                     .flat_map(|input| input.planes())
-                    .map(plane_address)
+                    .map(Plane::address)
                     .collect();
-                let own =
-                    (image.planes().iter()).filter(|plane| !held.contains(&plane_address(plane)));
+                let own = (image.planes().iter()).filter(|plane| !held.contains(&plane.address()));
                 let added = distinct_bytes(own);
                 if retained_bytes + added <= self.cap {
                     retained_bytes += added;
@@ -501,7 +548,7 @@ impl Evaluator {
 
     /// Releases every retained result the request does not contain, and returns the released
     /// planes nothing else holds, for the request's outputs.
-    fn release_except(&mut self, steps: &[Step]) -> Vec<Arc<[f32]>> {
+    fn release_except(&mut self, steps: &[Step]) -> Vec<Plane> {
         let requested: BTreeSet<*const Recipe> =
             steps.iter().map(|step| Arc::as_ptr(&step.key.0)).collect();
         let mut released = Vec::new();
@@ -512,9 +559,8 @@ impl Evaluator {
             }
             let (_, planes) = retained.image.into_parts();
             // A plane shared by two channels is unheld once at the last of them.
-            let unheld = planes
-                .into_iter()
-                .filter(|plane| Arc::strong_count(plane) == 1 && Arc::weak_count(plane) == 0);
+            let unheld = (planes.into_iter())
+                .filter_map(|mut plane| plane.get_mut().is_some().then_some(plane));
             released.extend(unheld);
         }
         released
@@ -531,58 +577,59 @@ impl Evaluator {
     }
 }
 
-/// A plane's address, which stays its own while a retained image holds it.
-fn plane_address(plane: &Arc<[f32]>) -> usize {
-    Arc::as_ptr(plane).cast::<f32>().addr()
-}
-
-/// The bytes of the planes, each counted once however often it appears.
-fn distinct_bytes<'a>(planes: impl Iterator<Item = &'a Arc<[f32]>>) -> u64 {
+/// The bytes of the planes' storage, each counted once however often it appears.
+fn distinct_bytes<'a>(planes: impl Iterator<Item = &'a Plane>) -> u64 {
     let mut counted = BTreeSet::new();
     planes
-        .filter(|plane| counted.insert(plane_address(plane)))
-        .map(|plane| std::mem::size_of_val::<[f32]>(plane) as u64)
+        .filter(|plane| counted.insert(plane.address()))
+        .map(|plane| (plane.capacity() * size_of::<f32>()) as u64)
         .sum()
 }
 
 impl Evaluator {
     /// Computes one node's image from the images of its connected inputs, in declaration order
     /// and then slot order, with its output planes taken from `released` while one of the right
-    /// length is there.
+    /// length is there. `None` if `stop` ended the operation part way, which only one long enough
+    /// to ask does.
     fn compute(
         &self,
         key: &ResultKey,
         inputs: &[&Image],
-        released: &mut Vec<Arc<[f32]>>,
-    ) -> Result<Image, EvalError> {
+        released: &mut Vec<Plane>,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<Image>, EvalError> {
+        // An unconnected input takes the empty image.
+        let empty = Image::empty();
+        let image_of = |source: &Option<ResultKey>| match source {
+            Some(_) => inputs[0],
+            None => &empty,
+        };
         let operation = || match &*key.0 {
-            Recipe::Reader { path: None, .. } => Ok(Image::empty()),
+            Recipe::Reader { path: None, .. } => Ok(Some(Image::empty())),
             Recipe::Reader {
                 path: Some(path), ..
-            } => read_image(path).map_err(|error| EvalError::Read {
+            } => read_image(path).map(Some).map_err(|error| EvalError::Read {
                 origin: key.clone(),
                 error,
             }),
-            Recipe::Exposure { stops, source, .. } => {
-                let empty;
-                let source = match source {
-                    Some(_) => inputs[0],
-                    None => {
-                        empty = Image::empty();
-                        &empty
-                    }
-                };
-                Ok(exposure(
-                    &self.pool,
-                    source,
-                    f64::from_bits(*stops),
-                    released,
-                ))
-            }
+            Recipe::Exposure { stops, source, .. } => Ok(Some(exposure(
+                &self.pool,
+                image_of(source),
+                f64::from_bits(*stops),
+                released,
+            ))),
             Recipe::Merge { mix, .. } => {
                 let mix = f64::from_bits(*mix) as f32;
-                merge::merge(&self.pool, key, inputs, mix, released)
+                merge::merge(&self.pool, key, inputs, mix, released).map(Some)
             }
+            Recipe::Blur { size, source, .. } => blur::blur(
+                &self.pool,
+                key,
+                image_of(source),
+                f64::from_bits(*size),
+                released,
+                stop,
+            ),
         };
         // Operations write only their own outputs, so a panic leaves nothing half done, and the
         // node fails instead of ending the worker. The panic hook has already reported it. A
@@ -664,6 +711,28 @@ impl Pool {
         row_len: usize,
         fill: impl Fn(Level, usize, [&mut [T]; N]) + Sync,
     ) {
+        self.fill_rows_with(
+            planes,
+            row_len,
+            CHUNK_ROWS,
+            || (),
+            |(), level, first, chunk| {
+                fill(level, first, chunk);
+            },
+        );
+    }
+
+    /// As [`Pool::fill_rows`], with chunks of `rows` rows and a value of `init`'s for each
+    /// thread's run of chunks, which `fill` is given first: a kernel's temporaries, made once
+    /// per thread rather than per chunk.
+    pub fn fill_rows_with<T: Send, S: Send, const N: usize>(
+        &self,
+        planes: [&mut [T]; N],
+        row_len: usize,
+        rows: usize,
+        init: impl Fn() -> S + Sync,
+        fill: impl Fn(&mut S, Level, usize, [&mut [T]; N]) + Sync,
+    ) {
         let Some(len) = planes.first().map(|plane| plane.len()) else {
             return;
         };
@@ -671,8 +740,9 @@ impl Pool {
             planes.iter().all(|plane| plane.len() == len),
             "the planes have one length"
         );
+        assert!(rows > 0, "a chunk has rows");
         // An empty plane has no chunks, whichever of its sides is zero.
-        let chunk = (CHUNK_ROWS * row_len).max(1);
+        let chunk = (rows * row_len).max(1);
         let mut splits = planes.map(|plane| plane.chunks_mut(chunk));
         let chunks: Vec<[&mut [T]; N]> = (0..len.div_ceil(chunk))
             .map(|_| {
@@ -682,10 +752,122 @@ impl Pool {
             })
             .collect();
         let level = self.level;
+        let states = ThreadStates::new(self.threads());
         self.threads.install(|| {
-            (chunks.into_par_iter().enumerate())
-                .for_each(|(index, chunk)| fill(level, index * CHUNK_ROWS, chunk));
+            (chunks.into_par_iter().enumerate()).for_each(|(index, chunk)| {
+                states.with(&init, |state| fill(state, level, index * rows, chunk));
+            });
         });
+    }
+
+    /// Runs `fill` over a plane of rows `width` samples long, a band of `band` columns at a
+    /// time over the threads, each band written through its [`Columns`] while the other bands
+    /// are. `fill` is given a value of `init`'s for its thread, as [`Pool::fill_rows_with`]
+    /// does, the level and the band; the last band is narrower where `band` does not divide
+    /// `width`.
+    pub fn fill_columns<S: Send>(
+        &self,
+        plane: &mut [f32],
+        width: usize,
+        band: usize,
+        init: impl Fn() -> S + Sync,
+        fill: impl Fn(&mut S, Level, Columns<'_>) + Sync,
+    ) {
+        assert!(band > 0, "a band has columns");
+        let height = plane.len().checked_div(width).unwrap_or(0);
+        assert_eq!(plane.len(), width * height, "whole rows");
+        if height == 0 {
+            return;
+        }
+        let shared = SharedPlane {
+            start: plane.as_mut_ptr(),
+            len: plane.len(),
+        };
+        let level = self.level;
+        let states = ThreadStates::new(self.threads());
+        self.threads.install(|| {
+            (0..width.div_ceil(band)).into_par_iter().for_each(|index| {
+                let columns = index * band..((index + 1) * band).min(width);
+                let band = Columns {
+                    plane: &shared,
+                    width,
+                    columns,
+                };
+                states.with(&init, |state| fill(state, level, band));
+            });
+        });
+    }
+}
+
+/// A kernel's temporaries for each of the pool's threads, made when the thread first takes a
+/// chunk. Rayon's `for_each_init` makes a value per job, and its jobs split down to single
+/// chunks as the threads steal, so that is a value per chunk: for Blur, a megabyte of scratch
+/// allocated, faulted in and freed per chunk by sixteen threads at once, which nearly doubled
+/// the passes' time over a 4K plane on the workstation.
+struct ThreadStates<S> {
+    states: Vec<Mutex<Option<S>>>,
+}
+
+impl<S: Send> ThreadStates<S> {
+    fn new(threads: usize) -> ThreadStates<S> {
+        ThreadStates {
+            states: (0..threads).map(|_| Mutex::new(None)).collect(),
+        }
+    }
+
+    /// Runs `use_state` on this thread's value, made with `init` if it has none yet.
+    fn with(&self, init: &(impl Fn() -> S + Sync), use_state: impl FnOnce(&mut S)) {
+        let index = rayon::current_thread_index().expect("a job runs on a pool thread");
+        // Only this thread locks its slot, and a kernel that panicked leaves scratch no one
+        // reads.
+        let mut slot = self.states[index]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        use_state(slot.get_or_insert_with(init));
+    }
+}
+
+/// A plane that [`Pool::fill_columns`] has several threads write at once, each through the
+/// [`Columns`] of its own band.
+#[derive(Debug)]
+struct SharedPlane {
+    start: *mut f32,
+    len: usize,
+}
+
+// SAFETY: the threads write through `Columns`, whose bands are disjoint, so no two write one
+// sample, and nothing reads the plane until `fill_columns` returns it.
+unsafe impl Sync for SharedPlane {}
+
+/// A band of a plane's columns for one thread to write, row by row, while other threads write
+/// the other bands.
+#[derive(Debug)]
+pub struct Columns<'a> {
+    plane: &'a SharedPlane,
+    width: usize,
+    columns: Range<usize>,
+}
+
+impl Columns<'_> {
+    /// The columns of the band.
+    pub fn columns(&self) -> Range<usize> {
+        self.columns.clone()
+    }
+
+    /// Writes the band's samples of row `y`, one per column.
+    pub fn write_row(&mut self, y: usize, samples: &[f32]) {
+        assert_eq!(samples.len(), self.columns.len(), "one sample per column");
+        assert!(y < self.plane.len / self.width, "a row of the plane");
+        let start = y * self.width + self.columns.start;
+        // SAFETY: row `y` is within the plane, so its columns of this band are too, and no other
+        // `Columns` has them; the plane is `fill_columns`'s to write while any exists.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                samples.as_ptr(),
+                self.plane.start.add(start),
+                samples.len(),
+            );
+        }
     }
 }
 
@@ -732,27 +914,37 @@ fn cpus_in(list: &str) -> Option<Vec<usize>> {
     Some(cpus)
 }
 
-/// A plane of `len` for an output: one of `released` if any has the length, else a new one.
-/// Touching a new plane costs more than Exposure over it (page faults, then unmapping when it
-/// drops), which is what reusing released planes saves.
-fn output_plane(released: &mut Vec<Arc<[f32]>>, len: usize) -> Arc<[f32]> {
-    match released.iter().position(|plane| plane.len() == len) {
-        Some(index) => released.swap_remove(index),
-        None => zeroed_plane(len),
+/// A plane of `len` for an output: the one of `released` whose storage holds `len` most
+/// closely, with up to half again to spare, else a new one with storage of `capacity`. Touching
+/// a new plane costs more than Exposure over it, and more than Blur over it when the columns
+/// pass is first to (page faults, then unmapping when it drops), which is what reusing released
+/// planes saves. Half to spare on reuse lets storage made for a window that grew serve the drag
+/// back down as well.
+fn output_plane(released: &mut Vec<Plane>, len: usize, capacity: usize) -> Plane {
+    let closest = (released.iter().enumerate())
+        .filter(|(_, plane)| (len..=len + len / 2).contains(&plane.capacity()))
+        .min_by_key(|(_, plane)| plane.capacity())
+        .map(|(index, _)| index);
+    match closest {
+        Some(index) => released.swap_remove(index).resized(len),
+        None => Plane::zeroed(len, capacity),
     }
 }
 
 /// Multiplies R, G and B by two to the power of `stops` and shares A, each colour plane through
 /// the shared function, Exposure's definition for both devices. Inputs are never written: an
 /// output is a plane from `released` or a new one, and A is the input's.
-fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Arc<[f32]>>) -> Image {
+fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Plane>) -> Image {
     // Exact for whole stops, and far inside f32's range at the limits.
     let gain = stops.exp2() as f32;
     let width = image.data_window().width as usize;
     let [r, g, b, a] = image.planes();
-    let mut scaled = |plane: &Arc<[f32]>| -> Arc<[f32]> {
-        let mut output = output_plane(released, plane.len());
-        let dst = Arc::get_mut(&mut output).expect("nothing else holds an output plane");
+    let mut scaled = |plane: &Plane| -> Plane {
+        // As roomy as its input, so that below a Blur whose Size is dragged it grows as rarely.
+        let mut output = output_plane(released, plane.len(), plane.capacity());
+        let dst = output
+            .get_mut()
+            .expect("nothing else holds an output plane");
         pool.run(width, plane, dst, |level, src, dst| {
             cpu::exposure(level, src, dst, gain);
         });
@@ -760,14 +952,14 @@ fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Arc<[f32]
     };
     // A grey image's colour planes are one plane, and stay one.
     let red = scaled(r);
-    let green = if Arc::ptr_eq(g, r) {
+    let green = if Plane::ptr_eq(g, r) {
         red.clone()
     } else {
         scaled(g)
     };
-    let blue = if Arc::ptr_eq(b, r) {
+    let blue = if Plane::ptr_eq(b, r) {
         red.clone()
-    } else if Arc::ptr_eq(b, g) {
+    } else if Plane::ptr_eq(b, g) {
         green.clone()
     } else {
         scaled(b)
@@ -823,6 +1015,7 @@ impl fmt::Display for EvalError {
             Recipe::Reader { path: None, .. } => write!(f, "Reader: ")?,
             Recipe::Exposure { .. } => write!(f, "Exposure: ")?,
             Recipe::Merge { .. } => write!(f, "Merge: ")?,
+            Recipe::Blur { .. } => write!(f, "Blur: ")?,
         }
         match self {
             EvalError::Read { error, .. } => error.fmt(f),
@@ -830,7 +1023,7 @@ impl fmt::Display for EvalError {
             EvalError::Oversize { oversize, .. } => oversize.fmt(f),
             EvalError::OverCap { window, bytes, .. } => write!(
                 f,
-                "needs {} MiB of planes for a {} × {} data window, over the {} MiB limit",
+                "needs {} MiB of memory for a {} × {} data window, over the {} MiB limit",
                 bytes >> 20,
                 window.width,
                 window.height,
