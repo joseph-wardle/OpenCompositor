@@ -81,7 +81,7 @@ impl Chain {
     fn budget(self) -> Duration {
         match self {
             Chain::Exposure | Chain::Merge => Duration::from_millis(50),
-            Chain::Blur => Duration::from_millis(80),
+            Chain::Blur => Duration::from_millis(70),
         }
     }
 }
