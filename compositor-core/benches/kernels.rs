@@ -27,13 +27,14 @@ const RUNS: usize = 21;
 /// pointwise kernel is memory-bound, so the copy is what the machine allows and the rest is the
 /// kernel's own cost.
 const GATE: f64 = 0.8;
-/// Blur's Size for its passes: mid-slider, with windows wide enough for the block sums every
-/// size above a few pixels takes, whose cost a sample does not grow with the width.
-const BLUR_SIZE: f64 = 50.0;
+/// Blur's Sizes for its passes: 12, where a row's windows are summed directly and the columns'
+/// in blocks, and mid-slider, where both take the block sums, whose cost a sample does not grow
+/// with the width.
+const BLUR_SIZES: [f64; 2] = [12.0, 50.0];
 /// The least of the copy's throughput by bytes moved each of Blur's passes must reach. A box
 /// pass sums from lines in cache, so its sums bound it, not memory: measured on the
-/// workstation, the rows reach about a fifth of the copy's throughput and the columns, gathered
-/// and scattered a band at a time, about a quarter. The gate catches a pass that lost half of
+/// workstation, the rows reach about a fifth of the copy's throughput at Size 50 and a third
+/// at 12, and the columns, gathered and scattered a band at a time, about a quarter at both. The gate catches a pass that lost half of
 /// that, as the pool making a kernel's scratch per job rather than per thread did.
 const BLUR_GATE: f64 = 0.15;
 
@@ -160,64 +161,67 @@ fn main() {
     // rows of a plane into one grown by the reach each side, then bands of that plane's columns
     // into one grown along the columns too. Each reads its input's bytes and writes the grown
     // output's.
-    let pass = BoxPass::new(BLUR_SIZE);
-    let reach = pass.reach() as usize;
-    let grown_width = WIDTH + 2 * reach;
-    let grown_height = HEIGHT + 2 * reach;
-    let mut rows_out: Vec<Vec<f32>> = (0..PLANES)
-        .map(|_| vec![0.0; grown_width * HEIGHT])
-        .collect();
-    let rows_pool = median(|| {
-        for (src, dst) in inputs.iter().zip(&mut rows_out) {
-            pool.fill_rows_with(
-                [dst],
-                grown_width,
-                BLUR_ROWS,
-                BoxScratch::default,
-                |scratch, level, first_row, [dst]| {
-                    let rows = dst.len() / grown_width;
-                    let src = &src[first_row * WIDTH..(first_row + rows) * WIDTH];
-                    blur_rows(level, pass, src, WIDTH, dst, scratch);
-                },
-            );
-        }
-    });
-    let mut columns_out: Vec<Vec<f32>> = (0..PLANES)
-        .map(|_| vec![0.0; grown_width * grown_height])
-        .collect();
-    let columns_pool = median(|| {
-        for (src, dst) in rows_out.iter().zip(&mut columns_out) {
-            pool.fill_columns(
-                dst,
-                grown_width,
-                BLUR_BAND,
-                BandScratch::default,
-                |state, level, band| {
-                    band_passes(level, pass, src, grown_width, HEIGHT, band, state);
-                },
-            );
-        }
-    });
-    println!(
-        "Blur at Size {BLUR_SIZE} ({} taps a pass) on {WIDTH}x{HEIGHT} RGB, median of {RUNS} runs",
-        2 * pass.tmax() + 1
-    );
-    let rows_bytes = (PLANES * (WIDTH + grown_width) * HEIGHT * size_of::<f32>()) as f64;
-    let columns_bytes = (PLANES * grown_width * (HEIGHT + grown_height) * size_of::<f32>()) as f64;
-    for (what, time, bytes) in [
-        ("rows, pool", rows_pool, rows_bytes),
-        ("columns, pool", columns_pool, columns_bytes),
-    ] {
-        let ms = time.as_secs_f64() * 1e3;
-        let throughput = bytes / time.as_secs_f64() / 1e9;
-        println!("  {what:<26}{ms:>8.2} ms{throughput:>8.1} GB/s");
-        let ratio = throughput / copy_throughput;
-        let verdict = if ratio >= BLUR_GATE { "pass" } else { "FAIL" };
-        let (name, _) = what.split_once(',').expect("a name before the comma");
+    for size in BLUR_SIZES {
+        let pass = BoxPass::new(size);
+        let reach = pass.reach() as usize;
+        let grown_width = WIDTH + 2 * reach;
+        let grown_height = HEIGHT + 2 * reach;
+        let mut rows_out: Vec<Vec<f32>> = (0..PLANES)
+            .map(|_| vec![0.0; grown_width * HEIGHT])
+            .collect();
+        let rows_pool = median(|| {
+            for (src, dst) in inputs.iter().zip(&mut rows_out) {
+                pool.fill_rows_with(
+                    [dst],
+                    grown_width,
+                    BLUR_ROWS,
+                    BoxScratch::default,
+                    |scratch, level, first_row, [dst]| {
+                        let rows = dst.len() / grown_width;
+                        let src = &src[first_row * WIDTH..(first_row + rows) * WIDTH];
+                        blur_rows(level, pass, src, WIDTH, dst, scratch);
+                    },
+                );
+            }
+        });
+        let mut columns_out: Vec<Vec<f32>> = (0..PLANES)
+            .map(|_| vec![0.0; grown_width * grown_height])
+            .collect();
+        let columns_pool = median(|| {
+            for (src, dst) in rows_out.iter().zip(&mut columns_out) {
+                pool.fill_columns(
+                    dst,
+                    grown_width,
+                    BLUR_BAND,
+                    BandScratch::default,
+                    |state, level, band| {
+                        band_passes(level, pass, src, grown_width, HEIGHT, band, state);
+                    },
+                );
+            }
+        });
         println!(
-            "  {name} at {ratio:.2} of the copy's throughput by bytes moved, gate {BLUR_GATE}: {verdict}"
+            "Blur at Size {size} ({} taps a pass) on {WIDTH}x{HEIGHT} RGB, median of {RUNS} runs",
+            2 * pass.tmax() + 1
         );
-        failed |= ratio < BLUR_GATE;
+        let rows_bytes = (PLANES * (WIDTH + grown_width) * HEIGHT * size_of::<f32>()) as f64;
+        let columns_bytes =
+            (PLANES * grown_width * (HEIGHT + grown_height) * size_of::<f32>()) as f64;
+        for (what, time, bytes) in [
+            ("rows, pool", rows_pool, rows_bytes),
+            ("columns, pool", columns_pool, columns_bytes),
+        ] {
+            let ms = time.as_secs_f64() * 1e3;
+            let throughput = bytes / time.as_secs_f64() / 1e9;
+            println!("  {what:<26}{ms:>8.2} ms{throughput:>8.1} GB/s");
+            let ratio = throughput / copy_throughput;
+            let verdict = if ratio >= BLUR_GATE { "pass" } else { "FAIL" };
+            let (name, _) = what.split_once(',').expect("a name before the comma");
+            println!(
+                "  {name} at {ratio:.2} of the copy's throughput by bytes moved, gate {BLUR_GATE}: {verdict}"
+            );
+            failed |= ratio < BLUR_GATE;
+        }
     }
     if failed {
         std::process::exit(1);

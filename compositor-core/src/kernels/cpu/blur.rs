@@ -38,9 +38,12 @@ pub const BLUR_ROWS: usize = 16;
 /// Columns per call of [`blur_band`]: one cache line of samples, the lanes of its sums.
 pub const BLUR_BAND: usize = 16;
 
-/// Windows of up to this many taps each side are summed directly, every output its own sum
-/// over the taps, which vectorises across the outputs of a row; wider ones go through block
-/// sums. Measured on the workstation: direct sums cost a tap each, block sums about seven.
+/// A single row's windows of up to this many taps each side are summed directly, every output
+/// its own sum over the taps, which vectorises across the outputs of the row; wider ones go
+/// through block sums, the rows interleaved as lanes. Measured on the workstation: direct sums
+/// cost a tap each, block sums about seven. Lines of lanes always take block sums: across 16
+/// lanes the direct sums were slower at every window, by a sixth at one tap each side and
+/// more than twice as slow from three.
 const DIRECT_TAPS: usize = 6;
 
 /// A thread's temporaries, kept from call to call: the passes' own, and the rows interleaved
@@ -187,6 +190,9 @@ fn padded<const L: usize>(pad: &mut Vec<f32>, n: usize, t: usize) -> &mut [f32] 
 /// The order is the same at every SIMD level, so the result is too.
 #[inline(always)]
 fn window_sums<const L: usize>(pass: BoxPass, z: &[f32], out: &mut [f32], suffixes: &mut Vec<f64>) {
+    if L > 1 {
+        return block_sums::<L>(pass, z, out, suffixes);
+    }
     match pass.tmax() {
         1 => direct_sums::<L, 1>(pass, z, out),
         2 => direct_sums::<L, 2>(pass, z, out),
