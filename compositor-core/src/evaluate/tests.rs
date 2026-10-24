@@ -11,7 +11,7 @@ use crate::parameter::Value;
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 
-/// A key at most this deep is compared and dropped on a thread with a `DEEP_STACK`.
+/// A key at most this deep is dropped on a thread with a `DEEP_STACK`.
 const DEEP_CHAIN: u64 = 10_000;
 
 fn reader(path: impl AsRef<Path>) -> Node {
@@ -240,20 +240,41 @@ fn a_deep_chain_keys_without_recursion() {
         .chain((1..DEEP_CHAIN).map(|stops| exposure(Some(stops as f64 % 64.0))));
     let document = chain(nodes);
 
-    // Built on the test's own stack, which recursion this deep would overflow.
+    // Built and compared on the test's own stack, which recursion this deep would overflow.
     let first = key(&document, DEEP_CHAIN);
     let second = key(&document, DEEP_CHAIN);
     let shallower = key(&document, DEEP_CHAIN - 1);
+    assert!(first == second);
+    assert!(first != shallower);
 
     std::thread::Builder::new()
         .stack_size(DEEP_STACK)
-        .spawn(move || {
-            assert!(first == second);
-            assert!(first != shallower);
-        })
+        .spawn(move || drop((first, second, shallower)))
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn keys_from_separate_builds_compare_each_shared_input_once() {
+    // Each Merge takes the node before it as both background and layer, so 2^64 paths lead from
+    // the last Merge to the Reader, and keys built separately share none of them.
+    const MERGES: u64 = 64;
+    let ladder = |path| {
+        let nodes = std::iter::once(reader(path)).chain((0..MERGES).map(|_| merge(None)));
+        let wires: Vec<(u64, InputSlot<'static>, u64)> = (2..=MERGES + 1)
+            .flat_map(|id| {
+                [
+                    (id, "background".into(), id - 1),
+                    (id, ("layer", 1).into(), id - 1),
+                ]
+            })
+            .collect();
+        graph(nodes, &wires)
+    };
+    let document = ladder("a.exr");
+    assert!(key(&document, MERGES + 1) == key(&document, MERGES + 1));
+    assert!(key(&document, MERGES + 1) != key(&ladder("b.exr"), MERGES + 1));
 }
 
 fn run(evaluator: &mut Evaluator, key: &ResultKey) -> Result<Image, EvalError> {
