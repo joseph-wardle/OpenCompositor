@@ -1,6 +1,6 @@
 [package]
 name = "opencompositor-core"
-version = "0.3.0"
+version = "0.3.1"
 description = "OpenCompositor without its Qt shell: document, history, evaluation, drawing, and everything testable headless."
 edition.workspace = true
 license.workspace = true

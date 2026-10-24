@@ -49,14 +49,30 @@ impl Reloads {
 ///
 /// Node IDs, positions and selection are outside it, so equal nodes have equal keys and moving
 /// a node changes nothing. Inputs are shared keys: cloning one is a reference count, and
-/// comparing stops at the first input two keys share. Comparing and dropping a key recurse once
-/// per node of its chain.
+/// comparing stops at the first input two keys share. Comparing visits each pair of inputs once,
+/// without recursion; dropping a key recurses once per node of its chain.
 #[derive(Clone, Debug)]
 pub struct ResultKey(Arc<Recipe>);
 
 impl PartialEq for ResultKey {
     fn eq(&self, other: &ResultKey) -> bool {
-        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        // Keys from separate builds share no inputs. Where a graph branches and rejoins, walking
+        // both chains would compare a shared input once per path to it, exponentially many.
+        let mut compared = BTreeSet::new();
+        let mut pending = vec![(self, other)];
+        while let Some((a, b)) = pending.pop() {
+            if Arc::ptr_eq(&a.0, &b.0) || !compared.insert((Arc::as_ptr(&a.0), Arc::as_ptr(&b.0))) {
+                continue;
+            }
+            if !a.0.same_but_inputs(&b.0) {
+                return false;
+            }
+            pending.extend(a.0.inputs().zip(b.0.inputs()));
+        }
+        true
     }
 }
 
@@ -78,7 +94,7 @@ impl ResultKey {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Recipe {
     Reader {
         version: ReaderVersion,
@@ -176,10 +192,13 @@ impl Recipe {
     /// Whether two recipes are equal, where equal inputs are known to be the same key: one step,
     /// where `==` walks both chains.
     fn same_as(&self, other: &Recipe) -> bool {
-        let same_input = |a: &Option<ResultKey>, b: &Option<ResultKey>| match (a, b) {
-            (Some(a), Some(b)) => Arc::ptr_eq(&a.0, &b.0),
-            (a, b) => a.is_none() && b.is_none(),
-        };
+        self.same_but_inputs(other)
+            && (self.inputs().zip(other.inputs())).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0))
+    }
+
+    /// Whether two recipes are of one kind with equal values and the same inputs connected,
+    /// whatever those inputs' keys.
+    fn same_but_inputs(&self, other: &Recipe) -> bool {
         match (self, other) {
             (
                 Recipe::Reader {
@@ -205,7 +224,9 @@ impl Recipe {
                     source: other_source,
                 },
             ) => {
-                version == other_version && stops == other_stops && same_input(source, other_source)
+                version == other_version
+                    && stops == other_stops
+                    && source.is_some() == other_source.is_some()
             }
             (
                 Recipe::Merge {
@@ -223,9 +244,8 @@ impl Recipe {
             ) => {
                 version == other_version
                     && mix == other_mix
-                    && same_input(background, other_background)
+                    && background.is_some() == other_background.is_some()
                     && layers.len() == other_layers.len()
-                    && (layers.iter().zip(other_layers)).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0))
             }
             (
                 Recipe::Blur {
@@ -238,7 +258,11 @@ impl Recipe {
                     size: other_size,
                     source: other_source,
                 },
-            ) => version == other_version && size == other_size && same_input(source, other_source),
+            ) => {
+                version == other_version
+                    && size == other_size
+                    && source.is_some() == other_source.is_some()
+            }
             // Listed by kind, so that a new kind cannot fall through as never equal.
             (
                 Recipe::Reader { .. }
@@ -342,8 +366,8 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
     }
 }
 
-/// A stack that holds comparing and dropping the deepest key the deep-chain tests evaluate, ten
-/// thousand nodes: both recurse once per node, and overflowing a stack aborts the process.
+/// A stack that holds dropping the deepest key the deep-chain tests evaluate, ten thousand nodes:
+/// it recurses once per node, and overflowing a stack aborts the process.
 pub(crate) const DEEP_STACK: usize = 64 << 20;
 
 /// The most bytes of planes an evaluator retains. Provisional, until a budget sets it.
