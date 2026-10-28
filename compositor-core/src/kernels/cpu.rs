@@ -1,11 +1,25 @@
-//! The CPU kernels: each operation over a slice of samples, compiled once per x86-64 feature
-//! level so the evaluator can use the vector width the machine has without being built for it.
+//! The primitives' CPU halves: the map and the fold here, the line reduction in [`line`], each
+//! generic over the operation, run over the evaluator's pool and compiled once per x86-64
+//! feature level so the evaluator can use the vector width the machine has without being built
+//! for it.
 //!
-//! The wrappers are the only place `target_feature` appears. Each enables exactly one level's
-//! features over the same body, so the body vectorises three ways while the per-sample
+//! [`at_level`]'s wrappers are the only place `target_feature` appears. Each enables exactly one
+//! level's features over the same body, so the body vectorises three ways while the per-sample
 //! arithmetic stays the kernel crate's, bit for bit at every level.
 
-use opencompositor_kernels as kernels;
+use std::ops::Range;
+
+use opencompositor_kernels::{Fold, Map};
+
+use crate::evaluate::Pool;
+use crate::image::{Overlap, Window};
+
+mod line;
+
+#[cfg(test)]
+pub(crate) use line::LINE_ROWS;
+pub(crate) use line::line_scratch_bytes;
+pub use line::{Stopped, line};
 
 /// The x86-64 feature level the kernels run at. Only [`Level::detect`] makes one, after checking
 /// every feature its wrapper enables, so holding a level proves this machine supports it. Other
@@ -13,7 +27,7 @@ use opencompositor_kernels as kernels;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Level(Kind);
 
-// Private so that no caller can name a level the machine lacks: the kernels' safety rests on it.
+// Private so that no caller can name a level the machine lacks: `at_level`'s safety rests on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
     /// The build's own target: SSE2 on x86-64, four lanes of f32.
@@ -56,121 +70,258 @@ impl Level {
     }
 }
 
-/// Defines an operation at a level: `$name` takes the level and the arguments and runs
-/// `$body`, an `#[inline(always)]` function of the same arguments, in the wrapper that enables
-/// the level's features, so the body vectorises once per level.
+/// Runs `body` in the wrapper that enables `level`'s features, so that the code inlined into it
+/// vectorises for the level. The feature lists are x86-64-v3 and v4 as the psABI defines them,
+/// and `Level::detect` checks the same lists.
 ///
-/// The feature lists are x86-64-v3 and v4 as the psABI defines them, and `Level::detect` checks
-/// the same lists.
-macro_rules! at_levels {
-    ($(#[$doc:meta])* $name:ident => $body:ident($($arg:ident: $ty:ty),* $(,)?)) => {
-        $(#[$doc])*
-        pub fn $name(level: Level, $($arg: $ty),*) {
-            #[cfg(target_arch = "x86_64")]
-            #[target_feature(enable = "avx2,fma,bmi1,bmi2,lzcnt,movbe,f16c")]
-            fn v3($($arg: $ty),*) {
-                $body($($arg),*);
-            }
-            #[cfg(target_arch = "x86_64")]
-            #[target_feature(
-                enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,avx2,fma,bmi1,bmi2,lzcnt,movbe,f16c"
-            )]
-            fn v4($($arg: $ty),*) {
-                $body($($arg),*);
-            }
-            match level.0 {
-                Kind::Baseline => $body($($arg),*),
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: `level` came from `Level::detect` on this machine, which found every
-                // feature the wrapper enables.
-                Kind::V3 => unsafe { v3($($arg),*) },
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: as above.
-                Kind::V4 => unsafe { v4($($arg),*) },
-            }
-        }
-    };
-}
-
-at_levels! {
-    /// Exposure by `gain` from `src` into `dst`, two slices of one length: each sample of `dst`
-    /// becomes [`kernels::exposure`] of the sample at the same index in `src`.
-    exposure => exposure_samples(src: &[f32], dst: &mut [f32], gain: f32)
-}
-
+/// A closure is not inlined into the wrapper by default: callers mark theirs
+/// `#[inline(always)]`, or the wrapper only calls a baseline copy, which still passes every
+/// numerical test and silently runs without the level's vectors.
 #[inline(always)]
-fn exposure_samples(src: &[f32], dst: &mut [f32], gain: f32) {
-    assert_eq!(src.len(), dst.len(), "Exposure's slices differ in length");
-    for (d, &s) in dst.iter_mut().zip(src) {
-        *d = kernels::exposure(s, gain);
+fn at_level<R>(level: Level, body: impl FnOnce() -> R) -> R {
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,bmi1,bmi2,lzcnt,movbe,f16c")]
+    fn v3<R>(body: impl FnOnce() -> R) -> R {
+        body()
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(
+        enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,avx2,fma,bmi1,bmi2,lzcnt,movbe,f16c"
+    )]
+    fn v4<R>(body: impl FnOnce() -> R) -> R {
+        body()
+    }
+    match level.0 {
+        Kind::Baseline => body(),
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `level` came from `Level::detect` on this machine, which found every feature
+        // the wrapper enables.
+        Kind::V3 => unsafe { v3(body) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above.
+        Kind::V4 => unsafe { v4(body) },
     }
 }
 
-at_levels! {
-    /// A layer over the background in `dst`, in place: each sample of each plane of `dst`
-    /// becomes [`kernels::over`] of itself, the layer's sample at the same index and the
-    /// layer's alpha there. The planes are R, G, B and A, all of one length.
-    over => over_samples(layer: [&[f32]; 4], dst: [&mut [f32]; 4])
-}
-
-#[inline(always)]
-fn over_samples(layer: [&[f32]; 4], dst: [&mut [f32]; 4]) {
-    let [lr, lg, lb, la] = layer;
-    let [dr, dg, db, da] = dst;
-    let len = la.len();
-    assert!(
-        [
-            lr.len(),
-            lg.len(),
-            lb.len(),
-            dr.len(),
-            dg.len(),
-            db.len(),
-            da.len()
-        ]
-        .iter()
-        .all(|&n| n == len),
-        "over's planes differ in length"
+/// `op` over `inputs`, each a plane over its window, into `outputs`, planes over `output`: each
+/// row of the output in spans over which every input either covers it or does not, each span
+/// one loop over its samples. An input is zero where its window does not reach.
+pub fn map<M: Map<I, O>, const I: usize, const O: usize>(
+    pool: &Pool,
+    op: &M,
+    inputs: [(&[f32], Window); I],
+    output: Window,
+    outputs: [&mut [f32]; O],
+) {
+    let width = output.width as usize;
+    for (plane, window) in inputs {
+        assert_eq!(
+            plane.len() as u64,
+            window.area(),
+            "an input over its window"
+        );
+    }
+    assert_eq!(
+        outputs[0].len() as u64,
+        output.area(),
+        "outputs over the output"
     );
-    // Alpha composes as the colours do: the layer's alpha is the sample composed and the
-    // coverage both.
-    for (d, (&l, &a)) in dr.iter_mut().zip(lr.iter().zip(la)) {
-        *d = kernels::over(*d, l, a);
+    let overlaps = inputs.map(|(_, window)| Overlap::of(window, output));
+    let zeros = vec![0.0f32; width];
+    pool.fill_rows(outputs, width, |level, first_row, mut chunk| {
+        let mut cuts = Vec::with_capacity(2 * I + 2);
+        let rows = chunk[0].len() / width;
+        for (index, y) in (first_row..first_row + rows).enumerate() {
+            let spans = overlaps.each_ref().map(|overlap| overlap.row(y));
+            cut(
+                spans.iter().flatten().map(|(_, columns)| columns),
+                width,
+                &mut cuts,
+            );
+            for pair in cuts.windows(2) {
+                let columns = pair[0]..pair[1];
+                let inside = spans.each_ref().map(|span| covers(span, columns.start));
+                let src: [&[f32]; I] = std::array::from_fn(|k| {
+                    samples(inputs[k].0, &spans[k], columns.clone(), &zeros)
+                });
+                let dst =
+                    (chunk.each_mut()).map(|plane| &mut plane[index * width..][columns.clone()]);
+                at_level(
+                    level,
+                    #[inline(always)]
+                    || map_samples(op, src, inside, dst),
+                );
+            }
+        }
+    });
+}
+
+/// `op` over a stack of `layers` on `base`, each planes over a window, into `outputs`, planes
+/// over `output`: each row of the output in spans over which the base and each layer either
+/// cover it or do not, each span folded a covering layer at a time into the outputs, then
+/// finished against the base. The base is zero where its window does not reach.
+pub fn fold<F: Fold<G, O>, const G: usize, const O: usize>(
+    pool: &Pool,
+    op: &F,
+    base: ([&[f32]; O], Window),
+    layers: &[([&[f32]; G], Window)],
+    output: Window,
+    outputs: [&mut [f32]; O],
+) {
+    let width = output.width as usize;
+    for (planes, window) in std::iter::once((&base.0[..], base.1))
+        .chain(layers.iter().map(|(planes, window)| (&planes[..], *window)))
+    {
+        for plane in planes {
+            assert_eq!(
+                plane.len() as u64,
+                window.area(),
+                "an input over its window"
+            );
+        }
     }
-    for (d, (&l, &a)) in dg.iter_mut().zip(lg.iter().zip(la)) {
-        *d = kernels::over(*d, l, a);
-    }
-    for (d, (&l, &a)) in db.iter_mut().zip(lb.iter().zip(la)) {
-        *d = kernels::over(*d, l, a);
-    }
-    for (d, &a) in da.iter_mut().zip(la) {
-        *d = kernels::over(*d, a, a);
+    assert_eq!(
+        outputs[0].len() as u64,
+        output.area(),
+        "outputs over the output"
+    );
+    let base_overlap = Overlap::of(base.1, output);
+    let overlaps: Vec<Overlap> = (layers.iter())
+        .map(|(_, window)| Overlap::of(*window, output))
+        .collect();
+    let zeros = vec![0.0f32; width];
+    pool.fill_rows(outputs, width, |level, first_row, mut chunk| {
+        let mut cuts = Vec::with_capacity(2 * layers.len() + 4);
+        let mut spans = Vec::with_capacity(layers.len());
+        let mut sources: Vec<[&[f32]; G]> = Vec::with_capacity(layers.len());
+        let rows = chunk[0].len() / width;
+        for (index, y) in (first_row..first_row + rows).enumerate() {
+            let base_span = base_overlap.row(y);
+            spans.clear();
+            spans.extend(overlaps.iter().map(|overlap| overlap.row(y)));
+            let all = base_span.iter().chain(spans.iter().flatten());
+            cut(all.map(|(_, columns)| columns), width, &mut cuts);
+            for pair in cuts.windows(2) {
+                let columns = pair[0]..pair[1];
+                let below =
+                    (base.0).map(|plane| samples(plane, &base_span, columns.clone(), &zeros));
+                sources.clear();
+                for ((planes, _), span) in layers.iter().zip(&spans) {
+                    if covers(span, columns.start) {
+                        sources.push(
+                            planes.map(|plane| samples(plane, span, columns.clone(), &zeros)),
+                        );
+                    }
+                }
+                let dst =
+                    (chunk.each_mut()).map(|plane| &mut plane[index * width..][columns.clone()]);
+                at_level(
+                    level,
+                    #[inline(always)]
+                    || fold_samples(op, below, &sources, dst),
+                );
+            }
+        }
+    });
+}
+
+/// A plane's span of an output row, as [`Overlap::row`] gives it: the plane's samples and the
+/// output's columns they lie in.
+type Span = Option<(Range<usize>, Range<usize>)>;
+
+/// Whether `span` covers the output's column `x`.
+fn covers(span: &Span, x: usize) -> bool {
+    span.as_ref()
+        .is_some_and(|(_, columns)| columns.contains(&x))
+}
+
+/// A plane's samples for the output's `columns` of a row, by its span in the row, which covers
+/// all of them or none: zeros where it covers none.
+fn samples<'a>(
+    plane: &'a [f32],
+    span: &Span,
+    columns: Range<usize>,
+    zeros: &'a [f32],
+) -> &'a [f32] {
+    match span {
+        Some((input, covered)) if covered.contains(&columns.start) => {
+            &plane[input.start + (columns.start - covered.start)..][..columns.len()]
+        }
+        _ => &zeros[..columns.len()],
     }
 }
 
-at_levels! {
-    /// The stack in `dst` dissolved against `base` by `mix`, in place: each sample of each plane
-    /// of `dst` becomes [`kernels::mix`] of the base's sample at the same index, itself and
-    /// `mix`. The planes are R, G, B and A, all of one length.
-    mix => mix_samples(base: [&[f32]; 4], dst: [&mut [f32]; 4], mix: f32)
+/// Into `cuts`, the distinct column boundaries of a row of `width` that `spans` make, from 0 to
+/// `width`: between consecutive cuts, each span covers every column or none.
+fn cut<'a>(spans: impl Iterator<Item = &'a Range<usize>>, width: usize, cuts: &mut Vec<usize>) {
+    cuts.clear();
+    cuts.push(0);
+    for span in spans {
+        cuts.extend([span.start, span.end]);
+    }
+    cuts.push(width);
+    cuts.sort_unstable();
+    cuts.dedup();
 }
 
+/// One span of a map: every input covers it or none of its samples, as `inside` says.
 #[inline(always)]
-fn mix_samples(base: [&[f32]; 4], dst: [&mut [f32]; 4], mix: f32) {
-    for (base, dst) in base.into_iter().zip(dst) {
-        assert_eq!(base.len(), dst.len(), "mix's planes differ in length");
-        for (d, &b) in dst.iter_mut().zip(base) {
-            *d = kernels::mix(b, *d, mix);
+fn map_samples<M: Map<I, O>, const I: usize, const O: usize>(
+    op: &M,
+    src: [&[f32]; I],
+    inside: [bool; I],
+    dst: [&mut [f32]; O],
+) {
+    let len = dst[0].len();
+    let src = src.map(|src| &src[..len]);
+    let mut dst = dst.map(|dst| &mut dst[..len]);
+    for i in 0..len {
+        let samples = std::array::from_fn(|k| src[k][i]);
+        let results = op.apply(samples, inside);
+        for (dst, result) in dst.iter_mut().zip(results) {
+            dst[i] = result;
         }
     }
 }
 
-mod blur;
-
-pub use blur::{BLUR_BAND, BLUR_ROWS, BoxScratch, blur_band, blur_rows, box_scratch_bytes};
+/// One span of a fold: the base's samples, then each layer's that covers the span, then the
+/// finish.
+#[inline(always)]
+fn fold_samples<F: Fold<G, O>, const G: usize, const O: usize>(
+    op: &F,
+    base: [&[f32]; O],
+    layers: &[[&[f32]; G]],
+    dst: [&mut [f32]; O],
+) {
+    let len = dst[0].len();
+    let base = base.map(|base| &base[..len]);
+    let mut dst = dst.map(|dst| &mut dst[..len]);
+    for (dst, base) in dst.iter_mut().zip(base) {
+        dst.copy_from_slice(base);
+    }
+    for planes in layers {
+        let planes = planes.map(|plane| &plane[..len]);
+        for i in 0..len {
+            let below = std::array::from_fn(|k| dst[k][i]);
+            let stack = op.step(below, std::array::from_fn(|k| planes[k][i]));
+            for (dst, sample) in dst.iter_mut().zip(stack) {
+                dst[i] = sample;
+            }
+        }
+    }
+    for i in 0..len {
+        let stack = std::array::from_fn(|k| dst[k][i]);
+        let result = op.finish(std::array::from_fn(|k| base[k][i]), stack);
+        for (dst, sample) in dst.iter_mut().zip(result) {
+            dst[i] = sample;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use opencompositor_kernels::{Exposure, Merge};
+
     use super::*;
 
     /// Gains across the stop range, including one that rounds.
@@ -207,24 +358,30 @@ mod tests {
             .collect()
     }
 
-    /// Every sample at every length against the kernel crate's definition, bit for bit, or
-    /// a skip when this machine lacks the level.
-    fn exposure_matches_the_kernel_crate(level: Level) {
+    /// Whether this machine has `level`, printing the skip when it has not.
+    fn supported(level: Level) -> bool {
         let detected = Level::detect();
         if level > detected {
             println!("skipped {level:?}: this machine detects {detected:?}");
-            return;
+            return false;
         }
         println!("cpu kernel tests at {level:?}");
+        true
+    }
+
+    /// Exposure through the map, one span of every length, against the kernel crate's
+    /// function bit for bit.
+    fn exposure_matches_the_kernel_crate(level: Level) {
         // A signalling NaN, which no multiply returns: a sample left unwritten fails below.
         let unwritten = f32::from_bits(0x7f80_0001);
         for len in (0..=70).chain([255, 1000, 4097]) {
             let src = samples(len);
             for gain in GAINS {
                 let mut dst = vec![unwritten; len];
-                exposure(level, &src, &mut dst, gain);
+                let op = Exposure { gain };
+                at_level(level, || map_samples(&op, [&src], [true], [&mut dst]));
                 for (i, (&s, &d)) in src.iter().zip(&dst).enumerate() {
-                    let expected = kernels::exposure(s, gain);
+                    let expected = opencompositor_kernels::exposure(s, gain);
                     assert_eq!(
                         d.to_bits(),
                         expected.to_bits(),
@@ -236,96 +393,214 @@ mod tests {
         }
     }
 
-    /// Four planes of samples at every length through `over` and then `mix`, in place, against
-    /// the kernel crate's functions bit for bit, or a skip when this machine lacks the level.
-    fn over_and_mix_match_the_kernel_crate(level: Level) {
-        let detected = Level::detect();
-        if level > detected {
-            println!("skipped {level:?}: this machine detects {detected:?}");
-            return;
-        }
+    /// Merge through the fold, one span of four planes of every length with one layer and with
+    /// two, against over and then mix from the kernel crate bit for bit, and Mix 1 as the
+    /// stack itself.
+    fn merge_matches_the_kernel_crate(level: Level) {
         for len in (0..=70).chain([255, 1000, 4097]) {
-            let layer: [Vec<f32>; 4] = [1, 2, 3, 4].map(|seed| samples(len + seed));
-            let background: [Vec<f32>; 4] = [5, 6, 7, 8].map(|seed| samples(len + seed));
-            let layer: [&[f32]; 4] = layer
-                .each_ref()
-                .map(|plane| &plane[seed_skip(plane, len)..]);
-            let background: [&[f32]; 4] = background
-                .each_ref()
-                .map(|plane| &plane[seed_skip(plane, len)..]);
-            let mut dst: [Vec<f32>; 4] = background.map(<[f32]>::to_vec);
-
-            over(level, layer, dst.each_mut().map(Vec::as_mut_slice));
-            for channel in 0..4 {
-                for i in 0..len {
-                    let expected =
-                        kernels::over(background[channel][i], layer[channel][i], layer[3][i]);
-                    assert_eq!(
-                        dst[channel][i].to_bits(),
-                        expected.to_bits(),
-                        "{level:?}, {len} samples: over at {i} of plane {channel}"
-                    );
-                }
-            }
-
-            let composed: [Vec<f32>; 4] = dst.clone();
-            mix(
-                level,
-                background,
-                dst.each_mut().map(Vec::as_mut_slice),
-                0.3,
-            );
-            for channel in 0..4 {
-                for i in 0..len {
-                    let expected = kernels::mix(background[channel][i], composed[channel][i], 0.3);
-                    assert_eq!(
-                        dst[channel][i].to_bits(),
-                        expected.to_bits(),
-                        "{level:?}, {len} samples: mix at {i} of plane {channel}"
-                    );
+            let planes = |seeds: [usize; 4]| seeds.map(|seed| samples(len + seed)[seed..].to_vec());
+            let base = planes([5, 6, 7, 8]);
+            let first = planes([1, 2, 3, 4]);
+            let second = planes([9, 10, 11, 12]);
+            let base_planes = base.each_ref().map(Vec::as_slice);
+            let first_planes = first.each_ref().map(Vec::as_slice);
+            let second_planes = second.each_ref().map(Vec::as_slice);
+            for mix in [0.3, 1.0] {
+                for layers in [&[first_planes][..], &[first_planes, second_planes]] {
+                    let mut dst: [Vec<f32>; 4] = [(); 4].map(|()| vec![0.0; len]);
+                    let op = Merge { mix };
+                    at_level(level, || {
+                        fold_samples(
+                            &op,
+                            base_planes,
+                            layers,
+                            dst.each_mut().map(Vec::as_mut_slice),
+                        )
+                    });
+                    for i in 0..len {
+                        let mut stack = base_planes.map(|plane| plane[i]);
+                        for layer in layers {
+                            let alpha = layer[3][i];
+                            for (channel, sample) in stack.iter_mut().enumerate() {
+                                *sample =
+                                    opencompositor_kernels::over(*sample, layer[channel][i], alpha);
+                            }
+                        }
+                        for channel in 0..4 {
+                            let expected = if mix == 1.0 {
+                                stack[channel]
+                            } else {
+                                opencompositor_kernels::mix(
+                                    base_planes[channel][i],
+                                    stack[channel],
+                                    mix,
+                                )
+                            };
+                            assert_eq!(
+                                dst[channel][i].to_bits(),
+                                expected.to_bits(),
+                                "{level:?}, {len} samples, {} layers at Mix {mix}: sample {i} of plane {channel}",
+                                layers.len()
+                            );
+                        }
+                    }
                 }
             }
         }
-    }
-
-    /// Where a plane of `len + seed` samples starts, so that planes of one length differ.
-    fn seed_skip(plane: &[f32], len: usize) -> usize {
-        plane.len() - len
     }
 
     #[test]
     fn baseline_matches_the_kernel_crate() {
-        exposure_matches_the_kernel_crate(Level(Kind::Baseline));
-        over_and_mix_match_the_kernel_crate(Level(Kind::Baseline));
+        let level = Level(Kind::Baseline);
+        exposure_matches_the_kernel_crate(level);
+        merge_matches_the_kernel_crate(level);
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn v3_matches_the_kernel_crate() {
-        exposure_matches_the_kernel_crate(Level(Kind::V3));
-        over_and_mix_match_the_kernel_crate(Level(Kind::V3));
+        let level = Level(Kind::V3);
+        if supported(level) {
+            exposure_matches_the_kernel_crate(level);
+            merge_matches_the_kernel_crate(level);
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn v4_matches_the_kernel_crate() {
-        exposure_matches_the_kernel_crate(Level(Kind::V4));
-        over_and_mix_match_the_kernel_crate(Level(Kind::V4));
+        let level = Level(Kind::V4);
+        if supported(level) {
+            exposure_matches_the_kernel_crate(level);
+            merge_matches_the_kernel_crate(level);
+        }
+    }
+
+    fn window(x: i32, y: i32, width: u32, height: u32) -> Window {
+        Window {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// The map over the pool with an input offset in the output, reaching past it on two
+    /// sides: each output sample is Exposure of the input's sample at the same position, and
+    /// zero where the input is not.
+    #[test]
+    fn the_map_places_its_inputs() {
+        let pool = Pool::new();
+        let input = window(3, -2, 9, 6);
+        let output = window(0, 0, 10, 7);
+        let src: Vec<f32> = (0..input.area()).map(|i| i as f32 + 1.0).collect();
+        let mut dst = vec![f32::NAN; output.area() as usize];
+        map(
+            &pool,
+            &Exposure { gain: 2.0 },
+            [(&src, input)],
+            output,
+            [&mut dst],
+        );
+        for y in 0..7 {
+            for x in 0..10 {
+                let expected = if input.contains(x, y) {
+                    let at = (y - input.y) as u32 * input.width + (x - input.x) as u32;
+                    2.0 * src[at as usize]
+                } else {
+                    0.0
+                };
+                assert_eq!(dst[(y * 10 + x) as usize], expected, "({x}, {y})");
+            }
+        }
+    }
+
+    /// The fold over the pool with two layers in different parts of the output: each texel is
+    /// the base, overed by each layer whose window holds it, in order, and the base is zero
+    /// outside its own window.
+    #[test]
+    fn the_fold_places_its_layers() {
+        let pool = Pool::new();
+        let base_window = window(0, 0, 6, 4);
+        let first_window = window(4, 2, 5, 5);
+        let second_window = window(-2, 1, 4, 3);
+        let output = window(-2, 0, 11, 7);
+        let plane = |window: Window, value: f32| vec![value; window.area() as usize];
+        let base = [0.1, 0.2, 0.3, 0.4].map(|v| plane(base_window, v));
+        let first = [0.5, 0.25, 0.125, 0.5].map(|v| plane(first_window, v));
+        let second = [0.0625, 0.75, 1.0, 1.0].map(|v| plane(second_window, v));
+        let mut dst: [Vec<f32>; 4] = [(); 4].map(|()| vec![f32::NAN; output.area() as usize]);
+        fold(
+            &pool,
+            &Merge { mix: 1.0 },
+            (base.each_ref().map(Vec::as_slice), base_window),
+            &[
+                (first.each_ref().map(Vec::as_slice), first_window),
+                (second.each_ref().map(Vec::as_slice), second_window),
+            ],
+            output,
+            dst.each_mut().map(Vec::as_mut_slice),
+        );
+        for y in 0..7 {
+            for x in -2..9 {
+                let at = |window: Window, planes: &[Vec<f32>; 4]| {
+                    window
+                        .contains(x, y)
+                        .then(|| planes.each_ref().map(|plane| plane[0]))
+                };
+                let mut expected = at(base_window, &base).unwrap_or([0.0; 4]);
+                for layer in [at(first_window, &first), at(second_window, &second)]
+                    .into_iter()
+                    .flatten()
+                {
+                    for channel in 0..4 {
+                        expected[channel] = opencompositor_kernels::over(
+                            expected[channel],
+                            layer[channel],
+                            layer[3],
+                        );
+                    }
+                }
+                let index = (y * 11 + x + 2) as usize;
+                for channel in 0..4 {
+                    assert_eq!(
+                        dst[channel][index], expected[channel],
+                        "({x}, {y}) plane {channel}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    #[should_panic(expected = "differ in length")]
-    fn slices_of_different_lengths_are_refused() {
-        exposure(Level::detect(), &[1.0; 8], &mut [0.0; 7], 1.0);
+    #[should_panic(expected = "an input over its window")]
+    fn an_input_not_over_its_window_is_refused() {
+        let pool = Pool::new();
+        let output = window(0, 0, 4, 2);
+        map(
+            &pool,
+            &Exposure { gain: 1.0 },
+            [(&[1.0; 7], output)],
+            output,
+            [&mut [0.0; 8]],
+        );
     }
 
     #[test]
-    #[should_panic(expected = "differ in length")]
-    fn planes_of_different_lengths_are_refused() {
-        let layer = [1.0; 8];
-        let mut short = [0.0; 7];
+    #[should_panic(expected = "one length")]
+    fn outputs_of_different_lengths_are_refused() {
+        let pool = Pool::new();
+        let output = window(0, 0, 4, 2);
+        let planes = [[1.0; 8]; 4];
         let mut dst = [[0.0; 8]; 3];
         let [r, g, b] = &mut dst;
-        over(Level::detect(), [&layer; 4], [r, g, b, &mut short]);
+        fold(
+            &pool,
+            &Merge { mix: 1.0 },
+            (planes.each_ref().map(|plane| &plane[..]), output),
+            &[(planes.each_ref().map(|plane| &plane[..]), output)],
+            output,
+            [r, g, b, &mut [0.0; 7]],
+        );
     }
 }

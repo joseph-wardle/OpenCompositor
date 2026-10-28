@@ -1,6 +1,8 @@
 //! Blur's definition: three box passes along each axis, each a direct weighted sum of the taps
 //! within its half-width, a third of the size, with pixel-coverage weights.
 
+use crate::{LineReduce, Params, Real, flush};
+
 /// One of Blur's box passes, for a size in pixels: the taps and their weights that the CPU
 /// kernel sums, the host uploads for the GPU entry point and the tests' reference convolves.
 ///
@@ -94,6 +96,68 @@ impl BoxPass {
             (self.half_width - (f64::from(tap) - 0.5)).min(1.0)
         };
         overlap as f32
+    }
+}
+
+/// One of Blur's box passes as a line reduction: the window's core summed, then weighted with
+/// the two ends, `edge (first + last) + inner core` fused, the line grown by `2 tmax`. The CPU
+/// sums in f64, whose products and sums of f32 samples round far below the f32 each pass
+/// stores; the GPU in f32.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct BoxSum {
+    tmax: u32,
+    inner_weight: f32,
+    edge_weight: f32,
+}
+
+impl BoxSum {
+    /// The reduction for `pass`, which must have at least one tap each side: a pass of the
+    /// centre alone is the identity, and Blur skips it.
+    pub fn new(pass: BoxPass) -> BoxSum {
+        assert!(pass.tmax() >= 1, "a box pass with taps beside the centre");
+        BoxSum {
+            tmax: pass.tmax(),
+            inner_weight: pass.inner_weight(),
+            edge_weight: pass.edge_weight(),
+        }
+    }
+}
+
+// SAFETY: `#[repr(C)]`, four-byte fields.
+unsafe impl Params for BoxSum {}
+
+impl LineReduce for BoxSum {
+    type Acc = f64;
+
+    const DIRECT: &'static str = "gpu::blur_direct";
+    const SCAN: &'static str = "gpu::blur_scan";
+
+    #[inline(always)]
+    fn t(&self) -> u32 {
+        self.tmax
+    }
+
+    #[inline(always)]
+    fn shift(&self) -> u32 {
+        2 * self.tmax
+    }
+
+    #[inline(always)]
+    fn identity<R: Real>(&self) -> R {
+        R::from_f32(0.0)
+    }
+
+    #[inline(always)]
+    fn combine<R: Real>(&self, a: R, b: R) -> R {
+        a + b
+    }
+
+    #[inline(always)]
+    fn finish<R: Real>(&self, core: R, first: R, last: R) -> f32 {
+        let edge = R::from_f32(self.edge_weight);
+        let inner = R::from_f32(self.inner_weight);
+        flush(edge.mul_add(first + last, inner * core).to_f32())
     }
 }
 

@@ -1,137 +1,351 @@
-//! The kernels as compositor-core runs them: the CPU shells in [`cpu`], and here the GPU
-//! pipelines, one per operation over the entry points the kernel crate compiled to SPIR-V,
-//! dispatched over the evaluator's per-plane R32Float textures.
+//! The primitives as compositor-core runs them: their CPU halves in [`cpu`], and here their GPU
+//! halves, recording an operation's entry points from the module the kernel crate compiled to
+//! SPIR-V over the evaluator's per-plane R32Float textures.
 //!
-//! A dispatch records into the caller's encoder and never submits, so one submission can carry
-//! an evaluation's dispatches and copies together. Nothing here uploads or reads back: the tests
-//! do, as test support until the worker stages the GPU's inputs. Over and the box pass have no
-//! production dispatch yet: their entry points establish that naga accepts the module and that
-//! the numbers land within their bounds, ahead of the GPU step.
+//! Recording goes into the caller's encoder and never submits, so one submission can carry an
+//! evaluation's dispatches and copies together. Nothing here uploads or reads back: the tests
+//! do, as test support until the worker stages the GPU's inputs. The GPU primitives have no
+//! production caller yet: they establish that naga accepts the module and that the numbers
+//! land within their bounds, ahead of the GPU step.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use opencompositor_kernels::{
-    Axis, BOX_PASS_ENTRY, BoxPass, BoxPassParams, EXPOSURE_ENTRY, ExposureParams, OVER_ENTRY,
-    OverParams, SPIRV, WORKGROUP,
+    Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Params, Placement,
+    SCAN_BLOCK, SPIRV, WORKGROUP,
 };
+
+use crate::image::Window;
 
 pub(crate) mod cpu;
 
 /// The format of every plane texture.
 pub(crate) const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
-/// An entry point's pipeline on one device, made once per device: a uniform of parameters,
-/// its input planes read as textures, and one plane written as a storage texture, bound in
-/// that order as the kernel crate declares them.
+/// The primitives on one device: the module, and each entry point's pipeline, built the first
+/// time an operation is recorded.
 #[derive(Debug)]
-struct Pipeline {
+pub(crate) struct Kernels {
     device: wgpu::Device,
-    label: &'static str,
-    layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::ComputePipeline,
-    params_size: u64,
+    module: wgpu::ShaderModule,
+    pipelines: HashMap<&'static str, Pipeline>,
 }
 
-impl Pipeline {
-    /// Makes the pipeline, which naga validates, for an entry point reading `inputs` planes.
-    fn new(
-        device: &wgpu::Device,
-        label: &'static str,
-        entry: &str,
-        inputs: u32,
-        params_size: u64,
-    ) -> Pipeline {
+impl Kernels {
+    /// Loads the module, which naga validates as each pipeline is built.
+    pub(crate) fn new(device: &wgpu::Device) -> Kernels {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kernels"),
             source: wgpu::util::make_spirv(SPIRV),
         });
+        Kernels {
+            device: device.clone(),
+            module,
+            pipelines: HashMap::new(),
+        }
+    }
+
+    /// Records `op` over `inputs`, each a plane over its window, into `outputs`, planes over
+    /// `output`, one invocation per texel. An input is zero where its window does not reach.
+    pub(crate) fn map<M: Map<I, O>, const I: usize, const O: usize>(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        op: &M,
+        inputs: [(&wgpu::Texture, Window); I],
+        output: Window,
+        outputs: [&wgpu::Texture; O],
+    ) -> Result<(), PlaneError> {
+        for (plane, window) in inputs {
+            check_input(plane, window)?;
+        }
+        for plane in outputs {
+            check_output(plane, output)?;
+        }
+        let params = MapParams {
+            places: inputs.map(|(_, window)| place(window, output)),
+            width: output.width,
+            height: output.height,
+            op: *op,
+        };
+        let textures = inputs.map(|(plane, _)| plane);
+        let groups = per_texel(output);
+        self.dispatch(encoder, M::ENTRY, &params, &textures, &outputs, groups);
+        Ok(())
+    }
+
+    /// Records `op` over a stack of `layers` on `base`, each planes over a window, into
+    /// `outputs`, planes over `output`: a dispatch per layer, each onto the last's planes, the
+    /// last with the finish. Every layer but the last writes planes taken from `planes`, which
+    /// get them back once recorded. There is at least one layer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a stack, its output and its scratch"
+    )]
+    pub(crate) fn fold<F: Fold<G, O>, const G: usize, const O: usize>(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        op: &F,
+        base: ([&wgpu::Texture; O], Window),
+        layers: &[([&wgpu::Texture; G], Window)],
+        output: Window,
+        outputs: [&wgpu::Texture; O],
+        planes: &mut Planes,
+    ) -> Result<(), PlaneError> {
+        assert!(!layers.is_empty(), "a fold has a layer");
+        for (textures, window) in std::iter::once((&base.0[..], base.1)).chain(
+            layers
+                .iter()
+                .map(|(textures, window)| (&textures[..], *window)),
+        ) {
+            for plane in textures {
+                check_input(plane, window)?;
+            }
+        }
+        for plane in outputs {
+            check_output(plane, output)?;
+        }
+        // The stack below the next layer, the base's planes until a layer has been recorded.
+        let mut below: Option<([wgpu::Texture; O], Window)> = None;
+        for (index, (layer, window)) in layers.iter().enumerate() {
+            let (below_planes, below_window) = match &below {
+                Some((planes, window)) => (planes.each_ref(), *window),
+                None => base,
+            };
+            let params = FoldParams {
+                base: place(base.1, output),
+                below: place(below_window, output),
+                layer: place(*window, output),
+                width: output.width,
+                height: output.height,
+                op: *op,
+            };
+            let groups = per_texel(output);
+            if index + 1 == layers.len() {
+                let textures: Vec<&wgpu::Texture> =
+                    (base.0.iter().chain(&below_planes).chain(layer))
+                        .copied()
+                        .collect();
+                self.dispatch(encoder, F::LAST, &params, &textures, &outputs, groups);
+            } else {
+                let textures: Vec<&wgpu::Texture> =
+                    (below_planes.iter().chain(layer)).copied().collect();
+                let targets: [wgpu::Texture; O] =
+                    std::array::from_fn(|_| planes.take(&self.device, output));
+                self.dispatch(
+                    encoder,
+                    F::STEP,
+                    &params,
+                    &textures,
+                    &targets.each_ref(),
+                    groups,
+                );
+                if let Some((previous, _)) = below.replace((targets, output)) {
+                    previous.into_iter().for_each(|plane| planes.keep(plane));
+                }
+            }
+        }
+        if let Some((previous, _)) = below {
+            previous.into_iter().for_each(|plane| planes.keep(plane));
+        }
+        Ok(())
+    }
+
+    /// Records `passes` passes of `op` along `axis` of `input`, a plane of `width` by
+    /// `height`, into `output`, which each pass lengthens along the axis by the operation's
+    /// growth: a dispatch per pass, directly for narrow windows and by blocks for wide ones,
+    /// every pass but the last into a plane taken from `planes`, which get them back once
+    /// recorded.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a plane, its size, its output and scratch"
+    )]
+    pub(crate) fn line<L: LineReduce>(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        op: &L,
+        axis: Axis,
+        passes: u32,
+        input: &wgpu::Texture,
+        (width, height): (u32, u32),
+        output: &wgpu::Texture,
+        planes: &mut Planes,
+    ) -> Result<(), PlaneError> {
+        assert!(2 * op.t() <= SCAN_BLOCK, "a window the scan's block holds");
+        let mut size = Window {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        check_input(input, size)?;
+        let growth = op.growth() * passes;
+        let grown = match axis {
+            Axis::Rows => Window {
+                width: width + growth,
+                ..size
+            },
+            Axis::Columns => Window {
+                height: height + growth,
+                ..size
+            },
+        };
+        check_output(output, grown)?;
+        let mut current: Option<wgpu::Texture> = None;
+        for pass in 0..passes {
+            let len = match axis {
+                Axis::Rows => size.width,
+                Axis::Columns => size.height,
+            };
+            match axis {
+                Axis::Rows => size.width += op.growth(),
+                Axis::Columns => size.height += op.growth(),
+            }
+            let target = (pass + 1 < passes).then(|| planes.take(&self.device, size));
+            let params = LineParams {
+                width: size.width,
+                height: size.height,
+                axis: axis as u32,
+                len,
+                op: *op,
+            };
+            let source = current.as_ref().unwrap_or(input);
+            let written = target.as_ref().unwrap_or(output);
+            if op.t() <= DIRECT_T {
+                let groups = per_texel(size);
+                self.dispatch(encoder, L::DIRECT, &params, &[source], &[written], groups);
+            } else {
+                let (extent, lines) = match axis {
+                    Axis::Rows => (size.width, size.height),
+                    Axis::Columns => (size.height, size.width),
+                };
+                let blocks = extent / (2 * op.t() - 1) + 1;
+                let groups = [blocks, lines];
+                self.dispatch(encoder, L::SCAN, &params, &[source], &[written], groups);
+            }
+            if let Some(previous) = std::mem::replace(&mut current, target) {
+                planes.keep(previous);
+            }
+        }
+        Ok(())
+    }
+
+    /// Records `entry` with `params` over `inputs` into `outputs` in `groups` workgroups,
+    /// building its pipeline first if nothing has recorded it yet.
+    fn dispatch<P: Params>(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        entry: &'static str,
+        params: &P,
+        inputs: &[&wgpu::Texture],
+        outputs: &[&wgpu::Texture],
+        groups: [u32; 2],
+    ) {
+        let (device, module) = (&self.device, &self.module);
+        let pipeline = self
+            .pipelines
+            .entry(entry)
+            .or_insert_with(|| Pipeline::new(device, module, entry, inputs.len(), outputs.len()));
+        pipeline.record(device, encoder, params, inputs, outputs, groups);
+    }
+}
+
+/// An entry point's pipeline: a storage buffer of parameters, its input planes read as
+/// textures, and its output planes written as storage textures, bound in that order as the
+/// kernel crate declares them.
+#[derive(Debug)]
+struct Pipeline {
+    label: &'static str,
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+
+impl Pipeline {
+    fn new(
+        device: &wgpu::Device,
+        module: &wgpu::ShaderModule,
+        entry: &'static str,
+        inputs: usize,
+        outputs: usize,
+    ) -> Pipeline {
         let mut entries = vec![wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
                 has_dynamic_offset: false,
-                min_binding_size: wgpu::BufferSize::new(params_size),
+                min_binding_size: None,
             },
             count: None,
         }];
-        entries.extend((1..=inputs).map(|binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        }));
-        entries.push(wgpu::BindGroupLayoutEntry {
-            binding: inputs + 1,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::StorageTexture {
-                // rust-gpu declares a storage image readable and writable, and naga holds the
-                // layout to the same; R32Float may be bound read-write without any feature.
-                access: wgpu::StorageTextureAccess::ReadWrite,
-                format: PLANE_FORMAT,
-                view_dimension: wgpu::TextureViewDimension::D2,
-            },
-            count: None,
-        });
+        entries.extend(
+            (1..=inputs as u32).map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }),
+        );
+        entries.extend(
+            (1..=outputs as u32).map(|output| wgpu::BindGroupLayoutEntry {
+                binding: inputs as u32 + output,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    // rust-gpu declares a storage image readable and writable, and naga holds the
+                    // layout to the same; R32Float may be bound read-write without any feature.
+                    access: wgpu::StorageTextureAccess::ReadWrite,
+                    format: PLANE_FORMAT,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            }),
+        );
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(label),
+            label: Some(entry),
             entries: &entries,
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(label),
+            label: Some(entry),
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(label),
+            label: Some(entry),
             layout: Some(&pipeline_layout),
-            module: &module,
+            module,
             entry_point: Some(entry),
             compilation_options: Default::default(),
             cache: None,
         });
         Pipeline {
-            device: device.clone(),
-            label,
+            label: entry,
             layout,
             pipeline,
-            params_size,
         }
     }
 
-    /// Records the entry point with `params` over `inputs`, planes of `inputs_size`, into
-    /// `output`, into the encoder. Workgroups cover the output rounded up to whole ones; the
-    /// entry point skips the invocations past the edge.
-    ///
-    /// The planes are checked here rather than left to wgpu, whose validation error would count
-    /// as a bug on the device.
-    fn dispatch(
+    fn record<P: Params>(
         &self,
+        device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        params: &[u8],
+        params: &P,
         inputs: &[&wgpu::Texture],
-        inputs_size: wgpu::Extent3d,
-        output: &wgpu::Texture,
-    ) -> Result<(), PlaneError> {
-        assert_eq!(params.len() as u64, self.params_size, "the params' bytes");
-        for &input in inputs {
-            check_plane(Role::Input, input, wgpu::TextureUsages::TEXTURE_BINDING)?;
-            if input.size() != inputs_size {
-                return Err(PlaneError::Size {
-                    input: input.size(),
-                    needed: inputs_size,
-                });
-            }
-        }
-        check_plane(Role::Output, output, wgpu::TextureUsages::STORAGE_BINDING)?;
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+        outputs: &[&wgpu::Texture],
+        groups: [u32; 2],
+    ) {
+        // SAFETY: `Params` is implemented only for `#[repr(C)]` structs of four-byte values,
+        // which have no padding, so all `size_of::<P>()` bytes are initialised.
+        let bytes = unsafe {
+            std::slice::from_raw_parts((params as *const P).cast::<u8>(), size_of::<P>())
+        };
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(self.label),
-            size: self.params_size,
-            usage: wgpu::BufferUsages::UNIFORM,
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: true,
         });
         buffer
@@ -139,9 +353,9 @@ impl Pipeline {
             .get_mapped_range_mut()
             .expect("a buffer mapped at creation")
             .slice(..)
-            .copy_from_slice(params);
+            .copy_from_slice(bytes);
         buffer.unmap();
-        let views: Vec<wgpu::TextureView> = (inputs.iter().chain([&output]))
+        let views: Vec<wgpu::TextureView> = (inputs.iter().chain(outputs))
             .map(|texture| texture.create_view(&Default::default()))
             .collect();
         let mut entries = vec![wgpu::BindGroupEntry {
@@ -154,7 +368,7 @@ impl Pipeline {
                 resource: wgpu::BindingResource::TextureView(view),
             }),
         );
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(self.label),
             layout: &self.layout,
             entries: &entries,
@@ -165,119 +379,91 @@ impl Pipeline {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(
-            output.width().div_ceil(WORKGROUP),
-            output.height().div_ceil(WORKGROUP),
-            1,
-        );
-        Ok(())
+        pass.dispatch_workgroups(groups[0], groups[1], 1);
     }
 }
 
-/// Exposure's pipeline on one device.
-#[derive(Debug)]
-pub(crate) struct Exposure(Pipeline);
+/// Workgroups covering a plane over `window`, one invocation per texel.
+fn per_texel(window: Window) -> [u32; 2] {
+    [
+        window.width.div_ceil(WORKGROUP),
+        window.height.div_ceil(WORKGROUP),
+    ]
+}
 
-impl Exposure {
-    pub(crate) fn new(device: &wgpu::Device) -> Exposure {
-        let params_size = size_of::<ExposureParams>() as u64;
-        Exposure(Pipeline::new(
-            device,
-            "exposure",
-            EXPOSURE_ENTRY,
-            1,
-            params_size,
-        ))
-    }
-
-    /// Records Exposure by `gain` over `input` into `output`, two planes of one size, into the
-    /// encoder.
-    pub(crate) fn dispatch(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        input: &wgpu::Texture,
-        output: &wgpu::Texture,
-        gain: f32,
-    ) -> Result<(), PlaneError> {
-        let params = ExposureParams {
-            width: output.width(),
-            height: output.height(),
-            gain,
-        };
-        self.0
-            .dispatch(encoder, &params.bytes(), &[input], output.size(), output)
+/// Where `input` lies in `output`, in the output's texels.
+fn place(input: Window, output: Window) -> Placement {
+    Placement {
+        x: input.x - output.x,
+        y: input.y - output.y,
+        width: input.width,
+        height: input.height,
     }
 }
 
-/// Over's pipeline on one device.
-#[derive(Debug)]
-pub(crate) struct Over(Pipeline);
+/// Planes the primitives' intermediate results are written to, kept for reuse once recorded:
+/// a later dispatch in the same submission may write one again, since wgpu orders the two.
+#[derive(Debug, Default)]
+pub(crate) struct Planes(Vec<wgpu::Texture>);
 
-impl Over {
-    pub(crate) fn new(device: &wgpu::Device) -> Over {
-        let params_size = size_of::<OverParams>() as u64;
-        Over(Pipeline::new(device, "over", OVER_ENTRY, 3, params_size))
+impl Planes {
+    /// A plane over `window`'s size, readable and writable by the kernels, whose contents the
+    /// caller overwrites.
+    fn take(&mut self, device: &wgpu::Device, window: Window) -> wgpu::Texture {
+        let size = extent(window);
+        match self.0.iter().position(|plane| plane.size() == size) {
+            Some(index) => self.0.swap_remove(index),
+            None => device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("intermediate"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: PLANE_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+                view_formats: &[],
+            }),
+        }
     }
 
-    /// Records one plane of `layer` over the same plane of `background`, with the layer's
-    /// `alpha` plane, into `output`, four planes of one size, into the encoder. For the alpha
-    /// plane itself, `layer` is `alpha`.
-    pub(crate) fn dispatch(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        background: &wgpu::Texture,
-        layer: &wgpu::Texture,
-        alpha: &wgpu::Texture,
-        output: &wgpu::Texture,
-    ) -> Result<(), PlaneError> {
-        let params = OverParams {
-            width: output.width(),
-            height: output.height(),
-        };
-        let inputs = [background, layer, alpha];
-        self.0
-            .dispatch(encoder, &params.bytes(), &inputs, output.size(), output)
+    fn keep(&mut self, plane: wgpu::Texture) {
+        self.0.push(plane);
     }
 }
 
-/// Blur's box pass on one device: one pass along one axis. Running the three passes along
-/// each axis, through planes a pass both reads and writes, is the GPU step's.
-#[derive(Debug)]
-pub(crate) struct Blur(Pipeline);
-
-impl Blur {
-    pub(crate) fn new(device: &wgpu::Device) -> Blur {
-        let params_size = size_of::<BoxPassParams>() as u64;
-        Blur(Pipeline::new(
-            device,
-            "box pass",
-            BOX_PASS_ENTRY,
-            1,
-            params_size,
-        ))
+/// The texture size of a plane over `window`.
+fn extent(window: Window) -> wgpu::Extent3d {
+    wgpu::Extent3d {
+        width: window.width,
+        height: window.height,
+        depth_or_array_layers: 1,
     }
+}
 
-    /// Records one box pass of `pass` along `axis` over `input` into `output`, which is `2
-    /// tmax` texels longer along the axis, into the encoder. An output no longer than that
-    /// has no input it could come from and is refused as a size mismatch.
-    pub(crate) fn dispatch(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        pass: BoxPass,
-        axis: Axis,
-        input: &wgpu::Texture,
-        output: &wgpu::Texture,
-    ) -> Result<(), PlaneError> {
-        let params = BoxPassParams::new(pass, axis, output.width(), output.height());
-        let mut inputs_size = output.size();
-        let shorter = match axis {
-            Axis::Rows => &mut inputs_size.width,
-            Axis::Columns => &mut inputs_size.height,
-        };
-        *shorter = shorter.saturating_sub(2 * pass.tmax());
-        self.0
-            .dispatch(encoder, &params.bytes(), &[input], inputs_size, output)
+/// Checks an input plane before anything is recorded, rather than leaving it to wgpu, whose
+/// validation error would count as a bug on the device.
+fn check_input(texture: &wgpu::Texture, window: Window) -> Result<(), PlaneError> {
+    check_plane(Role::Input, texture, wgpu::TextureUsages::TEXTURE_BINDING)?;
+    if texture.size() != extent(window) {
+        return Err(PlaneError::Size {
+            role: Role::Input,
+            plane: texture.size(),
+            needed: extent(window),
+        });
     }
+    Ok(())
+}
+
+fn check_output(texture: &wgpu::Texture, window: Window) -> Result<(), PlaneError> {
+    check_plane(Role::Output, texture, wgpu::TextureUsages::STORAGE_BINDING)?;
+    if texture.size() != extent(window) {
+        return Err(PlaneError::Size {
+            role: Role::Output,
+            plane: texture.size(),
+            needed: extent(window),
+        });
+    }
+    Ok(())
 }
 
 fn check_plane(
@@ -318,9 +504,10 @@ pub(crate) enum PlaneError {
         role: Role,
         missing: wgpu::TextureUsages,
     },
-    /// An input is not the size the output needs.
+    /// The plane is not the size of its window.
     Size {
-        input: wgpu::Extent3d,
+        role: Role,
+        plane: wgpu::Extent3d,
         needed: wgpu::Extent3d,
     },
 }
@@ -334,10 +521,14 @@ impl fmt::Display for PlaneError {
             PlaneError::Usage { role, missing } => {
                 write!(f, "the {role:?} plane was made without {missing:?}")
             }
-            PlaneError::Size { input, needed } => write!(
+            PlaneError::Size {
+                role,
+                plane,
+                needed,
+            } => write!(
                 f,
-                "the input plane is {} by {}, not the {} by {} the output needs",
-                input.width, input.height, needed.width, needed.height
+                "the {role:?} plane is {} by {}, not the {} by {} of its window",
+                plane.width, plane.height, needed.width, needed.height
             ),
         }
     }
@@ -487,28 +678,90 @@ mod headless {
 
 #[cfg(test)]
 mod tests {
-    use opencompositor_kernels::ulp_distance;
+    use opencompositor_kernels::{BoxPass, BoxSum, Exposure, Merge, ulp_distance};
 
     use super::*;
-    use crate::gpu::{noop_device, noop_parts};
+    use crate::gpu::noop_parts;
 
+    fn window(x: i32, y: i32, width: u32, height: u32) -> Window {
+        Window {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn at_origin(width: u32, height: u32) -> Window {
+        window(0, 0, width, height)
+    }
+
+    /// Records every entry point once, which builds its pipeline: naga validates each against
+    /// its layout without a GPU.
     #[test]
     fn the_module_and_pipelines_validate_without_a_gpu() {
-        let device = noop_device(None);
-        Exposure::new(&device);
-        Over::new(&device);
-        Blur::new(&device);
+        // The queue kept: a noop device whose queue dropped refuses to make an encoder.
+        let (_, device, _queue) = noop_parts(None);
+        let mut kernels = Kernels::new(&device);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut planes = Planes::default();
+        let plane = |width, height| {
+            let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING;
+            headless::plane(&device, width, height, usage)
+        };
+        let size = at_origin(4, 4);
+        let (input, output) = (plane(4, 4), plane(4, 4));
+        let op = Exposure { gain: 1.0 };
+        kernels
+            .map(&mut encoder, &op, [(&input, size)], size, [&output])
+            .expect("planes of one size");
+        let four = [(); 4].map(|()| plane(4, 4));
+        let four = four.each_ref();
+        let outputs = [(); 4].map(|()| plane(4, 4));
+        let layers = [(four, size), (four, size)];
+        let merge = Merge { mix: 0.5 };
+        kernels
+            .fold(
+                &mut encoder,
+                &merge,
+                (four, size),
+                &layers,
+                size,
+                outputs.each_ref(),
+                &mut planes,
+            )
+            .expect("planes of one size");
+        for size in [3.0, 1000.0] {
+            let pass = BoxPass::new(size);
+            let grown = plane(4 + 2 * pass.tmax(), 4);
+            let op = BoxSum::new(pass);
+            kernels
+                .line(
+                    &mut encoder,
+                    &op,
+                    Axis::Rows,
+                    1,
+                    &input,
+                    (4, 4),
+                    &grown,
+                    &mut planes,
+                )
+                .expect("an output grown by the pass");
+        }
+        assert_eq!(kernels.pipelines.len(), 5, "every entry point");
     }
 
     #[test]
     fn a_wrong_plane_is_refused_before_anything_is_recorded() {
         let (_, device, _queue) = noop_parts(None);
-        let exposure = Exposure::new(&device);
+        let mut kernels = Kernels::new(&device);
         let mut encoder = device.create_command_encoder(&Default::default());
         let readable = wgpu::TextureUsages::TEXTURE_BINDING;
         let writable = wgpu::TextureUsages::STORAGE_BINDING;
         let input = headless::plane(&device, 4, 4, readable);
         let output = headless::plane(&device, 4, 4, writable);
+        let size = at_origin(4, 4);
+        let op = Exposure { gain: 1.0 };
 
         let rgba = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -521,7 +774,7 @@ mod tests {
             view_formats: &[],
         });
         assert_eq!(
-            exposure.dispatch(&mut encoder, &rgba, &output, 1.0),
+            kernels.map(&mut encoder, &op, [(&rgba, size)], size, [&output]),
             Err(PlaneError::Format {
                 role: Role::Input,
                 format: wgpu::TextureFormat::Rgba32Float,
@@ -530,41 +783,65 @@ mod tests {
 
         let unwritable = headless::plane(&device, 4, 4, readable);
         assert_eq!(
-            exposure.dispatch(&mut encoder, &input, &unwritable, 1.0),
+            kernels.map(&mut encoder, &op, [(&input, size)], size, [&unwritable]),
             Err(PlaneError::Usage {
                 role: Role::Output,
                 missing: writable,
             })
         );
 
+        // An input placed anywhere must be its window's size, and an output the output's.
+        let wider = window(-1, 0, 5, 4);
+        assert_eq!(
+            kernels.map(&mut encoder, &op, [(&input, wider)], size, [&output]),
+            Err(PlaneError::Size {
+                role: Role::Input,
+                plane: input.size(),
+                needed: extent(wider),
+            })
+        );
         let smaller = headless::plane(&device, 4, 3, writable);
         assert_eq!(
-            exposure.dispatch(&mut encoder, &input, &smaller, 1.0),
+            kernels.map(&mut encoder, &op, [(&input, size)], size, [&smaller]),
             Err(PlaneError::Size {
-                input: input.size(),
-                needed: smaller.size(),
+                role: Role::Output,
+                plane: smaller.size(),
+                needed: input.size(),
             })
         );
 
-        // A box pass of one tap each side along rows needs an input two texels narrower.
-        let blur = Blur::new(&device);
-        let pass = BoxPass::new(3.0);
-        let result = blur.dispatch(&mut encoder, pass, Axis::Rows, &input, &output);
+        // Three passes of one tap each side along rows grow the plane by six texels.
+        let op = BoxSum::new(BoxPass::new(3.0));
+        let mut planes = Planes::default();
         assert_eq!(
-            result,
+            kernels.line(
+                &mut encoder,
+                &op,
+                Axis::Rows,
+                3,
+                &input,
+                (4, 4),
+                &output,
+                &mut planes
+            ),
             Err(PlaneError::Size {
-                input: input.size(),
-                needed: headless::plane(&device, 2, 4, readable).size(),
+                role: Role::Output,
+                plane: output.size(),
+                needed: extent(at_origin(10, 4)),
             })
         );
-        let narrower = headless::plane(&device, 2, 4, readable);
+        let grown = headless::plane(&device, 4, 10, writable);
         assert_eq!(
-            blur.dispatch(&mut encoder, pass, Axis::Rows, &narrower, &output),
-            Ok(())
-        );
-        let shorter = headless::plane(&device, 4, 2, readable);
-        assert_eq!(
-            blur.dispatch(&mut encoder, pass, Axis::Columns, &shorter, &output),
+            kernels.line(
+                &mut encoder,
+                &op,
+                Axis::Columns,
+                3,
+                &input,
+                (4, 4),
+                &grown,
+                &mut planes
+            ),
             Ok(())
         );
     }
@@ -605,17 +882,24 @@ mod tests {
     #[test]
     fn exposure_on_the_gpu_is_the_cpu_definition() {
         let (device, queue) = headless::device();
-        let exposure = Exposure::new(&device);
+        let mut kernels = Kernels::new(&device);
         // A quarter-stop gain, rounded like the host's, and one that flushes MIN_POSITIVE.
         let gains = [0.75f64.exp2() as f32, (-10f64).exp2() as f32];
         for (width, height) in SIZES {
+            let size = at_origin(width, height);
             let texels = texels((width * height) as usize);
             let input = headless::upload(&device, &queue, width, height, &texels);
             for gain in gains {
                 let output = headless::output(&device, width, height);
                 let mut encoder = device.create_command_encoder(&Default::default());
-                exposure
-                    .dispatch(&mut encoder, &input, &output, gain)
+                kernels
+                    .map(
+                        &mut encoder,
+                        &Exposure { gain },
+                        [(&input, size)],
+                        size,
+                        [&output],
+                    )
                     .expect("two planes of one size");
                 queue.submit([encoder.finish()]);
                 let result = headless::readback(&device, &queue, &output);
@@ -657,69 +941,157 @@ mod tests {
             .collect()
     }
 
-    /// Over on the GPU against the CPU definition, within 1 ULP where the result is not a
-    /// cancellation, since a driver that splits the fused multiply-add rounds twice; where the
-    /// product and the layer cancel, within the ULP of what was summed. Non-finite results agree
-    /// by class.
+    /// Merge of one layer at Mix 1, over alone, on the GPU against the CPU definition: within
+    /// 1 ULP where the result is not a cancellation, since a driver that splits the fused
+    /// multiply-add rounds twice; where the product and the layer cancel, within the ULP of
+    /// what was summed. Non-finite results agree by class. Every plane is one texel pattern
+    /// rotated, alpha the alphas.
     #[test]
     fn over_on_the_gpu_is_within_a_ulp_of_the_cpu_definition() {
         let (device, queue) = headless::device();
-        let over = Over::new(&device);
+        let mut kernels = Kernels::new(&device);
         let mut worst = 0;
         for (width, height) in SIZES {
+            let size = at_origin(width, height);
             let count = (width * height) as usize;
-            let background = texels(count);
-            let mut layer = texels(count);
-            layer.rotate_left(1);
-            let alpha = alphas(count);
-            let planes = [&background, &layer, &alpha]
-                .map(|texels| headless::upload(&device, &queue, width, height, texels));
-            let [background_plane, layer_plane, alpha_plane] = &planes;
-            let output = headless::output(&device, width, height);
+            let rotated = |by: usize| {
+                let mut plane = texels(count);
+                plane.rotate_left(by.min(count));
+                plane
+            };
+            let background = [rotated(0), rotated(1), rotated(2), rotated(3)];
+            let layer = [rotated(4), rotated(5), rotated(6), alphas(count)];
+            let upload =
+                |texels: &Vec<f32>| headless::upload(&device, &queue, width, height, texels);
+            let background_planes = background.each_ref().map(upload);
+            let layer_planes = layer.each_ref().map(upload);
+            let outputs = [(); 4].map(|()| headless::output(&device, width, height));
             let mut encoder = device.create_command_encoder(&Default::default());
-            over.dispatch(
-                &mut encoder,
-                background_plane,
-                layer_plane,
-                alpha_plane,
-                &output,
-            )
-            .expect("four planes of one size");
+            kernels
+                .fold(
+                    &mut encoder,
+                    &Merge { mix: 1.0 },
+                    (background_planes.each_ref(), size),
+                    &[(layer_planes.each_ref(), size)],
+                    size,
+                    outputs.each_ref(),
+                    &mut Planes::default(),
+                )
+                .expect("planes of one size");
             queue.submit([encoder.finish()]);
-            let result = headless::readback(&device, &queue, &output);
-            assert_eq!(result.len(), count);
-            for (i, &actual) in result.iter().enumerate() {
-                let (b, l, a) = (background[i], layer[i], alpha[i]);
-                let expected = opencompositor_kernels::over(b, l, a);
-                let what = format!("{width}x{height} texel {i}: {l:?} at {a:?} over {b:?}");
-                if !expected.is_finite() {
-                    assert_eq!(
-                        ulp_distance(actual, expected),
-                        0,
-                        "{what} gave {actual:?}, not {expected:?}"
+            for (channel, output) in outputs.iter().enumerate() {
+                let result = headless::readback(&device, &queue, output);
+                assert_eq!(result.len(), count);
+                for (i, &actual) in result.iter().enumerate() {
+                    let (b, l, a) = (background[channel][i], layer[channel][i], layer[3][i]);
+                    let expected = opencompositor_kernels::over(b, l, a);
+                    let what = format!(
+                        "{width}x{height} plane {channel} texel {i}: {l:?} at {a:?} over {b:?}"
                     );
-                    continue;
-                }
-                let product = f64::from(b) * f64::from(1.0 - a);
-                let summed = product.abs() + f64::from(l).abs();
-                if summed <= 4.0 * f64::from(expected).abs() {
-                    let distance = ulp_distance(actual, expected);
-                    assert!(
-                        distance <= 1,
-                        "{what} gave {actual:?}, {distance} ULP from {expected:?}"
-                    );
-                    worst = worst.max(distance);
-                } else {
-                    let summed_ulp = f64::from(summed as f32).abs() * f64::from(f32::EPSILON);
-                    let difference = (f64::from(actual) - f64::from(expected)).abs();
-                    assert!(
-                        difference <= summed_ulp,
-                        "{what} gave {actual:?}, not {expected:?}, with {summed} summed"
-                    );
+                    if !expected.is_finite() {
+                        assert_eq!(
+                            ulp_distance(actual, expected),
+                            0,
+                            "{what} gave {actual:?}, not {expected:?}"
+                        );
+                        continue;
+                    }
+                    let product = f64::from(b) * f64::from(1.0 - a);
+                    let summed = product.abs() + f64::from(l).abs();
+                    if summed <= 4.0 * f64::from(expected).abs() {
+                        let distance = ulp_distance(actual, expected);
+                        assert!(
+                            distance <= 1,
+                            "{what} gave {actual:?}, {distance} ULP from {expected:?}"
+                        );
+                        worst = worst.max(distance);
+                    } else {
+                        let summed_ulp = f64::from(summed as f32).abs() * f64::from(f32::EPSILON);
+                        let difference = (f64::from(actual) - f64::from(expected)).abs();
+                        assert!(
+                            difference <= summed_ulp,
+                            "{what} gave {actual:?}, not {expected:?}, with {summed} summed"
+                        );
+                    }
                 }
             }
         }
         println!("over on the GPU: at worst {worst} ULP from the CPU");
+    }
+
+    /// Merge of two layers placed in different parts of the output, with the base smaller
+    /// than it, through the step and the last dispatch, against the CPU's fold bit for bit:
+    /// the values make every product and sum exact, so a split multiply-add cannot differ.
+    #[test]
+    fn the_fold_on_the_gpu_places_its_layers_as_the_cpu_does() {
+        let (device, queue) = headless::device();
+        let mut kernels = Kernels::new(&device);
+        let pool = crate::evaluate::Pool::new();
+        let base_window = window(0, 0, 20, 9);
+        let first_window = window(13, 4, 19, 17);
+        let second_window = window(-5, 2, 9, 6);
+        let output = window(-5, 0, 37, 21);
+        let plane = |window: Window, values: [f32; 2]| -> Vec<f32> {
+            (0..window.area())
+                .map(|i| values[(i % 2) as usize])
+                .collect()
+        };
+        let base =
+            [[0.5, 0.25], [0.125, 1.0], [2.0, 0.0], [1.0, 0.5]].map(|v| plane(base_window, v));
+        let first =
+            [[0.25, 0.5], [0.5, 0.0], [1.0, 0.75], [0.5, 1.0]].map(|v| plane(first_window, v));
+        let second =
+            [[0.0625, 1.0], [0.75, 0.5], [1.0, 0.25], [1.0, 0.5]].map(|v| plane(second_window, v));
+        for mix in [1.0, 0.5] {
+            let op = Merge { mix };
+            let mut cpu_planes: [Vec<f32>; 4] = [(); 4].map(|()| vec![0.0; output.area() as usize]);
+            cpu::fold(
+                &pool,
+                &op,
+                (base.each_ref().map(Vec::as_slice), base_window),
+                &[
+                    (first.each_ref().map(Vec::as_slice), first_window),
+                    (second.each_ref().map(Vec::as_slice), second_window),
+                ],
+                output,
+                cpu_planes.each_mut().map(Vec::as_mut_slice),
+            );
+            let upload = |window: Window, planes: &[Vec<f32>; 4]| {
+                planes.each_ref().map(|texels| {
+                    headless::upload(&device, &queue, window.width, window.height, texels)
+                })
+            };
+            let (base_planes, first_planes, second_planes) = (
+                upload(base_window, &base),
+                upload(first_window, &first),
+                upload(second_window, &second),
+            );
+            let outputs = [(); 4].map(|()| headless::output(&device, output.width, output.height));
+            let mut encoder = device.create_command_encoder(&Default::default());
+            kernels
+                .fold(
+                    &mut encoder,
+                    &op,
+                    (base_planes.each_ref(), base_window),
+                    &[
+                        (first_planes.each_ref(), first_window),
+                        (second_planes.each_ref(), second_window),
+                    ],
+                    output,
+                    outputs.each_ref(),
+                    &mut Planes::default(),
+                )
+                .expect("planes over their windows");
+            queue.submit([encoder.finish()]);
+            for (channel, output) in outputs.iter().enumerate() {
+                let result = headless::readback(&device, &queue, output);
+                let bits = |plane: &[f32]| plane.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert!(
+                    bits(&result) == bits(&cpu_planes[channel]),
+                    "Mix {mix}, plane {channel}"
+                );
+            }
+        }
     }
 
     /// A plane for the box pass: values of both signs over sixty stops on every texel but five
@@ -767,23 +1139,25 @@ mod tests {
         (sum, magnitude)
     }
 
-    /// The GPU's K for a box pass: under three times the 96 that the RTX 4070 Ti SUPER and
-    /// llvmpipe needed, so that a change in how the shader sums shows here. The test prints
-    /// the factor the adapter needed.
+    /// The GPU's K for a box pass: an f32 sum's worst case grows with the tap count, and 256
+    /// keeps the error within 2⁻¹⁶ of the magnitude sum. The test prints the factor the
+    /// adapter needed.
     const BOX_PASS_K: f64 = 256.0;
 
     /// One box pass on the GPU, along each axis, against the definition's f64 sum, within
     /// `BOX_PASS_K` times 2⁻²⁴ of the sum over the magnitudes plus one `MIN_POSITIVE`, at sizes
-    /// from one tap each side to the limit, over the usual planes and a line longer than the
-    /// widest window; non-finite results agree by class.
+    /// from one tap each side to the limit, summed directly and by blocks, over the usual
+    /// planes and a line longer than the widest window; non-finite results agree by class.
     #[test]
     fn a_box_pass_on_the_gpu_is_within_its_bound_of_the_direct_sum() {
         let (device, queue) = headless::device();
-        let blur = Blur::new(&device);
+        let mut kernels = Kernels::new(&device);
+        let mut planes = Planes::default();
         let mut worst: f64 = 0.0;
-        for size in [2.0, 3.0, 10.0, 31.4, 100.0, 1000.0, 4096.0] {
+        for size in [2.0, 3.0, 10.0, 31.4, 100.0, 180.0, 1000.0, 4096.0] {
             let pass = BoxPass::new(size);
             let t = pass.tmax();
+            let op = BoxSum::new(pass);
             let weights: Vec<f32> = pass.weights().collect();
             for axis in [Axis::Rows, Axis::Columns] {
                 let long_line = match axis {
@@ -799,8 +1173,18 @@ mod tests {
                     };
                     let output = headless::output(&device, out_width, out_height);
                     let mut encoder = device.create_command_encoder(&Default::default());
-                    blur.dispatch(&mut encoder, pass, axis, &input, &output)
-                        .expect("an input shorter by the taps");
+                    kernels
+                        .line(
+                            &mut encoder,
+                            &op,
+                            axis,
+                            1,
+                            &input,
+                            (width, height),
+                            &output,
+                            &mut planes,
+                        )
+                        .expect("an output grown by the pass");
                     queue.submit([encoder.finish()]);
                     let result = headless::readback(&device, &queue, &output);
                     assert_eq!(result.len(), (out_width * out_height) as usize);
@@ -844,5 +1228,70 @@ mod tests {
             "box pass on the GPU: K {} at most, under {BOX_PASS_K}",
             worst.ceil()
         );
+    }
+
+    /// Three passes in one call, through the intermediate planes, are the three passes one at
+    /// a time, bit for bit, along each axis and by both reductions.
+    #[test]
+    fn passes_in_one_call_are_the_passes_one_at_a_time() {
+        let (device, queue) = headless::device();
+        let mut kernels = Kernels::new(&device);
+        let mut planes = Planes::default();
+        let (width, height) = (61, 7);
+        let texels = blur_texels((width * height) as usize);
+        let input = headless::upload(&device, &queue, width, height, &texels);
+        for size in [10.0, 400.0] {
+            let op = BoxSum::new(BoxPass::new(size));
+            let growth = op.growth();
+            for axis in [Axis::Rows, Axis::Columns] {
+                let grown = |passes: u32| match axis {
+                    Axis::Rows => (width + passes * growth, height),
+                    Axis::Columns => (width, height + passes * growth),
+                };
+                let (w, h) = grown(3);
+                let together = headless::output(&device, w, h);
+                let mut encoder = device.create_command_encoder(&Default::default());
+                kernels
+                    .line(
+                        &mut encoder,
+                        &op,
+                        axis,
+                        3,
+                        &input,
+                        (width, height),
+                        &together,
+                        &mut planes,
+                    )
+                    .expect("an output grown by three passes");
+                let usage = wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC;
+                let mut current = (input.clone(), (width, height));
+                for pass in 1..=3 {
+                    let (w, h) = grown(pass);
+                    let next = headless::plane(&device, w, h, usage);
+                    kernels
+                        .line(
+                            &mut encoder,
+                            &op,
+                            axis,
+                            1,
+                            &current.0,
+                            current.1,
+                            &next,
+                            &mut planes,
+                        )
+                        .expect("an output grown by one pass");
+                    current = (next, (w, h));
+                }
+                queue.submit([encoder.finish()]);
+                let bits = |plane: Vec<f32>| plane.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert!(
+                    bits(headless::readback(&device, &queue, &together))
+                        == bits(headless::readback(&device, &queue, &current.0)),
+                    "size {size} along {axis:?}"
+                );
+            }
+        }
     }
 }

@@ -1,20 +1,18 @@
-//! The CPU kernels' throughput on this machine, as `cargo bench -p opencompositor-core` runs
-//! it. Exposure: the kernel alone on one thread, the evaluator's pool over its chunking with
+//! The CPU primitives' throughput on this machine, as `cargo bench -p opencompositor-core` runs
+//! them, each through an operation over the evaluator's pool. Exposure through the map, with
 //! reused and with fresh outputs, and a copy of the same planes through the same pool and
-//! chunking, the reference a pointwise kernel is held to. Merge's over and mix: each in place
-//! over four planes through the pool, held to the copy by the bytes each moves. Blur's passes
-//! along rows and along columns: each over three planes through the pool as the evaluator runs
-//! it, held to the copy by the bytes it moves at the fraction a window sum reaches. It runs on
-//! the workstation before each PR to `main`, never in CI: each gate is a fraction of the copy
-//! measured in the same run, so it holds on any machine and never blesses a number.
+//! chunking, the reference a pointwise kernel is held to. Merge through the fold, one layer
+//! over a background dissolved by Mix, held to the copy by the bytes it moves. Blur through the
+//! line reduction, its passes along rows and along columns, each over three planes, held to the
+//! copy by the bytes it moves at the fraction a window sum reaches. It runs on the workstation
+//! before each PR to `main`, never in CI: each gate is a fraction of the copy measured in the
+//! same run, so it holds on any machine and never blesses a number.
 
 use std::time::{Duration, Instant};
 
-use opencompositor_core::bench::{
-    BLUR_BAND, BLUR_ROWS, BandScratch, BoxScratch, Pool, band_passes, blur_rows, exposure, mix,
-    over,
-};
-use opencompositor_kernels::BoxPass;
+use opencompositor_core::Window;
+use opencompositor_core::bench::{Pool, fold, line, map};
+use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, Merge};
 
 /// A 4K plate. Its three colour planes go through; alpha is shared unchanged, so neither
 /// Exposure nor the copy touches one.
@@ -47,26 +45,27 @@ fn main() {
     let level = pool.level();
     let area = WIDTH * HEIGHT;
     // Half a stop, as the evaluator derives it from Stops.
-    let gain = 0.5f64.exp2() as f32;
+    let op = Exposure {
+        gain: 0.5f64.exp2() as f32,
+    };
+    let plate_window = Window {
+        x: 0,
+        y: 0,
+        width: WIDTH as u32,
+        height: HEIGHT as u32,
+    };
     let inputs: Vec<Vec<f32>> = (1..=PLANES as u32).map(|seed| plate(seed, area)).collect();
     let mut outputs: Vec<Vec<f32>> = (0..PLANES).map(|_| vec![0.0; area]).collect();
 
-    let alone = median(|| {
-        for (src, dst) in inputs.iter().zip(&mut outputs) {
-            exposure(level, src, dst, gain);
-        }
-    });
     let reused = median(|| {
         for (src, dst) in inputs.iter().zip(&mut outputs) {
-            pool.run(WIDTH, src, dst, |level, src, dst| {
-                exposure(level, src, dst, gain)
-            });
+            map(&pool, &op, [(src, plate_window)], plate_window, [dst]);
         }
     });
     for (src, dst) in inputs.iter().zip(&outputs) {
         let expected = src
             .iter()
-            .map(|&v| opencompositor_kernels::exposure(v, gain).to_bits());
+            .map(|&v| opencompositor_kernels::exposure(v, op.gain).to_bits());
         assert!(
             dst.iter().map(|v| v.to_bits()).eq(expected),
             "the pool wrote Exposure"
@@ -76,9 +75,7 @@ fn main() {
         for src in &inputs {
             // Allocated as the evaluator allocates a plane and dropped as one it did not reuse.
             let mut dst = vec![0.0; area];
-            pool.run(WIDTH, src, &mut dst, |level, src, dst| {
-                exposure(level, src, dst, gain)
-            });
+            map(&pool, &op, [(src, plate_window)], plate_window, [&mut dst]);
         }
     });
     let copy = median(|| {
@@ -96,7 +93,6 @@ fn main() {
         pool.threads()
     );
     for (what, time) in [
-        ("kernel alone, one thread", alone),
         ("pool, reused outputs", reused),
         ("pool, fresh outputs", fresh),
         ("copy, reused outputs", copy),
@@ -110,59 +106,48 @@ fn main() {
     println!("  Exposure at {ratio:.2} of the copy's throughput, gate {GATE}: {verdict}");
     let mut failed = ratio < GATE;
 
-    // Merge's kernels, in place over four planes: over reads the layer's four planes and the
-    // four it writes, and mix the base's four and the four it writes, so each moves twelve
-    // planes' bytes where the copy moves two per plane.
+    // Merge through the fold: one layer over a background, dissolved by Mix into four planes,
+    // reads the layer's four planes and the background's and writes four, twelve planes' bytes
+    // where the copy moves two per plane.
     let layer: Vec<Vec<f32>> = (11..=14).map(|seed| plate(seed, area)).collect();
     let base: Vec<Vec<f32>> = (21..=24).map(|seed| plate(seed, area)).collect();
-    let mut stack: Vec<Vec<f32>> = base.clone();
+    let mut stack: Vec<Vec<f32>> = (0..4).map(|_| vec![0.0; area]).collect();
     let layer_planes: [&[f32]; 4] = [&layer[0], &layer[1], &layer[2], &layer[3]];
     let base_planes: [&[f32]; 4] = [&base[0], &base[1], &base[2], &base[3]];
-    let over_pool = median(|| {
+    let merge = median(|| {
         let [r, g, b, a] = &mut stack[..] else {
             unreachable!("four planes");
         };
-        pool.fill_rows([r, g, b, a], WIDTH, |level, first_row, chunk| {
-            let rows = first_row * WIDTH..first_row * WIDTH + chunk[0].len();
-            over(level, layer_planes.map(|plane| &plane[rows.clone()]), chunk);
-        });
-    });
-    let mix_pool = median(|| {
-        let [r, g, b, a] = &mut stack[..] else {
-            unreachable!("four planes");
-        };
-        pool.fill_rows([r, g, b, a], WIDTH, |level, first_row, chunk| {
-            let rows = first_row * WIDTH..first_row * WIDTH + chunk[0].len();
-            mix(
-                level,
-                base_planes.map(|plane| &plane[rows.clone()]),
-                chunk,
-                0.5,
-            );
-        });
+        fold(
+            &pool,
+            &Merge { mix: 0.5 },
+            (base_planes, plate_window),
+            &[(layer_planes, plate_window)],
+            plate_window,
+            [r, g, b, a],
+        );
     });
     let copy_throughput = bytes / copy.as_secs_f64() / 1e9;
     let merge_bytes = (12 * area * size_of::<f32>()) as f64;
-    println!("Merge on {WIDTH}x{HEIGHT} RGBA, in place over four planes, median of {RUNS} runs");
-    for (what, time) in [("over, pool", over_pool), ("mix, pool", mix_pool)] {
-        let ms = time.as_secs_f64() * 1e3;
-        let throughput = merge_bytes / time.as_secs_f64() / 1e9;
-        println!("  {what:<26}{ms:>8.2} ms{throughput:>8.1} GB/s");
-        let ratio = throughput / copy_throughput;
-        let verdict = if ratio >= GATE { "pass" } else { "FAIL" };
-        let (name, _) = what.split_once(',').expect("a name before the comma");
-        println!(
-            "  {name} at {ratio:.2} of the copy's throughput by bytes moved, gate {GATE}: {verdict}"
-        );
-        failed |= ratio < GATE;
-    }
+    println!("Merge on {WIDTH}x{HEIGHT} RGBA, one layer at Mix 0.5, median of {RUNS} runs");
+    let ms = merge.as_secs_f64() * 1e3;
+    let throughput = merge_bytes / merge.as_secs_f64() / 1e9;
+    println!("  {:<26}{ms:>8.2} ms{throughput:>8.1} GB/s", "fold, pool");
+    let ratio = throughput / copy_throughput;
+    let verdict = if ratio >= GATE { "pass" } else { "FAIL" };
+    println!(
+        "  fold at {ratio:.2} of the copy's throughput by bytes moved, gate {GATE}: {verdict}"
+    );
+    failed |= ratio < GATE;
 
     // Blur's passes, each the three box passes along one axis as the evaluator runs them: the
     // rows of a plane into one grown by the reach each side, then bands of that plane's columns
     // into one grown along the columns too. Each reads its input's bytes and writes the grown
     // output's.
+    let never = || false;
     for size in BLUR_SIZES {
         let pass = BoxPass::new(size);
+        let op = BoxSum::new(pass);
         let reach = pass.reach() as usize;
         let grown_width = WIDTH + 2 * reach;
         let grown_height = HEIGHT + 2 * reach;
@@ -171,17 +156,8 @@ fn main() {
             .collect();
         let rows_pool = median(|| {
             for (src, dst) in inputs.iter().zip(&mut rows_out) {
-                pool.fill_rows_with(
-                    [dst],
-                    grown_width,
-                    BLUR_ROWS,
-                    BoxScratch::default,
-                    |scratch, level, first_row, [dst]| {
-                        let rows = dst.len() / grown_width;
-                        let src = &src[first_row * WIDTH..(first_row + rows) * WIDTH];
-                        blur_rows(level, pass, src, WIDTH, dst, scratch);
-                    },
-                );
+                let size = (WIDTH, HEIGHT);
+                line(&pool, &op, Axis::Rows, 3, src, size, dst, &never).expect("never stopped");
             }
         });
         let mut columns_out: Vec<Vec<f32>> = (0..PLANES)
@@ -189,15 +165,8 @@ fn main() {
             .collect();
         let columns_pool = median(|| {
             for (src, dst) in rows_out.iter().zip(&mut columns_out) {
-                pool.fill_columns(
-                    dst,
-                    grown_width,
-                    BLUR_BAND,
-                    BandScratch::default,
-                    |state, level, band| {
-                        band_passes(level, pass, src, grown_width, HEIGHT, band, state);
-                    },
-                );
+                let size = (grown_width, HEIGHT);
+                line(&pool, &op, Axis::Columns, 3, src, size, dst, &never).expect("never stopped");
             }
         });
         println!(
