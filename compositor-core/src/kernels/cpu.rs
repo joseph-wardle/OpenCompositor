@@ -76,7 +76,9 @@ impl Level {
 ///
 /// A closure is not inlined into the wrapper by default: callers mark theirs
 /// `#[inline(always)]`, or the wrapper only calls a baseline copy, which still passes every
-/// numerical test and silently runs without the level's vectors.
+/// numerical test and silently runs without the level's vectors. The kernels benchmark's fold
+/// and Blur gates fail without them; Exposure is memory-bound either way, so its gate cannot
+/// tell, and a costlier map would need a gate of its own.
 #[inline(always)]
 fn at_level<R>(level: Level, body: impl FnOnce() -> R) -> R {
     #[cfg(target_arch = "x86_64")]
