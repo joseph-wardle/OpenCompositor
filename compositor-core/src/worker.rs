@@ -34,7 +34,7 @@ const COMPLETION_POLL: Duration = Duration::from_millis(1);
 pub enum EvaluationDevice {
     /// The CPU, whose images are staged for the viewer.
     Cpu,
-    /// The GPU the panes draw on. A request containing an operation without a GPU path fails.
+    /// The GPU the panes draw on.
     Gpu,
 }
 

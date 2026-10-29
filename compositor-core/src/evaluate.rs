@@ -1031,10 +1031,6 @@ pub enum EvalError {
         window: Window,
         bytes: u64,
     },
-    /// The operation runs only on the CPU so far, and the request was for a GPU.
-    NoGpuPath {
-        origin: ResultKey,
-    },
     /// The data window has a side longer than the device's textures.
     BeyondDevice {
         origin: ResultKey,
@@ -1061,7 +1057,6 @@ impl EvalError {
             | EvalError::Panicked { origin }
             | EvalError::Oversize { origin, .. }
             | EvalError::OverCap { origin, .. }
-            | EvalError::NoGpuPath { origin }
             | EvalError::BeyondDevice { origin, .. }
             | EvalError::OutOfGpuMemory { origin }
             | EvalError::GpuValidation { origin, .. } => origin,
@@ -1092,12 +1087,6 @@ impl fmt::Display for EvalError {
                 window.height,
                 NODE_BYTES_CAP >> 20
             ),
-            EvalError::NoGpuPath { .. } => {
-                write!(
-                    f,
-                    "runs only on the CPU so far; choose the CPU to evaluate it"
-                )
-            }
             EvalError::BeyondDevice { window, side, .. } => write!(
                 f,
                 "its data window is {} × {} pixels, and this GPU's images are at most {side} \
@@ -1119,7 +1108,6 @@ impl std::error::Error for EvalError {
             EvalError::Panicked { .. }
             | EvalError::Oversize { .. }
             | EvalError::OverCap { .. }
-            | EvalError::NoGpuPath { .. }
             | EvalError::BeyondDevice { .. }
             | EvalError::OutOfGpuMemory { .. }
             | EvalError::GpuValidation { .. } => None,

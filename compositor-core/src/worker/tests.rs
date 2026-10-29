@@ -679,23 +679,6 @@ fn a_gpu_session_evaluates_nothing_until_a_device_is_connected() {
 }
 
 #[test]
-fn a_gpu_session_refuses_an_operation_without_a_gpu_path() {
-    use crate::evaluate::tests::{blur, graph, key, reader};
-    let path = directory("gpu-refused").join("image.png");
-    write_png(&path, 3, 2);
-    let (worker, deliveries, _, _) = gpu_worker();
-    let blurred = graph([reader(&path), blur(Some(4.0))], &[(2, "source".into(), 1)]);
-
-    worker.request(Some(on(1, key(&blurred, 2))));
-
-    let error = receive(&deliveries).result.unwrap_err();
-    assert!(
-        matches!(error, ViewerError::Eval(EvalError::NoGpuPath { .. })),
-        "{error}"
-    );
-}
-
-#[test]
 fn a_replaced_device_drops_its_state_and_the_new_one_shows_the_request_again() {
     let path = directory("gpu-replaced").join("image.png");
     write_png(&path, 3, 2);

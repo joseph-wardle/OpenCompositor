@@ -158,10 +158,6 @@ impl Kernels {
         clippy::too_many_arguments,
         reason = "a plane, its size, its output and scratch"
     )]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Blur records it from GPU slice 5")
-    )]
     pub(crate) fn line<L: LineReduce>(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,

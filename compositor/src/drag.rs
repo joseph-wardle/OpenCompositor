@@ -16,14 +16,13 @@
 //! the value as it was. It exits 0 if those held and the chain's latencies' p95 and final edit
 //! met the chain's budget, and 1 otherwise.
 //!
-//! With `--gpu` first, the session evaluates on the GPU and the check runs only the chains with
-//! a GPU path. An edit's latency then ends when the GPU completes the frame, not when it is
-//! submitted, since a frame queued behind the worker's compute completes only after it; the
-//! check polls the GPU every millisecond to learn when. The budget is two of the viewer's
-//! refreshes for every chain, and the GUI's frames must meet theirs during the drag: from
-//! acquiring a frame to submitting it p99 1 ms and at most 4 ms, and to the GPU's completion at
-//! most two refreshes. Both sessions report those frame times, and how long the first image took
-//! from marking the chain's node to its frame, cold.
+//! With `--gpu` first, the session evaluates on the GPU. An edit's latency then ends when the
+//! GPU completes the frame, not when it is submitted, since a frame queued behind the worker's
+//! compute completes only after it; the check polls the GPU every millisecond to learn when.
+//! The budget is two of the viewer's refreshes for every chain, and the GUI's frames must meet
+//! theirs during the drag: from acquiring a frame to submitting it p99 1 ms and at most 4 ms,
+//! and to the GPU's completion at most two refreshes. Both sessions report those frame times,
+//! and how long the first image took from marking the chain's node to its frame, cold.
 //!
 //! Run it in a release build on the workstation, and twice, since the first run's shader and
 //! file caches are cold. In a CPU session a frame counts when the GUI thread submits it, not
@@ -90,11 +89,6 @@ impl Chain {
             Chain::Merge => ("mix", "Mix"),
             Chain::Blur => ("size", "Size"),
         }
-    }
-
-    /// Whether the chain's operations all run on the device.
-    fn runs_on(self, device: EvaluationDevice) -> bool {
-        device == EvaluationDevice::Cpu || self != Chain::Blur
     }
 
     /// What the latencies' p95 and the final edit's latency must meet on the workstation, whose
@@ -169,20 +163,15 @@ thread_local! {
     static CHECK: RefCell<Option<Check>> = const { RefCell::new(None) };
 }
 
-/// Runs every chain with a path on the device, each as a child process of this binary dragging
-/// that chain alone, and exits: 1 if any child did not exit 0, else 0. One process per chain
-/// because a chain run after another in the same process showed its f16 conversion several
-/// times slower, whichever chain it was; the hypothesis is that the staging buffer, recreated
-/// for the second chain, lands in a slower heap. Either way the chains are only comparable from
-/// equal starts.
+/// Runs every chain, each as a child process of this binary dragging that chain alone, and
+/// exits: 1 if any child did not exit 0, else 0. One process per chain because a chain run
+/// after another in the same process showed its f16 conversion several times slower, whichever
+/// chain it was; the hypothesis is that the staging buffer, recreated for the second chain,
+/// lands in a slower heap. Either way the chains are only comparable from equal starts.
 pub fn run_chains(image: &Path, device: EvaluationDevice) -> ! {
     let binary = std::env::current_exe().expect("the binary knows its own path");
     let mut failed = false;
     for chain in CHAINS {
-        if !chain.runs_on(device) {
-            eprintln!("drag check ({chain:?}): no GPU path yet, not run");
-            continue;
-        }
         let mut command = std::process::Command::new(&binary);
         if device == EvaluationDevice::Gpu {
             command.arg("--gpu");

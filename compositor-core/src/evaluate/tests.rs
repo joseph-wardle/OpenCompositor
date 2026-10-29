@@ -1002,7 +1002,7 @@ fn blur_key(size: f64) -> ResultKey {
 
 /// Blur's one-dimensional kernel along either axis: the three passes' weights convolved
 /// together, `2 reach + 1` long, in f64.
-fn composed(pass: BoxPass) -> Vec<f64> {
+pub(crate) fn composed(pass: BoxPass) -> Vec<f64> {
     let t = pass.tmax() as usize;
     let weights: Vec<f64> = pass.weights().map(f64::from).collect();
     let line: Vec<f64> = (0..=2 * t).map(|i| weights[i.abs_diff(t)]).collect();

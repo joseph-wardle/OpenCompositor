@@ -393,24 +393,337 @@ fn merge_of_the_base_alone_or_at_mix_0_is_the_base_itself() {
     }
 }
 
+/// A document of a Reader, node 1, and a Blur of it at `size`, node 2.
+fn blurred(reader: Node, size: f64) -> crate::document::Document {
+    graph([reader, blur(Some(size))], &[(2, "source".into(), 1)])
+}
+
+/// Values for one channel of a Blur's source, `channel` in `Channel::ALL`'s order: zeros and
+/// normal magnitudes of both signs over sixty stops, then, where the plane has the room, in R a
+/// spike near f32's limit beside its negation, in G an infinity of each sign and in B a NaN, so
+/// that most of every blur stays finite and bounded by its own magnitudes rather than a spike's.
+fn blur_values(count: usize, channel: usize) -> Vec<f32> {
+    let mut values: Vec<f32> = (0..count)
+        .map(|i| {
+            let i = i + 7 * channel;
+            if i.is_multiple_of(5) {
+                0.0
+            } else {
+                let magnitude = ((i % 800) as f32 * 0.0731 - 30.0).exp2();
+                if i.is_multiple_of(2) {
+                    magnitude
+                } else {
+                    -magnitude
+                }
+            }
+        })
+        .collect();
+    let mut put = |at: usize, value: f32| {
+        if at < count {
+            values[at] = value;
+        }
+    };
+    match channel {
+        0 => {
+            put(count / 3, 3.0e38);
+            put(count / 3 + 1, -3.0e38);
+        }
+        1 => {
+            put(count / 8, f32::INFINITY);
+            put(2 * count / 3, f32::NEG_INFINITY);
+        }
+        2 => put(count / 4, f32::NAN),
+        _ => {}
+    }
+    values
+}
+
+/// Blur's definition over the grown window of one channel of `source`: the composed
+/// two-dimensional kernel summed in f64 over the source, transparent black beyond its data
+/// window, and the same sum over the magnitudes, which bounds the error of any computation that
+/// rounds its intermediates. The kernel is the outer product of the composed line kernel with
+/// itself, so each output is summed along the source's longer side and then across it, in f64,
+/// whose rounding is far below f32's; every weight is positive, so the order leaves the
+/// non-finite classes as one sum would.
+struct BlurDefinition {
+    kernel: Vec<f64>,
+    rows_first: bool,
+    /// The source's length across the first sums, and the grown window's along them.
+    across: usize,
+    along: usize,
+    /// The first sums: `across` lines of `along` values and magnitudes.
+    lines: Vec<(f64, f64)>,
+}
+
+impl BlurDefinition {
+    fn new(pass: BoxPass, source: &Image, channel: Channel) -> BlurDefinition {
+        let kernel = crate::evaluate::tests::composed(pass);
+        let window = source.data_window();
+        let (width, height) = (window.width as usize, window.height as usize);
+        let rows_first = width >= height;
+        let (len, across) = if rows_first {
+            (width, height)
+        } else {
+            (height, width)
+        };
+        let along = len + kernel.len() - 1;
+        let mut lines = Vec::with_capacity(across * along);
+        for j in 0..across {
+            let sample = |i: usize| {
+                let (x, y) = if rows_first { (i, j) } else { (j, i) };
+                f64::from(source.value(channel, window.x + x as i32, window.y + y as i32))
+            };
+            lines.extend((0..along).map(|o| weighted_sum(&kernel, o, len, sample)));
+        }
+        BlurDefinition {
+            kernel,
+            rows_first,
+            across,
+            along,
+            lines,
+        }
+    }
+
+    /// The value and the magnitude at `(x, y)` from the grown window's corner.
+    fn at(&self, x: usize, y: usize) -> (f64, f64) {
+        let (along, across) = if self.rows_first { (x, y) } else { (y, x) };
+        let line = |j: usize| self.lines[j * self.along + along];
+        let value = weighted_sum(&self.kernel, across, self.across, |j| line(j).0);
+        let magnitude = weighted_sum(&self.kernel, across, self.across, |j| line(j).1).0;
+        (value.0, magnitude)
+    }
+}
+
+/// Output `o` of `kernel` along a line of `len` samples, sample `i` lying `i + 2 reach - o`
+/// along the kernel, and the same sum over the samples' magnitudes.
+fn weighted_sum(kernel: &[f64], o: usize, len: usize, sample: impl Fn(usize) -> f64) -> (f64, f64) {
+    let span = kernel.len() - 1;
+    let (mut value, mut magnitude) = (0.0, 0.0);
+    for i in o.saturating_sub(span)..(o + 1).min(len) {
+        let (weight, v) = (kernel[i + span - o], sample(i));
+        value += weight * v;
+        magnitude += weight * v.abs();
+    }
+    (value, magnitude)
+}
+
+/// The GPU's K for Blur, under the quality ceiling: within 2⁻¹⁶ of the magnitude sum, a
+/// thirty-second of a half-float step. The test prints the factor the adapter needed.
+const BLUR_GPU_K: f64 = 256.0;
+
+/// Every output of a Blur on the GPU against its definition: a non-finite result by IEEE class,
+/// and a finite one within K units of 2⁻²⁴ of the same blur of the source's magnitudes, plus one
+/// `MIN_POSITIVE` for each of the six passes' flushes. Returns the K it needed.
+fn assert_gpu_blur_matches_the_definition(
+    gpu: &GpuEvaluation,
+    size: f64,
+    source: &Image,
+    output: &GpuImage,
+    what: &str,
+) -> f64 {
+    let pass = BoxPass::new(size);
+    let window = output.info().data_window;
+    assert_eq!(window, source.data_window().grow(pass.reach()).unwrap());
+    assert_eq!(output.info().display_window, source.display_window());
+    assert_eq!(output.info().warnings, source.warnings());
+    let flushes = 6.0 * f64::from(f32::MIN_POSITIVE);
+    let mut worst: f64 = 0.0;
+    let mut checked: Vec<&wgpu::Texture> = Vec::new();
+    for channel in Channel::ALL {
+        let texture = output.texture(channel).unwrap();
+        if checked.contains(&texture) {
+            continue;
+        }
+        checked.push(texture);
+        let definition = BlurDefinition::new(pass, source, channel);
+        let actual = read_back(gpu, output, channel);
+        assert_eq!(actual.len() as u64, window.area());
+        for (i, &actual) in actual.iter().enumerate() {
+            let (x, y) = (i % window.width as usize, i / window.width as usize);
+            let (expected, magnitude) = definition.at(x, y);
+            let place = || format!("{what} {channel:?} at ({x}, {y}): {actual} for {expected}");
+            if expected.is_nan() || actual.is_nan() {
+                assert!(expected.is_nan() && actual.is_nan(), "{}", place());
+            } else if expected.is_infinite() || actual.is_infinite() {
+                assert!(f64::from(actual) == expected, "{}", place());
+            } else {
+                let difference = (f64::from(actual) - expected).abs();
+                let unit = magnitude * 2f64.powi(-24);
+                assert!(
+                    difference <= BLUR_GPU_K * unit + flushes,
+                    "{}, off by {difference} with {magnitude} summed",
+                    place()
+                );
+                if unit > 0.0 {
+                    worst = worst.max((difference - flushes) / unit);
+                }
+            }
+        }
+    }
+    worst
+}
+
+/// Blur on the GPU against its definition over whole images, every output within Blur's GPU
+/// bound and the non-finite ones by class, never beyond the reach: offset EXRs of every class
+/// and a line longer than the scan's blocks along each axis, at sizes from one tap each side,
+/// either side of a tap count's change, and either side of the change from direct sums to the
+/// scan's blocks; then a grey PNG up to the largest Size, where only so small a source fits the
+/// device's textures. The test prints the K it needed.
 #[test]
-fn an_operation_without_a_gpu_path_is_refused_before_anything_is_recorded() {
-    let path = directory("refused").join("image.png");
+fn blur_on_the_gpu_is_within_its_bound_of_the_composed_kernel() {
+    let directory = directory("blur");
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let mut cpu = Evaluator::new();
+    let mut worst: f64 = 0.0;
+    let mut check = |path: &Path, sizes: &[f64]| {
+        let read = key(&chain([reader(path)]), 1);
+        let source = cpu.evaluate(&read, || false).unwrap().unwrap();
+        for &size in sizes {
+            let requested = key(&blurred(reader(path), size), 2);
+            let output = run(&mut evaluator, &mut gpu, &requested);
+            let what = format!("{} at size {size}", path.display());
+            let needed =
+                assert_gpu_blur_matches_the_definition(&gpu, size, &source, &output, &what);
+            worst = worst.max(needed);
+        }
+    };
+    // Tap counts change after 1.5 + 3 k, and the scan takes over after 181.5.
+    let after = |size: f64| size + 1e-9;
+    let sizes = [
+        after(1.5),
+        2.0,
+        3.0,
+        4.5,
+        after(4.5),
+        10.0,
+        31.4,
+        100.0,
+        181.5,
+        after(181.5),
+    ];
+    let shapes = [(1, 1), (16, 16), (33, 17), (257, 3), (2800, 2), (2, 2800)];
+    for (index, (width, height)) in shapes.into_iter().enumerate() {
+        let path = directory.join(format!("{width}x{height}.exr"));
+        let channels = ["R", "G", "B", "A"]
+            .into_iter()
+            .zip(0..)
+            .map(|(name, channel)| (name, blur_values(width * height, channel)))
+            .collect();
+        let origin = (index as i32 - 3, 2 - index as i32);
+        write_exr(&path, ((0, 0), (32, 16)), origin, (width, height), channels);
+        check(&path, &sizes);
+    }
+    let grey = directory.join("grey.png");
+    crate::evaluate::tests::write_grey_png(&grey, 200);
+    check(&grey, &[1000.0, 1201.5, after(1201.5), 4096.0]);
+    println!(
+        "Blur on the GPU: K {} at most, under {BLUR_GPU_K}",
+        worst.ceil()
+    );
+}
+
+/// As on the CPU: a plane the channels share is blurred once, and a size whose reach is zero,
+/// or an empty source, gives the source itself.
+#[test]
+fn blur_on_the_gpu_keeps_a_grey_image_one_plane_and_shares_a_source_it_leaves() {
+    let grey = directory("blur_sharing").join("grey.png");
+    crate::evaluate::tests::write_grey_png(&grey, 200);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let texture = |image: &GpuImage, channel| image.texture(channel).unwrap() as *const _;
+
+    let grey_blurred = run(
+        &mut evaluator,
+        &mut gpu,
+        &key(&blurred(reader(&grey), 3.0), 2),
+    );
+    assert_eq!(
+        texture(&grey_blurred, Channel::R),
+        texture(&grey_blurred, Channel::G)
+    );
+    assert_eq!(
+        texture(&grey_blurred, Channel::R),
+        texture(&grey_blurred, Channel::B)
+    );
+    assert_ne!(
+        texture(&grey_blurred, Channel::R),
+        texture(&grey_blurred, Channel::A)
+    );
+
+    let read = run(&mut evaluator, &mut gpu, &key(&chain([reader(&grey)]), 1));
+    for size in [0.0, 1.0, 1.5] {
+        let unchanged = run(
+            &mut evaluator,
+            &mut gpu,
+            &key(&blurred(reader(&grey), size), 2),
+        );
+        for channel in Channel::ALL {
+            assert_eq!(texture(&unchanged, channel), texture(&read, channel));
+        }
+    }
+    let empty = blurred(reader_without_a_file(), 10.0);
+    let image = run(&mut evaluator, &mut gpu, &key(&empty, 2));
+    assert!(image.info().data_window.is_empty());
+}
+
+/// A Size edit that keeps the reach uploads nothing and writes the previous result's released
+/// textures.
+#[test]
+fn a_size_edit_uploads_nothing_and_reuses_the_released_outputs() {
+    let path = directory("size_edit").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
     let mut gpu = GpuEvaluation::new(&device, &queue);
     let mut evaluator = Evaluator::new();
-    let blurred = graph([reader(&path), blur(Some(4.0))], &[(2, "source".into(), 1)]);
-    let requested = key(&blurred, 2);
+    // Three taps each side at both.
+    let [one, two] = [10.0, 10.5].map(|size| key(&blurred(reader(&path), size), 2));
+    let first = run(&mut evaluator, &mut gpu, &one);
+    let uploaded = gpu.uploaded_bytes();
+    let outputs: Vec<wgpu::Texture> = Channel::ALL
+        .map(|channel| first.texture(channel).unwrap().clone())
+        .to_vec();
+    drop(first);
+
+    let second = run(&mut evaluator, &mut gpu, &two);
+
+    assert_eq!(gpu.uploaded_bytes(), uploaded);
+    for channel in Channel::ALL {
+        assert!(
+            outputs.contains(second.texture(channel).unwrap()),
+            "{channel:?}"
+        );
+    }
+}
+
+/// The outputs, the scratch plane and the passes' intermediate planes count toward the cap on
+/// one node's allocations, which fails the request before anything is recorded.
+#[test]
+fn a_blur_over_the_cap_fails_before_recording() {
+    let path = directory("blur_cap").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let requested = key(&blurred(reader(&path), 4096.0), 2);
 
     let error = evaluator
         .evaluate_on(&mut gpu, &requested, || false)
         .expect("nothing stops it")
-        .expect_err("refused");
+        .expect_err("over the cap");
 
-    assert!(matches!(error, EvalError::NoGpuPath { .. }), "{error:?}");
-    assert!(*error.origin() == requested);
-    assert_eq!(gpu.uploaded_bytes(), 0);
+    // Four distinct planes over the 2 × 1 source grown by 4095 each side, the rows' scratch,
+    // and the planes after the first and second passes along each axis.
+    let (width, height) = (8192u64, 8191u64);
+    let intermediates = (2 + 2730) + (2 + 5460) + width * (1 + 2730) + width * (1 + 5460);
+    let bytes = 4 * (4 * width * height + width + intermediates);
+    assert!(
+        matches!(&error, EvalError::OverCap { origin, bytes: needed, .. }
+            if *origin == requested && *needed == bytes),
+        "{error:?}"
+    );
     assert_eq!(gpu.submitted, 0);
 }
 
