@@ -474,6 +474,40 @@ fn a_staging_buffer_returned_after_its_device_was_replaced_is_dropped() {
 }
 
 #[test]
+fn a_staging_buffer_returned_once_the_session_is_on_the_gpu_is_dropped() {
+    let path = directory("gpu-return").join("image.png");
+    write_png(&path, 3, 2);
+    let (worker, deliveries) = worker();
+    connect(&worker, noop_device(None), 1);
+    worker.request(Some(on(1, key(&path))));
+    let held = staged(receive(&deliveries));
+
+    worker.evaluate_on(EvaluationDevice::Gpu);
+    drop(held);
+    {
+        let state = worker.mailbox.lock();
+        let connection = state.connection.as_ref().expect("connected");
+        assert!(matches!(connection.staging, StagingSlot::Empty));
+    }
+
+    // Back on the CPU, the worker makes a buffer rather than waiting for the dropped one.
+    // The GPU session's delivery of it, if it made one before the move back, comes first.
+    worker.evaluate_on(EvaluationDevice::Cpu);
+    loop {
+        let evaluated = receive(&deliveries);
+        if let Ok(ViewerImage {
+            pixels: Some(Pixels {
+                staged: Some(_), ..
+            }),
+            ..
+        }) = evaluated.result
+        {
+            break;
+        }
+    }
+}
+
+#[test]
 fn an_image_finishing_for_a_replaced_device_is_staged_again_for_the_new_one() {
     let [first, second] = two_images("replaced-finishing");
     let (worker, deliveries) = worker();

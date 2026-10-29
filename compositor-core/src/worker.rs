@@ -8,8 +8,9 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::document::NodeId;
-use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, GpuEvaluation, Pool, ResultKey};
-use crate::gpu::wait_for_device;
+use crate::evaluate::{
+    DEEP_STACK, EvalError, Evaluator, GpuEvaluation, Pool, ResultKey, poll_device,
+};
 use crate::image::{ImageInfo, Plane, Window};
 
 /// The staging buffer's first size, a DCI 4K image of four planes, and its least.
@@ -18,13 +19,9 @@ const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
 /// Images in a row that fit in half the staging buffer before it shrinks to fit them.
 const IMAGES_BEFORE_SHRINKING: u32 = 3;
 
-/// The longest the worker waits on the GPU before checking that it still wants the device, so
-/// that a wait that never ends cannot hold the worker's drop, and with it the GUI thread.
-const LONGEST_GPU_WAIT: Duration = Duration::from_millis(100);
-
-/// How often a GPU session's worker asks whether the GPU has completed its submission. It never
-/// blocks on the GPU: a blocking wait would hold the device's lock against the GUI thread's
-/// present for as long.
+/// How often the worker asks whether the GPU has completed the work it waits for: a GPU
+/// session's submission, or a CPU session's copy out of the staging buffer. It never blocks on the
+/// GPU: a blocking wait would hold the device's lock against the GUI thread's present for as long.
 const COMPLETION_POLL: Duration = Duration::from_millis(1);
 
 /// Where a session evaluates. Every request runs on one device, and results never mix devices.
@@ -160,7 +157,8 @@ impl Staged {
 /// whichever thread holds it, so that neither a skipped result nor a panic loses it. Without a
 /// buffer, as after a failure, it leaves the slot empty for the worker to fill. A buffer for a
 /// device no longer connected drops here instead, so that it can never occupy the slot of the
-/// device that replaced it.
+/// device that replaced it, and so does one returned once the session is on the GPU, which
+/// stages nothing.
 #[derive(Debug)]
 struct Staging {
     buffer: Option<wgpu::Buffer>,
@@ -172,6 +170,7 @@ impl Drop for Staging {
     fn drop(&mut self) {
         let buffer = self.buffer.take();
         let mut state = self.mailbox.lock();
+        let on_cpu = state.device == EvaluationDevice::Cpu;
         let Some(connection) = &mut state.connection else {
             return;
         };
@@ -179,8 +178,8 @@ impl Drop for Staging {
             return;
         }
         connection.staging = match buffer {
-            Some(buffer) => StagingSlot::Waiting(buffer),
-            None => StagingSlot::Empty,
+            Some(buffer) if on_cpu => StagingSlot::Waiting(buffer),
+            _ => StagingSlot::Empty,
         };
         self.mailbox.changed.notify_all();
     }
@@ -929,7 +928,8 @@ fn stage(
                 buffer
             }
             Some(replacement) => {
-                // Destroyed first, so that the two buffers never hold memory together.
+                // Destroyed first, so that the two buffers hold memory together only until the
+                // GPU finishes any copy out of the old one.
                 buffer.destroy();
                 staging_buffer(device, replacement)?
             }
@@ -945,9 +945,11 @@ fn stage(
         let mut bytes = view.slice(..);
         let floats = bytes.len() / size_of::<f32>();
         let start = bytes.as_raw_element_ptr().cast::<f32>();
-        // SAFETY: the mapping is `size` bytes, aligned to `wgpu::MAP_ALIGNMENT`, which is at least
-        // f32's alignment, and only this view accesses it until the view drops. Mapped memory may
-        // be write-combining, so the copy only writes to it.
+        debug_assert!(start.as_ptr().is_aligned());
+        // SAFETY: the mapping is `size` bytes, initialised, and only this view accesses it until
+        // the view drops. wgpu does not promise the host pointer's alignment, but its allocators
+        // align mapped memory well beyond f32's, as the assertion checks. Mapped memory may be
+        // write-combining, so the copy only writes to it.
         let out = unsafe { std::slice::from_raw_parts_mut(start.as_ptr(), floats) };
         let distinct: Vec<&[f32]> = firsts.iter().map(|&first| &planes[first][..]).collect();
         copy_rows(
@@ -1098,13 +1100,14 @@ fn map(phase: &GpuPhase, device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result
         let _ = sender.send(result);
     });
     loop {
-        wait_for_device(device, Some(LONGEST_GPU_WAIT))?;
+        poll_device(device).map_err(|lost| lost.to_string())?;
         if let Ok(result) = receiver.try_recv() {
             return result.map_err(|error| error.to_string());
         }
         if phase.abandoned() {
             return Err("the worker stopped waiting for the GPU".to_owned());
         }
+        phase.mailbox.pause(COMPLETION_POLL);
     }
 }
 
