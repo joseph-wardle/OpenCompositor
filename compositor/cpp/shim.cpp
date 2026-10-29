@@ -2,17 +2,21 @@
 #include "opencompositor/src/qt.cxxqt.h"
 
 #include <QtCore/QFile>
+#include <QtCore/QSignalBlocker>
 #include <QtCore/QTimer>
 #include <QtGui/QCursor>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QInputMethodQueryEvent>
 #include <QtGui/QKeyEvent>
+#include <QtGui/QMouseEvent>
 #include <QtGui/QPlatformSurfaceEvent>
 #include <QtGui/QScreen>
 #include <QtGui/QWheelEvent>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QGridLayout>
+#include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLineEdit>
 #include <QtWidgets/QListWidget>
 #include <QtWidgets/QMenuBar>
@@ -74,19 +78,77 @@ QWidget *container(Pane *pane, QDockWidget *dock) {
     dock->setWidget(container);
     return container;
 }
-QLabel *container_with_caption(Pane *pane, QDockWidget *dock) {
+namespace {
+// Stops with their sign, as exposure is read; Ctrl+click resets to 0, as on the panel's sliders.
+class ExposureBox : public QDoubleSpinBox {
+  public:
+    using QDoubleSpinBox::QDoubleSpinBox;
+
+  protected:
+    QString textFromValue(double value) const override {
+        QString text = QDoubleSpinBox::textFromValue(value);
+        return value > 0 ? QStringLiteral("+") + text : text;
+    }
+    void mousePressEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton && event->modifiers() & Qt::ControlModifier) {
+            setValue(0);
+            event->accept();
+            return;
+        }
+        QDoubleSpinBox::mousePressEvent(event);
+    }
+};
+} // namespace
+
+ViewerStrip::ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set,
+                         QWidget *parent)
+    : QWidget(parent) {
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(6, 2, 6, 2);
+    layout->setSpacing(2);
+    caption = new QLabel;
+    // Clipped rather than widening the dock, as is the readout.
+    caption->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    layout->addWidget(caption);
+    auto *row = new QHBoxLayout;
+    readout = new QLabel;
+    readout->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    readout->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    row->addWidget(readout, 1);
+    row->addWidget(new QLabel(QStringLiteral("Exposure")));
+    exposure = new ExposureBox;
+    exposure->setRange(-limit, limit);
+    exposure->setSingleStep(step);
+    exposure->setDecimals(2);
+    exposure->setToolTip(
+        QStringLiteral("Stops on the shown values, which the image keeps. E and Shift+E step it "
+                       "over the viewer, and Ctrl+E or Ctrl+click resets it."));
+    // Typing takes the keyboard from the panes until Enter or a click elsewhere gives it back.
+    exposure->setFocusPolicy(Qt::ClickFocus);
+    row->addWidget(exposure);
+    layout->addLayout(row);
+    connect(exposure, &QDoubleSpinBox::valueChanged, this,
+            [exposure_set](double stops) { exposure_set(stops); });
+    connect(exposure, &QDoubleSpinBox::editingFinished, exposure, &QWidget::clearFocus);
+}
+
+ViewerStrip *container_with_strip(Pane *pane, QDockWidget *dock, double limit, double step,
+                                  rust::Fn<void(double)> exposure_set) {
     auto *widget = new QWidget(dock);
     auto *layout = new QVBoxLayout(widget);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     layout->addWidget(QWidget::createWindowContainer(pane, widget), 1);
-    auto *label = new QLabel(widget);
-    // Clipped rather than widening the dock.
-    label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-    label->setContentsMargins(6, 2, 6, 2);
-    layout->addWidget(label);
+    auto *strip = new ViewerStrip(limit, step, exposure_set, widget);
+    layout->addWidget(strip);
     dock->setWidget(widget);
-    return label;
+    return strip;
+}
+QLabel *strip_caption(ViewerStrip *strip) { return strip->caption; }
+void set_readout(ViewerStrip *strip, const QString &text) { strip->readout->setText(text); }
+void show_viewer_exposure(ViewerStrip *strip, double stops) {
+    const QSignalBlocker blocker(strip->exposure);
+    strip->exposure->setValue(stops);
 }
 
 namespace {

@@ -142,6 +142,25 @@ pub(crate) struct ViewerFrame {
     pub(crate) data_window: Window,
     /// The pane's physical pixels per logical pixel, which sets the outline's width.
     pub(crate) scale_factor: f32,
+    /// The viewer's exposure as a factor on the working values, before they are clamped.
+    pub(crate) gain: f32,
+}
+
+/// A pixel of a shown image to read its working values at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Probe {
+    /// The image, numbered as [`Gpu::show_image`] was given it.
+    pub(crate) image: u64,
+    /// The pixel's texel in the image's planes, from the data window's bottom-left corner.
+    pub(crate) texel: [u32; 2],
+}
+
+/// A probe's pixel, read back once the GPU had copied it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PixelRead {
+    pub(crate) probe: Probe,
+    /// In `Channel::ALL`'s order.
+    pub(crate) values: [f32; 4],
 }
 
 /// Everything made once there is a surface to choose an adapter for, which goes with the device.
@@ -352,50 +371,40 @@ impl Gpu {
         let _ = wait_for_device(&device.device, None);
     }
 
-    /// Shows an image's pixels in the viewer from the next frame. Staged pixels are copied into
-    /// their texture first; converted ones are in theirs already, which the viewer holds while it
-    /// shows them. Pixels for an earlier device are dropped.
+    /// Shows an image's planes in the viewer from the next frame, numbered for the probes that
+    /// read it. Staged planes are copied into their textures first. Planes for an earlier device
+    /// are dropped.
     ///
     /// The copy is submitted at once rather than with the viewer's next frame, which may never
     /// come while the viewer is closed, so that the staging buffer goes back to the worker.
-    pub(crate) fn show_image(&mut self, pixels: Pixels) {
+    pub(crate) fn show_image(&mut self, pixels: Pixels, number: u64) {
         let Some(device) = &mut self.device else {
             return;
         };
-        if pixels.device_generation() != self.device_generation {
+        if pixels.device_generation != self.device_generation {
             return;
         }
-        let (view, held) = match pixels {
-            Pixels::Staged(staged) => {
-                let mut encoder = device.device.create_command_encoder(&Default::default());
+        if let Some(staged) = &pixels.staged {
+            let mut encoder = device.device.create_command_encoder(&Default::default());
+            for &(channel, offset) in &staged.copies {
+                let texture = &pixels.planes[channel];
                 encoder.copy_buffer_to_texture(
                     wgpu::TexelCopyBufferInfo {
                         buffer: staged.buffer(),
                         layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
+                            offset,
                             bytes_per_row: Some(staged.bytes_per_row),
                             rows_per_image: None,
                         },
                     },
-                    staged.texture.as_image_copy(),
-                    staged.texture.size(),
+                    texture.as_image_copy(),
+                    texture.size(),
                 );
-                device.queue.submit([encoder.finish()]);
-                (staged.texture.create_view(&Default::default()), None)
             }
-            Pixels::Converted { texture, .. } => {
-                (texture.create_view(&Default::default()), Some(texture))
-            }
-        };
-        let group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("viewer image"),
-            layout: &device.viewer.image_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            }],
-        });
-        device.viewer.image = Some(ShownImage { group, held });
+            device.queue.submit([encoder.finish()]);
+        }
+        let image = ShownImage::new(&device.device, &device.viewer, pixels.planes, number);
+        device.viewer.image = Some(image);
     }
 
     /// Stops drawing the viewer's image, which a failed read or an unmarked slot replaces.
@@ -403,6 +412,45 @@ impl Gpu {
         if let Some(device) = &mut self.device {
             device.viewer.image = None;
         }
+    }
+
+    /// Reads the working values at the probe's pixel of the image shown, if it is the probe's,
+    /// once the reads already asked for are done: one at a time, the latest asked for next.
+    pub(crate) fn read_pixel(&mut self, probe: Probe) {
+        let Some(device) = &mut self.device else {
+            return;
+        };
+        let reader = &mut device.viewer.reader;
+        if reader.in_flight.is_some() {
+            reader.next = Some(probe);
+        } else {
+            reader.start(
+                &device.device,
+                &device.queue,
+                device.viewer.image.as_ref(),
+                probe,
+            );
+        }
+    }
+
+    /// Whether a pixel read is waiting for the GPU.
+    pub(crate) fn reading_pixel(&self) -> bool {
+        (self.device.as_ref()).is_some_and(|device| device.viewer.reader.in_flight.is_some())
+    }
+
+    /// The pixel read the GPU has finished, without waiting for it, if its image is still
+    /// shown, and starts the next one asked for.
+    pub(crate) fn take_pixel_read(&mut self) -> Option<PixelRead> {
+        let device = self.device.as_mut()?;
+        let _ = device.device.poll(wgpu::PollType::Poll);
+        let reader = &mut device.viewer.reader;
+        let image = device.viewer.image.as_ref();
+        let read = reader.finish()?;
+        if let Some(next) = reader.next.take() {
+            reader.start(&device.device, &device.queue, image, next);
+        }
+        let shown = image.map(|image| image.number);
+        read.filter(|read| Some(read.probe.image) == shown)
     }
 
     /// Drops the pane's surface, if it has one, and its native window, before the window goes.
@@ -835,7 +883,7 @@ impl Device {
     }
 }
 
-/// Draws the viewer's image and the outline of its display window.
+/// Draws the viewer's image and the outline of its display window, and reads its pixels.
 #[derive(Debug)]
 struct ViewerRenderer {
     image_pipeline: wgpu::RenderPipeline,
@@ -843,17 +891,147 @@ struct ViewerRenderer {
     frame_buffer: wgpu::Buffer,
     frame_group: wgpu::BindGroup,
     image_layout: wgpu::BindGroupLayout,
-    /// The shown image's texture, while the viewer has one.
+    /// The shown image's planes, while the viewer has one.
     image: Option<ShownImage>,
+    reader: PixelReader,
 }
 
 #[derive(Debug)]
 struct ShownImage {
     group: wgpu::BindGroup,
-    /// A GPU session's display texture, held so that the worker does not convert into it while
-    /// it is shown.
-    #[expect(dead_code, reason = "held for its count, never read")]
-    held: Option<Arc<wgpu::Texture>>,
+    /// Held so that the worker writes no later result into them while they are shown, and for
+    /// reading their pixels.
+    planes: [Arc<wgpu::Texture>; 4],
+    number: u64,
+}
+
+impl ShownImage {
+    fn new(
+        device: &wgpu::Device,
+        viewer: &ViewerRenderer,
+        planes: [Arc<wgpu::Texture>; 4],
+        number: u64,
+    ) -> ShownImage {
+        let views = planes
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+        let entries: Vec<wgpu::BindGroupEntry> = (0..)
+            .zip(&views)
+            .map(|(binding, view)| wgpu::BindGroupEntry {
+                binding,
+                resource: wgpu::BindingResource::TextureView(view),
+            })
+            .collect();
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("viewer image"),
+            layout: &viewer.image_layout,
+            entries: &entries,
+        });
+        ShownImage {
+            group,
+            planes,
+            number,
+        }
+    }
+}
+
+/// Reads one pixel of each plane of the shown image at a time, into a small buffer the GUI
+/// thread maps without waiting.
+#[derive(Debug)]
+struct PixelReader {
+    buffer: wgpu::Buffer,
+    /// The probe being read, and once the GPU is done, whether its buffer mapped.
+    in_flight: Option<(Probe, Arc<OnceLock<bool>>)>,
+    /// The latest probe asked for while one was in flight.
+    next: Option<Probe>,
+}
+
+/// Bytes of one pixel of a plane.
+const PLANE_PIXEL_BYTES: u64 = 4;
+
+impl PixelReader {
+    fn new(device: &wgpu::Device) -> PixelReader {
+        PixelReader {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pixel read"),
+                size: 4 * PLANE_PIXEL_BYTES,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            in_flight: None,
+            next: None,
+        }
+    }
+
+    /// Copies the probe's pixel of each plane and maps the copies, unless the image is not the
+    /// probe's or the pixel is outside it.
+    fn start(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: Option<&ShownImage>,
+        probe: Probe,
+    ) {
+        let Some(image) = image.filter(|image| image.number == probe.image) else {
+            return;
+        };
+        let [x, y] = probe.texel;
+        let size = image.planes[0].size();
+        if x >= size.width || y >= size.height {
+            return;
+        }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for (plane, offset) in image.planes.iter().zip((0..).step_by(4)) {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: plane,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &self.buffer,
+                    // One row needs no row pitch.
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset,
+                        ..Default::default()
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit([encoder.finish()]);
+        let mapped = Arc::new(OnceLock::new());
+        let report = Arc::clone(&mapped);
+        (self.buffer).map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = report.set(result.is_ok());
+        });
+        self.in_flight = Some((probe, mapped));
+    }
+
+    /// The read in flight, once its mapping is done: `Some(None)` if it failed.
+    fn finish(&mut self) -> Option<Option<PixelRead>> {
+        let (probe, mapped) = self.in_flight.as_ref()?;
+        let (probe, mapped) = (*probe, *mapped.get()?);
+        self.in_flight = None;
+        if !mapped {
+            return Some(None);
+        }
+        let values = self.buffer.get_mapped_range(..).ok().map(|view| {
+            let bytes: [[u8; 4]; 4] = *view
+                .as_chunks::<4>()
+                .0
+                .first_chunk()
+                .expect("four planes were copied");
+            bytes.map(f32::from_ne_bytes)
+        });
+        self.buffer.unmap();
+        Some(values.map(|values| PixelRead { probe, values }))
+    }
 }
 
 /// The size of the shader's `Frame`.
@@ -866,7 +1044,7 @@ impl ViewerRenderer {
             label: Some("viewer frame"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -875,18 +1053,19 @@ impl ViewerRenderer {
                 count: None,
             }],
         });
+        let plane = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("viewer image"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            }],
+            entries: &[plane(0), plane(1), plane(2), plane(3)],
         });
         let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("viewer frame"),
@@ -940,6 +1119,7 @@ impl ViewerRenderer {
             frame_group,
             image_layout,
             image: None,
+            reader: PixelReader::new(device),
         }
     }
 
@@ -967,7 +1147,7 @@ impl ViewerRenderer {
             frame.scale_factor.round().max(1.0),
             config.width as f32,
             config.height as f32,
-            0.0,
+            frame.gain,
             0.0,
             data[0],
             data[1],
@@ -1196,13 +1376,87 @@ mod tests {
             key,
             number: 1,
         }));
-        gpu.show_image(staged());
+        gpu.show_image(staged(), 1);
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_none());
 
         // Connecting delivers the last key again, now for the GPU's generation.
         worker.connect(device, queue, 1);
-        gpu.show_image(staged());
+        gpu.show_image(staged(), 1);
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_some());
+    }
+
+    #[test]
+    fn a_pixel_read_returns_each_planes_working_value_at_the_probe_of_its_image() {
+        use crate::kernels::headless;
+
+        let (device, queue) = headless::device();
+        let viewer = ViewerRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb);
+        // 3 × 2, with values a display copy could not hold at the probed texel, (2, 1).
+        let special = [
+            f32::from_bits(0x7fc0_1234),
+            f32::NEG_INFINITY,
+            3e38,
+            f32::from_bits(1),
+        ];
+        let plane = |value: f32| {
+            let texture = headless::plane(
+                &device,
+                3,
+                2,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+            );
+            let mut texels = [0.5f32; 6];
+            texels[5] = value;
+            let bytes: Vec<u8> = texels.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            queue.write_texture(
+                texture.as_image_copy(),
+                &bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(12),
+                    rows_per_image: None,
+                },
+                texture.size(),
+            );
+            Arc::new(texture)
+        };
+        let image = ShownImage::new(&device, &viewer, special.map(plane), 7);
+        let mut reader = PixelReader::new(&device);
+
+        // Another image's probe, and a texel outside this one, read nothing.
+        for probe in [[2, 1], [3, 0]].map(|texel| Probe { image: 8, texel }) {
+            reader.start(&device, &queue, Some(&image), probe);
+            assert!(reader.in_flight.is_none());
+        }
+        let outside = Probe {
+            image: 7,
+            texel: [0, 2],
+        };
+        reader.start(&device, &queue, Some(&image), outside);
+        assert!(reader.in_flight.is_none());
+
+        let probe = Probe {
+            image: 7,
+            texel: [2, 1],
+        };
+        reader.start(&device, &queue, Some(&image), probe);
+        let start = Instant::now();
+        let read = loop {
+            let _ = device.poll(wgpu::PollType::Poll);
+            if let Some(read) = reader.finish() {
+                break read.expect("the buffer maps");
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the read finishes"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(read.probe, probe);
+        assert_eq!(read.values.map(f32::to_bits), special.map(f32::to_bits));
+        assert!(reader.in_flight.is_none());
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! The viewer's navigation: the slot it shows, and where and how large the image appears.
+//! The viewer's navigation and look: the slot it shows, where and how large the image appears,
+//! and its exposure.
 
 use open_ng::{Button, PhysicalPoint};
 
@@ -13,6 +14,10 @@ const MIN_ZOOM: f32 = 1.0 / 64.0;
 const MAX_ZOOM: f32 = 64.0;
 /// The fraction of the pane a fitted display window fills, leaving its outline in view.
 const FIT_FILL: f32 = 0.9;
+/// The viewer's exposure in stops either way, as the shell's control allows.
+pub const MAX_EXPOSURE: f32 = 20.0;
+/// Stops for one press of E.
+pub const EXPOSURE_STEP: f32 = 0.5;
 
 /// Where an image appears in the viewer pane: a point in image pixels lands at `(x * scale +
 /// offset[0], offset[1] - y * scale)` in the pane's physical pixels, whose y counts down.
@@ -48,6 +53,9 @@ pub struct Viewer {
     space_held: bool,
     /// The pan in progress: its button and the pointer's last position.
     pan: Option<(Button, PhysicalPoint)>,
+    /// Stops applied to the shown working values before they are clamped for display: how the
+    /// artist looks, never part of a result.
+    exposure: f32,
 }
 
 impl Viewer {
@@ -63,6 +71,7 @@ impl Viewer {
             },
             space_held: false,
             pan: None,
+            exposure: 0.0,
         }
     }
 
@@ -72,6 +81,23 @@ impl Viewer {
 
     pub(crate) fn show_slot(&mut self, slot: Slot) {
         self.slot = slot;
+    }
+
+    pub fn exposure(&self) -> f32 {
+        self.exposure
+    }
+
+    /// Sets the exposure in stops, within [`MAX_EXPOSURE`] either way. A value that is not a
+    /// number leaves it as it was.
+    pub(crate) fn set_exposure(&mut self, stops: f32) {
+        if !stops.is_nan() {
+            self.exposure = stops.clamp(-MAX_EXPOSURE, MAX_EXPOSURE);
+        }
+    }
+
+    /// The exposure as a factor on working values.
+    pub(crate) fn gain(&self) -> f32 {
+        f64::from(self.exposure).exp2() as f32
     }
 
     pub(crate) fn scale_factor(&self) -> f32 {

@@ -47,6 +47,9 @@ pub struct GpuEvaluation {
     queue: wgpu::Queue,
     kernels: Kernels,
     retained: Vec<GpuRetained>,
+    /// Planes released while something else held them, as the viewer holds the result it
+    /// shows: reused once it lets go, rather than each edit making new ones.
+    lent: Vec<GpuPlane>,
     cap: u64,
     /// Submissions made, and the number of the last the GPU has completed, which a callback on
     /// the queue advances.
@@ -70,6 +73,7 @@ impl GpuEvaluation {
             queue: queue.clone(),
             kernels: Kernels::new(device),
             retained: Vec::new(),
+            lent: Vec::new(),
             cap: RETAINED_TEXTURE_BYTES_CAP,
             submitted: 0,
             completed: Arc::new(AtomicU64::new(0)),
@@ -109,6 +113,7 @@ impl GpuEvaluation {
     /// Releases every retained result, as when the viewer wants nothing.
     pub fn release_all(&mut self) {
         self.retained.clear();
+        self.lent.clear();
     }
 
     fn find(&self, key: &ResultKey) -> Option<GpuImage> {
@@ -118,23 +123,28 @@ impl GpuEvaluation {
     }
 
     /// Releases every retained result the request does not contain, and returns the released
-    /// planes nothing else holds, for the request's outputs and uploads.
+    /// planes nothing else holds, for the request's outputs and uploads. Planes still held
+    /// elsewhere are lent until a later request finds them free.
     fn release_except(&mut self, keys: &[&ResultKey]) -> Vec<GpuPlane> {
-        let mut released = Vec::new();
+        let mut freed = std::mem::take(&mut self.lent);
         for retained in std::mem::take(&mut self.retained) {
             if keys.iter().any(|key| Arc::ptr_eq(&key.0, &retained.key.0)) {
                 self.retained.push(retained);
-                continue;
-            }
-            let unheld = (retained.image.planes.into_iter().flatten())
-                .filter(|plane| Arc::strong_count(&plane.0) == 1);
-            for plane in unheld {
-                // A plane shared by channels appears once per channel.
-                if !released.iter().any(|other| GpuPlane::ptr_eq(other, &plane)) {
-                    released.push(plane);
-                }
+            } else {
+                freed.extend(retained.image.planes.into_iter().flatten());
             }
         }
+        // A plane shared by channels appears once per channel; the copies drop here, so that
+        // only holders outside the table count.
+        let mut distinct: Vec<GpuPlane> = Vec::new();
+        for plane in freed {
+            if !distinct.iter().any(|other| GpuPlane::ptr_eq(other, &plane)) {
+                distinct.push(plane);
+            }
+        }
+        let released;
+        (self.lent, released) =
+            (distinct.into_iter()).partition(|plane| Arc::strong_count(&plane.0) > 1);
         released
     }
 
@@ -602,6 +612,12 @@ impl GpuImage {
     pub fn texture(&self, channel: Channel) -> Option<&wgpu::Texture> {
         (self.planes.as_ref()).map(|planes| &*planes[channel as usize].0)
     }
+
+    /// The planes' textures in `Channel::ALL`'s order, for the viewer to hold while it shows
+    /// them; `None` if the data window is empty.
+    pub(crate) fn textures(&self) -> Option<[Arc<wgpu::Texture>; 4]> {
+        (self.planes.as_ref()).map(|planes| planes.each_ref().map(|plane| Arc::clone(&plane.0)))
+    }
 }
 
 /// One texture of a result, shared by the channels, images and tables that hold it: one the
@@ -616,9 +632,9 @@ impl GpuPlane {
 }
 
 /// A request recorded on one generation and not yet submitted: [`GpuEvaluation::submit`]
-/// submits it and retains its results, and dropping it submits and retains nothing. Its caller
-/// may record more into the same submission, reading the image, on the same thread: the
-/// validation scope that decides whether its results are kept belongs to the thread.
+/// submits it and retains its results, and dropping it submits and retains nothing. It is
+/// submitted on the thread that recorded it: the validation scope that decides whether its
+/// results are kept belongs to the thread.
 #[derive(Debug)]
 pub struct Recorded {
     origin: ResultKey,
@@ -633,9 +649,10 @@ impl Recorded {
         &self.image
     }
 
-    /// The encoder, to record more into the request's submission, beside the image to read.
-    pub fn encoder_and_image(&mut self) -> (&mut wgpu::CommandEncoder, &GpuImage) {
-        (&mut self.encoder, &self.image)
+    /// The request's encoder, for a test to record what wgpu rejects into its submission.
+    #[cfg(test)]
+    pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
+        &mut self.encoder
     }
 }
 

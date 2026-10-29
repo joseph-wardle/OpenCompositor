@@ -20,8 +20,8 @@ use std::time::Instant;
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
 use opencompositor_core::{
-    App, Command, EvaluationDevice, Event, FileIntent, FrameCheck, FrameTiming, Notice, Pane,
-    Request, Session, Slot,
+    App, Command, EXPOSURE_STEP, EvaluationDevice, Event, FileIntent, FrameCheck, FrameTiming,
+    MAX_EXPOSURE, Notice, Pane, Request, Session, Slot,
 };
 
 use crate::qt::ffi;
@@ -50,7 +50,9 @@ pub struct Widgets {
     pub panes: [*mut qt::Pane; Pane::COUNT],
     pub panel: *mut ffi::ParameterPanel,
     pub creation_menu: *mut ffi::CreationMenu,
-    /// Under the viewer.
+    /// Under the viewer: its caption, readout and exposure.
+    pub strip: *mut ffi::ViewerStrip,
+    /// The strip's first line.
     pub caption: *mut ffi::QLabel,
     /// At the status bar's right, while the GPU is unavailable or has reported errors.
     pub gpu_label: *mut ffi::QLabel,
@@ -66,19 +68,18 @@ enum Check {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--gpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur]]"
+        "usage: opencompositor [--cpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur]]"
     );
     std::process::exit(2)
 }
 
 fn main() {
-    // The GPU evaluates only when chosen, until it runs every built-in operation and reads out.
     let mut arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let device = if arguments.first().is_some_and(|flag| flag == "--gpu") {
+    let device = if arguments.first().is_some_and(|flag| flag == "--cpu") {
         arguments.remove(0);
-        EvaluationDevice::Gpu
-    } else {
         EvaluationDevice::Cpu
+    } else {
+        EvaluationDevice::Gpu
     };
     let check = match &arguments[..] {
         [] => None,
@@ -185,6 +186,16 @@ fn main() {
     unsafe { ffi::add_note(viewer_menu, &QString::from("Pan\tSpace+Drag, Middle-Drag")) };
     // SAFETY: the viewer menu is live.
     unsafe { ffi::add_separator(viewer_menu) };
+    add(viewer_menu, "&Brighten\tE", "", Command::ExposureUp);
+    add(viewer_menu, "&Darken\tShift+E", "", Command::ExposureDown);
+    add(
+        viewer_menu,
+        "&Reset the Exposure\tCtrl+E",
+        "",
+        Command::ResetExposure,
+    );
+    // SAFETY: the viewer menu is live.
+    unsafe { ffi::add_separator(viewer_menu) };
     add(
         viewer_menu,
         "Evaluate on the &GPU",
@@ -226,10 +237,17 @@ fn main() {
             panel::gesture,
         )
     };
-    // SAFETY: the docks are live; each owns its pane, and the viewer's its caption, from here on.
-    let caption = unsafe {
+    // SAFETY: the docks are live; each owns its pane, and the viewer's its strip, from here on.
+    let (strip, caption) = unsafe {
         ffi::container(panes[Pane::Graph.index()], graph_dock);
-        ffi::container_with_caption(panes[Pane::Viewer.index()], viewer_dock)
+        let strip = ffi::container_with_strip(
+            panes[Pane::Viewer.index()],
+            viewer_dock,
+            f64::from(MAX_EXPOSURE),
+            f64::from(EXPOSURE_STEP),
+            exposure_set,
+        );
+        (strip, ffi::strip_caption(strip))
     };
     // SAFETY: the window is live; it owns the menu.
     let creation_menu = unsafe { ffi::new_creation_menu(window_ptr, creation::chosen) };
@@ -242,6 +260,7 @@ fn main() {
             panes,
             panel,
             creation_menu,
+            strip,
             caption,
             gpu_label,
             undo,
@@ -322,6 +341,10 @@ fn show_undo_labels(labels: [Option<&str>; 2]) {
     }
 }
 
+fn exposure_set(stops: f64) {
+    dispatch(Event::ViewerExposureSet(stops as f32));
+}
+
 fn run_command(index: usize) {
     let command =
         COMMANDS.with(|cell| cell.get().expect("menus are made before the event loop")[index]);
@@ -364,6 +387,14 @@ pub fn perform(request: Request) {
         // SAFETY: the caption lives as long as the viewer's dock.
         Request::ShowViewerCaption(text) => unsafe {
             ffi::set_caption(widgets.caption, &QString::from(&text))
+        },
+        // SAFETY: the strip lives as long as the viewer's dock.
+        Request::ShowReadout(text) => unsafe {
+            ffi::set_readout(widgets.strip, &QString::from(&text))
+        },
+        // SAFETY: the strip lives as long as the viewer's dock.
+        Request::ShowViewerExposure(stops) => unsafe {
+            ffi::show_viewer_exposure(widgets.strip, f64::from(stops))
         },
         Request::ShowUndoLabels { undo, redo } => show_undo_labels([undo, redo]),
         Request::ShowCreationMenu(anchor) => creation::show(anchor),

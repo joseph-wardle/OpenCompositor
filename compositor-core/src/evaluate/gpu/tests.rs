@@ -209,20 +209,27 @@ fn a_stops_edit_uploads_nothing_and_reuses_the_released_output() {
 }
 
 #[test]
-fn a_released_texture_held_by_an_image_is_not_reused() {
+fn a_released_texture_held_by_an_image_is_reused_only_once_let_go() {
     let path = directory("held").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
     let mut gpu = GpuEvaluation::new(&device, &queue);
     let mut evaluator = Evaluator::new();
-    let [one, two] = [1.0, 2.0].map(|stops| key(&chain([reader(&path), exposure(Some(stops))]), 2));
+    let [one, two, three] =
+        [1.0, 2.0, 3.0].map(|stops| key(&chain([reader(&path), exposure(Some(stops))]), 2));
+    // Held, as the viewer holds the image it shows.
     let shown = run(&mut evaluator, &mut gpu, &one);
     let before = read_back(&gpu, &shown, Channel::R);
+    let shown_output = shown.texture(Channel::R).unwrap().clone();
 
     let second = run(&mut evaluator, &mut gpu, &two);
 
-    assert_ne!(second.texture(Channel::R), shown.texture(Channel::R));
+    assert_ne!(second.texture(Channel::R), Some(&shown_output));
     assert_eq!(read_back(&gpu, &shown, Channel::R), before);
+    drop((shown, second));
+
+    let third = run(&mut evaluator, &mut gpu, &three);
+    assert_eq!(third.texture(Channel::R), Some(&shown_output));
 }
 
 #[test]
@@ -898,8 +905,9 @@ fn a_request_wgpu_rejects_fails_and_retains_nothing() {
         usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let (encoder, _) = recorded.encoder_and_image();
-    encoder.copy_buffer_to_buffer(&buffer, 0, &buffer, 0, 8);
+    recorded
+        .encoder()
+        .copy_buffer_to_buffer(&buffer, 0, &buffer, 0, 8);
 
     let rejected = gpu.submit(recorded);
 

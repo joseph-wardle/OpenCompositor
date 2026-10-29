@@ -8,6 +8,7 @@ use crate::evaluate::EvalError;
 use crate::panel::ValueState;
 use crate::parameter::{Value, resolve};
 use crate::read::ReadError;
+use crate::viewer::MAX_EXPOSURE;
 use crate::worker::{EvaluationDevice, Timing, ViewerImage};
 
 const NONE: Modifiers = Modifiers {
@@ -1196,4 +1197,172 @@ fn two_losses_while_evaluation_had_work_on_the_gpu_move_it_to_the_cpu() {
         assert_eq!(app.evaluation_device(), device);
     }
     assert_eq!(app.left_gpu, Some(LeftGpu::Lost));
+}
+
+/// The readout the requests show, if they change it.
+fn shown_readout(requests: &[Request]) -> Option<&str> {
+    requests.iter().find_map(|request| match request {
+        Request::ShowReadout(text) => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+/// An app viewing a 4000 × 2000 image, fitted in a 1000 × 500 viewer so that a physical pixel
+/// is 1 / 0.225 image pixels from (50, 475), whose data window is the 2000 × 1000 at (1000, 500).
+fn viewing_a_cropped_image() -> (App, Receiver<Evaluated>) {
+    let (mut app, deliveries) = app();
+    app.dispatch(Event::Resized {
+        pane: Pane::Viewer,
+        size: PaneSize {
+            width: 1000,
+            height: 500,
+            scale_factor: 1.0,
+        },
+    });
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(cropped(&sent(&app)));
+    (app, deliveries)
+}
+
+fn cropped(wanted: &Wanted) -> Event {
+    let Event::Evaluated(mut evaluated) = read(wanted, 4000, 2000) else {
+        unreachable!("an evaluation");
+    };
+    if let Ok(image) = &mut evaluated.result {
+        image.info.data_window = Window {
+            x: 1000,
+            y: 500,
+            width: 2000,
+            height: 1000,
+        };
+    }
+    Event::Evaluated(evaluated)
+}
+
+fn pointer_at(x: f32, y: f32) -> Event {
+    input(
+        Pane::Viewer,
+        Input::PointerMoved {
+            position: PhysicalPoint { x, y },
+        },
+    )
+}
+
+#[test]
+fn the_readout_follows_the_pointer_and_labels_a_read_with_its_own_pixel_while_its_image_shows() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+
+    // Outside the data window: zeros, said so, with nothing to read.
+    let requests = app.dispatch(pointer_at(51.0, 474.0));
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 4 y 4 · R 0 G 0 B 0 A 0, outside the data window")
+    );
+    assert_eq!(app.probed, None);
+
+    // Inside: the pixel, until its values are read.
+    let requests = app.dispatch(pointer_at(500.0, 250.0));
+    assert_eq!(shown_readout(&requests), Some("x 2000 y 1000"));
+    let probe = app.probed.expect("a probe");
+    assert_eq!(probe.texel, [1000, 500]);
+    app.pixel_read = Some(PixelRead {
+        probe,
+        values: [0.18017578, -2.5, 1e9, f32::NAN],
+    });
+    // A read arriving with the frame, whatever else the dispatch did.
+    let requests = app.dispatch(Event::Draw(Pane::Viewer));
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2000 y 1000 · R 0.1802 G -2.5 B 1.000e9 A NaN")
+    );
+
+    // Another pixel keeps the last read, labelled with the pixel it read, until its own arrives.
+    let requests = app.dispatch(pointer_at(501.0, 250.0));
+    assert_eq!(shown_readout(&requests), None);
+    assert_ne!(app.probed, Some(probe));
+
+    // A newer image drops a read of the older one.
+    let requests = app.dispatch(cropped(&sent(&app)));
+    assert_eq!(shown_readout(&requests), Some("x 2004 y 1000"));
+
+    let requests = app.dispatch(input(Pane::Viewer, Input::PointerLeft));
+    assert_eq!(shown_readout(&requests), Some(""));
+}
+
+#[test]
+fn a_device_loss_drops_the_read_of_its_copy_of_the_image() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+    app.dispatch(pointer_at(500.0, 250.0));
+    let probe = app.probed.expect("a probe");
+    app.pixel_read = Some(PixelRead {
+        probe,
+        values: [1.0; 4],
+    });
+    app.dispatch(Event::Draw(Pane::Viewer));
+    app.gpu = Gpu::with_noop_device(Waker::channel().0);
+
+    let requests = app.dispatch(Event::DeviceLost {
+        generation: 1,
+        at: std::time::Instant::now(),
+    });
+
+    assert_eq!(shown_readout(&requests), Some("x 2000 y 1000"));
+}
+
+#[test]
+fn e_steps_the_viewers_exposure_and_its_control_follows_without_editing_the_document() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+    app.dispatch(input(Pane::Viewer, Input::PointerEntered));
+    let version = app.session().version();
+    let undo = app.session().undo_label();
+    let key = |modifiers| Event::KeyPressed {
+        key: Key::E,
+        modifiers,
+    };
+
+    assert_eq!(
+        app.dispatch(key(NONE)),
+        [
+            Request::Redraw(Pane::Viewer),
+            Request::ShowViewerExposure(0.5)
+        ]
+    );
+    app.dispatch(key(SHIFT));
+    app.dispatch(key(SHIFT));
+    assert_eq!(app.session().viewer().exposure(), -0.5);
+    assert_eq!(app.session().viewer().gain(), 0.5f32.sqrt());
+    app.dispatch(key(CTRL));
+    assert_eq!(app.session().viewer().exposure(), 0.0);
+
+    // What the artist typed is not echoed back to the control, but is clamped where it holds.
+    assert_eq!(
+        app.dispatch(Event::ViewerExposureSet(3.25)),
+        [Request::Redraw(Pane::Viewer)]
+    );
+    app.dispatch(Event::ViewerExposureSet(f32::NAN));
+    assert_eq!(app.session().viewer().exposure(), 3.25);
+    app.dispatch(Event::ViewerExposureSet(1e9));
+    assert_eq!(app.session().viewer().exposure(), MAX_EXPOSURE);
+
+    assert_eq!(app.session().version(), version);
+    assert_eq!(app.session().undo_label(), undo);
+}
+
+#[test]
+fn working_values_read_with_four_decimals_or_an_exponent() {
+    let cases = [
+        (0.0, "0"),
+        (-0.0, "0"),
+        (1.0, "1"),
+        (0.18017578, "0.1802"),
+        (-123456.5, "-123456.5"),
+        (0.00001, "1.000e-5"),
+        (3e38, "3.000e38"),
+        (f32::INFINITY, "inf"),
+        (f32::NEG_INFINITY, "-inf"),
+    ];
+    for (value, text) in cases {
+        assert_eq!(working_value(value), text, "{value}");
+    }
 }

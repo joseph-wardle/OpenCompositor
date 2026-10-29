@@ -52,12 +52,17 @@ fn connect(worker: &Worker, (device, queue): (wgpu::Device, wgpu::Queue), genera
     worker.connect(device, queue, generation);
 }
 
-/// The staged pixels of a CPU session's image.
-fn staged(evaluated: Evaluated) -> Staged {
+/// The staged planes of a CPU session's image.
+fn staged(evaluated: Evaluated) -> Pixels {
     match evaluated.result.expect("an image").pixels {
-        Some(Pixels::Staged(staged)) => staged,
-        pixels => panic!("staged pixels, not {pixels:?}"),
+        Some(pixels) if pixels.staged.is_some() => pixels,
+        pixels => panic!("staged planes, not {pixels:?}"),
     }
+}
+
+/// The staging buffer staged planes are copied from.
+fn buffer(pixels: &Pixels) -> &wgpu::Buffer {
+    pixels.staged.as_ref().expect("staged").buffer()
 }
 
 fn receive(deliveries: &Receiver<Evaluated>) -> Evaluated {
@@ -253,7 +258,8 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
         ["small.png", "other.png", "tall.png"].map(|name| directory.join(name));
     write_png(&small, 3, 2);
     write_png(&other, 5, 1);
-    // One pixel wide, which pads each row to 256 bytes: over twice what the first buffer holds.
+    // One pixel wide, which pads each row of its four planes to 256 bytes: over twice what the
+    // first buffer holds.
     let (_, first_height) = FIRST_STAGING_SIZE;
     write_png(&tall, 1, 2 * (row_bytes(4096) / 256) * first_height + 1);
     let (worker, deliveries) = worker();
@@ -261,16 +267,20 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
 
     worker.request(Some(on(1, key(&small))));
     let first = staged(receive(&deliveries));
-    assert_eq!(first.bytes_per_row, 256);
+    let copies = first.staged.as_ref().unwrap();
+    assert_eq!(copies.bytes_per_row, 256);
+    // Four planes, one after another.
+    let offsets: Vec<u64> = copies.copies.iter().map(|&(_, offset)| offset).collect();
+    assert_eq!(offsets, [0, 512, 1024, 1536]);
     assert_eq!(
-        first.texture.size(),
+        first.planes[0].size(),
         wgpu::Extent3d {
             width: 3,
             height: 2,
             depth_or_array_layers: 1
         }
     );
-    let buffer = first.buffer().clone();
+    let first_buffer = buffer(&first).clone();
 
     // Held by the GUI, the buffer is not the worker's to write.
     worker.request(Some(on(1, key(&other))));
@@ -280,22 +290,22 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     );
     drop(first);
     let second = staged(receive(&deliveries));
-    assert_eq!(second.buffer(), &buffer);
+    assert_eq!(buffer(&second), &first_buffer);
     drop(second);
 
     worker.request(Some(on(1, key(&tall))));
     let third = staged(receive(&deliveries));
-    assert_ne!(third.buffer(), &buffer);
-    assert!(third.buffer().size() > buffer.size());
+    assert_ne!(buffer(&third), &first_buffer);
+    assert!(buffer(&third).size() > first_buffer.size());
     // When it shrinks again is `StagingSizing`'s to test.
 }
 
 #[test]
 fn alternating_large_and_small_images_keeps_one_staging_buffer() {
     let (first_width, first_height) = FIRST_STAGING_SIZE;
-    let mut current = staging_size(first_width, first_height);
-    let uhd = staging_size(3840, 2160);
-    let eight_k = staging_size(8192, 4320);
+    let mut current = staging_size(first_width, first_height, 4);
+    let uhd = staging_size(3840, 2160, 4);
+    let eight_k = staging_size(8192, 4320, 4);
     let mut sizing = StagingSizing::default();
     let mut replacements = Vec::new();
 
@@ -315,14 +325,14 @@ fn alternating_large_and_small_images_keeps_one_staging_buffer() {
             current = size;
         }
     }
-    assert_eq!(current, staging_size(first_width, first_height));
+    assert_eq!(current, staging_size(first_width, first_height, 4));
 }
 
 /// The quarter to spare stops at the GPU's largest buffer, as long as the image fits in it.
 #[test]
 fn a_growing_staging_buffer_stays_within_the_gpus_limit() {
-    let uhd = staging_size(3840, 2160);
-    let eight_k = staging_size(8192, 4320);
+    let uhd = staging_size(3840, 2160, 4);
+    let eight_k = staging_size(8192, 4320, 4);
     let mut sizing = StagingSizing::default();
     assert_eq!(sizing.first(uhd, uhd), uhd);
     assert_eq!(sizing.replacement(uhd, eight_k, eight_k), Some(eight_k));
@@ -439,13 +449,13 @@ fn a_staging_buffer_returned_after_its_device_was_replaced_is_dropped() {
 
     connect(&worker, replacement, 2);
     let new = staged(receive(&deliveries));
-    let buffer = new.buffer().clone();
+    let returned = buffer(&new).clone();
     drop(new);
     drop(old);
 
     worker.request(Some(on(1, key(&second))));
     let staged = staged(receive(&deliveries));
-    assert_eq!(staged.buffer(), &buffer);
+    assert_eq!(buffer(&staged), &returned);
 }
 
 #[test]
@@ -513,55 +523,53 @@ fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels(
 }
 
 #[test]
-fn every_row_is_staged_where_its_row_number_says() {
+fn every_row_of_every_plane_is_staged_where_its_row_number_says() {
     // More rows than one chunk of the pool's, and a count no chunk divides.
     let (width, height) = (3, 21);
-    let plane = |channel: usize| -> Vec<f32> {
-        (0..width * height)
-            .map(|i| (i * 4 + channel) as f32)
-            .collect()
-    };
-    let planes = [plane(0), plane(1), plane(2), plane(3)];
-    let halves_per_row = row_bytes(width as u32) as usize / 2;
-    let mut out = vec![f16::NAN; halves_per_row * height];
+    let plane =
+        |first: usize| -> Vec<f32> { (first..first + width * height).map(|i| i as f32).collect() };
+    let planes = [plane(0), plane(1000)];
+    let floats_per_row = row_bytes(width as u32) as usize / 4;
+    let mut out = vec![f32::NAN; floats_per_row * height * 2];
 
-    convert_rows(
+    copy_rows(
         &Pool::new(),
-        planes.each_ref().map(|plane| &plane[..]),
+        &[&planes[0], &planes[1]],
         width,
         &mut out,
-        halves_per_row,
+        floats_per_row,
     );
 
-    for row in 0..height {
-        let staged = &out[row * halves_per_row..][..width * 4];
-        let expected = (row * width * 4..(row + 1) * width * 4).map(|i| f16::from_f32(i as f32));
-        assert!(staged.iter().copied().eq(expected), "row {row}");
+    for (index, plane) in planes.iter().enumerate() {
+        for row in 0..height {
+            let staged = &out[(index * height + row) * floats_per_row..][..width];
+            assert_eq!(
+                staged,
+                &plane[row * width..][..width],
+                "plane {index} row {row}"
+            );
+        }
     }
 }
 
 #[test]
-fn staged_rows_are_interleaved_half_floats_padded_to_the_copy_alignment() {
-    // Two rows of one pixel each; the second has a NaN and a value beyond f16's range.
-    let planes = [[0.5, f32::NAN], [1.0, 1e6], [-2.0, 0.0], [0.25, 1.0]];
-    let padding = f16::from_f32(7.0);
-    let mut out = vec![padding; 2 * 128];
+fn staged_planes_keep_every_value_and_leave_the_row_padding() {
+    // Two rows of one pixel; a NaN with a payload, an infinity and a value beyond f16's range.
+    let payload = f32::from_bits(0x7fc0_1234);
+    let plane = [payload, 1e6];
+    let other = [f32::NEG_INFINITY, -0.0];
+    let padding = 7.0;
+    let mut out = vec![padding; 4 * 64];
 
-    convert_rows(
-        &Pool::new(),
-        planes.each_ref().map(|plane| &plane[..]),
-        1,
-        &mut out,
-        128,
-    );
+    copy_rows(&Pool::new(), &[&plane, &other], 1, &mut out, 64);
 
-    let row = |index: usize| out[index * 128..index * 128 + 4].to_vec();
-    assert_eq!(row(0), [0.5, 1.0, -2.0, 0.25].map(f16::from_f32));
-    let second = row(1);
-    assert!(second[0].is_nan());
-    assert_eq!(second[1], f16::INFINITY);
-    assert_eq!(second[2..], [0.0, 1.0].map(f16::from_f32));
-    assert!(out[4..128].iter().all(|&half| half == padding));
+    let staged: Vec<u32> = [0, 64, 128, 192].map(|start| out[start].to_bits()).to_vec();
+    let expected: Vec<u32> = [payload, 1e6, f32::NEG_INFINITY, -0.0]
+        .map(f32::to_bits)
+        .to_vec();
+    assert_eq!(staged, expected);
+    let padded = (0..4).flat_map(|row| out[row * 64 + 1..(row + 1) * 64].iter());
+    assert!(padded.into_iter().all(|&value| value == padding));
 }
 
 #[test]
@@ -571,23 +579,23 @@ fn a_file_is_staged_bottom_row_first() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/tiled_zip.exr");
     let (info, planes) = read_image(&path).unwrap().into_parts();
     let window = info.data_window;
-    let (width, halves_per_row) = (window.width as usize, row_bytes(window.width) as usize / 2);
-    let mut out = vec![f16::ZERO; halves_per_row * window.height as usize];
+    let (width, height) = (window.width as usize, window.height as usize);
+    let floats_per_row = row_bytes(window.width) as usize / 4;
+    let mut out = vec![0.0; floats_per_row * height * 2];
 
-    convert_rows(
+    copy_rows(
         &Pool::new(),
-        planes.each_ref().map(|plane| &plane[..]),
+        &[&planes[0][..], &planes[1][..]],
         width,
         &mut out,
-        halves_per_row,
+        floats_per_row,
     );
 
-    for (row, y) in (window.y..).take(window.height as usize).enumerate() {
+    for (row, y) in (window.y..).take(height).enumerate() {
         for (column, x) in (window.x..).take(width).enumerate() {
-            let start = row * halves_per_row + column * 4;
-            let staged = out[start..start + 4].iter().map(|half| half.to_f32());
-            let expected = [x as f32, (9 - y) as f32, 0.0, 1.0];
-            assert!(staged.eq(expected), "({x}, {y})");
+            let red = out[row * floats_per_row + column];
+            let green = out[(height + row) * floats_per_row + column];
+            assert_eq!([red, green], [x as f32, (9 - y) as f32], "({x}, {y})");
         }
     }
 }
@@ -603,14 +611,15 @@ fn gpu_worker() -> (Worker, Receiver<Evaluated>, wgpu::Device, wgpu::Queue) {
     (worker, deliveries, device, queue)
 }
 
-/// The display texture of a GPU session's image, and its device's generation.
-fn converted(evaluated: Evaluated) -> (Arc<wgpu::Texture>, u64) {
+/// The planes a GPU session's request wrote, and their device's generation.
+fn evaluated_planes(evaluated: Evaluated) -> ([Arc<wgpu::Texture>; 4], u64) {
     match evaluated.result.expect("an image").pixels {
-        Some(Pixels::Converted {
-            texture,
+        Some(Pixels {
+            planes,
             device_generation,
-        }) => (texture, device_generation),
-        pixels => panic!("converted pixels, not {pixels:?}"),
+            staged: None,
+        }) => (planes, device_generation),
+        pixels => panic!("evaluated planes, not {pixels:?}"),
     }
 }
 
@@ -636,8 +645,7 @@ fn retained_on_gpu(worker: &Worker) -> Vec<ResultKey> {
 }
 
 #[test]
-fn a_gpu_session_delivers_the_display_copy_its_request_converted() {
-    use crate::display::tests::{expected, read_halves};
+fn a_gpu_session_delivers_the_planes_its_request_wrote() {
     let path = directory("gpu-session").join("image.png");
     write_png(&path, 3, 2);
     let (worker, deliveries, device, queue) = gpu_worker();
@@ -646,15 +654,14 @@ fn a_gpu_session_delivers_the_display_copy_its_request_converted() {
 
     let evaluated = receive(&deliveries);
     assert!(evaluated.timing.read.is_some());
-    let (texture, generation) = converted(evaluated);
+    let (planes, generation) = evaluated_planes(evaluated);
     assert_eq!(generation, 1);
-    assert_eq!((texture.width(), texture.height()), (3, 2));
-    let halves = read_halves(&device, &queue, &texture);
     // White, opaque, and half as bright; alpha is not exposed.
-    for pixel in halves.as_chunks::<4>().0 {
-        let want = [0.5, 0.5, 0.5, 1.0].map(expected);
-        assert_eq!(*pixel, want);
-    }
+    let values = planes.each_ref().map(|plane| {
+        assert_eq!((plane.width(), plane.height()), (3, 2));
+        crate::kernels::headless::readback(&device, &queue, plane)
+    });
+    assert_eq!(values, [0.5, 0.5, 0.5, 1.0].map(|value| vec![value; 6]));
 }
 
 #[test]
@@ -674,7 +681,7 @@ fn a_gpu_session_evaluates_nothing_until_a_device_is_connected() {
     let (device, queue) = crate::kernels::headless::device();
     worker.connect(device, queue, 1);
 
-    let (_, generation) = converted(receive(&deliveries));
+    let (_, generation) = evaluated_planes(receive(&deliveries));
     assert_eq!(generation, 1);
 }
 
@@ -685,7 +692,7 @@ fn a_replaced_device_drops_its_state_and_the_new_one_shows_the_request_again() {
     let (worker, deliveries, _, _) = gpu_worker();
     let requested = exposed(&path, 1.0);
     worker.request(Some(on(1, requested.clone())));
-    let (first, _) = converted(receive(&deliveries));
+    let (first, _) = evaluated_planes(receive(&deliveries));
     assert!(!retained_on_gpu(&worker).is_empty());
 
     let (device, queue) = crate::kernels::headless::device();
@@ -693,11 +700,11 @@ fn a_replaced_device_drops_its_state_and_the_new_one_shows_the_request_again() {
 
     let evaluated = receive(&deliveries);
     assert_eq!(evaluated.wanted.key, requested);
-    let (second, generation) = converted(evaluated);
+    let (second, generation) = evaluated_planes(evaluated);
     assert_eq!(generation, 2);
-    assert!(!Arc::ptr_eq(&first, &second));
-    // The first device's display texture is the test's alone: its state dropped with it.
-    assert_eq!(Arc::strong_count(&first), 1);
+    assert!(!Arc::ptr_eq(&first[0], &second[0]));
+    // The first device's planes are the test's alone: its state dropped with it.
+    assert_eq!(Arc::strong_count(&first[0]), 1);
 }
 
 #[test]
@@ -706,7 +713,7 @@ fn asking_for_nothing_releases_everything_on_the_gpu() {
     write_png(&path, 3, 2);
     let (worker, deliveries, _, _) = gpu_worker();
     worker.request(Some(on(1, exposed(&path, 1.0))));
-    drop(converted(receive(&deliveries)));
+    drop(evaluated_planes(receive(&deliveries)));
     assert_eq!(retained_on_gpu(&worker).len(), 2);
 
     worker.request(None);
@@ -746,37 +753,10 @@ fn dropping_a_gpu_session_worker_waits_for_its_gpu_phase() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the drop returns once the phase ends");
 
-    // The worker made the display texture in its phase and dropped its own with the
-    // connection, on the dropping thread.
-    let (texture, _) = converted(evaluated);
-    assert_eq!(Arc::strong_count(&texture), 1);
-}
-
-#[test]
-fn a_display_copy_the_gpu_has_no_memory_for_cannot_be_shown_and_retains_nothing() {
-    let path = directory("gpu-display-short").join("image.png");
-    write_png(&path, 3, 2);
-    let (worker, deliveries, _, _) = gpu_worker();
-    worker.request(Some(on(1, exposed(&path, 1.0))));
-    // Held, as the viewer holds what it shows, so the next request needs a new display texture.
-    let (_shown, _) = converted(receive(&deliveries));
-    wait_until_out_of_gpu_phase(&worker);
-    let mut state = worker.mailbox.lock();
-    let on_device = state
-        .connection
-        .as_mut()
-        .unwrap()
-        .on_device
-        .as_mut()
-        .unwrap();
-    on_device.conversion.refuse = true;
-    drop(state);
-
-    worker.request(Some(on(1, exposed(&path, 2.0))));
-
-    let error = receive(&deliveries).result.unwrap_err();
-    assert!(matches!(error, ViewerError::CannotShow(_)), "{error}");
-    assert!(retained_on_gpu(&worker).is_empty());
+    // The worker made the planes in its phase and dropped its own with the connection, on the
+    // dropping thread.
+    let (planes, _) = evaluated_planes(evaluated);
+    assert_eq!(Arc::strong_count(&planes[0]), 1);
 }
 
 #[test]
@@ -785,7 +765,7 @@ fn moving_a_gpu_session_to_the_cpu_drops_its_gpu_state_and_stages_the_request_ag
     write_png(&path, 3, 2);
     let (worker, deliveries, _, _) = gpu_worker();
     worker.request(Some(on(1, exposed(&path, 1.0))));
-    converted(receive(&deliveries));
+    evaluated_planes(receive(&deliveries));
     assert!(!retained_on_gpu(&worker).is_empty());
 
     worker.evaluate_on(EvaluationDevice::Cpu);
@@ -795,7 +775,7 @@ fn moving_a_gpu_session_to_the_cpu_drops_its_gpu_state_and_stages_the_request_ag
     staged(again);
     assert!(retained_on_gpu(&worker).is_empty());
     worker.evaluate_on(EvaluationDevice::Gpu);
-    converted(receive(&deliveries));
+    evaluated_planes(receive(&deliveries));
 }
 
 #[test]
@@ -805,7 +785,7 @@ fn a_loss_counts_as_during_evaluation_only_until_the_gpu_completed_its_work() {
     for lost_during in [true, false] {
         let (worker, deliveries, device, queue) = gpu_worker();
         worker.request(Some(on(1, exposed(&path, 1.0))));
-        converted(receive(&deliveries));
+        evaluated_planes(receive(&deliveries));
         wait_until_out_of_gpu_phase(&worker);
         let state = worker.mailbox.lock();
         let submission = state.last_submission.as_ref().unwrap();

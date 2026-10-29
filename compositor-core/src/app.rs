@@ -10,11 +10,14 @@ use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{EvalError, ResultKey, result_key};
-use crate::gpu::{Drawn, FrameCheck, FrameTiming, Gpu, NativeWindow, PaneSize, ViewerFrame};
+use crate::gpu::{
+    Drawn, FrameCheck, FrameTiming, Gpu, NativeWindow, PaneSize, PixelRead, Probe, ViewerFrame,
+};
 use crate::image::{ImageInfo, Window};
 use crate::panel::Panel;
 use crate::parameter::Value;
 use crate::session::Session;
+use crate::viewer::EXPOSURE_STEP;
 use crate::worker::{Evaluated, EvaluationDevice, ViewerError, Wanted, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
@@ -94,6 +97,8 @@ pub enum Event {
     },
     /// The time for the attempt, after [`Request::RetryDeviceCreation`].
     RetryDeviceCreation(u64),
+    /// The artist set the viewer's exposure, in stops, in the viewer's own control.
+    ViewerExposureSet(f32),
 }
 
 /// What another thread, or wgpu inside a call, tells the GUI thread through the waker
@@ -159,6 +164,12 @@ pub enum Request {
     ShowError(String),
     /// Describe under the viewer what it shows, or why it shows nothing.
     ShowViewerCaption(String),
+    /// Show under the caption the shown image's working values at the pixel under the pointer,
+    /// or nothing with an empty text.
+    ShowReadout(String),
+    /// Show the viewer's exposure, in stops, in its control, without dispatching
+    /// [`Event::ViewerExposureSet`]. It starts at 0.
+    ShowViewerExposure(f32),
     /// Name in the Edit menu what undo and redo would undo and redo, and disable either with
     /// `None`. Both start disabled.
     ShowUndoLabels {
@@ -205,6 +216,12 @@ pub enum Command {
     FitImage,
     /// Shows the viewed image one pixel to a physical pixel.
     ActualSize,
+    /// Raises the viewer's exposure by half a stop.
+    ExposureUp,
+    /// Lowers the viewer's exposure by half a stop.
+    ExposureDown,
+    /// Sets the viewer's exposure back to 0.
+    ResetExposure,
     /// Evaluates on the device from now on, also after the app moved evaluation off the GPU.
     EvaluateOn(EvaluationDevice),
 }
@@ -214,6 +231,7 @@ pub enum Command {
 pub enum Key {
     Space,
     Escape,
+    E,
     G,
     H,
     Y,
@@ -235,7 +253,7 @@ impl Key {
             Key::G => open_ng::Key::G,
             Key::H => open_ng::Key::H,
             Key::Y => open_ng::Key::Y,
-            Key::Delete | Key::Tab | Key::Slot(_) => return None,
+            Key::E | Key::Delete | Key::Tab | Key::Slot(_) => return None,
         })
     }
 }
@@ -405,6 +423,18 @@ pub struct App {
     shown: Shown,
     /// The request whose image the viewer's last presented frame showed.
     presented: Option<u64>,
+    /// Images given to the GPU to show, which numbers them for their pixel reads.
+    images_shown: u64,
+    /// The pointer's last position over the viewer pane.
+    viewer_pointer: Option<PhysicalPoint>,
+    /// The probe last asked of the GPU.
+    probed: Option<Probe>,
+    /// The last pixel read back, shown while its image is.
+    pixel_read: Option<PixelRead>,
+    /// The readout as last requested.
+    readout: String,
+    /// The viewer's exposure as its control last showed it.
+    exposure_shown: f32,
     /// The viewer's caption as last requested.
     caption: String,
     /// The Edit menu's undo and redo labels as last requested.
@@ -443,6 +473,12 @@ impl App {
             graph_pointer: None,
             shown: Shown::Nothing,
             presented: None,
+            images_shown: 0,
+            viewer_pointer: None,
+            probed: None,
+            pixel_read: None,
+            readout: String::new(),
+            exposure_shown: 0.0,
             caption: String::new(),
             undo_labels: [None, None],
             gpu_label: None,
@@ -519,6 +555,12 @@ impl App {
                 }
                 _ => Vec::new(),
             },
+            Event::ViewerExposureSet(stops) => {
+                self.session.viewer_mut().set_exposure(stops);
+                // The control shows what the artist typed, which echoing could rewrite.
+                self.exposure_shown = self.session.viewer().exposure();
+                vec![Request::Redraw(Pane::Viewer)]
+            }
         };
         self.after_change(requests)
     }
@@ -553,6 +595,12 @@ impl App {
     /// shell shows.
     fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
         self.follow_viewer(&mut requests);
+        self.follow_readout(&mut requests);
+        let exposure = self.session.viewer().exposure();
+        if exposure != self.exposure_shown {
+            self.exposure_shown = exposure;
+            requests.push(Request::ShowViewerExposure(exposure));
+        }
         // These go first, since performing another request may dispatch again and show newer
         // ones.
         self.follow_panel(&mut requests);
@@ -624,6 +672,9 @@ impl App {
         if !self.gpu.retire_lost_device(generation) {
             return Vec::new();
         }
+        // Read from the lost device's copy of the image, which the next device shows anew.
+        self.pixel_read = None;
+        self.probed = None;
         if self.worker.disconnect(at) && self.device == EvaluationDevice::Gpu {
             self.losses_during_evaluation += 1;
             if self.losses_during_evaluation >= LOSSES_BEFORE_LEAVING_THE_GPU {
@@ -690,11 +741,13 @@ impl App {
     }
 
     fn draw(&mut self, pane: Pane) -> Vec<Request> {
+        let viewer = self.session.viewer();
         let frame = self.shown.framed().map(|info| ViewerFrame {
-            placement: self.session.viewer().placement(info.display_window),
+            placement: viewer.placement(info.display_window),
             display_window: info.display_window,
             data_window: info.data_window,
-            scale_factor: self.session.viewer().scale_factor(),
+            scale_factor: viewer.scale_factor(),
+            gain: viewer.gain(),
         });
         match self
             .gpu
@@ -706,6 +759,10 @@ impl App {
                         Shown::Image { wanted, .. } => Some(wanted.number),
                         Shown::Nothing | Shown::Failed { .. } => None,
                     };
+                    // The frame tick on which a pixel read in flight is collected.
+                    if let Some(read) = self.gpu.take_pixel_read() {
+                        self.pixel_read = Some(read);
+                    }
                 }
                 Vec::new()
             }
@@ -762,6 +819,14 @@ impl App {
     }
 
     fn viewer_input(&mut self, input: Input) -> Vec<Request> {
+        match input {
+            Input::PointerMoved { position }
+            | Input::PointerPressed { position, .. }
+            | Input::PointerReleased { position, .. }
+            | Input::Scrolled { position, .. } => self.viewer_pointer = Some(position),
+            Input::PointerLeft => self.viewer_pointer = None,
+            Input::PointerEntered => {}
+        }
         let display = self.shown.display_window();
         let viewer = self.session.viewer_mut();
         let moved = match input {
@@ -828,6 +893,9 @@ impl App {
             }
             Key::H if modifiers.shift => self.command(Command::ActualSize),
             Key::H => self.command(Command::FitImage),
+            Key::E if modifiers.ctrl => self.command(Command::ResetExposure),
+            Key::E if modifiers.shift => self.command(Command::ExposureDown),
+            Key::E => self.command(Command::ExposureUp),
             _ => Vec::new(),
         }
     }
@@ -915,6 +983,16 @@ impl App {
                 } else {
                     viewer.actual_size(display);
                 }
+                vec![Request::Redraw(Pane::Viewer)]
+            }
+            Command::ExposureUp | Command::ExposureDown | Command::ResetExposure => {
+                let viewer = self.session.viewer_mut();
+                let stops = match command {
+                    Command::ExposureUp => viewer.exposure() + EXPOSURE_STEP,
+                    Command::ExposureDown => viewer.exposure() - EXPOSURE_STEP,
+                    _ => 0.0,
+                };
+                viewer.set_exposure(stops);
                 vec![Request::Redraw(Pane::Viewer)]
             }
             Command::EvaluateOn(device) => {
@@ -1008,8 +1086,9 @@ impl App {
         }
         self.shown = match result {
             Ok(image) => {
+                self.images_shown += 1;
                 match image.pixels {
-                    Some(pixels) => self.gpu.show_image(pixels),
+                    Some(pixels) => self.gpu.show_image(pixels, self.images_shown),
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
@@ -1073,6 +1152,64 @@ impl App {
             self.worker.request(wanted.clone());
             self.sent = wanted;
         }
+    }
+
+    /// Keeps the readout on the shown image's pixel under the pointer: asks the GPU to read it,
+    /// collects the read on the viewer's frames while one is in flight, and describes it.
+    fn follow_readout(&mut self, requests: &mut Vec<Request>) {
+        let pointed = self.pointed();
+        if let Some((_, Some(probe))) = pointed
+            && self.probed != Some(probe)
+        {
+            self.probed = Some(probe);
+            self.gpu.read_pixel(probe);
+        }
+        if self.gpu.reading_pixel() {
+            requests.push(Request::Redraw(Pane::Viewer));
+        }
+        let readout = match pointed {
+            None => String::new(),
+            Some(([x, y], None)) => {
+                format!("x {x} y {y} · R 0 G 0 B 0 A 0, outside the data window")
+            }
+            Some(([x, y], Some(probe))) => match (self.pixel_read, self.shown.framed()) {
+                // Labelled with the pixel it read, which the pointer may have left.
+                (Some(read), Some(info)) if read.probe.image == probe.image => {
+                    let [texel_x, texel_y] = read.probe.texel.map(|texel| texel as i32);
+                    let values = (["R", "G", "B", "A"].iter().zip(read.values))
+                        .map(|(channel, value)| format!("{channel} {}", working_value(value)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!(
+                        "x {} y {} · {values}",
+                        info.data_window.x + texel_x,
+                        info.data_window.y + texel_y
+                    )
+                }
+                _ => format!("x {x} y {y}"),
+            },
+        };
+        if readout != self.readout {
+            self.readout.clone_from(&readout);
+            requests.push(Request::ShowReadout(readout));
+        }
+    }
+
+    /// The shown image's pixel under the pointer, in image pixels with y up, and the probe that
+    /// reads it, or `None` for a pixel outside the data window, whose values are zero.
+    fn pointed(&self) -> Option<([i32; 2], Option<Probe>)> {
+        let pointer = self.viewer_pointer?;
+        let info = self.shown.framed()?;
+        let placement = self.session.viewer().placement(info.display_window);
+        let [x, y] = placement
+            .to_image(pointer)
+            .map(|value| value.floor() as i32);
+        let window = info.data_window;
+        let probe = window.contains(x, y).then(|| Probe {
+            image: self.images_shown,
+            texel: [(x - window.x) as u32, (y - window.y) as u32],
+        });
+        Some(([x, y], probe))
     }
 
     /// Names the viewed node from the document as it stands, then says what is shown of it, what
@@ -1201,6 +1338,24 @@ const GPU_UNAVAILABLE: &str = "GPU unavailable: the panes draw again once it rec
 fn gpu_errors(errors: u64) -> String {
     let noun = if errors == 1 { "error" } else { "errors" };
     format!("{errors} GPU {noun}, logged on standard error")
+}
+
+/// A working value for the readout: four decimals at most, without trailing zeros, or with an
+/// exponent where that would hide it.
+fn working_value(value: f32) -> String {
+    let magnitude = value.abs();
+    if value == 0.0 {
+        "0".to_owned()
+    } else if !value.is_finite() || (1e-4..1e6).contains(&magnitude) {
+        let fixed = format!("{value:.4}");
+        if fixed.contains('.') {
+            fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
+        } else {
+            fixed
+        }
+    } else {
+        format!("{value:.3e}")
+    }
 }
 
 /// The wait after a failed attempt that waited `delay`.

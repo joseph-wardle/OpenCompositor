@@ -1,20 +1,17 @@
 //! Evaluating the viewed image off the GUI thread, on the session's device, and readying its
-//! pixels for the viewer: staged for the GPU in a CPU session, converted on it in a GPU session.
+//! planes for the viewer: staged for the GPU in a CPU session, evaluated on it in a GPU session.
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use half::f16;
-
-use crate::display::Conversion;
 use crate::document::NodeId;
 use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, GpuEvaluation, Pool, ResultKey};
 use crate::gpu::wait_for_device;
 use crate::image::{ImageInfo, Plane, Window};
 
-/// The staging buffer's first size, a DCI 4K image, and its least.
+/// The staging buffer's first size, a DCI 4K image of four planes, and its least.
 const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
 
 /// Images in a row that fit in half the staging buffer before it shrinks to fit them.
@@ -83,8 +80,8 @@ pub struct Timing {
     pub started: Instant,
     /// In a GPU session, the files of the Readers it uploads were read.
     pub read: Option<Instant>,
-    /// The evaluator returned the image or its failure; in a GPU session, once its request and
-    /// display conversion were submitted.
+    /// The evaluator returned the image or its failure; in a GPU session, once its request was
+    /// submitted.
     pub evaluated: Instant,
     pub staging: StagingTiming,
     /// The result left for the GUI thread.
@@ -96,9 +93,9 @@ pub struct Timing {
 pub struct StagingTiming {
     /// The staging buffer was taken, mapped for writing.
     pub mapped: Option<Instant>,
-    /// The pixels were converted into it.
-    pub converted: Option<Instant>,
-    /// It was unmapped and the texture made.
+    /// The planes were written into it.
+    pub written: Option<Instant>,
+    /// It was unmapped and the textures made.
     pub staged: Option<Instant>,
 }
 
@@ -117,8 +114,7 @@ impl Timing {
     }
 }
 
-/// An image as the viewer receives it: its description, and its pixels for the GPU. Its planes
-/// stay with the evaluator.
+/// An image as the viewer receives it: its description, and its planes on the GPU.
 #[derive(Debug)]
 pub struct ViewerImage {
     pub info: ImageInfo,
@@ -126,40 +122,29 @@ pub struct ViewerImage {
     pub(crate) pixels: Option<Pixels>,
 }
 
-/// An image's display copy, for the device of one generation.
+/// An image's working planes on the device of one generation, for the viewer to draw and read
+/// from. Holding them keeps the worker from writing into them again.
 #[derive(Debug)]
-pub(crate) enum Pixels {
-    /// Staged by a CPU session, for the GUI thread to copy into the texture.
-    Staged(Staged),
-    /// Converted on the GPU by the request's own submission, which queue order completes
-    /// before any frame the GUI thread submits after receiving it. Holding the texture keeps the
-    /// worker from converting into it again.
-    Converted {
-        texture: Arc<wgpu::Texture>,
-        device_generation: u64,
-    },
+pub(crate) struct Pixels {
+    /// R32Float textures over the data window, bottom row first, in `Channel::ALL`'s order.
+    /// Channels that share values share a texture.
+    pub(crate) planes: [Arc<wgpu::Texture>; 4],
+    pub(crate) device_generation: u64,
+    /// A CPU session's planes, still to be copied from the worker's staging buffer; a GPU
+    /// session's request wrote them in its own submission, which queue order completes before
+    /// any frame the GUI thread submits after receiving it.
+    pub(crate) staged: Option<Staged>,
 }
 
-impl Pixels {
-    /// The generation of the device the pixels are for.
-    pub(crate) fn device_generation(&self) -> u64 {
-        match self {
-            Pixels::Staged(staged) => staged.staging.device_generation,
-            Pixels::Converted {
-                device_generation, ..
-            } => *device_generation,
-        }
-    }
-}
-
-/// An image's pixels, RGBA f16 rows bottom first in the worker's staging buffer, and the texture
-/// for them.
+/// Where a CPU session's planes are in the worker's staging buffer.
 ///
-/// The GUI thread copies the rows into the texture with its own queue. Dropping this returns the
+/// The GUI thread copies them into their textures with its own queue. Dropping this returns the
 /// buffer to the worker, which waits for the copy before writing to it again.
 #[derive(Debug)]
 pub(crate) struct Staged {
-    pub(crate) texture: wgpu::Texture,
+    /// For each distinct plane, its first channel's index in `Pixels::planes` and where its
+    /// rows start.
+    pub(crate) copies: Vec<(usize, u64)>,
     pub(crate) bytes_per_row: u32,
     staging: Staging,
 }
@@ -237,9 +222,8 @@ impl std::error::Error for ViewerError {
 ///
 /// The worker never writes to a texture with `Queue::write_texture`, which copies under a
 /// queue-wide lock that the GUI thread's submit then waits for. In a CPU session it never
-/// submits; in a GPU session it submits each request once, its display conversion included, and
-/// submits the next only once the GPU has completed it, so that superseded work on the GPU is at
-/// most one request.
+/// submits; in a GPU session it submits each request once, and submits the next only once the GPU
+/// has completed it, so that superseded work on the GPU is at most one request.
 #[derive(Debug)]
 pub struct Worker {
     mailbox: Arc<Mailbox>,
@@ -292,14 +276,7 @@ struct Connection {
     staging: StagingSlot,
     /// A GPU session's, which the worker makes in its first GPU phase on the device, off the GUI
     /// thread, and holds during each. Dropping the connection drops the generation's GPU state.
-    on_device: Option<OnDevice>,
-}
-
-/// Evaluation's state on one device generation in a GPU session.
-#[derive(Debug)]
-struct OnDevice {
-    evaluation: GpuEvaluation,
-    conversion: Conversion,
+    evaluation: Option<GpuEvaluation>,
 }
 
 /// Where a connection's staging buffer is.
@@ -373,7 +350,7 @@ impl Worker {
             device,
             queue,
             staging: StagingSlot::Empty,
-            on_device: None,
+            evaluation: None,
         }));
     }
 
@@ -405,14 +382,14 @@ impl Worker {
         }
         state.device = device;
         let left = state.connection.as_mut().map(|connection| {
-            let on_device = connection.on_device.take();
+            let evaluation = connection.evaluation.take();
             let staging = match connection.staging {
                 StagingSlot::Waiting(_) => {
                     std::mem::replace(&mut connection.staging, StagingSlot::Empty)
                 }
                 StagingSlot::Empty | StagingSlot::Out => StagingSlot::Empty,
             };
-            (on_device, staging)
+            (evaluation, staging)
         });
         if state.request.is_none() && state.started.is_some() {
             state.request = Some(state.started.clone());
@@ -560,8 +537,8 @@ impl Mailbox {
     fn retained_on_gpu(&self) -> Vec<ResultKey> {
         let state = self.lock();
         (state.connection.as_ref())
-            .and_then(|connection| connection.on_device.as_ref())
-            .map_or_else(Vec::new, |on_device| on_device.evaluation.retained_keys())
+            .and_then(|connection| connection.evaluation.as_ref())
+            .map_or_else(Vec::new, GpuEvaluation::retained_keys)
     }
 
     /// Waits until the state changes or for at most `timeout`.
@@ -620,38 +597,36 @@ impl GpuPhase<'_> {
             .is_some_and(|began| current != Some(began.generation))
     }
 
-    /// Calls `use_on_device` with evaluation's state on the phase's device, taken out of the
+    /// Calls `use_evaluation` with evaluation's state on the phase's device, taken out of the
     /// connection, or made if the connection has none yet, then returns it there, or drops it
     /// if another device has been connected since or evaluation has left the GPU. `None` without
     /// a device, or once replaced.
-    fn with_on_device<R>(
+    fn with_evaluation<R>(
         &self,
-        use_on_device: impl FnOnce(&mut OnDevice, &PhaseDevice) -> R,
+        use_evaluation: impl FnOnce(&mut GpuEvaluation, &PhaseDevice) -> R,
     ) -> Option<R> {
         let device = self.device.as_ref()?;
         let taken = {
             let mut state = self.mailbox.lock();
             match &mut state.connection {
                 Some(connection) if connection.generation == device.generation => {
-                    connection.on_device.take()
+                    connection.evaluation.take()
                 }
                 _ => return None,
             }
         };
-        let mut on_device = taken.unwrap_or_else(|| OnDevice {
-            evaluation: GpuEvaluation::new(&device.device, &device.queue),
-            conversion: Conversion::new(&device.device),
-        });
-        let result = use_on_device(&mut on_device, device);
+        let mut evaluation =
+            taken.unwrap_or_else(|| GpuEvaluation::new(&device.device, &device.queue));
+        let result = use_evaluation(&mut evaluation, device);
         let mut state = self.mailbox.lock();
         let on_gpu = state.device == EvaluationDevice::Gpu;
         match &mut state.connection {
             Some(connection) if connection.generation == device.generation && on_gpu => {
-                connection.on_device = Some(on_device);
+                connection.evaluation = Some(evaluation);
             }
             _ => {
                 drop(state);
-                drop(on_device);
+                drop(evaluation);
             }
         }
         Some(result)
@@ -710,10 +685,7 @@ fn evaluate(
             let (info, planes) = image.into_parts();
             let pool = evaluator.pool();
             match stage(&phase, &info, planes, pool, sizing, &mut staging) {
-                Ok(pixels) => Ok(ViewerImage {
-                    info,
-                    pixels: pixels.map(Pixels::Staged),
-                }),
+                Ok(pixels) => Ok(ViewerImage { info, pixels }),
                 Err(reason) => Err(ViewerError::CannotShow(reason)),
             }
         }
@@ -751,8 +723,8 @@ fn deliver_unless_superseded(
 }
 
 /// Evaluates the wanted key in a GPU session: reads the files of the Readers it uploads on the
-/// worker's thread, then in a GPU phase records the request and its display conversion, submits
-/// them as one, delivers the result, and waits without blocking for the GPU to complete it, unless
+/// worker's thread, then in a GPU phase records the request, submits it as one, delivers the
+/// result, and waits without blocking for the GPU to complete it, unless
 /// it is superseded first. Without a device it evaluates nothing: connecting one asks again.
 fn evaluate_on_gpu(
     mailbox: &Arc<Mailbox>,
@@ -794,10 +766,10 @@ fn evaluate_on_gpu(
         deliver_unless_superseded(&phase, wanted, result, timing, deliver);
         return;
     }
-    phase.with_on_device(|on_device, device| {
+    phase.with_evaluation(|evaluation, device| {
         let stop = || mailbox.superseded() || phase.abandoned();
         let Some(result) =
-            record_and_submit(mailbox, evaluator, on_device, device, &wanted.key, stop)
+            record_and_submit(mailbox, evaluator, evaluation, device, &wanted.key, stop)
         else {
             return;
         };
@@ -805,10 +777,10 @@ fn evaluate_on_gpu(
         deliver_unless_superseded(&phase, wanted, result, timing, deliver);
         // The next request is recorded only once this one is complete, so that superseded work
         // on the GPU is at most one request, and so is its memory.
-        while !on_device.evaluation.idle() && !phase.abandoned() {
+        while !evaluation.idle() && !phase.abandoned() {
             mailbox.pause(COMPLETION_POLL);
         }
-        if on_device.evaluation.idle()
+        if evaluation.idle()
             && let Some(submission) = &mut mailbox.lock().last_submission
         {
             submission.completed.get_or_insert_with(Instant::now);
@@ -816,20 +788,20 @@ fn evaluate_on_gpu(
     });
 }
 
-/// Records the key's request and its display conversion on the device, and submits them as one,
-/// unless `stop` returns true first, which records or submits nothing more.
+/// Records the key's request on the device and submits it, unless `stop` returns true first,
+/// which records or submits nothing more.
 fn record_and_submit(
     mailbox: &Mailbox,
     evaluator: &mut Evaluator,
-    on_device: &mut OnDevice,
+    evaluation: &mut GpuEvaluation,
     device: &PhaseDevice,
     key: &ResultKey,
     stop: impl Fn() -> bool,
 ) -> Option<Result<ViewerImage, ViewerError>> {
     let recorded = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        evaluator.record_on(&mut on_device.evaluation, key, &stop)
+        evaluator.record_on(evaluation, key, &stop)
     }));
-    let mut recorded = match recorded {
+    let recorded = match recorded {
         Ok(None) => return None,
         Ok(Some(Ok(recorded))) => recorded,
         Ok(Some(Err(error))) => return Some(Err(ViewerError::Eval(error))),
@@ -837,28 +809,10 @@ fn record_and_submit(
         // start again with nothing retained.
         Err(_) => {
             *evaluator = Evaluator::new();
-            on_device.evaluation.release_all();
+            evaluation.release_all();
             return Some(Err(ViewerError::Eval(EvalError::Panicked {
                 origin: key.clone(),
             })));
-        }
-    };
-    let (encoder, image) = recorded.encoder_and_image();
-    let texture = match on_device.conversion.record(encoder, image) {
-        Ok(texture) => texture,
-        // As evaluation retries: everything the request does not read released, then once more.
-        // The request itself holds what it reads.
-        Err(_) => {
-            on_device.conversion.release_unheld();
-            on_device.evaluation.release_all();
-            if !on_device.evaluation.wait_until_idle(&stop) {
-                return None;
-            }
-            let (encoder, image) = recorded.encoder_and_image();
-            match on_device.conversion.record(encoder, image) {
-                Ok(texture) => texture,
-                Err(reason) => return Some(Err(ViewerError::CannotShow(reason))),
-            }
         }
     };
     if stop() {
@@ -869,34 +823,32 @@ fn record_and_submit(
         at: Instant::now(),
         completed: None,
     });
-    let image = match on_device.evaluation.submit(recorded) {
+    let image = match evaluation.submit(recorded) {
         Ok(image) => image,
         Err(error) => return Some(Err(ViewerError::Eval(error))),
     };
     Some(Ok(ViewerImage {
         info: image.info().clone(),
-        pixels: texture.map(|texture| Pixels::Converted {
-            texture,
+        pixels: image.textures().map(|planes| Pixels {
+            planes,
             device_generation: device.generation,
+            staged: None,
         }),
     }))
 }
 
-/// Releases everything retained on the connected device and every display texture the viewer
-/// does not hold, as when the viewer wants nothing.
+/// Releases everything retained on the connected device, as when the viewer wants nothing.
 fn release_on_gpu(mailbox: &Arc<Mailbox>) {
     let Some(phase) = mailbox.start_gpu_phase() else {
         return;
     };
-    phase.with_on_device(|on_device, _| {
-        on_device.evaluation.release_all();
-        on_device.conversion.release_unheld();
-    });
+    phase.with_evaluation(|evaluation, _| evaluation.release_all());
 }
 
-/// Converts the planes into the staging buffer and makes their texture. `Ok(None)` without a GPU
-/// or pixels, or if the request was superseded or the worker stopped while waiting for the buffer,
-/// which the check for a superseded result after this catches.
+/// Copies the image's distinct planes into the staging buffer and makes their textures, for the
+/// GUI thread to copy them into. `Ok(None)` without a GPU or pixels, or if the request was
+/// superseded or the worker stopped while waiting for the buffer, which the check for a
+/// superseded result after this catches.
 fn stage(
     phase: &GpuPhase,
     info: &ImageInfo,
@@ -904,7 +856,7 @@ fn stage(
     pool: &Pool,
     sizing: &mut StagingSizing,
     timing: &mut StagingTiming,
-) -> Result<Option<Staged>, String> {
+) -> Result<Option<Pixels>, String> {
     let Some(PhaseDevice {
         device,
         generation: device_generation,
@@ -917,8 +869,22 @@ fn stage(
     if is_empty(info) {
         return Ok(None);
     }
+    // Each distinct plane once, by the first channel that has it, so that channels sharing a
+    // plane share its texture.
+    let mut firsts: Vec<usize> = Vec::new();
+    let mut distinct_of = [0; 4];
+    for (channel, plane) in planes.iter().enumerate() {
+        distinct_of[channel] =
+            match (firsts.iter()).position(|&first| Plane::ptr_eq(&planes[first], plane)) {
+                Some(index) => index,
+                None => {
+                    firsts.push(channel);
+                    firsts.len() - 1
+                }
+            };
+    }
     let limits = device.limits();
-    let size = staging_size(window.width, window.height);
+    let size = staging_size(window.width, window.height, firsts.len());
     let largest = window.width.max(window.height);
     if largest > limits.max_texture_dimension_2d {
         return Err(format!(
@@ -929,8 +895,7 @@ fn stage(
     }
     if size > limits.max_buffer_size {
         return Err(format!(
-            "its pixels take {size} bytes at half precision, and this GPU's buffers take at most \
-             {}",
+            "its planes take {size} bytes, and this GPU's buffers take at most {}",
             limits.max_buffer_size
         ));
     }
@@ -961,45 +926,60 @@ fn stage(
             .get_mapped_range_mut(..size)
             .map_err(|error| format!("the GPU could not write its staging buffer: {error}"))?;
         let mut bytes = view.slice(..);
-        let halves = bytes.len() / size_of::<f16>();
-        let start = bytes.as_raw_element_ptr().cast::<f16>();
+        let floats = bytes.len() / size_of::<f32>();
+        let start = bytes.as_raw_element_ptr().cast::<f32>();
         // SAFETY: the mapping is `size` bytes, aligned to `wgpu::MAP_ALIGNMENT`, which is at least
-        // f16's alignment, and only this view accesses it until the view drops. Mapped memory may
-        // be write-combining, so the conversion only writes to it.
-        let out = unsafe { std::slice::from_raw_parts_mut(start.as_ptr(), halves) };
-        convert_rows(
+        // f32's alignment, and only this view accesses it until the view drops. Mapped memory may
+        // be write-combining, so the copy only writes to it.
+        let out = unsafe { std::slice::from_raw_parts_mut(start.as_ptr(), floats) };
+        let distinct: Vec<&[f32]> = firsts.iter().map(|&first| &planes[first][..]).collect();
+        copy_rows(
             pool,
-            planes.each_ref().map(|plane| &plane[..]),
+            &distinct,
             window.width as usize,
             out,
-            bytes_per_row as usize / 2,
+            bytes_per_row as usize / size_of::<f32>(),
         );
     }
-    timing.converted = Some(Instant::now());
+    timing.written = Some(Instant::now());
     drop(planes);
     buffer.unmap();
     staging.buffer = Some(buffer);
-    let texture = allocate(device, "the image", || {
-        device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("image"),
-            size: wgpu::Extent3d {
-                width: window.width,
-                height: window.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+    let textures = (firsts.iter())
+        .map(|_| {
+            allocate(device, "the image", || {
+                Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("staged plane"),
+                    size: wgpu::Extent3d {
+                        width: window.width,
+                        height: window.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R32Float,
+                    // Copied from by the viewer's readout.
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                }))
+            })
         })
-    })?;
+        .collect::<Result<Vec<_>, String>>()?;
     timing.staged = Some(Instant::now());
-    Ok(Some(Staged {
-        texture,
-        bytes_per_row,
-        staging,
+    let plane_bytes = u64::from(bytes_per_row) * u64::from(window.height);
+    Ok(Some(Pixels {
+        planes: distinct_of.map(|index| Arc::clone(&textures[index])),
+        device_generation: *device_generation,
+        staged: Some(Staged {
+            copies: (firsts.iter().zip(0..))
+                .map(|(&first, index)| (first, index * plane_bytes))
+                .collect(),
+            bytes_per_row,
+            staging,
+        }),
     }))
 }
 
@@ -1048,7 +1028,7 @@ impl StagingSizing {
 fn fitted(needed: u64, largest: u64) -> u64 {
     let (first_width, first_height) = FIRST_STAGING_SIZE;
     needed
-        .max(staging_size(first_width, first_height))
+        .max(staging_size(first_width, first_height, 4))
         .min(largest)
 }
 
@@ -1056,13 +1036,13 @@ pub(crate) fn is_empty(info: &ImageInfo) -> bool {
     info.data_window.width == 0 || info.data_window.height == 0
 }
 
-/// Bytes per staged row: four f16 channels a pixel, padded as buffer-to-texture copies require.
+/// Bytes per staged row of a plane, padded as buffer-to-texture copies require.
 fn row_bytes(width: u32) -> u32 {
-    (width * 8).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+    (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
 }
 
-fn staging_size(width: u32, height: u32) -> u64 {
-    u64::from(row_bytes(width)) * u64::from(height)
+fn staging_size(width: u32, height: u32, planes: usize) -> u64 {
+    u64::from(row_bytes(width)) * u64::from(height) * planes as u64
 }
 
 /// A staging buffer, mapped for writing.
@@ -1111,29 +1091,14 @@ fn map(phase: &GpuPhase, device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result
     }
 }
 
-/// Interleaves planes of rows `width` pixels long, in `Channel::ALL`'s order, into RGBA f16 rows
-/// `halves_per_row` apart in `out`, in the planes' row order.
-fn convert_rows(
-    pool: &Pool,
-    planes: [&[f32]; 4],
-    width: usize,
-    out: &mut [f16],
-    halves_per_row: usize,
-) {
-    pool.fill_rows([out], halves_per_row, |_, first_row, [rows]| {
-        // A row is interleaved where it stays in cache, then converted in one call, which only
-        // writes to `out` and uses the CPU's f16 instructions where it has them.
-        let mut interleaved = vec![[0.0; 4]; width];
-        for (row, target) in (first_row..).zip(rows.chunks_mut(halves_per_row)) {
-            let start = row * width;
-            let [r, g, b, a] = planes.map(|plane| &plane[start..start + width]);
-            for (x, pixel) in interleaved.iter_mut().enumerate() {
-                *pixel = [r[x], g[x], b[x], a[x]];
-            }
-            half::slice::HalfFloatSliceExt::convert_from_f32_slice(
-                &mut target[..width * 4],
-                interleaved.as_flattened(),
-            );
+/// Copies planes of rows `width` pixels long into `out`, one after another, their rows
+/// `floats_per_row` apart, in the planes' row order.
+fn copy_rows(pool: &Pool, planes: &[&[f32]], width: usize, out: &mut [f32], floats_per_row: usize) {
+    let height = planes.first().map_or(0, |plane| plane.len() / width);
+    pool.fill_rows([out], floats_per_row, |_, first_row, [rows]| {
+        for (row, target) in (first_row..).zip(rows.chunks_mut(floats_per_row)) {
+            let start = row % height * width;
+            target[..width].copy_from_slice(&planes[row / height][start..start + width]);
         }
     });
 }

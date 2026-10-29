@@ -3,7 +3,6 @@
 //! a window or a GPU.
 
 mod app;
-mod display;
 mod document;
 mod evaluate;
 #[cfg(test)]
@@ -44,5 +43,5 @@ pub use parameter::{
 };
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Session};
-pub use viewer::{Placement, Viewer};
+pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};
 pub use worker::{Evaluated, EvaluationDevice, StagingTiming, Timing, ViewerError, ViewerImage};

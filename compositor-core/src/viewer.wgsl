@@ -1,4 +1,5 @@
-// The viewer: an image's data window, and an outline around its display window.
+// The viewer: an image's data window from its working planes, exposed, and an outline around its
+// display window.
 //
 // Positions are in image pixels, y up, until `placed` turns them into the pane's physical pixels,
 // y down. The target is sRGB, so fragments are linear values that the target encodes.
@@ -12,13 +13,18 @@ struct Frame {
     line: f32,
     // The pane's size in physical pixels.
     target_size: vec2<f32>,
+    // The viewer's exposure, a factor on working values.
+    gain: f32,
     // x, y, width, height in image pixels; (x, y) is the bottom-left corner.
     data_window: vec4<f32>,
     display_window: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
-@group(1) @binding(0) var image: texture_2d<f32>;
+@group(1) @binding(0) var red: texture_2d<f32>;
+@group(1) @binding(1) var green: texture_2d<f32>;
+@group(1) @binding(2) var blue: texture_2d<f32>;
+@group(1) @binding(3) var alpha: texture_2d<f32>;
 
 fn placed(point: vec2<f32>) -> vec2<f32> {
     return vec2(point.x * frame.scale + frame.offset.x, frame.offset.y - point.y * frame.scale);
@@ -36,8 +42,8 @@ fn corner(vertex: u32) -> vec2<f32> {
 
 struct ImageVertex {
     @builtin(position) position: vec4<f32>,
-    // From the data window's bottom-left corner, in image pixels up: the texture's rows are
-    // stored bottom first, as the image's planes are.
+    // From the data window's bottom-left corner, in image pixels up: the planes' rows are stored
+    // bottom first.
     @location(0) pixel: vec2<f32>,
 }
 
@@ -48,22 +54,27 @@ fn image_vertex(@builtin(vertex_index) vertex: u32) -> ImageVertex {
     return ImageVertex(to_clip(placed(point)), from_bottom_left);
 }
 
-// Clamped to what the display shows. A NaN's comparisons may be optimised away, so its bits are
-// tested instead; it shows black.
+// A working value exposed, then clamped to what the display shows, in f32 throughout, so that
+// exposure brings back values beyond any display format. A NaN's comparisons may be optimised
+// away, so its bits are tested instead; it shows black.
 fn shown(value: f32) -> f32 {
     if (bitcast<u32>(value) & 0x7fffffffu) > 0x7f800000u {
         return 0.0;
     }
-    return clamp(value, 0.0, 1.0);
+    return clamp(value * frame.gain, 0.0, 1.0);
 }
 
 @fragment
 fn image_fragment(vertex: ImageVertex) -> @location(0) vec4<f32> {
-    let last = vec2<i32>(textureDimensions(image)) - 1;
+    let last = vec2<i32>(textureDimensions(red)) - 1;
     let texel = clamp(vec2<i32>(floor(vertex.pixel)), vec2(0), last);
     // Premultiplied over black is the colour itself.
-    let colour = textureLoad(image, texel, 0);
-    return vec4(shown(colour.r), shown(colour.g), shown(colour.b), 1.0);
+    return vec4(
+        shown(textureLoad(red, texel, 0).r),
+        shown(textureLoad(green, texel, 0).r),
+        shown(textureLoad(blue, texel, 0).r),
+        1.0,
+    );
 }
 
 // One of the outline's four sides, drawn just outside the display window.

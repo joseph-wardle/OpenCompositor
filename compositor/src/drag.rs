@@ -16,8 +16,8 @@
 //! the value as it was. It exits 0 if those held and the chain's latencies' p95 and final edit
 //! met the chain's budget, and 1 otherwise.
 //!
-//! With `--gpu` first, the session evaluates on the GPU. An edit's latency then ends when the
-//! GPU completes the frame, not when it is submitted, since a frame queued behind the worker's
+//! The session evaluates on the GPU unless `--cpu` comes first. An edit's latency then ends when
+//! the GPU completes the frame, not when it is submitted, since a frame queued behind the worker's
 //! compute completes only after it; the check polls the GPU every millisecond to learn when.
 //! The budget is two of the viewer's refreshes for every chain, and the GUI's frames must meet
 //! theirs during the drag: from acquiring a frame to submitting it p99 1 ms and at most 4 ms,
@@ -165,16 +165,16 @@ thread_local! {
 
 /// Runs every chain, each as a child process of this binary dragging that chain alone, and
 /// exits: 1 if any child did not exit 0, else 0. One process per chain because a chain run
-/// after another in the same process showed its f16 conversion several times slower, whichever
-/// chain it was; the hypothesis is that the staging buffer, recreated for the second chain,
-/// lands in a slower heap. Either way the chains are only comparable from equal starts.
+/// after another in the same process showed its staging several times slower, whichever chain
+/// it was; the hypothesis is that the staging buffer, recreated for the second chain, lands in a
+/// slower heap. Either way the chains are only comparable from equal starts.
 pub fn run_chains(image: &Path, device: EvaluationDevice) -> ! {
     let binary = std::env::current_exe().expect("the binary knows its own path");
     let mut failed = false;
     for chain in CHAINS {
         let mut command = std::process::Command::new(&binary);
-        if device == EvaluationDevice::Gpu {
-            command.arg("--gpu");
+        if device == EvaluationDevice::Cpu {
+            command.arg("--cpu");
         }
         let status = command
             .arg("--drag-check")
@@ -605,11 +605,11 @@ fn report(mut failures: Vec<String>) {
         ("staging wait", |_, timing, _| {
             Some(timing.staging.mapped? - timing.evaluated)
         }),
-        ("f16 conversion", |_, timing, _| {
-            Some(timing.staging.converted? - timing.staging.mapped?)
+        ("planes written", |_, timing, _| {
+            Some(timing.staging.written? - timing.staging.mapped?)
         }),
-        ("texture", |_, timing, _| {
-            Some(timing.staging.staged? - timing.staging.converted?)
+        ("textures", |_, timing, _| {
+            Some(timing.staging.staged? - timing.staging.written?)
         }),
         ("delivery", |_, timing, received| {
             Some(received - timing.delivered)
