@@ -535,18 +535,30 @@ mod tests {
     fn blur_rows(level: Level, pass: BoxPass, src: &[f32], width: usize, dst: &mut [f32]) {
         let mut scratch = LineScratch::default();
         let op = BoxSum::new(pass);
-        at_level(level, || {
-            line_rows(&op, BoxPass::PASSES, src, width, dst, &mut scratch)
-        });
+        at_level(
+            level,
+            #[inline(always)]
+            || line_rows(&op, BoxPass::PASSES, src, width, dst, &mut scratch),
+        );
     }
 
     /// A band of columns, gathered row by row, through Blur's three passes at `level`.
     fn blur_band(level: Level, pass: BoxPass, src: &[f32], dst: &mut [f32]) {
         let mut scratch = LineScratch::default();
         let op = BoxSum::new(pass);
-        at_level(level, || {
-            line_passes::<BoxSum, LINE_BAND>(&op, BoxPass::PASSES, src, dst, &mut scratch.passes)
-        });
+        at_level(
+            level,
+            #[inline(always)]
+            || {
+                line_passes::<BoxSum, LINE_BAND>(
+                    &op,
+                    BoxPass::PASSES,
+                    src,
+                    dst,
+                    &mut scratch.passes,
+                )
+            },
+        );
     }
 
     /// Every size's passes along rows of every length, in chunks of every row count, and along

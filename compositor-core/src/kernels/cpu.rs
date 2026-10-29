@@ -381,7 +381,11 @@ mod tests {
             for gain in GAINS {
                 let mut dst = vec![unwritten; len];
                 let op = Exposure { gain };
-                at_level(level, || map_samples(&op, [&src], [true], [&mut dst]));
+                at_level(
+                    level,
+                    #[inline(always)]
+                    || map_samples(&op, [&src], [true], [&mut dst]),
+                );
                 for (i, (&s, &d)) in src.iter().zip(&dst).enumerate() {
                     let expected = opencompositor_kernels::exposure(s, gain);
                     assert_eq!(
@@ -411,14 +415,18 @@ mod tests {
                 for layers in [&[first_planes][..], &[first_planes, second_planes]] {
                     let mut dst: [Vec<f32>; 4] = [(); 4].map(|()| vec![0.0; len]);
                     let op = Merge { mix };
-                    at_level(level, || {
-                        fold_samples(
-                            &op,
-                            base_planes,
-                            layers,
-                            dst.each_mut().map(Vec::as_mut_slice),
-                        )
-                    });
+                    at_level(
+                        level,
+                        #[inline(always)]
+                        || {
+                            fold_samples(
+                                &op,
+                                base_planes,
+                                layers,
+                                dst.each_mut().map(Vec::as_mut_slice),
+                            )
+                        },
+                    );
                     for i in 0..len {
                         let mut stack = base_planes.map(|plane| plane[i]);
                         for layer in layers {
