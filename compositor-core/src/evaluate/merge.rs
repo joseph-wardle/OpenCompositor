@@ -3,7 +3,7 @@
 
 use opencompositor_kernels::Merge;
 
-use crate::evaluate::{EvalError, NODE_BYTES_CAP, Pool, ResultKey, output_plane};
+use crate::evaluate::{EvalError, Pool, ResultKey, check_node_bytes, output_plane};
 use crate::image::{Image, Plane, Warning, Window};
 use crate::kernels::cpu;
 
@@ -65,14 +65,7 @@ pub(super) fn merged_window(
             origin: key.clone(),
             oversize,
         })?;
-    let bytes = window.plane_bytes(4);
-    if bytes > NODE_BYTES_CAP {
-        return Err(EvalError::OverCap {
-            origin: key.clone(),
-            window,
-            bytes,
-        });
-    }
+    check_node_bytes(key, window, window.plane_bytes(4))?;
     Ok(window)
 }
 

@@ -9,34 +9,28 @@ use crate::fixtures::{directory, write_exr};
 use crate::kernels::headless;
 
 /// Tests' stand-in for the device running out of memory, which lavapipe never reports: with a
-/// cap, a plane made while the planes alive would exceed it refuses the attempt that made it, as
-/// a failed creation's error scope would. A plane counts as alive until nothing holds it.
+/// cap, an attempt that ends with the planes alive over it is refused, as a failed creation's
+/// error scope would refuse it. A plane counts as alive until nothing holds it; every plane an
+/// attempt made is alive when it ends, since wgpu would keep it until the submission completes.
 #[derive(Debug, Default)]
 pub(super) struct Shortage {
     cap: Option<u64>,
     made: Vec<std::sync::Weak<wgpu::Texture>>,
-    refused: bool,
 }
 
 impl Shortage {
-    pub(super) fn made(&mut self, texture: &Arc<wgpu::Texture>) {
+    /// Whether the attempt that made `made` is refused.
+    pub(super) fn refuses(&mut self, made: &[std::sync::Weak<wgpu::Texture>]) -> bool {
+        self.made.extend_from_slice(made);
         self.made.retain(|plane| plane.strong_count() > 0);
-        let alive: u64 = (self.made.iter())
-            .filter_map(std::sync::Weak::upgrade)
-            .map(|plane| texture_bytes(&plane))
-            .sum();
-        if self
-            .cap
-            .is_some_and(|cap| alive + texture_bytes(texture) > cap)
-        {
-            self.refused = true;
-        } else {
-            self.made.push(Arc::downgrade(texture));
-        }
+        self.cap.is_some_and(|cap| self.alive_bytes() > cap)
     }
 
-    pub(super) fn take_refusal(&mut self) -> bool {
-        std::mem::take(&mut self.refused)
+    fn alive_bytes(&self) -> u64 {
+        (self.made.iter())
+            .filter_map(std::sync::Weak::upgrade)
+            .map(|plane| texture_bytes(&plane))
+            .sum()
     }
 }
 
@@ -362,6 +356,42 @@ fn merge_on_the_gpu_is_the_cpu_result_over_whole_images() {
             }
         }
     }
+}
+
+/// The stack between layers counts toward the cap on one node's allocations: the four planes
+/// over the union that the CPU counts are within it, the twelve the GPU holds are not.
+#[test]
+fn a_merge_whose_stack_is_over_the_cap_fails_before_recording() {
+    let directory = directory("merge_cap");
+    let [near, far] = ["near", "far"].map(|name| directory.join(format!("{name}.exr")));
+    merge_exr(&near, (0, 0), (1, 1), 0);
+    merge_exr(&far, (8191, 8191), (1, 1), 3);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
+    let layer = |slot| ("layer", slot).into();
+    let wires = [
+        (3, "background".into(), 1),
+        (3, layer(1), 2),
+        (3, layer(2), 1),
+        (3, layer(3), 2),
+    ];
+    let requested = key(
+        &graph([reader(&near), reader(&far), merge(Some(1.0))], &wires),
+        3,
+    );
+
+    let error = Evaluator::new()
+        .evaluate_on(&mut gpu, &requested, || false)
+        .expect("nothing stops it")
+        .expect_err("over the cap");
+
+    let bytes = 12 * 8192 * 8192 * size_of::<f32>() as u64;
+    assert!(
+        matches!(&error, EvalError::OverCap { origin, bytes: needed, .. }
+            if *origin == requested && *needed == bytes),
+        "{error:?}"
+    );
+    assert_eq!(gpu.submitted, 0);
 }
 
 /// The base alone and Mix 0 are the base itself, as on the CPU: its textures, nothing computed.
@@ -847,6 +877,87 @@ fn a_request_out_of_gpu_memory_releases_what_it_does_not_read_and_fits_on_its_re
     assert_eq!(gpu.retained_bytes(), 7 * plane);
     let expected = Evaluator::new()
         .evaluate(&key(&document, 3), || false)
+        .unwrap()
+        .unwrap();
+    for channel in Channel::ALL {
+        assert_eq!(
+            read_back(&gpu, &image, channel),
+            expected.plane(channel).to_vec()
+        );
+    }
+}
+
+#[test]
+fn a_request_out_of_gpu_memory_keeps_what_its_read_results_were_computed_from() {
+    let path = directory("out_of_memory_ancestors").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
+    let mut evaluator = Evaluator::new();
+    let document = chain([
+        reader(&path),
+        exposure(Some(1.0)),
+        exposure(Some(2.0)),
+        exposure(Some(3.0)),
+    ]);
+    drop(run(&mut evaluator, &mut gpu, &key(&document, 3)));
+    let uploaded = gpu.uploaded_bytes();
+    // The upload's four planes and each Exposure's three are alive; the third Exposure's three
+    // fit only once the upload's colour planes are released. Releasing the first Exposure too
+    // would leave the second's key unplanned, and the retry would compute the whole chain.
+    let plane = 2 * size_of::<f32>() as u64;
+    assert_eq!(gpu.retained_bytes(), 10 * plane);
+    gpu.shortage.cap = Some(10 * plane);
+
+    let image = run(&mut evaluator, &mut gpu, &key(&document, 4));
+
+    assert_eq!(gpu.uploaded_bytes(), uploaded, "nothing uploaded again");
+    assert_eq!(
+        gpu.retained_keys().len(),
+        3,
+        "the Exposures, not the upload"
+    );
+    let expected = Evaluator::new()
+        .evaluate(&key(&document, 4), || false)
+        .unwrap()
+        .unwrap();
+    for channel in Channel::ALL {
+        assert_eq!(
+            read_back(&gpu, &image, channel),
+            expected.plane(channel).to_vec()
+        );
+    }
+}
+
+/// Past what the table retains, each Exposure of a chain reads the one before it and writes over
+/// the planes of the one before that, freed at their last use, so that the request's planes stay
+/// as many however deep the chain.
+#[test]
+fn a_deep_chain_writes_over_the_planes_of_images_already_read() {
+    let path = directory("deep_chain").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let document =
+        chain(std::iter::once(reader(&path)).chain((0..20).map(|_| exposure(Some(0.25)))));
+    let requested = key(&document, 21);
+    let plane = 2 * size_of::<f32>() as u64;
+    let record = |planes: u64| {
+        let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
+        // The upload's four planes and the first Exposure's three.
+        gpu.cap = 7 * plane;
+        gpu.shortage.cap = Some(planes * plane);
+        let recorded = Evaluator::new()
+            .record_attempt(&mut gpu, &requested, || false)
+            .expect("nothing stops it");
+        recorded.and_then(|recorded| Ok((gpu.submit(recorded)?, gpu)))
+    };
+
+    // Those retained, and the three planes of each of two Exposures.
+    let (image, gpu) = record(13).expect("within thirteen planes");
+    assert!(matches!(record(12), Err(EvalError::OutOfGpuMemory { .. })));
+
+    let expected = Evaluator::new()
+        .evaluate(&requested, || false)
         .unwrap()
         .unwrap();
     for channel in Channel::ALL {

@@ -598,6 +598,19 @@ impl Evaluator {
     }
 }
 
+/// Fails unless `bytes`, what a node would allocate for `window` on the device evaluating it,
+/// are within the cap on one node's allocation.
+fn check_node_bytes(origin: &ResultKey, window: Window, bytes: u64) -> Result<(), EvalError> {
+    if bytes > NODE_BYTES_CAP {
+        return Err(EvalError::OverCap {
+            origin: origin.clone(),
+            window,
+            bytes,
+        });
+    }
+    Ok(())
+}
+
 /// What a request needs computed or taken from a table, the requested node last, and how many of
 /// the nodes it computes take each image. `held` says whether a step's image is retained, which
 /// leaves its inputs unneeded.

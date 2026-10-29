@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use opencompositor_kernels::{
     Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Params, Placement,
@@ -20,6 +21,13 @@ pub(crate) mod cpu;
 
 /// The format of every plane texture.
 pub(crate) const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
+/// What every plane texture may be used for: read and written by the kernels, uploaded to, and
+/// copied from by the viewer, so that any free plane can serve any role.
+pub(crate) const PLANE_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
+    .union(wgpu::TextureUsages::STORAGE_BINDING)
+    .union(wgpu::TextureUsages::COPY_DST)
+    .union(wgpu::TextureUsages::COPY_SRC);
 
 /// The primitives on one device: the module, and each entry point's pipeline, built the first
 /// time an operation is recorded.
@@ -104,10 +112,10 @@ impl Kernels {
             check_output(plane, output)?;
         }
         // The stack below the next layer, the base's planes until a layer has been recorded.
-        let mut below: Option<([wgpu::Texture; O], Window)> = None;
+        let mut below: Option<([Arc<wgpu::Texture>; O], Window)> = None;
         for (index, (layer, window)) in layers.iter().enumerate() {
             let (below_planes, below_window) = match &below {
-                Some((planes, window)) => (planes.each_ref(), *window),
+                Some((planes, window)) => (planes.each_ref().map(|plane| &**plane), *window),
                 None => base,
             };
             let params = FoldParams {
@@ -128,14 +136,14 @@ impl Kernels {
             } else {
                 let textures: Vec<&wgpu::Texture> =
                     (below_planes.iter().chain(layer)).copied().collect();
-                let targets: [wgpu::Texture; O] =
+                let targets: [Arc<wgpu::Texture>; O] =
                     std::array::from_fn(|_| planes.take(&self.device, output));
                 self.dispatch(
                     encoder,
                     F::STEP,
                     &params,
                     &textures,
-                    &targets.each_ref(),
+                    &targets.each_ref().map(|plane| &**plane),
                     groups,
                 );
                 if let Some((previous, _)) = below.replace((targets, output)) {
@@ -189,7 +197,7 @@ impl Kernels {
             },
         };
         check_output(output, grown)?;
-        let mut current: Option<wgpu::Texture> = None;
+        let mut current: Option<Arc<wgpu::Texture>> = None;
         for pass in 0..passes {
             let len = match axis {
                 Axis::Rows => size.width,
@@ -207,8 +215,8 @@ impl Kernels {
                 len,
                 op: *op,
             };
-            let source = current.as_ref().unwrap_or(input);
-            let written = target.as_ref().unwrap_or(output);
+            let source = current.as_deref().unwrap_or(input);
+            let written = target.as_deref().unwrap_or(output);
             if op.t() <= DIRECT_T {
                 let groups = per_texel(size);
                 self.dispatch(encoder, L::DIRECT, &params, &[source], &[written], groups);
@@ -398,33 +406,46 @@ fn place(input: Window, output: Window) -> Placement {
     }
 }
 
-/// Planes the primitives' intermediate results are written to, kept for reuse once recorded:
-/// a later dispatch in the same submission may write one again, since wgpu orders the two.
+/// One submission's free planes: those whose last reader is recorded, and nothing else holds,
+/// for later dispatches of the submission to write, since wgpu orders a write after the reads
+/// recorded before it. The primitives' intermediate planes and the evaluator's results come from
+/// and go back to the same list.
 #[derive(Debug, Default)]
-pub(crate) struct Planes(Vec<wgpu::Texture>);
+pub(crate) struct Planes {
+    free: Vec<Arc<wgpu::Texture>>,
+    /// Every plane made, for the evaluator's tests to count what a submission allocates.
+    #[cfg(test)]
+    pub(crate) made: Vec<std::sync::Weak<wgpu::Texture>>,
+}
 
 impl Planes {
-    /// A plane over `window`'s size, readable and writable by the kernels, whose contents the
-    /// caller overwrites.
-    fn take(&mut self, device: &wgpu::Device, window: Window) -> wgpu::Texture {
+    /// A plane over `window`'s size whose contents the caller overwrites: a free one of that
+    /// size, else a new one. wgpu clears every new texture, which costs several times Exposure's
+    /// own dispatch at 4K, so free planes go first.
+    pub(crate) fn take(&mut self, device: &wgpu::Device, window: Window) -> Arc<wgpu::Texture> {
         let size = extent(window);
-        match self.0.iter().position(|plane| plane.size() == size) {
-            Some(index) => self.0.swap_remove(index),
-            None => device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("intermediate"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: PLANE_FORMAT,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
-                view_formats: &[],
-            }),
+        if let Some(index) = self.free.iter().position(|plane| plane.size() == size) {
+            return self.free.swap_remove(index);
         }
+        let plane = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("plane"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PLANE_FORMAT,
+            usage: PLANE_USAGE,
+            view_formats: &[],
+        }));
+        #[cfg(test)]
+        self.made.push(Arc::downgrade(&plane));
+        plane
     }
 
-    fn keep(&mut self, plane: wgpu::Texture) {
-        self.0.push(plane);
+    /// Frees a plane nothing else holds.
+    pub(crate) fn keep(&mut self, plane: Arc<wgpu::Texture>) {
+        debug_assert_eq!(Arc::strong_count(&plane), 1, "a plane nothing else holds");
+        self.free.push(plane);
     }
 }
 

@@ -16,10 +16,10 @@ use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, LineReduce, Merge}
 
 use super::merge::{is_the_base, merged_warnings, merged_window};
 use super::{
-    EvalError, Evaluator, NODE_BYTES_CAP, Recipe, ResultKey, Retained, distinct_bytes, needs,
+    EvalError, Evaluator, Recipe, ResultKey, Retained, check_node_bytes, distinct_bytes, needs,
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
-use crate::kernels::{Kernels, PLANE_FORMAT, Planes, extent};
+use crate::kernels::{Kernels, Planes};
 use crate::read::read_image;
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
@@ -28,13 +28,6 @@ const RETAINED_TEXTURE_BYTES_CAP: u64 = 2 << 30;
 
 /// How long waiting for the GPU to free memory sleeps between polls.
 const IDLE_POLL: Duration = Duration::from_millis(1);
-
-/// What every plane texture may be used for: read and written by the kernels, uploaded to, and
-/// copied from by the viewer, so that any released plane can serve any role.
-const PLANE_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
-    .union(wgpu::TextureUsages::STORAGE_BINDING)
-    .union(wgpu::TextureUsages::COPY_DST)
-    .union(wgpu::TextureUsages::COPY_SRC);
 
 /// Evaluation's state on one device generation: the kernels' pipelines, the GPU table and the
 /// count of submissions the GPU has completed. Dropping it drops the generation's GPU state, all
@@ -147,7 +140,7 @@ impl GpuEvaluation {
     /// Releases every retained result the request does not contain, and returns the released
     /// planes nothing else holds, for the request's outputs and uploads. Planes still held
     /// elsewhere are lent until a later request finds them free.
-    fn release_except(&mut self, keys: &[&ResultKey]) -> Vec<GpuPlane> {
+    fn release_except(&mut self, keys: &[&ResultKey]) -> Planes {
         let mut freed = std::mem::take(&mut self.lent);
         for retained in std::mem::take(&mut self.retained) {
             if keys.iter().any(|key| Arc::ptr_eq(&key.0, &retained.key.0)) {
@@ -156,17 +149,14 @@ impl GpuEvaluation {
                 freed.extend(retained.image.planes.into_iter().flatten());
             }
         }
-        // A plane shared by channels appears once per channel; the copies drop here, so that
-        // only holders outside the table count.
-        let mut distinct: Vec<GpuPlane> = Vec::new();
-        for plane in freed {
-            if !distinct.iter().any(|other| GpuPlane::ptr_eq(other, &plane)) {
-                distinct.push(plane);
+        let mut released = Planes::default();
+        for plane in distinct(freed) {
+            if Arc::strong_count(&plane.0) > 1 {
+                self.lent.push(plane);
+            } else {
+                released.keep(plane.0);
             }
         }
-        let released;
-        (self.lent, released) =
-            (distinct.into_iter()).partition(|plane| Arc::strong_count(&plane.0) > 1);
         released
     }
 
@@ -176,27 +166,9 @@ impl GpuEvaluation {
         )
     }
 
-    /// A plane over `window`'s size whose contents the caller overwrites: one of `released` of
-    /// that size, else a new one. wgpu clears every new texture, which costs several times
-    /// Exposure's own dispatch at 4K, so a request takes released planes first.
-    fn plane(&mut self, released: &mut Vec<GpuPlane>, window: Window) -> GpuPlane {
-        let size = extent(window);
-        if let Some(index) = released.iter().position(|plane| plane.0.size() == size) {
-            return released.swap_remove(index);
-        }
-        let texture = Arc::new(self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("plane"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: PLANE_FORMAT,
-            usage: PLANE_USAGE,
-            view_formats: &[],
-        }));
-        #[cfg(test)]
-        self.shortage.made(&texture);
-        GpuPlane(texture)
+    /// A plane over `window`'s size whose contents the caller overwrites.
+    fn plane(&self, released: &mut Planes, window: Window) -> GpuPlane {
+        GpuPlane(released.take(&self.device, window))
     }
 
     /// Records the upload of a decoded image's planes, each distinct plane once, so that planes
@@ -206,7 +178,7 @@ impl GpuEvaluation {
         encoder: &mut wgpu::CommandEncoder,
         origin: &ResultKey,
         image: &Image,
-        released: &mut Vec<GpuPlane>,
+        released: &mut Planes,
     ) -> Result<GpuImage, EvalError> {
         let (info, _) = image.clone().into_parts();
         let window = info.data_window;
@@ -331,7 +303,7 @@ impl GpuEvaluation {
         encoder: &mut wgpu::CommandEncoder,
         image: &GpuImage,
         stops: f64,
-        released: &mut Vec<GpuPlane>,
+        released: &mut Planes,
     ) -> GpuImage {
         let Some([r, g, b, a]) = &image.planes else {
             return image.clone();
@@ -376,7 +348,7 @@ impl GpuEvaluation {
         key: &ResultKey,
         inputs: &[&GpuImage],
         mix: f32,
-        released: &mut Vec<GpuPlane>,
+        released: &mut Planes,
     ) -> Result<GpuImage, EvalError> {
         let Some((base, layers)) = inputs.split_first() else {
             return Ok(GpuImage::empty());
@@ -393,6 +365,10 @@ impl GpuEvaluation {
         if window.is_empty() {
             return Ok(GpuImage { info, planes: None });
         }
+        // The outputs, and the stack between layers: the planes the last layer's dispatch reads
+        // and those it writes, each four over the union.
+        let stacks = (layers.len() - 1).min(2) as u64;
+        check_node_bytes(key, window, window.plane_bytes(4 * (1 + stacks)))?;
         self.check_side(key, window)?;
         // An empty input has no textures, and covers nothing, so its planes are never read; the
         // fold still binds four, another input's.
@@ -411,9 +387,6 @@ impl GpuEvaluation {
         let stack: Vec<([&wgpu::Texture; 4], Window)> = (layers.iter())
             .map(|layer| (planes_of(layer, stand_in), layer.info.data_window))
             .collect();
-        // The stack between layers, dropped once recorded: wgpu keeps its textures until the
-        // submission completes.
-        let mut scratch = Planes::default();
         self.kernels
             .fold(
                 encoder,
@@ -422,7 +395,7 @@ impl GpuEvaluation {
                 &stack,
                 window,
                 outputs.each_ref().map(|plane| &*plane.0),
-                &mut scratch,
+                released,
             )
             .expect("planes over their windows");
         Ok(GpuImage {
@@ -436,15 +409,15 @@ impl GpuEvaluation {
     /// columns into an output over the data window grown by the reach. The empty image, and a
     /// size whose reach is zero, give the source itself.
     ///
-    /// The scratch plane goes back to `released` once recorded, for later nodes of the request:
-    /// wgpu orders a later dispatch writing it after the passes reading it.
+    /// The scratch plane and the passes' intermediate planes go back to `released` once
+    /// recorded, for later nodes of the request.
     fn blur(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         key: &ResultKey,
         image: &GpuImage,
         size: f64,
-        released: &mut Vec<GpuPlane>,
+        released: &mut Planes,
     ) -> Result<GpuImage, EvalError> {
         let pass = BoxPass::new(size);
         let reach = pass.reach();
@@ -471,22 +444,13 @@ impl GpuEvaluation {
             .plane_bytes(sources.len() as u64)
             .saturating_add(scratch_window.plane_bytes(1))
             .saturating_add(intermediate_bytes(&op, input, window));
-        if bytes > NODE_BYTES_CAP {
-            return Err(EvalError::OverCap {
-                origin: key.clone(),
-                window,
-                bytes,
-            });
-        }
+        check_node_bytes(key, window, bytes)?;
         self.check_side(key, window)?;
         // The outputs before the scratch plane, as on the CPU.
         let outputs: Vec<GpuPlane> = (sources.iter())
             .map(|_| self.plane(released, window))
             .collect();
         let scratch = self.plane(released, scratch_window);
-        // The passes' planes between the first and the last along each axis, shared by every
-        // plane's passes and dropped once recorded.
-        let mut intermediates = Planes::default();
         for (source, output) in sources.iter().zip(&outputs) {
             self.kernels
                 .line(
@@ -497,7 +461,7 @@ impl GpuEvaluation {
                     &source.0,
                     (input.width, input.height),
                     &scratch.0,
-                    &mut intermediates,
+                    released,
                 )
                 .expect("a scratch plane of the grown width");
             self.kernels
@@ -509,11 +473,11 @@ impl GpuEvaluation {
                     &scratch.0,
                     (window.width, input.height),
                     &output.0,
-                    &mut intermediates,
+                    released,
                 )
                 .expect("an output over the grown window");
         }
-        released.push(scratch);
+        released.keep(scratch.0);
         let blurred = planes.each_ref().map(|plane| {
             let index = (sources.iter())
                 .position(|source| GpuPlane::ptr_eq(source, plane))
@@ -595,6 +559,17 @@ fn intermediate_bytes(op: &BoxSum, input: Window, window: Window) -> u64 {
             rows.plane_bytes(1).saturating_add(columns.plane_bytes(1))
         })
         .fold(0, u64::saturating_add)
+}
+
+/// The planes, each once however many channels and images share it.
+fn distinct(planes: impl IntoIterator<Item = GpuPlane>) -> Vec<GpuPlane> {
+    let mut distinct: Vec<GpuPlane> = Vec::new();
+    for plane in planes {
+        if !distinct.iter().any(|other| GpuPlane::ptr_eq(other, &plane)) {
+            distinct.push(plane);
+        }
+    }
+    distinct
 }
 
 /// The bytes of the textures, each counted once however often it appears.
@@ -763,10 +738,10 @@ impl Evaluator {
     /// Records the image a key names on the GPU of `gpu`, as [`Evaluator::evaluate_on`] computes
     /// it, without submitting it.
     ///
-    /// If the GPU has no memory for the request, this releases every retained GPU result the
-    /// request does not read, Reader uploads included, waits without blocking for the GPU to
-    /// free them, and records the request again, once. This is the one place that decides a
-    /// request's evaluation does not fit.
+    /// If the GPU has no memory for the request, this releases every retained GPU result but
+    /// those the request reads and what they were computed from, Reader uploads excepted, waits
+    /// without blocking for the GPU to free them, and records the request again, once. This is
+    /// the one place that decides a request's evaluation does not fit.
     pub fn record_on(
         &mut self,
         gpu: &mut GpuEvaluation,
@@ -791,7 +766,10 @@ impl Evaluator {
     }
 
     /// Records the request once, or fails, out of GPU memory, having released every retained
-    /// GPU result the request does not read.
+    /// GPU result but those the request reads and their ancestors other than Readers.
+    ///
+    /// An image the table does not retain is freed once its last reader is recorded, so that
+    /// later nodes of the request write its planes rather than new ones.
     fn record_attempt(
         &mut self,
         gpu: &mut GpuEvaluation,
@@ -805,7 +783,7 @@ impl Evaluator {
         let gpu_keys = gpu.retained_keys();
         let steps = self.plan(key, &gpu_keys);
         let held: Vec<Option<GpuImage>> = steps.iter().map(|step| gpu.find(&step.key)).collect();
-        let (needed, _) = needs(&steps, |index| held[index].is_some());
+        let (needed, mut uses) = needs(&steps, |index| held[index].is_some());
         let keys: Vec<&ResultKey> = steps.iter().map(|step| &step.key).collect();
         // The CPU table keeps what the request contains, its decoded Readers; nothing it
         // releases serves a GPU request.
@@ -884,18 +862,46 @@ impl Evaluator {
                     kept[index] = true;
                 }
             }
+            for &input in &step.inputs {
+                uses[input] -= 1;
+                if uses[input] == 0
+                    && let Some(input) = images[input].take()
+                {
+                    // Planes the table or the node's own image holds stay held.
+                    for plane in distinct(input.planes.into_iter().flatten()) {
+                        if Arc::strong_count(&plane.0) == 1 {
+                            released.keep(plane.0);
+                        }
+                    }
+                }
+            }
             images[index] = Some(image);
         }
         let image = images.pop().flatten().expect("the requested image");
         let short = pollster::block_on(out_of_memory.pop()).is_some();
         #[cfg(test)]
-        let short = short | gpu.shortage.take_refusal();
+        let short = short | gpu.shortage.refuses(&released.made);
         if short {
             drop((encoder, image, images, to_retain, released));
             // Everything else, not just enough: the allocator returns memory to the driver only
             // when a whole block of it empties, so releasing a few results may free nothing.
-            let read: Vec<&ResultKey> = read.iter().map(|&index| &steps[index].key).collect();
-            drop(gpu.release_except(&read));
+            // What a kept result was computed from stays, or the retry's plan, finding it gone,
+            // would compute the chain anew; a Reader's key stays in the CPU table, with its
+            // decoded image.
+            let mut keep: Vec<bool> = (0..steps.len())
+                .map(|index| read.contains(&index))
+                .collect();
+            for index in (0..steps.len()).rev() {
+                if keep[index] {
+                    for &input in &steps[index].inputs {
+                        keep[input] |= !matches!(*steps[input].key.0, Recipe::Reader { .. });
+                    }
+                }
+            }
+            let keep: Vec<&ResultKey> = (steps.iter().zip(&keep))
+                .filter_map(|(step, &keep)| keep.then_some(&step.key))
+                .collect();
+            drop(gpu.release_except(&keep));
             return Some(Err(EvalError::OutOfGpuMemory {
                 origin: key.clone(),
             }));
