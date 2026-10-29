@@ -97,6 +97,8 @@ pub enum Event {
     },
     /// The time for the attempt, after [`Request::RetryDeviceCreation`].
     RetryDeviceCreation(u64),
+    /// The time to collect the pixel read in flight, after [`Request::CollectPixelRead`].
+    CollectPixelRead,
     /// The artist set the viewer's exposure, in stops, in the viewer's own control.
     ViewerExposureSet(f32),
 }
@@ -188,6 +190,8 @@ pub enum Request {
     /// Dispatch [`Event::RetryDeviceCreation`] with the attempt after the delay. An attempt not
     /// the last one requested is ignored, so dispatching every one is safe.
     RetryDeviceCreation { attempt: u64, after: Duration },
+    /// Dispatch [`Event::CollectPixelRead`] after the delay.
+    CollectPixelRead { after: Duration },
 }
 
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
@@ -357,6 +361,11 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(1);
 /// again from the first wait.
 const LONGEST_RETRY: Duration = Duration::from_secs(30);
 
+/// Waited for between looks at a pixel read in flight. Its copy is tiny, but waits behind the
+/// evaluation's work on the queue; and nothing else polls an idle device, which a wait for the
+/// map callback alone would need.
+const PIXEL_READ_POLL: Duration = Duration::from_millis(4);
+
 /// Whether the panes have a device to draw on.
 #[derive(Debug)]
 enum Drawing {
@@ -427,10 +436,12 @@ pub struct App {
     images_shown: u64,
     /// The pointer's last position over the viewer pane.
     viewer_pointer: Option<PhysicalPoint>,
+    /// The image pixel the pointer last left the viewer from, which the readout stays on.
+    left_pixel: Option<[i32; 2]>,
     /// The probe last asked of the GPU.
     probed: Option<Probe>,
-    /// The last pixel read back, shown while its image is.
-    pixel_read: Option<PixelRead>,
+    /// The last pixel read back, shown until a newer read arrives.
+    last_read: Option<LastRead>,
     /// The readout as last requested.
     readout: String,
     /// The viewer's exposure as its control last showed it.
@@ -475,8 +486,9 @@ impl App {
             presented: None,
             images_shown: 0,
             viewer_pointer: None,
+            left_pixel: None,
             probed: None,
-            pixel_read: None,
+            last_read: None,
             readout: String::new(),
             exposure_shown: 0.0,
             caption: String::new(),
@@ -555,6 +567,14 @@ impl App {
                 }
                 _ => Vec::new(),
             },
+            Event::CollectPixelRead => {
+                if let Some(read) = self.gpu.take_pixel_read()
+                    && let Some(info) = self.shown.framed()
+                {
+                    self.last_read = Some(LastRead::new(read, info.data_window));
+                }
+                self.poll_pixel_read()
+            }
             Event::ViewerExposureSet(stops) => {
                 self.session.viewer_mut().set_exposure(stops);
                 // The control shows what the artist typed, which echoing could rewrite.
@@ -673,7 +693,7 @@ impl App {
             return Vec::new();
         }
         // Read from the lost device's copy of the image, which the next device shows anew.
-        self.pixel_read = None;
+        self.last_read = None;
         self.probed = None;
         if self.worker.disconnect(at) && self.device == EvaluationDevice::Gpu {
             self.losses_during_evaluation += 1;
@@ -759,10 +779,6 @@ impl App {
                         Shown::Image { wanted, .. } => Some(wanted.number),
                         Shown::Nothing | Shown::Failed { .. } => None,
                     };
-                    // The frame tick on which a pixel read in flight is collected.
-                    if let Some(read) = self.gpu.take_pixel_read() {
-                        self.pixel_read = Some(read);
-                    }
                 }
                 Vec::new()
             }
@@ -824,7 +840,10 @@ impl App {
             | Input::PointerPressed { position, .. }
             | Input::PointerReleased { position, .. }
             | Input::Scrolled { position, .. } => self.viewer_pointer = Some(position),
-            Input::PointerLeft => self.viewer_pointer = None,
+            Input::PointerLeft => {
+                self.left_pixel = self.pointed().map(|(pixel, _)| pixel);
+                self.viewer_pointer = None;
+            }
             Input::PointerEntered => {}
         }
         let display = self.shown.display_window();
@@ -1162,39 +1181,31 @@ impl App {
         }
     }
 
-    /// Keeps the readout on the shown image's pixel under the pointer: asks the GPU to read it,
-    /// collects the read on the viewer's frames while one is in flight, and describes it.
+    /// Keeps the readout on the shown image's pixel under the pointer, or the one it left the
+    /// viewer from: asks the GPU to read it, and describes the last read until a newer arrives.
     fn follow_readout(&mut self, requests: &mut Vec<Request>) {
         let pointed = self.pointed();
         if let Some((_, Some(probe))) = pointed
             && self.probed != Some(probe)
         {
             self.probed = Some(probe);
+            let reading = self.gpu.reading_pixel();
             self.gpu.read_pixel(probe);
-        }
-        if self.gpu.reading_pixel() {
-            requests.push(Request::Redraw(Pane::Viewer));
+            // A read already in flight polls until the one queued behind it is done.
+            if !reading {
+                requests.extend(self.poll_pixel_read());
+            }
         }
         let readout = match pointed {
             None => String::new(),
             Some(([x, y], None)) => {
                 format!("x {x} y {y} · R 0 G 0 B 0 A 0, outside the data window")
             }
-            Some(([x, y], Some(probe))) => match (self.pixel_read, self.shown.framed()) {
-                // Labelled with the pixel it read, which the pointer may have left.
-                (Some(read), Some(info)) if read.probe.image == probe.image => {
-                    let [texel_x, texel_y] = read.probe.texel.map(|texel| texel as i32);
-                    let values = (["R", "G", "B", "A"].iter().zip(read.values))
-                        .map(|(channel, value)| format!("{channel} {}", working_value(value)))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    format!(
-                        "x {} y {} · {values}",
-                        info.data_window.x + texel_x,
-                        info.data_window.y + texel_y
-                    )
-                }
-                _ => format!("x {x} y {y}"),
+            Some((pixel, Some(probe))) => match self.last_read {
+                Some(read) if read.image == probe.image && read.pixel == pixel => read.describe(),
+                // Labelled with the pixel it read, which may be another, or of an older image.
+                Some(read) => format!("{} · reading", read.describe()),
+                None => format!("x {} y {}", pixel[0], pixel[1]),
             },
         };
         if readout != self.readout {
@@ -1203,15 +1214,34 @@ impl App {
         }
     }
 
-    /// The shown image's pixel under the pointer, in image pixels with y up, and the probe that
-    /// reads it, or `None` for a pixel outside the data window, whose values are zero.
+    /// Asks to collect the pixel read in flight once the GPU may have done it.
+    fn poll_pixel_read(&self) -> Vec<Request> {
+        if self.gpu.reading_pixel() {
+            vec![Request::CollectPixelRead {
+                after: PIXEL_READ_POLL,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The shown image's pixel the readout describes, in image pixels with y up, and the probe
+    /// that reads it, or `None` for a pixel outside the data window, whose values are zero.
     fn pointed(&self) -> Option<([i32; 2], Option<Probe>)> {
-        let pointer = self.viewer_pointer?;
         let info = self.shown.framed()?;
-        let placement = self.session.viewer().placement(info.display_window);
-        let [x, y] = placement
-            .to_image(pointer)
-            .map(|value| value.floor() as i32);
+        let [x, y] = match self.viewer_pointer {
+            // The pixel drawn at the centre of the physical pixel the pointer is in, where the
+            // viewer's shader samples.
+            Some(pointer) => {
+                let centre = PhysicalPoint {
+                    x: pointer.x.floor() + 0.5,
+                    y: pointer.y.floor() + 0.5,
+                };
+                let placement = self.session.viewer().placement(info.display_window);
+                placement.to_image(centre).map(|value| value.floor() as i32)
+            }
+            None => self.left_pixel?,
+        };
         let window = info.data_window;
         let probe = window.contains(x, y).then(|| Probe {
             image: self.images_shown,
@@ -1337,6 +1367,35 @@ impl App {
     /// drag check.
     pub fn presented_request(&self) -> Option<u64> {
         self.presented
+    }
+}
+
+/// A pixel read back, at its pixel in image pixels, which a later image's data window would
+/// not give from its texel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LastRead {
+    image: u64,
+    pixel: [i32; 2],
+    values: [f32; 4],
+}
+
+impl LastRead {
+    fn new(read: PixelRead, data_window: Window) -> LastRead {
+        let [x, y] = read.probe.texel.map(|texel| texel as i32);
+        LastRead {
+            image: read.probe.image,
+            pixel: [data_window.x + x, data_window.y + y],
+            values: read.values,
+        }
+    }
+
+    fn describe(&self) -> String {
+        let [x, y] = self.pixel;
+        let values = (["R", "G", "B", "A"].iter().zip(self.values))
+            .map(|(channel, value)| format!("{channel} {}", working_value(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("x {x} y {y} · {values}")
     }
 }
 

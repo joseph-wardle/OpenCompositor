@@ -1296,57 +1296,107 @@ fn pointer_at(x: f32, y: f32) -> Event {
     )
 }
 
+/// The GPU's read of the probe last asked for arriving.
+fn read_arrives(app: &mut App, values: [f32; 4]) -> Vec<Request> {
+    let probe = app.probed.expect("a probe");
+    let info = app.shown.framed().expect("a framed image");
+    app.last_read = Some(LastRead::new(PixelRead { probe, values }, info.data_window));
+    app.dispatch(Event::CollectPixelRead)
+}
+
 #[test]
-fn the_readout_follows_the_pointer_and_labels_a_read_with_its_own_pixel_while_its_image_shows() {
+fn the_readout_follows_the_pointer_and_keeps_the_last_read_marked_until_the_next_arrives() {
     let (mut app, _deliveries) = viewing_a_cropped_image();
 
     // Outside the data window: zeros, said so, with nothing to read.
     let requests = app.dispatch(pointer_at(51.0, 474.0));
     assert_eq!(
         shown_readout(&requests),
-        Some("x 4 y 4 · R 0 G 0 B 0 A 0, outside the data window")
+        Some("x 6 y 2 · R 0 G 0 B 0 A 0, outside the data window")
     );
     assert_eq!(app.probed, None);
 
     // Inside: the pixel, until its values are read.
     let requests = app.dispatch(pointer_at(500.0, 250.0));
-    assert_eq!(shown_readout(&requests), Some("x 2000 y 1000"));
+    assert_eq!(shown_readout(&requests), Some("x 2002 y 997"));
     let probe = app.probed.expect("a probe");
-    assert_eq!(probe.texel, [1000, 500]);
-    app.pixel_read = Some(PixelRead {
-        probe,
-        values: [0.18017578, -2.5, 1e9, f32::NAN],
-    });
-    // A read arriving with the frame, whatever else the dispatch did.
-    let requests = app.dispatch(Event::Draw(Pane::Viewer));
+    assert_eq!(probe.texel, [1002, 497]);
+    let requests = read_arrives(&mut app, [0.18017578, -2.5, 1e9, f32::NAN]);
     assert_eq!(
         shown_readout(&requests),
-        Some("x 2000 y 1000 · R 0.1802 G -2.5 B 1.000e9 A NaN")
+        Some("x 2002 y 997 · R 0.1802 G -2.5 B 1.000e9 A NaN")
     );
 
     // Another pixel keeps the last read, labelled with the pixel it read, until its own arrives.
     let requests = app.dispatch(pointer_at(501.0, 250.0));
-    assert_eq!(shown_readout(&requests), None);
-    assert_ne!(app.probed, Some(probe));
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2002 y 997 · R 0.1802 G -2.5 B 1.000e9 A NaN · reading")
+    );
+    let probe = app.probed.expect("a probe");
+    assert_eq!(probe.texel, [1006, 497]);
+    let requests = read_arrives(&mut app, [1.0; 4]);
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2006 y 997 · R 1 G 1 B 1 A 1")
+    );
 
-    // A newer image drops a read of the older one.
+    // So does a newer image, whose own read of the pixel replaces it.
     let requests = app.dispatch(cropped(&sent(&app)));
-    assert_eq!(shown_readout(&requests), Some("x 2004 y 1000"));
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2006 y 997 · R 1 G 1 B 1 A 1 · reading")
+    );
+    let requests = read_arrives(&mut app, [2.0; 4]);
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2006 y 997 · R 2 G 2 B 2 A 2")
+    );
+}
+
+#[test]
+fn the_readout_stays_on_the_pixel_the_pointer_left_the_viewer_from() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+    app.dispatch(pointer_at(500.0, 250.0));
+    read_arrives(&mut app, [1.0; 4]);
 
     let requests = app.dispatch(input(Pane::Viewer, Input::PointerLeft));
-    assert_eq!(shown_readout(&requests), Some(""));
+    assert_eq!(shown_readout(&requests), None);
+    // One to one moves another pixel under where the pointer was, but not the readout.
+    app.dispatch(Event::Command(Command::ActualSize));
+    assert_eq!(app.readout, "x 2002 y 997 · R 1 G 1 B 1 A 1");
+
+    // A newer image is read at the same pixel.
+    let requests = app.dispatch(cropped(&sent(&app)));
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2002 y 997 · R 1 G 1 B 1 A 1 · reading")
+    );
+    let probe = app.probed.expect("a probe");
+    assert_eq!(probe.texel, [1002, 497]);
+}
+
+#[test]
+fn at_one_to_one_the_readout_names_the_pixel_drawn_under_the_pointer() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+    // The display window's centre, (2000, 1000), at the pane's, (500, 250): physical pixel
+    // (500, 250) is drawn from its centre, (500.5, 250.5), which is image point
+    // (2000.5, 999.5), in pixel (2000, 999). Its top-left corner is in the pixel above.
+    app.dispatch(Event::Command(Command::ActualSize));
+
+    for (x, y) in [(500.0, 250.0), (500.75, 250.75)] {
+        app.dispatch(pointer_at(x, y));
+        assert_eq!(app.readout, "x 2000 y 999");
+    }
+    app.dispatch(pointer_at(501.0, 251.0));
+    assert_eq!(app.readout, "x 2001 y 998");
 }
 
 #[test]
 fn a_device_loss_drops_the_read_of_its_copy_of_the_image() {
     let (mut app, _deliveries) = viewing_a_cropped_image();
     app.dispatch(pointer_at(500.0, 250.0));
-    let probe = app.probed.expect("a probe");
-    app.pixel_read = Some(PixelRead {
-        probe,
-        values: [1.0; 4],
-    });
-    app.dispatch(Event::Draw(Pane::Viewer));
+    read_arrives(&mut app, [1.0; 4]);
     app.gpu = Gpu::with_noop_device(Waker::channel().0);
 
     let requests = app.dispatch(Event::DeviceLost {
@@ -1354,7 +1404,7 @@ fn a_device_loss_drops_the_read_of_its_copy_of_the_image() {
         at: std::time::Instant::now(),
     });
 
-    assert_eq!(shown_readout(&requests), Some("x 2000 y 1000"));
+    assert_eq!(shown_readout(&requests), Some("x 2002 y 997"));
 }
 
 #[test]

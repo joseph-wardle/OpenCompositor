@@ -408,6 +408,10 @@ pub fn perform(request: Request) {
             let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
             ffi::single_shot(milliseconds, retry_device_creation, attempt as usize);
         }
+        Request::CollectPixelRead { after } => {
+            let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
+            ffi::single_shot(milliseconds, collect_pixel_read, 0);
+        }
     }
 }
 
@@ -439,6 +443,11 @@ fn retry_device_creation(attempt: usize) {
     let started = Instant::now();
     dispatch(Event::RetryDeviceCreation(attempt as u64));
     lifecycle::attempt_took(started.elapsed());
+}
+
+/// One whose timer fires after the app has dropped dispatches to nothing.
+fn collect_pixel_read(_: usize) {
+    dispatch(Event::CollectPixelRead);
 }
 
 pub fn path(name: &QString) -> PathBuf {

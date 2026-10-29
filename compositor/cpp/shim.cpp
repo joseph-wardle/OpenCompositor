@@ -80,22 +80,44 @@ QWidget *container(Pane *pane, QDockWidget *dock) {
 }
 namespace {
 // Stops with their sign, as exposure is read; Ctrl+click resets to 0, as on the panel's sliders.
+// Only typing keeps the keyboard from the panes: Qt gives the box focus before it delivers a
+// press, so a reset or an arrow click gives it back.
 class ExposureBox : public QDoubleSpinBox {
   public:
-    using QDoubleSpinBox::QDoubleSpinBox;
+    ExposureBox() {
+        // A press on the text goes to the line edit rather than to mousePressEvent.
+        lineEdit()->installEventFilter(this);
+    }
 
   protected:
     QString textFromValue(double value) const override {
         QString text = QDoubleSpinBox::textFromValue(value);
         return value > 0 ? QStringLiteral("+") + text : text;
     }
-    void mousePressEvent(QMouseEvent *event) override {
-        if (event->button() == Qt::LeftButton && event->modifiers() & Qt::ControlModifier) {
-            setValue(0);
-            event->accept();
-            return;
+    bool eventFilter(QObject *watched, QEvent *event) override {
+        if (event->type() == QEvent::MouseButtonPress &&
+            reset_by(static_cast<QMouseEvent *>(event))) {
+            return true;
         }
-        QDoubleSpinBox::mousePressEvent(event);
+        return QDoubleSpinBox::eventFilter(watched, event);
+    }
+    void mousePressEvent(QMouseEvent *event) override {
+        if (!reset_by(event)) QDoubleSpinBox::mousePressEvent(event);
+    }
+    // On release, since clearing focus on the press would stop a held arrow repeating.
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        QDoubleSpinBox::mouseReleaseEvent(event);
+        clearFocus();
+    }
+
+  private:
+    bool reset_by(QMouseEvent *event) {
+        if (event->button() != Qt::LeftButton || !(event->modifiers() & Qt::ControlModifier)) {
+            return false;
+        }
+        setValue(0);
+        clearFocus();
+        return true;
     }
 };
 } // namespace
