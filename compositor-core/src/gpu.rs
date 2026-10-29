@@ -134,6 +134,8 @@ pub struct FrameTiming {
     pub acquired: Instant,
     /// The frame was submitted.
     pub submitted: Instant,
+    /// The frame was handed to the display, which shows it at a later refresh.
+    pub presented: Instant,
     /// When the GPU reported the frame complete, set by whichever thread's poll or submit ran
     /// the report. Nothing polls an idle device, so the check polls while it waits.
     pub completed: Arc<OnceLock<Instant>>,
@@ -520,6 +522,7 @@ impl Gpu {
             // Only under an error scope or handler, which this code does not install.
             wgpu::CurrentSurfaceTexture::Validation => return Drawn::Skipped,
         };
+        let acquired = Instant::now();
         match pane {
             Pane::Graph => device.renderer.prepare(
                 &device.device,
@@ -534,7 +537,6 @@ impl Gpu {
                 }
             }
         }
-        let acquired = Instant::now();
         let target = frame.texture.create_view(&Default::default());
         let mut encoder = device.device.create_command_encoder(&Default::default());
         {
@@ -567,24 +569,29 @@ impl Gpu {
             _ => None,
         };
         device.queue.submit([encoder.finish()]);
-        if let Some(timings) = &mut self.timings {
-            self.frames_timed += 1;
+        let submitted = Instant::now();
+        let completed = self.timings.is_some().then(|| {
             let completed = Arc::new(OnceLock::new());
             let report = Arc::clone(&completed);
             device.queue.on_submitted_work_done(move || {
                 let _ = report.set(Instant::now());
             });
-            timings[pane.index()] = Some(FrameTiming {
-                number: self.frames_timed,
-                acquired,
-                submitted: Instant::now(),
-                completed,
-            });
-        }
+            completed
+        });
         if let Some(checks) = &mut self.checks {
             checks.record(pane, device, readback);
         }
         device.queue.present(frame);
+        if let (Some(timings), Some(completed)) = (&mut self.timings, completed) {
+            self.frames_timed += 1;
+            timings[pane.index()] = Some(FrameTiming {
+                number: self.frames_timed,
+                acquired,
+                submitted,
+                presented: Instant::now(),
+                completed,
+            });
+        }
         Drawn::Presented
     }
 }

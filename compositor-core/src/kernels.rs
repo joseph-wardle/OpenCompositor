@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use opencompositor_kernels::{
     Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Params, Placement,
-    SCAN_BLOCK, SPIRV, WORKGROUP,
+    SCAN_BLOCK, SPIRV, WORKGROUP, scan_lines,
 };
 
 use crate::image::Window;
@@ -226,7 +226,7 @@ impl Kernels {
                     Axis::Columns => (size.height, size.width),
                 };
                 let blocks = extent / (2 * op.t() - 1) + 1;
-                let groups = [blocks, lines];
+                let groups = [blocks, lines.div_ceil(scan_lines(op.t()))];
                 self.dispatch(encoder, L::SCAN, &params, &[source], &[written], groups);
             }
             if let Some(previous) = std::mem::replace(&mut current, target) {
@@ -1174,15 +1174,20 @@ mod tests {
     }
 
     /// The scan's block and totals within the workgroup memory every device is asked for,
-    /// which wgpu does not check, and its block over Blur's widest window.
+    /// which wgpu does not check, its invocations within the default limits, and its block over
+    /// Blur's widest window.
     #[test]
     fn the_scan_fits_the_default_workgroup_memory_and_the_widest_blur() {
-        let bytes = (SCAN_BLOCK + 2 * opencompositor_kernels::SCAN_THREADS) * 4;
-        let limit = wgpu::Limits::default().max_compute_workgroup_storage_size;
+        let threads = opencompositor_kernels::SCAN_THREADS;
+        let bytes = (SCAN_BLOCK + 2 * threads) * 4;
+        let limits = wgpu::Limits::default();
+        let limit = limits.max_compute_workgroup_storage_size;
         assert!(
             bytes <= limit,
             "{bytes} bytes of workgroup memory, over {limit}"
         );
+        assert!(threads <= limits.max_compute_invocations_per_workgroup);
+        assert!(threads <= limits.max_compute_workgroup_size_x);
         let widest = BoxSum::new(BoxPass::new(4096.0));
         assert!(2 * widest.t() <= SCAN_BLOCK, "t = {}", widest.t());
     }

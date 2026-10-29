@@ -204,18 +204,32 @@ pub const WORKGROUP: u32 = 16;
 /// Line reductions whose half-width is at most this are reduced directly on the GPU, each
 /// output its own window; wider ones by the scan's blocks.
 ///
-/// The scan gives each workgroup one block of `2 t - 1` samples, so narrow windows spread a
-/// line over many tiny workgroups: at `t = 2` the scan was over a thousand times slower than
-/// direct sums. Direct sums cost `2 t + 1` taps per output, and the two crossed near `t = 60`
-/// on an RTX 4070 Ti SUPER at 4K.
-pub const DIRECT_T: u32 = 60;
+/// Direct sums cost `2 t + 1` taps per output, the scan about the same at any width until its
+/// workgroup holds a single line, and the two crossed between `t = 5` and `6` on an RTX 4070 Ti
+/// SUPER at 4K.
+pub const DIRECT_T: u32 = 5;
 
-/// Invocations in a scan's workgroup; the scan's `threads` must say the same.
-pub const SCAN_THREADS: u32 = 64;
+/// Invocations in a scan's workgroup, the most wgpu's default limits allow; the scan's
+/// `threads` must say the same.
+pub const SCAN_THREADS: u32 = 256;
 
 /// The longest block the scan holds in workgroup memory: the widest window it reduces has
 /// `2 t - 1` below this. Its entry points declare the array's length as this.
 ///
 /// Blur's largest Size, 4096, has `t = 1365`. With the scan's totals the workgroup holds
-/// 11,520 bytes, inside the 16,384 that Vulkan guarantees and wgpu's default limits ask for.
+/// 13,056 bytes, inside the 16,384 that Vulkan guarantees and wgpu's default limits ask for.
 pub const SCAN_BLOCK: u32 = 2752;
+
+/// How many adjacent lines a scan's workgroup reduces for half-width `t`: the most, a power of
+/// two up to [`SCAN_THREADS`], whose blocks fit the workgroup's memory together. Its invocations
+/// take the lines in turn, so neighbouring invocations read neighbouring lines, which along
+/// columns are neighbouring texels.
+#[inline(always)]
+pub fn scan_lines(t: u32) -> u32 {
+    let l = 2 * t - 1;
+    let mut lines = SCAN_THREADS;
+    while lines > 1 && lines * l > SCAN_BLOCK {
+        lines /= 2;
+    }
+    lines
+}
