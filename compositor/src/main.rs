@@ -183,6 +183,20 @@ fn main() {
     );
     // SAFETY: the viewer menu is live; it owns the note.
     unsafe { ffi::add_note(viewer_menu, &QString::from("Pan\tSpace+Drag, Middle-Drag")) };
+    // SAFETY: the viewer menu is live.
+    unsafe { ffi::add_separator(viewer_menu) };
+    add(
+        viewer_menu,
+        "Evaluate on the &GPU",
+        "",
+        Command::EvaluateOn(EvaluationDevice::Gpu),
+    );
+    add(
+        viewer_menu,
+        "Evaluate on the &CPU",
+        "",
+        Command::EvaluateOn(EvaluationDevice::Cpu),
+    );
     COMMANDS.with(|cell| cell.set(commands).expect("menus are made once"));
     // In one area, which the parameter panel's dock then divides.
     let docks = Pane::ALL.map(|pane| {
@@ -369,14 +383,14 @@ pub fn perform(request: Request) {
 /// Dispatches a notice from another thread. Retiring a lost device blocks the GUI thread, so
 /// the lifecycle check reports how long; the drag check records each result's arrival.
 fn receive(notice: Notice) {
-    let lost = matches!(notice, Notice::DeviceLost(_));
+    let lost = matches!(notice, Notice::DeviceLost { .. });
     let evaluated = match &notice {
         Notice::Evaluated(evaluated) => Some((
             evaluated.request(),
             evaluated.timing,
             evaluated.data_window(),
         )),
-        Notice::DeviceLost(_) => None,
+        Notice::DeviceLost { .. } => None,
     };
     let started = Instant::now();
     dispatch(Event::from(notice));

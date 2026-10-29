@@ -350,12 +350,11 @@ impl Pipeline {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: true,
         });
-        buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .expect("a buffer mapped at creation")
-            .slice(..)
-            .copy_from_slice(bytes);
+        // Mapping fails only when creating the buffer did, out of memory, which the caller's
+        // error scope reports.
+        if let Ok(mut view) = buffer.slice(..).get_mapped_range_mut() {
+            view.slice(..).copy_from_slice(bytes);
+        }
         buffer.unmap();
         let views: Vec<wgpu::TextureView> = (inputs.iter().chain(outputs))
             .map(|texture| texture.create_view(&Default::default()))

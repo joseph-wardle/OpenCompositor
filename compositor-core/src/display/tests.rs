@@ -114,7 +114,9 @@ fn convert(
     image: &GpuImage,
 ) -> Option<Arc<wgpu::Texture>> {
     let mut encoder = device.create_command_encoder(&Default::default());
-    let texture = conversion.record(&mut encoder, image);
+    let texture = conversion
+        .record(&mut encoder, image)
+        .expect("memory for the display copy");
     queue.submit([encoder.finish()]);
     texture
 }

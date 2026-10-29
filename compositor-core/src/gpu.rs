@@ -708,7 +708,10 @@ impl ErrorCounter {
         let waker = waker.clone();
         device.set_device_lost_callback(move |_, _| {
             counter.lost.store(true, Ordering::Relaxed);
-            waker.wake(Notice::DeviceLost(generation));
+            waker.wake(Notice::DeviceLost {
+                generation,
+                at: Instant::now(),
+            });
         });
     }
 
@@ -1130,7 +1133,7 @@ mod tests {
 
         assert!(!gpu.retire_lost_device(0));
         gpu.destroy_device();
-        let Ok(Notice::DeviceLost(generation)) = notices.try_recv() else {
+        let Ok(Notice::DeviceLost { generation, .. }) = notices.try_recv() else {
             panic!("the lost callback sent no notice");
         };
 

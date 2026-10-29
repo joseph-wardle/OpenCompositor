@@ -21,7 +21,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cxx_qt_lib::QString;
 use open_ng::{Modifiers, Point};
@@ -76,6 +76,9 @@ const STEPS: [(i32, &str, &[Pane]); 23] = [
 /// Configuring the panes' swapchains is most of it and varies most from run to run.
 /// Hypothesis, untested: after a real reset the same adapter returns, so its shader cache is warm.
 const REBUILD_BUDGET: Duration = Duration::from_millis(350);
+/// The longest from the loss to the viewer's first frame showing the image again, re-uploaded and
+/// re-evaluated, in a GPU session on the workstation's desktop.
+const TOTAL_RECOVERY_BUDGET: Duration = Duration::from_millis(700);
 
 thread_local! {
     static IMAGE: RefCell<PathBuf> = RefCell::default();
@@ -84,6 +87,10 @@ thread_local! {
     static CHECKED: Cell<[Option<FrameCheck>; Pane::COUNT]> = const { Cell::new([None; Pane::COUNT]) };
     /// What each pane's frames proved on the device the check destroyed.
     static DESTROYED: Cell<Option<[Option<FrameCheck>; Pane::COUNT]>> = const { Cell::new(None) };
+    /// When the check destroyed the device, and how long until the viewer's first frame on a
+    /// new one finished showing the image again.
+    static DESTROYED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+    static RECOVERED_IN: Cell<Option<Duration>> = const { Cell::new(None) };
     /// The longest an attempt to make a device took.
     static LONGEST_ATTEMPT: Cell<Option<Duration>> = const { Cell::new(None) };
     /// How long retiring the lost device took, which has no budget yet.
@@ -240,7 +247,9 @@ fn step(index: usize) {
                 ));
             }
             DESTROYED.with(|cell| cell.set(Some(checks)));
+            DESTROYED_AT.with(|cell| cell.set(Some(Instant::now())));
             crate::destroy_device();
+            ffi::single_shot(1, watch_recovery, 0);
         }
         _ => {
             check_recovery(checks);
@@ -358,6 +367,31 @@ fn new_frames(before: Option<FrameCheck>, now: Option<FrameCheck>) -> u64 {
     }
 }
 
+/// Records when the viewer's last finished frame is on a new device and has the centre it had
+/// before the loss, so shows the image again, re-evaluated in a GPU session; until then looks
+/// again each millisecond.
+fn watch_recovery(_: usize) {
+    let (Some(destroyed), Some(at)) = (DESTROYED.with(Cell::get), DESTROYED_AT.with(Cell::get))
+    else {
+        return;
+    };
+    let before = destroyed[Pane::Viewer.index()];
+    let now = crate::frame_check(Pane::Viewer);
+    let recovered = match (before, now) {
+        (Some(before), Some(now)) => {
+            now.generation > before.generation
+                && before.centre.is_some()
+                && now.centre == before.centre
+        }
+        _ => false,
+    };
+    if recovered {
+        RECOVERED_IN.with(|cell| cell.set(Some(at.elapsed())));
+    } else {
+        ffi::single_shot(1, watch_recovery, 0);
+    }
+}
+
 /// Checks that a new device replaced the destroyed one: both panes drew on it with the same
 /// centre as before, the viewer's not black, the GPU label is gone, and making it kept within the
 /// budget.
@@ -410,6 +444,21 @@ fn check_recovery(checks: [Option<FrameCheck>; Pane::COUNT]) {
     }
     if let Some(retirement) = RETIREMENT.with(Cell::get) {
         eprintln!("lifecycle check: retiring the lost device took {retirement:?}");
+    }
+    match RECOVERED_IN.with(Cell::get) {
+        None => fail("the viewer did not show the image again on a new device".to_owned()),
+        Some(recovered) => {
+            eprintln!(
+                "lifecycle check: from the loss to the viewer's first frame showing the image \
+                 again took {recovered:?} ({} evaluation)",
+                crate::evaluation_device()
+            );
+            if recovered > TOTAL_RECOVERY_BUDGET {
+                fail(format!(
+                    "recovery took {recovered:?}, over {TOTAL_RECOVERY_BUDGET:?}"
+                ));
+            }
+        }
     }
     match LONGEST_ATTEMPT.with(Cell::get) {
         None => fail("no attempt made a device after the loss".to_owned()),

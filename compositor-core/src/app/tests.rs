@@ -592,7 +592,10 @@ fn a_pane_opened_while_the_gpu_is_unavailable_is_tried_without_waiting_out_the_b
 fn a_stale_attempt_is_ignored_so_attempts_never_overlap() {
     let (mut app, _deliveries) = app();
     app.gpu = Gpu::with_noop_device(Waker::channel().0);
-    let (attempt, _) = retry(&app.dispatch(Event::DeviceLost(1)));
+    let (attempt, _) = retry(&app.dispatch(Event::DeviceLost {
+        generation: 1,
+        at: Instant::now(),
+    }));
     let (next, _) = retry(&app.dispatch(Event::RetryDeviceCreation(attempt)));
 
     assert_eq!(app.dispatch(Event::RetryDeviceCreation(attempt)), []);
@@ -621,7 +624,10 @@ fn a_device_lost_soon_after_recovering_waits_longer_than_the_attempt_that_made_i
             }),
         };
 
-        let requests = app.dispatch(Event::DeviceLost(1));
+        let requests = app.dispatch(Event::DeviceLost {
+            generation: 1,
+            at: Instant::now(),
+        });
 
         assert_eq!(retry(&requests).1, delay);
     }
@@ -641,7 +647,10 @@ fn the_gpu_label_shows_while_the_panes_cannot_draw_and_names_each_new_error_coun
     let requests = app.dispatch(Event::FocusLost(Pane::Viewer));
     assert_eq!(requests, [label("2 GPU errors, logged on standard error")]);
 
-    let requests = app.dispatch(Event::DeviceLost(1));
+    let requests = app.dispatch(Event::DeviceLost {
+        generation: 1,
+        at: Instant::now(),
+    });
     let expected = format!("{GPU_UNAVAILABLE}. 2 GPU errors, logged on standard error");
     assert!(requests.contains(&label(&expected)), "{requests:?}");
     assert_eq!(app.gpu.take_errors(), 2);
@@ -654,7 +663,10 @@ fn closing_during_recovery_notices_no_loss() {
     app.gpu = Gpu::with_noop_device(waker);
     create(&mut app, "missing.png");
     app.dispatch(slot_key(1, CTRL));
-    retry(&app.dispatch(Event::DeviceLost(1)));
+    retry(&app.dispatch(Event::DeviceLost {
+        generation: 1,
+        at: Instant::now(),
+    }));
 
     drop(app);
 
@@ -1128,4 +1140,60 @@ fn a_viewed_merge_with_nothing_connected_is_empty_and_misses_nothing() {
     app.dispatch(Event::Draw(Pane::Viewer));
     app.dispatch(read(&sent(&app), 0, 0));
     assert_eq!(app.caption, "Slot 1 · Merge · empty · CPU");
+}
+
+#[test]
+fn out_of_gpu_memory_moves_evaluation_to_the_cpu_until_the_artist_chooses_the_gpu() {
+    let (mut app, deliveries) = app();
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let wanted = sent(&app);
+    app.dispatch(read(&wanted, 4, 4));
+
+    app.dispatch(Event::Evaluated(Evaluated {
+        timing: Timing::now(),
+        wanted: wanted.clone(),
+        result: Err(ViewerError::Eval(EvalError::OutOfGpuMemory {
+            origin: wanted.key.clone(),
+        })),
+    }));
+
+    assert_eq!(app.evaluation_device(), EvaluationDevice::Cpu);
+    assert!(matches!(app.shown, Shown::Image { .. }), "the frame stays");
+    assert_eq!(
+        app.caption,
+        "Slot 1 · a.exr · 4 × 4 · CPU (the GPU ran out of memory)"
+    );
+    assert_eq!(receive(&deliveries).wanted.number, wanted.number);
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+    assert_eq!(app.evaluation_device(), EvaluationDevice::Gpu);
+    assert_eq!(app.caption, "Slot 1 · a.exr · 4 × 4 · GPU");
+}
+
+#[test]
+fn two_losses_while_evaluation_had_work_on_the_gpu_move_it_to_the_cpu() {
+    let (mut app, _deliveries) = app();
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+    // Each loss on generation 1 of a new noop device, the first without work in flight.
+    for (submitting, device) in [
+        (false, EvaluationDevice::Gpu),
+        (true, EvaluationDevice::Gpu),
+        (true, EvaluationDevice::Cpu),
+    ] {
+        app.gpu = Gpu::with_noop_device(Waker::channel().0);
+        let (noop, queue) = crate::gpu::noop_device(None);
+        app.worker.connect(noop, queue, 1);
+        if submitting {
+            app.worker.submitting_on(1);
+        }
+
+        app.dispatch(Event::DeviceLost {
+            generation: 1,
+            at: Instant::now(),
+        });
+
+        assert_eq!(app.evaluation_device(), device);
+    }
+    assert_eq!(app.left_gpu, Some(LeftGpu::Lost));
 }

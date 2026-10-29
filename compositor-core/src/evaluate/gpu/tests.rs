@@ -9,6 +9,43 @@ use crate::evaluate::tests::{blur, chain, exposure, graph, key, merge, reader, w
 use crate::fixtures::{directory, write_exr};
 use crate::kernels::headless;
 
+/// Tests' stand-in for the device running out of memory, which lavapipe never reports: with a
+/// cap, a plane made while the planes alive would exceed it refuses the attempt that made it, as
+/// a failed creation's error scope would. A plane counts as alive until nothing holds it.
+#[derive(Debug, Default)]
+pub(super) struct Shortage {
+    cap: Option<u64>,
+    made: Vec<std::sync::Weak<wgpu::Texture>>,
+    refused: bool,
+}
+
+impl Shortage {
+    pub(super) fn made(&mut self, texture: &Arc<wgpu::Texture>) {
+        self.made.retain(|plane| plane.strong_count() > 0);
+        let alive: u64 = (self.made.iter())
+            .filter_map(std::sync::Weak::upgrade)
+            .map(|plane| texture_bytes(&plane))
+            .sum();
+        if self
+            .cap
+            .is_some_and(|cap| alive + texture_bytes(texture) > cap)
+        {
+            self.refused = true;
+        } else {
+            self.made.push(Arc::downgrade(texture));
+        }
+    }
+
+    pub(super) fn take_refusal(&mut self) -> bool {
+        std::mem::take(&mut self.refused)
+    }
+}
+
+fn texture_bytes(texture: &wgpu::Texture) -> u64 {
+    let size = texture.size();
+    u64::from(size.width) * u64::from(size.height) * size_of::<f32>() as u64
+}
+
 /// Waits for the GPU to complete evaluation's submissions by polling without blocking, as the
 /// worker will, failing after a generous while.
 fn wait_until_idle(gpu: &GpuEvaluation) {
@@ -471,4 +508,89 @@ fn a_recorded_request_dropped_unsubmitted_submits_and_retains_nothing() {
 
     assert_eq!(gpu.submitted, 0);
     assert!(gpu.retained_keys().is_empty());
+}
+
+#[test]
+fn a_request_out_of_gpu_memory_releases_what_it_does_not_read_and_fits_on_its_retry() {
+    let path = directory("out_of_memory_retry").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let document = chain([reader(&path), exposure(Some(1.0)), exposure(Some(2.0))]);
+    drop(run(&mut evaluator, &mut gpu, &key(&document, 2)));
+    // The upload's four planes and the first Exposure's three are alive; the second Exposure's
+    // three fit only once the upload's colour planes, which it does not read, are released.
+    let plane = 2 * size_of::<f32>() as u64;
+    assert_eq!(gpu.retained_bytes(), 7 * plane);
+    gpu.shortage.cap = Some(7 * plane);
+
+    let image = run(&mut evaluator, &mut gpu, &key(&document, 3));
+
+    assert_eq!(
+        gpu.retained_keys().len(),
+        2,
+        "the two Exposures, not the upload"
+    );
+    assert_eq!(gpu.retained_bytes(), 7 * plane);
+    let expected = Evaluator::new()
+        .evaluate(&key(&document, 3), || false)
+        .unwrap()
+        .unwrap();
+    for channel in Channel::ALL {
+        assert_eq!(
+            read_back(&gpu, &image, channel),
+            expected.plane(channel).to_vec()
+        );
+    }
+}
+
+#[test]
+fn a_request_out_of_gpu_memory_after_its_retry_fails_and_submits_nothing() {
+    let path = directory("out_of_memory").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
+    gpu.shortage.cap = Some(0);
+
+    let failed = evaluator.evaluate_on(&mut gpu, &key, || false).unwrap();
+
+    let Err(EvalError::OutOfGpuMemory { origin }) = failed else {
+        panic!("out of GPU memory, not {failed:?}");
+    };
+    assert!(Arc::ptr_eq(&origin.0, &key.0));
+    assert_eq!(gpu.submitted, 0);
+    assert!(gpu.retained_keys().is_empty());
+    gpu.shortage.cap = None;
+    run(&mut evaluator, &mut gpu, &key);
+}
+
+#[test]
+fn a_request_wgpu_rejects_fails_and_retains_nothing() {
+    let path = directory("rejected").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
+    let mut recorded = evaluator
+        .record_on(&mut gpu, &key, || false)
+        .unwrap()
+        .unwrap();
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 4,
+        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let (encoder, _) = recorded.encoder_and_image();
+    encoder.copy_buffer_to_buffer(&buffer, 0, &buffer, 0, 8);
+
+    let rejected = gpu.submit(recorded);
+
+    assert!(matches!(rejected, Err(EvalError::GpuValidation { .. })));
+    assert!(gpu.retained_keys().is_empty());
+    run(&mut evaluator, &mut gpu, &key);
 }

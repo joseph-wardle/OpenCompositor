@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::evaluate::GpuImage;
 use crate::image::Channel;
+use crate::worker::allocate;
 
 /// The format the viewer samples, as the CPU session stages it.
 pub(crate) const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -23,6 +24,9 @@ pub(crate) struct Conversion {
     /// Reused once nothing else holds them: wgpu clears every new storage texture, which would
     /// cost a 4K edit more than the conversion.
     textures: Vec<Arc<wgpu::Texture>>,
+    /// Tests' stand-in for the device having no memory for a display texture.
+    #[cfg(test)]
+    pub(crate) refuse: bool,
 }
 
 impl Conversion {
@@ -75,22 +79,25 @@ impl Conversion {
             pipeline,
             layout,
             textures: Vec::new(),
+            #[cfg(test)]
+            refuse: false,
         }
     }
 
     /// Records converting the image into a display texture, one nothing else holds or else a new
-    /// one, and returns it; `None` for an empty data window.
+    /// one, and returns it; `None` for an empty data window. Fails, recording nothing, if the GPU
+    /// has no memory for a new one.
     pub(crate) fn record(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         image: &GpuImage,
-    ) -> Option<Arc<wgpu::Texture>> {
+    ) -> Result<Option<Arc<wgpu::Texture>>, String> {
         let planes = Channel::ALL.map(|channel| image.texture(channel));
         let [Some(red), Some(green), Some(blue), Some(alpha)] = planes else {
-            return None;
+            return Ok(None);
         };
         let size = red.size();
-        let display = self.texture(size);
+        let display = self.texture(size)?;
         let view = |texture: &wgpu::Texture| texture.create_view(&Default::default());
         let views = [red, green, blue, alpha, &display].map(view);
         let entries: Vec<wgpu::BindGroupEntry> = (0..)
@@ -117,33 +124,40 @@ impl Conversion {
             1,
         );
         drop(pass);
-        Some(display)
+        Ok(Some(display))
     }
 
     /// A display texture of the size, which the caller overwrites whole. Unheld textures of other
     /// sizes are dropped.
-    fn texture(&mut self, size: wgpu::Extent3d) -> Arc<wgpu::Texture> {
+    fn texture(&mut self, size: wgpu::Extent3d) -> Result<Arc<wgpu::Texture>, String> {
         self.textures
             .retain(|texture| texture.size() == size || Arc::strong_count(texture) > 1);
         let unheld = (self.textures.iter())
             .find(|texture| texture.size() == size && Arc::strong_count(texture) == 1);
         if let Some(texture) = unheld {
-            return Arc::clone(texture);
+            return Ok(Arc::clone(texture));
         }
-        let texture = Arc::new(self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("display"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DISPLAY_FORMAT,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        }));
+        #[cfg(test)]
+        if self.refuse {
+            return Err("the GPU has no memory for the display copy".to_owned());
+        }
+        let texture = allocate(&self.device, "the display copy", || {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("display"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DISPLAY_FORMAT,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        })?;
+        let texture = Arc::new(texture);
         self.textures.push(Arc::clone(&texture));
-        texture
+        Ok(texture)
     }
 
     /// Drops every display texture nothing else holds, as when the viewer wants nothing.

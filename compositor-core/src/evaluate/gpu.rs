@@ -9,6 +9,7 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use opencompositor_kernels::{Exposure, Merge};
 
@@ -21,6 +22,9 @@ use crate::read::read_image;
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
 /// 6 GB beside the viewer's textures and the GUI's surfaces.
 const RETAINED_TEXTURE_BYTES_CAP: u64 = 2 << 30;
+
+/// How long waiting for the GPU to free memory sleeps between polls.
+const IDLE_POLL: Duration = Duration::from_millis(1);
 
 /// What every plane texture may be used for: read and written by the kernels, uploaded to, and
 /// copied from by the viewer, so that any released plane can serve any role.
@@ -47,6 +51,8 @@ pub struct GpuEvaluation {
     submitted: u64,
     completed: Arc<AtomicU64>,
     uploaded_bytes: u64,
+    #[cfg(test)]
+    shortage: tests::Shortage,
 }
 
 #[derive(Debug)]
@@ -66,6 +72,8 @@ impl GpuEvaluation {
             submitted: 0,
             completed: Arc::new(AtomicU64::new(0)),
             uploaded_bytes: 0,
+            #[cfg(test)]
+            shortage: tests::Shortage::default(),
         }
     }
 
@@ -76,6 +84,19 @@ impl GpuEvaluation {
         // A lost device fails the poll; the loss is noticed where the device is.
         let _ = self.device.poll(wgpu::PollType::Poll);
         self.completed.load(Ordering::Acquire) >= self.submitted
+    }
+
+    /// Waits without blocking until the GPU has completed evaluation's submissions, so that the
+    /// textures they used and nothing holds any longer are freed. False if `stop` returned true
+    /// first.
+    pub fn wait_until_idle(&self, stop: impl Fn() -> bool) -> bool {
+        while !self.idle() {
+            if stop() {
+                return false;
+            }
+            std::thread::sleep(IDLE_POLL);
+        }
+        true
     }
 
     /// The bytes of planes uploaded since this generation began.
@@ -124,23 +145,24 @@ impl GpuEvaluation {
     /// A plane over `window`'s size whose contents the caller overwrites: one of `released` of
     /// that size, else a new one. wgpu clears every new texture, which costs several times
     /// Exposure's own dispatch at 4K, so a request takes released planes first.
-    fn plane(&self, released: &mut Vec<GpuPlane>, window: Window) -> GpuPlane {
+    fn plane(&mut self, released: &mut Vec<GpuPlane>, window: Window) -> GpuPlane {
         let size = extent(window);
-        match released.iter().position(|plane| plane.0.size() == size) {
-            Some(index) => released.swap_remove(index),
-            None => GpuPlane(Arc::new(self.device.create_texture(
-                &wgpu::TextureDescriptor {
-                    label: Some("plane"),
-                    size,
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: PLANE_FORMAT,
-                    usage: PLANE_USAGE,
-                    view_formats: &[],
-                },
-            ))),
+        if let Some(index) = released.iter().position(|plane| plane.0.size() == size) {
+            return released.swap_remove(index);
         }
+        let texture = Arc::new(self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("plane"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PLANE_FORMAT,
+            usage: PLANE_USAGE,
+            view_formats: &[],
+        }));
+        #[cfg(test)]
+        self.shortage.made(&texture);
+        GpuPlane(texture)
     }
 
     /// Records the upload of a decoded image's planes, each distinct plane once, so that planes
@@ -221,10 +243,11 @@ impl GpuEvaluation {
                 mapped_at_creation: true,
             });
             {
-                let mut view = buffer
-                    .slice(..)
-                    .get_mapped_range_mut()
-                    .expect("a buffer mapped at creation");
+                // Mapping fails only when creating the buffer did, which the request's error
+                // scope reports.
+                let Ok(mut view) = buffer.slice(..).get_mapped_range_mut() else {
+                    continue;
+                };
                 // Mapped memory may be write-combining, so it is only written, a row at a time
                 // unless the rows need no padding.
                 if padded == row_bytes {
@@ -375,12 +398,16 @@ impl GpuEvaluation {
     }
 
     /// Submits a request recorded on this generation, retains what its recording chose, and
-    /// returns its image. Its completion is counted when the GPU reports it.
-    pub fn submit(&mut self, recorded: Recorded) -> GpuImage {
+    /// returns its image. Its completion is counted when the GPU reports it. Fails if wgpu
+    /// rejected anything in the submission, which then runs none of it, so that nothing is
+    /// retained.
+    pub fn submit(&mut self, recorded: Recorded) -> Result<GpuImage, EvalError> {
         let Recorded {
+            origin,
             encoder,
             image,
             to_retain,
+            validation,
         } = recorded;
         self.queue.submit([encoder.finish()]);
         self.submitted += 1;
@@ -388,8 +415,14 @@ impl GpuEvaluation {
         self.queue.on_submitted_work_done(move || {
             completed.fetch_max(number, Ordering::Release);
         });
+        if let Some(error) = pollster::block_on(validation.pop()) {
+            return Err(EvalError::GpuValidation {
+                origin,
+                message: error.to_string(),
+            });
+        }
         self.retained.extend(to_retain);
-        image
+        Ok(image)
     }
 
     /// The keys of the retained results, for planning a request before this is at hand.
@@ -464,12 +497,15 @@ impl GpuPlane {
 
 /// A request recorded on one generation and not yet submitted: [`GpuEvaluation::submit`]
 /// submits it and retains its results, and dropping it submits and retains nothing. Its caller
-/// may record more into the same submission, reading the image.
+/// may record more into the same submission, reading the image, on the same thread: the
+/// validation scope that decides whether its results are kept belongs to the thread.
 #[derive(Debug)]
 pub struct Recorded {
+    origin: ResultKey,
     encoder: wgpu::CommandEncoder,
     image: GpuImage,
     to_retain: Vec<GpuRetained>,
+    validation: wgpu::ErrorScopeGuard,
 }
 
 impl Recorded {
@@ -501,7 +537,7 @@ impl Evaluator {
         stop: impl Fn() -> bool,
     ) -> Option<Result<GpuImage, EvalError>> {
         let recorded = self.record_on(gpu, key, stop)?;
-        Some(recorded.map(|recorded| gpu.submit(recorded)))
+        Some(recorded.and_then(|recorded| gpu.submit(recorded)))
     }
 
     /// Reads the files of the Readers a request on a GPU retaining `on_gpu` would upload, unless
@@ -539,12 +575,39 @@ impl Evaluator {
 
     /// Records the image a key names on the GPU of `gpu`, as [`Evaluator::evaluate_on`] computes
     /// it, without submitting it.
+    ///
+    /// If the GPU has no memory for the request, this releases every retained GPU result the
+    /// request does not read, Reader uploads included, waits without blocking for the GPU to
+    /// free them, and records the request again, once. This is the one place that decides a
+    /// request's evaluation does not fit.
     pub fn record_on(
         &mut self,
         gpu: &mut GpuEvaluation,
         key: &ResultKey,
         stop: impl Fn() -> bool,
     ) -> Option<Result<Recorded, EvalError>> {
+        match self.record_attempt(gpu, key, &stop)? {
+            Err(EvalError::OutOfGpuMemory { .. }) => {}
+            recorded => return Some(recorded),
+        }
+        if !gpu.wait_until_idle(&stop) {
+            return None;
+        }
+        self.record_attempt(gpu, key, &stop)
+    }
+
+    /// Records the request once, or fails, out of GPU memory, having released every retained
+    /// GPU result the request does not read.
+    fn record_attempt(
+        &mut self,
+        gpu: &mut GpuEvaluation,
+        key: &ResultKey,
+        stop: impl Fn() -> bool,
+    ) -> Option<Result<Recorded, EvalError>> {
+        // Popped in reverse on every return. A creation that fails out of memory makes an
+        // invalid object, and recording with it a validation error, which then means nothing.
+        let validation = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let out_of_memory = gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let gpu_keys = gpu.retained_keys();
         let steps = self.plan(key, &gpu_keys);
         let held: Vec<Option<GpuImage>> = steps.iter().map(|step| gpu.find(&step.key)).collect();
@@ -563,6 +626,9 @@ impl Evaluator {
             }
         }
         let mut retained_bytes = gpu.retained_bytes();
+        let read: Vec<usize> = (0..steps.len())
+            .filter(|&index| needed[index] && held[index].is_some())
+            .collect();
         let mut kept: Vec<bool> = held.iter().map(Option::is_some).collect();
         let mut to_retain = Vec::new();
         let mut images: Vec<Option<GpuImage>> = held;
@@ -630,10 +696,25 @@ impl Evaluator {
             images[index] = Some(image);
         }
         let image = images.pop().flatten().expect("the requested image");
+        let short = pollster::block_on(out_of_memory.pop()).is_some();
+        #[cfg(test)]
+        let short = short | gpu.shortage.take_refusal();
+        if short {
+            drop((encoder, image, images, to_retain, released));
+            // Everything else, not just enough: the allocator returns memory to the driver only
+            // when a whole block of it empties, so releasing a few results may free nothing.
+            let read: Vec<&ResultKey> = read.iter().map(|&index| &steps[index].key).collect();
+            drop(gpu.release_except(&read));
+            return Some(Err(EvalError::OutOfGpuMemory {
+                origin: key.clone(),
+            }));
+        }
         Some(Ok(Recorded {
+            origin: key.clone(),
             encoder,
             image,
             to_retain,
+            validation,
         }))
     }
 

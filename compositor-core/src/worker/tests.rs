@@ -500,7 +500,7 @@ fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels(
     // Waiting for the buffer the test holds when the device is lost.
     worker.request(Some(on(1, key(&second))));
     wait_until_finishing(&worker);
-    worker.disconnect();
+    worker.disconnect(Instant::now());
 
     let evaluated = receive(&deliveries);
     assert_eq!(evaluated.wanted.key, key(&second));
@@ -767,4 +767,76 @@ fn dropping_a_gpu_session_worker_waits_for_its_gpu_phase() {
     // connection, on the dropping thread.
     let (texture, _) = converted(evaluated);
     assert_eq!(Arc::strong_count(&texture), 1);
+}
+
+#[test]
+fn a_display_copy_the_gpu_has_no_memory_for_cannot_be_shown_and_retains_nothing() {
+    let path = directory("gpu-display-short").join("image.png");
+    write_png(&path, 3, 2);
+    let (worker, deliveries, _, _) = gpu_worker();
+    worker.request(Some(on(1, exposed(&path, 1.0))));
+    // Held, as the viewer holds what it shows, so the next request needs a new display texture.
+    let (_shown, _) = converted(receive(&deliveries));
+    wait_until_out_of_gpu_phase(&worker);
+    let mut state = worker.mailbox.lock();
+    let on_device = state
+        .connection
+        .as_mut()
+        .unwrap()
+        .on_device
+        .as_mut()
+        .unwrap();
+    on_device.conversion.refuse = true;
+    drop(state);
+
+    worker.request(Some(on(1, exposed(&path, 2.0))));
+
+    let error = receive(&deliveries).result.unwrap_err();
+    assert!(matches!(error, ViewerError::CannotShow(_)), "{error}");
+    assert!(retained_on_gpu(&worker).is_empty());
+}
+
+#[test]
+fn moving_a_gpu_session_to_the_cpu_drops_its_gpu_state_and_stages_the_request_again() {
+    let path = directory("gpu-to-cpu").join("image.png");
+    write_png(&path, 3, 2);
+    let (worker, deliveries, _, _) = gpu_worker();
+    worker.request(Some(on(1, exposed(&path, 1.0))));
+    converted(receive(&deliveries));
+    assert!(!retained_on_gpu(&worker).is_empty());
+
+    worker.evaluate_on(EvaluationDevice::Cpu);
+
+    let again = receive(&deliveries);
+    assert_eq!(again.wanted.key, exposed(&path, 1.0));
+    staged(again);
+    assert!(retained_on_gpu(&worker).is_empty());
+    worker.evaluate_on(EvaluationDevice::Gpu);
+    converted(receive(&deliveries));
+}
+
+#[test]
+fn a_loss_counts_as_during_evaluation_only_until_the_gpu_completed_its_work() {
+    let path = directory("gpu-loss-during").join("image.png");
+    write_png(&path, 3, 2);
+    for lost_during in [true, false] {
+        let (worker, deliveries, device, queue) = gpu_worker();
+        worker.request(Some(on(1, exposed(&path, 1.0))));
+        converted(receive(&deliveries));
+        wait_until_out_of_gpu_phase(&worker);
+        let state = worker.mailbox.lock();
+        let submission = state.last_submission.as_ref().unwrap();
+        let completed = submission.completed.expect("seen complete");
+        let lost_at = if lost_during {
+            submission.at
+        } else {
+            completed + Duration::from_millis(1)
+        };
+        drop(state);
+
+        assert_eq!(worker.disconnect(lost_at), lost_during);
+        // Without a submission on the device connected now, a loss is not during evaluation.
+        connect(&worker, (device, queue), 2);
+        assert!(!worker.disconnect(Instant::now()));
+    }
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{Missing, NodeId, Slot, missing};
-use crate::evaluate::{ResultKey, result_key};
+use crate::evaluate::{EvalError, ResultKey, result_key};
 use crate::gpu::{Drawn, FrameCheck, FrameTiming, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
 use crate::panel::Panel;
@@ -87,8 +87,11 @@ pub enum Event {
     },
     /// An evaluation finished on the evaluator's thread.
     Evaluated(Evaluated),
-    /// The GPU device of the generation was lost.
-    DeviceLost(u64),
+    /// The GPU device of the generation was lost, when wgpu reported it.
+    DeviceLost {
+        generation: u64,
+        at: Instant,
+    },
     /// The time for the attempt, after [`Request::RetryDeviceCreation`].
     RetryDeviceCreation(u64),
 }
@@ -102,14 +105,14 @@ pub enum Event {
 )]
 pub enum Notice {
     Evaluated(Evaluated),
-    DeviceLost(u64),
+    DeviceLost { generation: u64, at: Instant },
 }
 
 impl From<Notice> for Event {
     fn from(notice: Notice) -> Event {
         match notice {
             Notice::Evaluated(evaluated) => Event::Evaluated(evaluated),
-            Notice::DeviceLost(generation) => Event::DeviceLost(generation),
+            Notice::DeviceLost { generation, at } => Event::DeviceLost { generation, at },
         }
     }
 }
@@ -202,6 +205,8 @@ pub enum Command {
     FitImage,
     /// Shows the viewed image one pixel to a physical pixel.
     ActualSize,
+    /// Evaluates on the device from now on, also after the app moved evaluation off the GPU.
+    EvaluateOn(EvaluationDevice),
 }
 
 /// The keys the window uses. The pane under the pointer receives all but the slot keys.
@@ -344,6 +349,27 @@ enum Drawing {
     Unavailable { attempt: u64, delay: Duration },
 }
 
+/// Losses of the device while evaluation had work on its GPU, since the artist last chose the
+/// GPU, after which evaluation moves to the CPU: likely its own work lost them. A heuristic: a
+/// display driver that fails during evaluation moves it too.
+const LOSSES_BEFORE_LEAVING_THE_GPU: u32 = 2;
+
+/// Why the app moved evaluation off the GPU the artist chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeftGpu {
+    OutOfMemory,
+    Lost,
+}
+
+impl fmt::Display for LeftGpu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LeftGpu::OutOfMemory => "the GPU ran out of memory",
+            LeftGpu::Lost => "the GPU device was lost twice during evaluation",
+        })
+    }
+}
+
 /// A device made after a loss: when, and after what wait.
 #[derive(Clone, Copy, Debug)]
 struct Recovered {
@@ -355,8 +381,12 @@ struct Recovered {
 pub struct App {
     session: Session,
     gpu: Gpu,
-    /// Where the worker evaluates, for the whole session.
+    /// Where the worker evaluates: where the artist chose, or the CPU once the GPU failed it.
     device: EvaluationDevice,
+    /// Why evaluation left the GPU, until the artist next chooses a device.
+    left_gpu: Option<LeftGpu>,
+    /// Losses while evaluation had work on the GPU since the artist last chose it.
+    losses_during_evaluation: u32,
     /// Nothing is delivered once the app has dropped.
     worker: Worker,
     /// What the worker was last asked for.
@@ -399,6 +429,8 @@ impl App {
             session: Session::new(),
             gpu: Gpu::new(waker),
             device,
+            left_gpu: None,
+            losses_during_evaluation: 0,
             worker: Worker::start(device, move |evaluated| {
                 deliver.wake(Notice::Evaluated(evaluated));
             }),
@@ -474,7 +506,7 @@ impl App {
             }
             Event::FilesChosen { intent, paths } => self.files_chosen(intent, paths),
             Event::Evaluated(evaluated) => self.evaluated(evaluated),
-            Event::DeviceLost(generation) => self.device_lost(generation),
+            Event::DeviceLost { generation, at } => self.device_lost(generation, at),
             Event::RetryDeviceCreation(attempt) => match self.drawing {
                 Drawing::Unavailable { attempt: last, .. } if attempt == last => {
                     let mut requests = self.make_device();
@@ -585,12 +617,19 @@ impl App {
 
     /// Retires the lost device, which stops the panes drawing, and requests the first attempt to
     /// replace it. A device lost before it worked for the longest wait counts as a failed
-    /// attempt, so that a device lost again at once is not rebuilt at once forever.
-    fn device_lost(&mut self, generation: u64) -> Vec<Request> {
+    /// attempt, so that a device lost again at once is not rebuilt at once forever. Evaluation
+    /// stays on the GPU, since nothing could show a CPU result meanwhile, unless this loss makes
+    /// too many while it had work there.
+    fn device_lost(&mut self, generation: u64, at: Instant) -> Vec<Request> {
         if !self.gpu.retire_lost_device(generation) {
             return Vec::new();
         }
-        self.worker.disconnect();
+        if self.worker.disconnect(at) && self.device == EvaluationDevice::Gpu {
+            self.losses_during_evaluation += 1;
+            if self.losses_during_evaluation >= LOSSES_BEFORE_LEAVING_THE_GPU {
+                self.leave_gpu(LeftGpu::Lost);
+            }
+        }
         let delay = match self.drawing {
             Drawing::Ready {
                 recovered: Some(recovered),
@@ -598,6 +637,13 @@ impl App {
             Drawing::Ready { .. } | Drawing::Unavailable { .. } => FIRST_RETRY,
         };
         vec![self.request_attempt(delay)]
+    }
+
+    /// Moves evaluation to the CPU, which evaluates the last request again, saying why.
+    fn leave_gpu(&mut self, why: LeftGpu) {
+        self.device = EvaluationDevice::Cpu;
+        self.left_gpu = Some(why);
+        self.worker.evaluate_on(EvaluationDevice::Cpu);
     }
 
     /// Makes a device for every pane with a native window, which the worker then uses. On
@@ -871,6 +917,13 @@ impl App {
                 }
                 vec![Request::Redraw(Pane::Viewer)]
             }
+            Command::EvaluateOn(device) => {
+                self.device = device;
+                self.left_gpu = None;
+                self.losses_during_evaluation = 0;
+                self.worker.evaluate_on(device);
+                Vec::new()
+            }
         }
     }
 
@@ -929,6 +982,15 @@ impl App {
     /// buffer to the worker.
     fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
         let Evaluated { wanted, result, .. } = evaluated;
+        // Not the node's failure, nor shown: the CPU evaluates the request again, and the last
+        // frame stays until it does. One evaluated on the GPU before a move to the CPU may
+        // still arrive.
+        if let Err(ViewerError::Eval(EvalError::OutOfGpuMemory { .. })) = result {
+            if self.device == EvaluationDevice::Gpu {
+                self.leave_gpu(LeftGpu::OutOfMemory);
+            }
+            return Vec::new();
+        }
         // Not only later: connecting the GPU delivers the request shown again, with its pixels.
         let not_older = (self.shown.wanted()).is_none_or(|shown| wanted.number >= shown.number);
         if self.session.viewed() != Some(wanted.node) || !not_older {
@@ -1062,11 +1124,14 @@ impl App {
         if details.is_empty() {
             details.push("empty".to_owned());
         }
+        let device = match self.left_gpu {
+            Some(why) => format!("{} ({why})", self.device),
+            None => self.device.to_string(),
+        };
         format!(
-            "Slot {slot} · {} · {} · {}",
+            "Slot {slot} · {} · {} · {device}",
             node.name(),
-            details.join("; "),
-            self.device
+            details.join("; ")
         )
     }
 }

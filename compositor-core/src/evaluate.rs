@@ -1042,6 +1042,16 @@ pub enum EvalError {
         /// The longest side the device's textures may have.
         side: u32,
     },
+    /// The GPU had no memory for the request, even after evaluation released every result the
+    /// request does not read. The origin is the requested key: memory belongs to no one node.
+    OutOfGpuMemory {
+        origin: ResultKey,
+    },
+    /// wgpu rejected the request's commands, a bug, so the GPU ran none of them.
+    GpuValidation {
+        origin: ResultKey,
+        message: String,
+    },
 }
 
 impl EvalError {
@@ -1052,7 +1062,9 @@ impl EvalError {
             | EvalError::Oversize { origin, .. }
             | EvalError::OverCap { origin, .. }
             | EvalError::NoGpuPath { origin }
-            | EvalError::BeyondDevice { origin, .. } => origin,
+            | EvalError::BeyondDevice { origin, .. }
+            | EvalError::OutOfGpuMemory { origin }
+            | EvalError::GpuValidation { origin, .. } => origin,
         }
     }
 }
@@ -1092,6 +1104,10 @@ impl fmt::Display for EvalError {
                  pixels on a side",
                 window.width, window.height
             ),
+            EvalError::OutOfGpuMemory { .. } => write!(f, "the GPU ran out of memory"),
+            EvalError::GpuValidation { message, .. } => {
+                write!(f, "the GPU refused the request: {message}")
+            }
         }
     }
 }
@@ -1104,7 +1120,9 @@ impl std::error::Error for EvalError {
             | EvalError::Oversize { .. }
             | EvalError::OverCap { .. }
             | EvalError::NoGpuPath { .. }
-            | EvalError::BeyondDevice { .. } => None,
+            | EvalError::BeyondDevice { .. }
+            | EvalError::OutOfGpuMemory { .. }
+            | EvalError::GpuValidation { .. } => None,
         }
     }
 }

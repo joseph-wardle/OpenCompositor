@@ -29,8 +29,7 @@ const LONGEST_GPU_WAIT: Duration = Duration::from_millis(100);
 /// present for as long.
 const COMPLETION_POLL: Duration = Duration::from_millis(1);
 
-/// Where a session evaluates. Every request runs on the one device, and results never mix
-/// devices.
+/// Where a session evaluates. Every request runs on one device, and results never mix devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvaluationDevice {
     /// The CPU, whose images are staged for the viewer.
@@ -246,7 +245,7 @@ pub struct Worker {
     mailbox: Arc<Mailbox>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Mailbox {
     state: Mutex<MailboxState>,
     changed: Condvar,
@@ -256,7 +255,7 @@ struct Mailbox {
 /// to the worker, which may still be running when the process exits: the last reference to a GPU
 /// object must not drop on its thread after the driver has begun tearing itself down. The worker
 /// holds them only in a GPU phase, which the worker's drop waits for.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MailboxState {
     /// A request the worker has not started: what the viewer wants, or `None` for nothing,
     /// which releases everything retained.
@@ -268,6 +267,19 @@ struct MailboxState {
     connection: Option<Connection>,
     /// Whether the worker is in a GPU phase, and so may hold GPU objects.
     in_gpu_phase: bool,
+    /// Where requests are evaluated from the next one started.
+    device: EvaluationDevice,
+    /// Evaluation's last submission in a GPU session, for telling whether a device was lost
+    /// while it had work on the GPU.
+    last_submission: Option<Submission>,
+}
+
+#[derive(Debug)]
+struct Submission {
+    generation: u64,
+    at: Instant,
+    /// When the worker saw the GPU complete it.
+    completed: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -305,7 +317,18 @@ impl Worker {
     /// Starts the worker, evaluating on `device`. It passes each result to `deliver` on its own
     /// thread.
     pub fn start(device: EvaluationDevice, deliver: impl Fn(Evaluated) + Send + 'static) -> Worker {
-        let mailbox = Arc::new(Mailbox::default());
+        let mailbox = Arc::new(Mailbox {
+            state: Mutex::new(MailboxState {
+                request: None,
+                started: None,
+                stopping: false,
+                connection: None,
+                in_gpu_phase: false,
+                device,
+                last_submission: None,
+            }),
+            changed: Condvar::new(),
+        });
         let worker = Arc::clone(&mailbox);
         std::thread::Builder::new()
             .name("evaluator".to_owned())
@@ -313,7 +336,7 @@ impl Worker {
             .spawn(move || {
                 let mut evaluator = Evaluator::new();
                 let mut sizing = StagingSizing::default();
-                while let Some(request) = worker.next() {
+                while let Some((request, device)) = worker.next() {
                     match (request, device) {
                         (Some(wanted), EvaluationDevice::Cpu) => {
                             evaluate(&worker, &mut evaluator, wanted, &deliver, &mut sizing);
@@ -354,10 +377,49 @@ impl Worker {
         }));
     }
 
-    /// Stops using the connected device, which was lost, and delivers the last request again,
-    /// without pixels in a CPU session, since a result finished for that device is dropped.
-    pub(crate) fn disconnect(&self) {
+    /// Stops using the connected device, which was lost at `lost_at`, and delivers the last
+    /// request again, without pixels in a CPU session, since a result finished for that device
+    /// is dropped. Returns whether evaluation had work on that device's GPU when it was lost.
+    pub(crate) fn disconnect(&self, lost_at: Instant) -> bool {
+        let state = self.mailbox.lock();
+        let lost = (state.connection.as_ref()).map(|connection| connection.generation);
+        let had_work = (state.last_submission.as_ref()).is_some_and(|submission| {
+            Some(submission.generation) == lost
+                && submission.at <= lost_at
+                && submission
+                    .completed
+                    .is_none_or(|completed| completed >= lost_at)
+        });
+        drop(state);
         self.replace_connection(None);
+        had_work
+    }
+
+    /// Evaluates on `device` from the next request, and delivers the last request again from
+    /// there. Leaving the GPU drops evaluation's state on it; leaving the CPU drops the staging
+    /// buffer, unless the viewer holds it.
+    pub(crate) fn evaluate_on(&self, device: EvaluationDevice) {
+        let mut state = self.mailbox.lock();
+        if state.device == device {
+            return;
+        }
+        state.device = device;
+        let left = state.connection.as_mut().map(|connection| {
+            let on_device = connection.on_device.take();
+            let staging = match connection.staging {
+                StagingSlot::Waiting(_) => {
+                    std::mem::replace(&mut connection.staging, StagingSlot::Empty)
+                }
+                StagingSlot::Empty | StagingSlot::Out => StagingSlot::Empty,
+            };
+            (on_device, staging)
+        });
+        if state.request.is_none() && state.started.is_some() {
+            state.request = Some(state.started.clone());
+        }
+        drop(state);
+        self.mailbox.changed.notify_all();
+        drop(left);
     }
 
     fn replace_connection(&self, connection: Option<Connection>) {
@@ -369,6 +431,19 @@ impl Worker {
         drop(state);
         self.mailbox.changed.notify_all();
         drop(replaced);
+    }
+}
+
+#[cfg(test)]
+impl Worker {
+    /// Records a submission on the generation that the GPU has not completed, as a request in
+    /// flight would.
+    pub(crate) fn submitting_on(&self, generation: u64) {
+        self.mailbox.lock().last_submission = Some(Submission {
+            generation,
+            at: Instant::now(),
+            completed: None,
+        });
     }
 }
 
@@ -401,14 +476,14 @@ impl Mailbox {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Waits for a request, or `None` once the worker is stopping.
-    fn next(&self) -> Option<Option<Wanted>> {
+    /// Waits for a request, and where to evaluate it, or `None` once the worker is stopping.
+    fn next(&self) -> Option<(Option<Wanted>, EvaluationDevice)> {
         self.wait_for(|state| {
             let Some(request) = state.request.take() else {
                 return Take::Wait;
             };
             state.started.clone_from(&request);
-            Take::Taken(request)
+            Take::Taken((request, state.device))
         })
     }
 
@@ -547,7 +622,8 @@ impl GpuPhase<'_> {
 
     /// Calls `use_on_device` with evaluation's state on the phase's device, taken out of the
     /// connection, or made if the connection has none yet, then returns it there, or drops it
-    /// if another device has been connected since. `None` without a device, or once replaced.
+    /// if another device has been connected since or evaluation has left the GPU. `None` without
+    /// a device, or once replaced.
     fn with_on_device<R>(
         &self,
         use_on_device: impl FnOnce(&mut OnDevice, &PhaseDevice) -> R,
@@ -568,8 +644,9 @@ impl GpuPhase<'_> {
         });
         let result = use_on_device(&mut on_device, device);
         let mut state = self.mailbox.lock();
+        let on_gpu = state.device == EvaluationDevice::Gpu;
         match &mut state.connection {
-            Some(connection) if connection.generation == device.generation => {
+            Some(connection) if connection.generation == device.generation && on_gpu => {
                 connection.on_device = Some(on_device);
             }
             _ => {
@@ -718,7 +795,9 @@ fn evaluate_on_gpu(
         return;
     }
     phase.with_on_device(|on_device, device| {
-        let Some(result) = record_and_submit(mailbox, evaluator, on_device, device, &wanted.key)
+        let stop = || mailbox.superseded() || phase.abandoned();
+        let Some(result) =
+            record_and_submit(mailbox, evaluator, on_device, device, &wanted.key, stop)
         else {
             return;
         };
@@ -729,20 +808,26 @@ fn evaluate_on_gpu(
         while !on_device.evaluation.idle() && !phase.abandoned() {
             mailbox.pause(COMPLETION_POLL);
         }
+        if on_device.evaluation.idle()
+            && let Some(submission) = &mut mailbox.lock().last_submission
+        {
+            submission.completed.get_or_insert_with(Instant::now);
+        }
     });
 }
 
 /// Records the key's request and its display conversion on the device, and submits them as one,
-/// unless the request is superseded first, which records or submits nothing more.
+/// unless `stop` returns true first, which records or submits nothing more.
 fn record_and_submit(
     mailbox: &Mailbox,
     evaluator: &mut Evaluator,
     on_device: &mut OnDevice,
     device: &PhaseDevice,
     key: &ResultKey,
+    stop: impl Fn() -> bool,
 ) -> Option<Result<ViewerImage, ViewerError>> {
     let recorded = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        evaluator.record_on(&mut on_device.evaluation, key, || mailbox.superseded())
+        evaluator.record_on(&mut on_device.evaluation, key, &stop)
     }));
     let mut recorded = match recorded {
         Ok(None) => return None,
@@ -759,11 +844,35 @@ fn record_and_submit(
         }
     };
     let (encoder, image) = recorded.encoder_and_image();
-    let texture = on_device.conversion.record(encoder, image);
-    if mailbox.superseded() {
+    let texture = match on_device.conversion.record(encoder, image) {
+        Ok(texture) => texture,
+        // As evaluation retries: everything the request does not read released, then once more.
+        // The request itself holds what it reads.
+        Err(_) => {
+            on_device.conversion.release_unheld();
+            on_device.evaluation.release_all();
+            if !on_device.evaluation.wait_until_idle(&stop) {
+                return None;
+            }
+            let (encoder, image) = recorded.encoder_and_image();
+            match on_device.conversion.record(encoder, image) {
+                Ok(texture) => texture,
+                Err(reason) => return Some(Err(ViewerError::CannotShow(reason))),
+            }
+        }
+    };
+    if stop() {
         return None;
     }
-    let image = on_device.evaluation.submit(recorded);
+    mailbox.lock().last_submission = Some(Submission {
+        generation: device.generation,
+        at: Instant::now(),
+        completed: None,
+    });
+    let image = match on_device.evaluation.submit(recorded) {
+        Ok(image) => image,
+        Err(error) => return Some(Err(ViewerError::Eval(error))),
+    };
     Some(Ok(ViewerImage {
         info: image.info().clone(),
         pixels: texture.map(|texture| Pixels::Converted {
@@ -970,7 +1079,11 @@ fn staging_buffer(device: &wgpu::Device, size: u64) -> Result<wgpu::Buffer, Stri
 
 /// Makes a buffer or texture, failing if the GPU has no memory for it. wgpu reports that for
 /// these without losing the device, so it fails one image rather than the session.
-fn allocate<T>(device: &wgpu::Device, what: &str, make: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn allocate<T>(
+    device: &wgpu::Device,
+    what: &str,
+    make: impl FnOnce() -> T,
+) -> Result<T, String> {
     // Error scopes belong to the thread that pushes them, so the GUI thread's errors stay out.
     let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let made = make();
