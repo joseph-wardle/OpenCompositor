@@ -455,13 +455,16 @@ impl Mailbox {
 
     /// Waits for a request, and where to evaluate it, or `None` once the worker is stopping.
     fn next(&self) -> Option<(Option<Wanted>, EvaluationDevice)> {
-        self.wait_for(|state| {
+        let next = self.wait_for(|state| {
             let Some(request) = state.request.take() else {
                 return Take::Wait;
             };
             state.started.clone_from(&request);
             Take::Taken((request, state.device))
-        })
+        });
+        // For waits on the request being started, which only tests make.
+        self.changed.notify_all();
+        next
     }
 
     /// Waits for the device's staging buffer to come back and takes it, or takes its empty slot

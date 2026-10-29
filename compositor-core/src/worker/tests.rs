@@ -71,13 +71,31 @@ fn receive(deliveries: &Receiver<Evaluated>) -> Evaluated {
         .expect("the worker delivers")
 }
 
+/// Waits until `done` holds of the mailbox, checking it each time the state changes, failing
+/// after a generous while.
+fn wait_until(worker: &Worker, what: &str, done: impl Fn(&MailboxState) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut state = worker.mailbox.lock();
+    while !done(&state) {
+        let left = (deadline.checked_duration_since(Instant::now()))
+            .unwrap_or_else(|| panic!("the worker never {what}"));
+        state = (worker.mailbox.changed.wait_timeout(state, left))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+}
+
 /// Waits until the worker has started the last request.
 fn wait_until_started(worker: &Worker) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while worker.mailbox.lock().request.is_some() {
-        assert!(Instant::now() < deadline, "the worker never started");
-        std::thread::yield_now();
-    }
+    wait_until(worker, "started", |state| state.request.is_none());
+}
+
+/// Waits until the worker has started the last request and finished with it, once it is past
+/// evaluating: nothing it does for that request remains to be delivered.
+fn wait_until_done_after_evaluating(worker: &Worker) {
+    wait_until(worker, "finished", |state| {
+        state.request.is_none() && !state.in_gpu_phase
+    });
 }
 
 #[test]
@@ -282,10 +300,12 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     );
     let first_buffer = buffer(&first).clone();
 
-    // Held by the GUI, the buffer is not the worker's to write.
+    // Held by the GUI, the buffer is not the worker's to write: it waits in its GPU phase,
+    // which an image only leaves staged, and stages into that buffer once it returns.
     worker.request(Some(on(1, key(&other))));
+    wait_until_finishing(&worker);
     assert!(
-        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        deliveries.try_recv().is_err(),
         "staged while the buffer was held"
     );
     drop(first);
@@ -363,16 +383,9 @@ fn an_image_larger_than_the_gpu_allows_is_read_but_cannot_be_shown() {
 
 /// Waits until the worker has started the last request and is staging or delivering it.
 fn wait_until_finishing(worker: &Worker) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let state = worker.mailbox.lock();
-        if state.request.is_none() && state.in_gpu_phase {
-            break;
-        }
-        drop(state);
-        assert!(Instant::now() < deadline, "the worker never began staging");
-        std::thread::yield_now();
-    }
+    wait_until(worker, "began staging", |state| {
+        state.request.is_none() && state.in_gpu_phase
+    });
 }
 
 #[test]
@@ -395,8 +408,9 @@ fn a_newer_request_for_another_node_ends_the_wait_for_the_staging_buffer() {
     assert_eq!(evaluated.wanted.key, missing("missing"));
     assert!(evaluated.result.is_err());
     drop(held);
+    wait_until_done_after_evaluating(&worker);
     assert!(
-        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        deliveries.try_recv().is_err(),
         "the abandoned image was delivered"
     );
 }
@@ -516,8 +530,9 @@ fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels(
     assert_eq!(evaluated.wanted.key, key(&second));
     assert!(evaluated.result.unwrap().pixels.is_none());
     drop(held);
+    wait_until_done_after_evaluating(&worker);
     assert!(
-        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        deliveries.try_recv().is_err(),
         "the image finishing for the lost device was delivered"
     );
 }
@@ -631,11 +646,7 @@ fn exposed(path: &Path, stops: f64) -> ResultKey {
 
 /// Waits until the worker has left its GPU phase.
 fn wait_until_out_of_gpu_phase(worker: &Worker) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while worker.mailbox.lock().in_gpu_phase {
-        assert!(Instant::now() < deadline, "the GPU phase never ended");
-        std::thread::yield_now();
-    }
+    wait_until(worker, "left its GPU phase", |state| !state.in_gpu_phase);
 }
 
 /// The keys retained on the connected device.
@@ -718,11 +729,13 @@ fn asking_for_nothing_releases_everything_on_the_gpu() {
 
     worker.request(None);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !retained_on_gpu(&worker).is_empty() {
-        assert!(Instant::now() < deadline, "nothing was released");
-        std::thread::yield_now();
-    }
+    // The evaluation is the phase's while it lasts, so retained keys are read outside one.
+    wait_until(&worker, "released everything", |state| {
+        let retained = (state.connection.as_ref())
+            .and_then(|connection| connection.evaluation.as_ref())
+            .map_or(0, |evaluation| evaluation.retained_keys().len());
+        state.request.is_none() && !state.in_gpu_phase && retained == 0
+    });
 }
 
 #[test]

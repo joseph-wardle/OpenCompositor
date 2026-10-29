@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use opencompositor_kernels::ulp_distance;
 
@@ -46,19 +45,6 @@ fn texture_bytes(texture: &wgpu::Texture) -> u64 {
     u64::from(size.width) * u64::from(size.height) * size_of::<f32>() as u64
 }
 
-/// Waits for the GPU to complete evaluation's submissions by polling without blocking, as the
-/// worker will, failing after a generous while.
-fn wait_until_idle(gpu: &GpuEvaluation) {
-    let start = Instant::now();
-    while !gpu.idle() {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "the GPU completes evaluation's work"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
 fn run(evaluator: &mut Evaluator, gpu: &mut GpuEvaluation, key: &ResultKey) -> GpuImage {
     evaluator
         .evaluate_on(gpu, key, || false)
@@ -66,13 +52,18 @@ fn run(evaluator: &mut Evaluator, gpu: &mut GpuEvaluation, key: &ResultKey) -> G
         .expect("the request runs on the GPU")
 }
 
-/// The channel's values, read back once evaluation's work is complete.
+/// The channel's values. The read back waits for every earlier submission, so evaluation is
+/// idle afterwards: its completion callbacks have run.
 fn read_back(gpu: &GpuEvaluation, image: &GpuImage, channel: Channel) -> Vec<f32> {
-    wait_until_idle(gpu);
     let texture = image
         .texture(channel)
         .expect("a texture over the data window");
-    headless::readback(&gpu.device, &gpu.queue, texture)
+    let values = headless::readback(&gpu.device, &gpu.queue, texture);
+    assert!(
+        gpu.idle(),
+        "evaluation's work completed before the read back"
+    );
+    values
 }
 
 /// Values for every sample of an image of `count` samples: the special values Exposure must
