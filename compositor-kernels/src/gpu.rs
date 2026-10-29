@@ -192,9 +192,11 @@ fn line_direct<L: LineReduce>(id: UVec3, params: &LineParams<L>, input: &Input, 
 /// One pass of a line reduction for wide windows, a workgroup per block of `l = 2 t - 1` padded
 /// samples of each of [`crate::scan_lines`] adjacent lines: the core of the window starting at
 /// offset `k` of block `j` is that block's suffix from `k` and block `j + 1`'s first `k`
-/// samples. Each line's invocations reduce runs of the block's offsets in order, and each
-/// carries the totals of its line's runs before and after its own, so every core combines
-/// exactly its window's samples, as a direct reduction would.
+/// samples. The workgroup takes the block in segments of [`crate::scan_segment`] offsets, the
+/// whole block where the lines' blocks fit its memory together. In each segment a line's
+/// invocations reduce runs of offsets in order, and each carries the totals of the line's
+/// runs and segments before and after its own, so every core combines exactly its window's
+/// samples, as a direct reduction would.
 ///
 /// Dispatched as (blocks, groups of lines): block `j` writes outputs `j l - 1 .. (j + 1) l - 1`.
 fn line_scan<L: LineReduce>(
@@ -205,6 +207,7 @@ fn line_scan<L: LineReduce>(
     output: &Output,
     block: &mut [f32; 2752],
     totals: &mut [f32; 512],
+    segments: &mut [f32; 256],
 ) {
     // A copy out of the storage buffer, whose fields the loops would otherwise reread; it
     // slowed the direct pass, so only here.
@@ -220,87 +223,142 @@ fn line_scan<L: LineReduce>(
     } else {
         (params.height as i32, params.width as i32)
     };
-    // The block holds the lines' samples interleaved, offset `k` of the group's line `c` at
-    // `k across + c`, and invocation `i` reduces run `i / across` of line `i % across`.
+    // The block holds a segment of the lines' samples interleaved, offset `k` of the group's
+    // line `c` at `k across + c`, and invocation `i` reduces run `i / across` of line
+    // `i % across`.
     let across = crate::scan_lines(op.t()) as i32;
+    let span = crate::scan_segment(op.t()) as i32;
     let runs = threads / across;
     let i = local.x as i32;
     let c = i % across;
-    let line = group.y as i32 * across + c;
-    let start = group.x as i32 * l;
-    let run = (l + runs - 1) / runs;
-    let first = ((i / across) * run).min(l);
-    let last = (first + run).min(l);
+    let r = i / across;
+    let line = group.x as i32 * across + c;
+    let inside = line < lines;
+    let start = group.y as i32 * l;
+    let run = (span + runs - 1) / runs;
+    let segmented = span < l;
 
-    let mut n = i;
-    while n < across * l {
-        let line = group.y as i32 * across + n % across;
-        block[n as usize] = if line < lines {
-            padded(input, reach, line, start + n / across)
+    // Each segment's total after the first, from its end, then in its place the total of the
+    // segments after it.
+    let mut g = 1 + r;
+    while g * span < l {
+        let mut total = op.identity::<f32>();
+        if inside {
+            let mut k = (g * span + span).min(l) - 1;
+            while k >= g * span {
+                total = op.combine(total, padded(input, reach, line, start + k));
+                k -= 1;
+            }
+        }
+        segments[(g * across + c) as usize] = total;
+        g += runs;
+    }
+    if segmented {
+        workgroup_memory_barrier_with_group_sync();
+    }
+    if segmented && r == 0 {
+        let mut after = op.identity::<f32>();
+        let mut g = (l + span - 1) / span - 1;
+        while g > 0 {
+            let own = segments[(g * across + c) as usize];
+            segments[(g * across + c) as usize] = after;
+            after = op.combine(after, own);
+            g -= 1;
+        }
+        segments[c as usize] = after;
+    }
+    // The total of block `j + 1`'s samples before the segment.
+    let mut before = op.identity::<f32>();
+    let mut from = 0;
+    while from < l {
+        let len = span.min(l - from);
+        if from > 0 {
+            // The previous segment's invocations are done with the block and the totals.
+            workgroup_memory_barrier_with_group_sync();
+        }
+        let mut n = i;
+        while n < across * len {
+            let line = group.x as i32 * across + n % across;
+            block[n as usize] = if line < lines {
+                padded(input, reach, line, start + from + n / across)
+            } else {
+                op.identity::<f32>()
+            };
+            n += threads;
+        }
+        workgroup_memory_barrier_with_group_sync();
+        let first = (r * run).min(len);
+        let last = (first + run).min(len);
+        let mut suffix = op.identity::<f32>();
+        let mut k = last - 1;
+        while k >= first {
+            suffix = op.combine(suffix, block[(k * across + c) as usize]);
+            k -= 1;
+        }
+        let mut prefix = op.identity::<f32>();
+        if inside {
+            for k in first..last {
+                prefix = op.combine(prefix, padded(input, reach, line, start + l + from + k));
+            }
+        }
+        totals[i as usize] = suffix;
+        totals[(threads + i) as usize] = prefix;
+        workgroup_memory_barrier_with_group_sync();
+        // The suffix carried in is the total of the line's samples after this run, in later
+        // runs and segments, and the prefix the total of those before it.
+        let mut suffix = if segmented {
+            segments[((from / span) * across + c) as usize]
         } else {
             op.identity::<f32>()
         };
-        n += threads;
-    }
-    workgroup_memory_barrier_with_group_sync();
-    let mut suffix = op.identity::<f32>();
-    let mut k = last - 1;
-    while k >= first {
-        suffix = op.combine(suffix, block[(k * across + c) as usize]);
-        k -= 1;
-    }
-    let mut prefix = op.identity::<f32>();
-    if line < lines {
-        for k in first..last {
-            prefix = op.combine(prefix, padded(input, reach, line, start + l + k));
+        let mut m = threads - across + c;
+        while m > i {
+            suffix = op.combine(suffix, totals[m as usize]);
+            m -= across;
         }
-    }
-    totals[i as usize] = suffix;
-    totals[(threads + i) as usize] = prefix;
-    workgroup_memory_barrier_with_group_sync();
-    if line >= lines {
-        return;
-    }
-    // The suffix carried in is the total of the line's runs after this one, and the prefix the
-    // total of those before it.
-    let mut suffix = op.identity::<f32>();
-    let mut m = threads - across + c;
-    while m > i {
-        suffix = op.combine(suffix, totals[m as usize]);
-        m -= across;
-    }
-    let mut prefix = op.identity::<f32>();
-    let mut m = c;
-    while m < i {
-        prefix = op.combine(prefix, totals[(threads + m) as usize]);
-        m += across;
-    }
-    // The block's suffixes over this run, in place.
-    let mut k = last - 1;
-    while k >= first {
-        let at = (k * across + c) as usize;
-        suffix = op.combine(suffix, block[at]);
-        block[at] = suffix;
-        k -= 1;
-    }
-    for k in first..last {
-        // The window of output `o = start + k - 1` ends at `o + 2 t = start + l + k`, the next
-        // block's sample that enters the prefix after it.
-        let entering = padded(input, reach, line, start + l + k);
-        let o = start + k - 1;
-        if o >= 0 && o < extent {
-            let core = op.combine(block[(k * across + c) as usize], prefix);
-            let first = padded(input, reach, line, o);
-            // SAFETY: `o` is inside the output along the axis and `line` across it, which the
-            // host dispatches no further than, and the output is R32Float.
-            unsafe {
-                output.write(
-                    along(params.axis, line, o),
-                    op.finish(core, first, entering),
-                )
-            };
+        let mut prefix = before;
+        let mut m = c;
+        while m < i {
+            prefix = op.combine(prefix, totals[(threads + m) as usize]);
+            m += across;
         }
-        prefix = op.combine(prefix, entering);
+        if from + span < l {
+            before = prefix;
+            while m < threads {
+                before = op.combine(before, totals[(threads + m) as usize]);
+                m += across;
+            }
+        }
+        if inside {
+            // The segment's suffixes over this run, in place.
+            let mut k = last - 1;
+            while k >= first {
+                let at = (k * across + c) as usize;
+                suffix = op.combine(suffix, block[at]);
+                block[at] = suffix;
+                k -= 1;
+            }
+            for k in first..last {
+                // The window of output `o = start + from + k - 1` ends at `o + 2 t`, the next
+                // block's sample that enters the prefix after it.
+                let entering = padded(input, reach, line, start + l + from + k);
+                let o = start + from + k - 1;
+                if o >= 0 && o < extent {
+                    let core = op.combine(block[(k * across + c) as usize], prefix);
+                    let first = padded(input, reach, line, o);
+                    // SAFETY: `o` is inside the output along the axis and `line` across it,
+                    // and the output is R32Float.
+                    unsafe {
+                        output.write(
+                            along(params.axis, line, o),
+                            op.finish(core, first, entering),
+                        )
+                    };
+                }
+                prefix = op.combine(prefix, entering);
+            }
+        }
+        from += span;
     }
 }
 
@@ -385,6 +443,7 @@ pub fn blur_scan(
     #[spirv(descriptor_set = 0, binding = 2)] output: &Output,
     #[spirv(workgroup)] block: &mut [f32; 2752], // SCAN_BLOCK
     #[spirv(workgroup)] totals: &mut [f32; 512], // 2 SCAN_THREADS
+    #[spirv(workgroup)] segments: &mut [f32; 256], // SCAN_MIN_LINES²
 ) {
-    line_scan(group, local, params, input, output, block, totals);
+    line_scan(group, local, params, input, output, block, totals, segments);
 }

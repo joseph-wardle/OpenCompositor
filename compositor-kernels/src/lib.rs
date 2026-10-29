@@ -20,7 +20,7 @@ pub mod primitives;
 pub use blur::{BoxPass, BoxSum};
 pub use primitives::{
     Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Params, Placement,
-    Real, SCAN_BLOCK, SCAN_THREADS, WORKGROUP, scan_lines,
+    Real, SCAN_BLOCK, SCAN_MIN_LINES, SCAN_THREADS, WORKGROUP, scan_lines, scan_segment,
 };
 
 /// `a * b + c` with one rounding: std's `mul_add` on the host, and on SPIR-V libm's `fmaf`,

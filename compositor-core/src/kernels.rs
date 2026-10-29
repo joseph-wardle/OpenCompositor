@@ -226,7 +226,7 @@ impl Kernels {
                     Axis::Columns => (size.height, size.width),
                 };
                 let blocks = extent / (2 * op.t() - 1) + 1;
-                let groups = [blocks, lines.div_ceil(scan_lines(op.t()))];
+                let groups = [lines.div_ceil(scan_lines(op.t())), blocks];
                 self.dispatch(encoder, L::SCAN, &params, &[source], &[written], groups);
             }
             if let Some(previous) = std::mem::replace(&mut current, target) {
@@ -1179,7 +1179,8 @@ mod tests {
     #[test]
     fn the_scan_fits_the_default_workgroup_memory_and_the_widest_blur() {
         let threads = opencompositor_kernels::SCAN_THREADS;
-        let bytes = (SCAN_BLOCK + 2 * threads) * 4;
+        let segments = opencompositor_kernels::SCAN_MIN_LINES.pow(2);
+        let bytes = (SCAN_BLOCK + 2 * threads + segments) * 4;
         let limits = wgpu::Limits::default();
         let limit = limits.max_compute_workgroup_storage_size;
         assert!(
@@ -1190,6 +1191,7 @@ mod tests {
         assert!(threads <= limits.max_compute_workgroup_size_x);
         let widest = BoxSum::new(BoxPass::new(4096.0));
         assert!(2 * widest.t() <= SCAN_BLOCK, "t = {}", widest.t());
+        assert_eq!(SCAN_BLOCK % opencompositor_kernels::SCAN_MIN_LINES, 0);
     }
 
     /// The GPU's K for a box pass: an f32 sum's worst case grows with the tap count, and 256
