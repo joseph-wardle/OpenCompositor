@@ -1,13 +1,12 @@
 //! Blur on the CPU: each plane's three box passes along its rows into a scratch plane, then
-//! along the scratch plane's columns into the output, which the reach grows on every side.
+//! along the scratch plane's columns into the output, which the reach grows on every side,
+//! each axis one line reduction.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use opencompositor_kernels::{Axis, BoxPass, BoxSum};
 
-use opencompositor_kernels::BoxPass;
-
-use crate::evaluate::{Columns, EvalError, NODE_BYTES_CAP, Pool, ResultKey, output_plane};
+use crate::evaluate::{EvalError, NODE_BYTES_CAP, Pool, ResultKey, output_plane};
 use crate::image::{Image, Plane, Window};
-use crate::kernels::cpu::{self, BLUR_BAND, BLUR_ROWS, BoxScratch, Level};
+use crate::kernels::cpu::{self, Stopped};
 
 /// Blur's image: its source blurred by `size`, every channel through the same passes, over the
 /// source's data window grown by the reach, with the display window and warnings the source's.
@@ -66,7 +65,6 @@ pub(super) fn blur(
     });
     let scratch_len = scratch_window.area() as usize;
     let mut scratch = output_plane(released, scratch_len, scratch_len);
-    let skipped = AtomicBool::new(false);
     for (plane, output) in source.planes().iter().zip(&mut blurred) {
         let Some(output) = output else { continue };
         let planes = Planes {
@@ -76,8 +74,7 @@ pub(super) fn blur(
                 .get_mut()
                 .expect("nothing else holds an output plane"),
         };
-        blur_plane(pool, pass, input, planes, stop, &skipped);
-        if skipped.load(Ordering::Relaxed) {
+        if blur_plane(pool, pass, input, planes, stop).is_err() {
             released.push(scratch);
             return Ok(None);
         }
@@ -92,13 +89,12 @@ pub(super) fn blur(
     )))
 }
 
-/// The most bytes one thread's temporaries hold over `input`: the rows pass's, or the columns
-/// pass's with the band gathered and its results.
+/// The most bytes one thread's temporaries hold over `input`: the rows pass's or the columns
+/// pass's.
 pub(super) fn thread_scratch_bytes(pass: BoxPass, input: Window) -> u64 {
-    let (width, height) = (input.width as usize, input.height as usize);
-    let grown = height as u64 + 2 * u64::from(pass.reach());
-    let band = (height as u64 + grown) * BLUR_BAND as u64 * 4;
-    cpu::box_scratch_bytes(pass, width).max(cpu::box_scratch_bytes(pass, height) + band)
+    let op = BoxSum::new(pass);
+    let along = |len: u32| cpu::line_scratch_bytes(&op, BoxPass::PASSES, len as usize);
+    along(input.width).max(along(input.height))
 }
 
 /// One plane's source over the input window, the scratch plane of the grown width and the
@@ -110,95 +106,37 @@ struct Planes<'a> {
 }
 
 /// The passes over one plane: the rows of `src` into `scratch`, then the columns of `scratch`
-/// into `dst`, each over the pool. Sets `skipped` and leaves the rest undone once `stop` says
-/// to.
+/// into `dst`, each over the pool, leaving the rest undone once `stop` says to.
 fn blur_plane(
     pool: &Pool,
     pass: BoxPass,
     input: Window,
     planes: Planes<'_>,
     stop: &(dyn Fn() -> bool + Sync),
-    skipped: &AtomicBool,
-) {
+) -> Result<(), Stopped> {
     let Planes { src, scratch, dst } = planes;
-    let width = input.width as usize;
-    let height = input.height as usize;
+    let op = BoxSum::new(pass);
+    let (width, height) = (input.width as usize, input.height as usize);
     let grown = width + 2 * pass.reach() as usize;
-    pool.fill_rows_with(
-        [scratch],
-        grown,
-        BLUR_ROWS,
-        BoxScratch::default,
-        |scratch, level, first_row, [dst]| {
-            if stop() {
-                skipped.store(true, Ordering::Relaxed);
-                return;
-            }
-            let rows = dst.len() / grown;
-            let src = &src[first_row * width..(first_row + rows) * width];
-            cpu::blur_rows(level, pass, src, width, dst, scratch);
-        },
-    );
-    if skipped.load(Ordering::Relaxed) {
-        return;
-    }
-    let scratch: &[f32] = scratch;
-    pool.fill_columns(
+    let passes = BoxPass::PASSES;
+    cpu::line(
+        pool,
+        &op,
+        Axis::Rows,
+        passes,
+        src,
+        (width, height),
+        scratch,
+        stop,
+    )?;
+    cpu::line(
+        pool,
+        &op,
+        Axis::Columns,
+        passes,
+        scratch,
+        (grown, height),
         dst,
-        grown,
-        BLUR_BAND,
-        BandScratch::default,
-        |state, level, band| {
-            if stop() {
-                skipped.store(true, Ordering::Relaxed);
-                return;
-            }
-            band_passes(level, pass, scratch, grown, height, band, state);
-        },
-    );
-}
-
-/// A thread's temporaries for the columns: the kernel's, the band gathered from the scratch
-/// plane's rows and the band's results.
-#[derive(Debug, Default)]
-pub struct BandScratch {
-    kernel: BoxScratch,
-    gathered: Vec<f32>,
-    results: Vec<f32>,
-}
-
-/// One band's passes: its columns gathered from the `height` rows of `scratch`, `stride` samples
-/// long, the kernel over the band, and its results written to the output's rows.
-pub fn band_passes(
-    level: Level,
-    pass: BoxPass,
-    scratch: &[f32],
-    stride: usize,
-    height: usize,
-    mut band: Columns<'_>,
-    state: &mut BandScratch,
-) {
-    let columns = band.columns();
-    let lanes = columns.len();
-    state.gathered.resize(height * BLUR_BAND, 0.0);
-    let (gathered, _) = state.gathered.as_chunks_mut::<BLUR_BAND>();
-    for (y, row) in gathered.iter_mut().enumerate() {
-        row[..lanes]
-            .copy_from_slice(&scratch[y * stride + columns.start..y * stride + columns.end]);
-        // The last band's missing lanes, which may hold an earlier band's samples.
-        row[lanes..].fill(0.0);
-    }
-    let grown = height + 2 * pass.reach() as usize;
-    state.results.resize(grown * BLUR_BAND, 0.0);
-    cpu::blur_band(
-        level,
-        pass,
-        &state.gathered,
-        &mut state.results,
-        &mut state.kernel,
-    );
-    let (results, _) = state.results.as_chunks::<BLUR_BAND>();
-    for (y, row) in results.iter().enumerate() {
-        band.write_row(y, &row[..lanes]);
-    }
+        stop,
+    )
 }

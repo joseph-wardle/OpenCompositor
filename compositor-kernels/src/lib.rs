@@ -1,9 +1,10 @@
-//! Per-pixel functions shared by OpenCompositor's CPU and GPU kernels, and the GPU entry points
-//! built on them.
+//! Each operation OpenCompositor computes, written once against the execution primitives in
+//! [`primitives`], with the per-sample functions they apply and, compiled to SPIR-V, the GPU
+//! halves of the primitives in the `gpu` module.
 //!
-//! Each operation's CPU result is its definition; its GPU entry point must land within the
+//! Each operation's CPU result is its definition; its GPU result must land within the
 //! operation's ULP bound of that result, measured by [`ulp_distance`]. Nothing here owns an
-//! image, allocates or spawns threads: the CPU shells and the GPU dispatch live in
+//! image, allocates or spawns threads: the primitives' CPU halves and the GPU dispatch live in
 //! compositor-core, and the entry points are compiled to SPIR-V by the builder in `shaders/`.
 #![no_std]
 
@@ -12,8 +13,15 @@
 extern crate std;
 
 mod blur;
+#[cfg(target_arch = "spirv")]
+pub mod gpu;
+pub mod primitives;
 
-pub use blur::BoxPass;
+pub use blur::{BoxPass, BoxSum};
+pub use primitives::{
+    Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Params, Placement,
+    Real, SCAN_BLOCK, SCAN_THREADS, WORKGROUP,
+};
 
 /// `a * b + c` with one rounding: std's `mul_add` on the host, and on SPIR-V libm's `fmaf`,
 /// which rust-gpu lowers to the GLSL `Fma` instruction. The host result is always fused, so the
@@ -80,18 +88,70 @@ const SIGN: u32 = 1 << 31;
 #[cfg(not(target_arch = "spirv"))]
 pub const SPIRV: &[u8] = include_bytes!("../kernels.spv");
 
-/// Exposure's entry point in [`SPIRV`]: rust-gpu names each one by its path in this crate.
-pub const EXPOSURE_ENTRY: &str = "gpu::exposure";
+/// Exposure: one sample times the gain, each colour plane through the map.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Exposure {
+    pub gain: f32,
+}
 
-/// Over's entry point in [`SPIRV`].
-pub const OVER_ENTRY: &str = "gpu::over";
+// SAFETY: `#[repr(C)]`, four-byte fields.
+unsafe impl Params for Exposure {}
 
-/// The box pass's entry point in [`SPIRV`].
-pub const BOX_PASS_ENTRY: &str = "gpu::box_pass";
+impl Map<1, 1> for Exposure {
+    const ENTRY: &'static str = "gpu::exposure";
 
-/// The entry points' workgroup is this many invocations on each side; their `threads` must say
-/// the same, since the host dispatches `ceil(width / WORKGROUP)` by `ceil(height / WORKGROUP)`.
-pub const WORKGROUP: u32 = 16;
+    #[inline(always)]
+    fn apply(&self, [v]: [f32; 1]) -> [f32; 1] {
+        [exposure(v, self.gain)]
+    }
+}
+
+/// Merge: each layer's four planes over the stack below it where the layer is, then the stack
+/// dissolved against the background by Mix. The fold always has a layer: a background alone,
+/// and Mix 0, are the evaluator's to return unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Merge {
+    pub mix: f32,
+}
+
+// SAFETY: `#[repr(C)]`, four-byte fields.
+unsafe impl Params for Merge {}
+
+impl Fold<4, 4> for Merge {
+    const STEP: &'static str = "gpu::merge_step";
+    const LAST: &'static str = "gpu::merge_last";
+
+    /// Alpha composes as the colours do: the layer's alpha is the sample composed and the
+    /// coverage both.
+    #[inline(always)]
+    fn step(&self, below: [f32; 4], [r, g, b, a]: [f32; 4]) -> [f32; 4] {
+        [
+            over(below[0], r, a),
+            over(below[1], g, a),
+            over(below[2], b, a),
+            over(below[3], a, a),
+        ]
+    }
+
+    /// Mix 1 is the stack as composed: the dissolve's product by zero would make NaN of an
+    /// infinite background.
+    #[inline(always)]
+    fn finish(&self, background: [f32; 4], stack: [f32; 4]) -> [f32; 4] {
+        if self.mix == 1.0 {
+            stack
+        } else {
+            let m = self.mix;
+            [
+                mix(background[0], stack[0], m),
+                mix(background[1], stack[1], m),
+                mix(background[2], stack[2], m),
+                mix(background[3], stack[3], m),
+            ]
+        }
+    }
+}
 
 /// How far apart two results are, in representable values: the distance every per-operation
 /// bound is stated in.
@@ -116,210 +176,6 @@ pub fn ulp_distance(a: f32, b: f32) -> u32 {
     };
     // The largest distance is between the infinities, 0xff00_0000.
     (ordered(a) - ordered(b)).unsigned_abs() as u32
-}
-
-/// Exposure's dispatch parameters, as the entry point reads them from its uniform buffer.
-///
-/// The host writes exactly these bytes, in this order.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct ExposureParams {
-    pub width: u32,
-    pub height: u32,
-    pub gain: f32,
-}
-
-impl ExposureParams {
-    /// The uniform buffer's contents.
-    pub fn bytes(self) -> [u8; 12] {
-        let mut bytes = [0; 12];
-        bytes[0..4].copy_from_slice(&self.width.to_ne_bytes());
-        bytes[4..8].copy_from_slice(&self.height.to_ne_bytes());
-        bytes[8..12].copy_from_slice(&self.gain.to_ne_bytes());
-        bytes
-    }
-}
-
-// The bytes the host writes are the struct the shader reads, with no padding.
-const _: () = assert!(size_of::<ExposureParams>() == 12);
-
-/// Over's dispatch parameters, as the entry point reads them from its uniform buffer: the
-/// planes' size, which is all it needs.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct OverParams {
-    pub width: u32,
-    pub height: u32,
-}
-
-impl OverParams {
-    /// The uniform buffer's contents.
-    pub fn bytes(self) -> [u8; 8] {
-        let mut bytes = [0; 8];
-        bytes[0..4].copy_from_slice(&self.width.to_ne_bytes());
-        bytes[4..8].copy_from_slice(&self.height.to_ne_bytes());
-        bytes
-    }
-}
-
-const _: () = assert!(size_of::<OverParams>() == 8);
-
-/// The axis a box pass sums along.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Axis {
-    /// Each row over itself: the output is `2 tmax` texels wider than the input.
-    Rows = 0,
-    /// Each column over itself: the output is `2 tmax` texels taller.
-    Columns = 1,
-}
-
-/// A box pass's dispatch parameters, as the entry point reads them from its uniform buffer:
-/// the output's size, the axis as [`Axis`]'s discriminant, and the pass's outermost tap and
-/// two weights as [`BoxPass`] holds them.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct BoxPassParams {
-    pub width: u32,
-    pub height: u32,
-    pub axis: u32,
-    pub tmax: u32,
-    pub inner_weight: f32,
-    pub edge_weight: f32,
-}
-
-impl BoxPassParams {
-    /// The parameters of `pass` along `axis` into an output `width` by `height`.
-    pub fn new(pass: BoxPass, axis: Axis, width: u32, height: u32) -> BoxPassParams {
-        BoxPassParams {
-            width,
-            height,
-            axis: axis as u32,
-            tmax: pass.tmax(),
-            inner_weight: pass.inner_weight(),
-            edge_weight: pass.edge_weight(),
-        }
-    }
-
-    /// The uniform buffer's contents.
-    pub fn bytes(self) -> [u8; 24] {
-        let mut bytes = [0; 24];
-        bytes[0..4].copy_from_slice(&self.width.to_ne_bytes());
-        bytes[4..8].copy_from_slice(&self.height.to_ne_bytes());
-        bytes[8..12].copy_from_slice(&self.axis.to_ne_bytes());
-        bytes[12..16].copy_from_slice(&self.tmax.to_ne_bytes());
-        bytes[16..20].copy_from_slice(&self.inner_weight.to_ne_bytes());
-        bytes[20..24].copy_from_slice(&self.edge_weight.to_ne_bytes());
-        bytes
-    }
-}
-
-const _: () = assert!(size_of::<BoxPassParams>() == 24);
-
-/// The GPU entry points, one invocation per texel of one output plane.
-#[cfg(target_arch = "spirv")]
-pub mod gpu {
-    use spirv_std::glam::{IVec2, UVec3, Vec4};
-    use spirv_std::{Image, spirv};
-
-    use crate::{BoxPassParams, ExposureParams, OverParams};
-
-    type Input = Image!(2D, type = f32, sampled);
-    type Output = Image!(2D, format = r32f, sampled = false);
-
-    /// Exposure over one R32Float plane. Dispatched once per distinct colour plane, with the
-    /// grid rounded up to whole 16 by 16 workgroups; invocations past the edge return, since
-    /// an image store outside the texture is discarded only under robust image access.
-    #[spirv(compute(threads(16, 16)))] // WORKGROUP
-    pub fn exposure(
-        #[spirv(global_invocation_id)] id: UVec3,
-        #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &ExposureParams,
-        #[spirv(descriptor_set = 0, binding = 1)] input: &Input,
-        #[spirv(descriptor_set = 0, binding = 2)] output: &Output,
-    ) {
-        if id.x >= params.width || id.y >= params.height {
-            return;
-        }
-        let at = IVec2::new(id.x as i32, id.y as i32);
-        let texel: Vec4 = input.fetch(at);
-        // SAFETY: `at` is inside both textures, which the host sizes to the params' width and
-        // height, and the output is bound as R32Float, the format this image type declares.
-        unsafe { output.write(at, crate::exposure(texel.x, params.gain)) };
-    }
-
-    /// One plane of a layer over the same plane of the background, with the layer's alpha
-    /// plane, into the output: dispatched once per plane, alpha's with the alpha plane bound
-    /// as the layer too, over planes of one size.
-    #[spirv(compute(threads(16, 16)))] // WORKGROUP
-    pub fn over(
-        #[spirv(global_invocation_id)] id: UVec3,
-        #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &OverParams,
-        #[spirv(descriptor_set = 0, binding = 1)] background: &Input,
-        #[spirv(descriptor_set = 0, binding = 2)] layer: &Input,
-        #[spirv(descriptor_set = 0, binding = 3)] alpha: &Input,
-        #[spirv(descriptor_set = 0, binding = 4)] output: &Output,
-    ) {
-        if id.x >= params.width || id.y >= params.height {
-            return;
-        }
-        let at = IVec2::new(id.x as i32, id.y as i32);
-        let background: Vec4 = background.fetch(at);
-        let layer: Vec4 = layer.fetch(at);
-        let alpha: Vec4 = alpha.fetch(at);
-        // SAFETY: as for `exposure`: `at` is inside every texture, and the output is R32Float.
-        unsafe { output.write(at, crate::over(background.x, layer.x, alpha.x)) };
-    }
-
-    /// One of Blur's box passes along the params' axis over one plane: each output texel is
-    /// the weighted sum of the `2 tmax + 1` input texels centred on it, the input being `2
-    /// tmax` texels shorter along the axis than the output and transparent black beyond its
-    /// ends, as the CPU's passes read it. A tap outside the input is skipped rather than
-    /// fetched: a fetch outside a texture is defined only under robust image access, and a
-    /// zero's product would add nothing.
-    ///
-    /// The sum is one f32 accumulator through the taps in order, each a fused multiply-add,
-    /// so its distance from the definition's f64 sum grows with the tap count; the readback
-    /// test records the factor across sizes. The weights' normalisation keeps every partial
-    /// sum within the largest input magnitude, so finite inputs sum finite. The taps are a
-    /// loop, not straight-line, since their count is the size's; its cost is the GPU step's.
-    #[spirv(compute(threads(16, 16)))] // WORKGROUP
-    pub fn box_pass(
-        #[spirv(global_invocation_id)] id: UVec3,
-        #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &BoxPassParams,
-        #[spirv(descriptor_set = 0, binding = 1)] input: &Input,
-        #[spirv(descriptor_set = 0, binding = 2)] output: &Output,
-    ) {
-        if id.x >= params.width || id.y >= params.height {
-            return;
-        }
-        let at = IVec2::new(id.x as i32, id.y as i32);
-        let (step, position, extent) = if params.axis == 0 {
-            (IVec2::X, at.x, params.width)
-        } else {
-            (IVec2::Y, at.y, params.height)
-        };
-        let t = params.tmax as i32;
-        let length = extent as i32 - 2 * t;
-        let taps = 2 * t + 1;
-        let mut sum = 0.0f32;
-        for k in 0..taps {
-            // Tap `k` of the window is input texel `position - 2 t + k` along the axis.
-            let i = position - 2 * t + k;
-            if i < 0 || i >= length {
-                continue;
-            }
-            let weight = if k == 0 || k == taps - 1 {
-                params.edge_weight
-            } else {
-                params.inner_weight
-            };
-            let texel: Vec4 = input.fetch(at + step * (k - 2 * t));
-            sum = crate::mul_add(weight, texel.x, sum);
-        }
-        // SAFETY: `at` is inside the output, which the host sizes to the params' width and
-        // height, and the output is R32Float.
-        unsafe { output.write(at, crate::flush(sum)) };
-    }
 }
 
 #[cfg(test)]

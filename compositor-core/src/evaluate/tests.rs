@@ -1286,7 +1286,7 @@ fn a_stopped_blur_leaves_the_rest_undone() {
     // Every chunk of the first plane's rows asked, and no band or later plane did.
     assert_eq!(
         asked.load(Ordering::Relaxed),
-        40_usize.div_ceil(cpu::BLUR_ROWS)
+        40_usize.div_ceil(cpu::LINE_ROWS)
     );
     assert_eq!(released.len(), 1, "the scratch plane came back");
 

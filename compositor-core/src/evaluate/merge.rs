@@ -1,19 +1,17 @@
-//! Merge on the CPU: the layers composed over the background by premultiplied over, in slot
-//! order, and the stack dissolved against the base by Mix.
+//! Merge: the layers composed over the background by premultiplied over, in slot order, and
+//! the stack dissolved against the base by Mix, through the fold.
 
-use std::ops::Range;
+use opencompositor_kernels::Merge;
 
 use crate::evaluate::{EvalError, NODE_BYTES_CAP, Pool, ResultKey, output_plane};
-use crate::image::{Image, Overlap, Plane, Warning};
-use crate::kernels::cpu::{self, Level};
+use crate::image::{Image, Plane, Warning, Window};
+use crate::kernels::cpu;
 
 /// Merge's image from its connected inputs: the background if connected, then the layers in
 /// slot order, so that the base, the lowest connected input, comes first.
 ///
 /// The display window is the base's and the data window the union of the inputs', with each
-/// input transparent black outside its own. Every row of the output is made at once: the base
-/// copied in, each layer composed over it in turn, then the dissolve, so the passes between
-/// meet in the cache rather than in memory.
+/// input transparent black outside its own.
 pub(super) fn merge(
     pool: &Pool,
     key: &ResultKey,
@@ -45,41 +43,21 @@ pub(super) fn merge(
             bytes,
         });
     }
-    // Mix 1 is the stack as composed: the kernel's product by zero would make NaN of an
-    // infinite base.
-    let mix = (mix != 1.0).then_some(mix);
-    let width = window.width as usize;
     let len = window.area() as usize;
     let mut outputs: [Plane; 4] = [(); 4].map(|()| output_plane(released, len, len));
-    let base_placed = Overlap::of(base.data_window(), window);
-    let layers_placed: Vec<Overlap> = layers
-        .iter()
-        .map(|layer| Overlap::of(layer.data_window(), window))
+    let stack: Vec<([&[f32]; 4], Window)> = (layers.iter())
+        .map(|layer| (planes_of(layer), layer.data_window()))
         .collect();
-    // The base outside its own window, for the dissolve.
-    let zeros = vec![0.0f32; width];
-    let planes = outputs
-        .each_mut()
-        .map(|plane| plane.get_mut().expect("nothing else holds an output plane"));
-    pool.fill_rows(planes, width, |level, first_row, mut chunk| {
-        let rows = chunk[0].len() / width.max(1);
-        for (index, y) in (first_row..first_row + rows).enumerate() {
-            let columns = index * width..(index + 1) * width;
-            let mut out: [&mut [f32]; 4] =
-                chunk.each_mut().map(|plane| &mut plane[columns.clone()]);
-            fill_base(base, base_placed.row(y), &mut out);
-            for (layer, placed) in layers.iter().zip(&layers_placed) {
-                if let Some((input, output)) = placed.row(y) {
-                    let layer = layer.planes().each_ref().map(|plane| &plane[input.clone()]);
-                    let dst = out.each_mut().map(|plane| &mut plane[output.clone()]);
-                    cpu::over(level, layer, dst);
-                }
-            }
-            if let Some(mix) = mix {
-                dissolve(level, base, base_placed.row(y), &zeros, &mut out, mix);
-            }
-        }
-    });
+    cpu::fold(
+        pool,
+        &Merge { mix },
+        (planes_of(base), base.data_window()),
+        &stack,
+        window,
+        outputs
+            .each_mut()
+            .map(|plane| plane.get_mut().expect("nothing else holds an output plane")),
+    );
     // Each once: a diamond brings one file's warnings by every branch.
     let mut warnings: Vec<Warning> = Vec::new();
     for warning in inputs.iter().flat_map(|input| input.warnings()) {
@@ -90,46 +68,7 @@ pub(super) fn merge(
     Ok(Image::new(base.display_window(), window, outputs, warnings))
 }
 
-/// Writes the base's row into an output row, and transparent black where the base is not.
-fn fill_base(base: &Image, span: Option<(Range<usize>, Range<usize>)>, out: &mut [&mut [f32]; 4]) {
-    match span {
-        Some((input, output)) => {
-            for (plane, dst) in base.planes().iter().zip(out.iter_mut()) {
-                dst[..output.start].fill(0.0);
-                dst[output.clone()].copy_from_slice(&plane[input.clone()]);
-                dst[output.end..].fill(0.0);
-            }
-        }
-        None => {
-            for dst in out.iter_mut() {
-                dst.fill(0.0);
-            }
-        }
-    }
-}
-
-/// Dissolves an output row, the stack as composed, against the base's row, with `zeros` for
-/// the base outside its window.
-fn dissolve(
-    level: Level,
-    base: &Image,
-    span: Option<(Range<usize>, Range<usize>)>,
-    zeros: &[f32],
-    out: &mut [&mut [f32]; 4],
-    mix: f32,
-) {
-    let width = out[0].len();
-    let (input, output) = span.unwrap_or((0..0, 0..0));
-    for (columns, rows) in [
-        (0..output.start, None),
-        (output.clone(), Some(input)),
-        (output.end..width, None),
-    ] {
-        let base = match &rows {
-            Some(rows) => base.planes().each_ref().map(|plane| &plane[rows.clone()]),
-            None => [&zeros[..columns.len()]; 4],
-        };
-        let dst = out.each_mut().map(|plane| &mut plane[columns.clone()]);
-        cpu::mix(level, base, dst, mix);
-    }
+/// An image's four planes as the fold reads them.
+fn planes_of(image: &Image) -> [&[f32]; 4] {
+    image.planes().each_ref().map(|plane| &plane[..])
 }

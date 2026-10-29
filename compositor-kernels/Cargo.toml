@@ -1,6 +1,6 @@
 [package]
 name = "opencompositor-kernels"
-version = "0.0.2"
+version = "0.1.0"
 description = "OpenCompositor's per-pixel kernel functions, one source for the CPU shells and the GPU entry points."
 edition.workspace = true
 license.workspace = true

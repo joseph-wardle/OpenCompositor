@@ -8,6 +8,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use opencompositor_kernels::Exposure;
 use rayon::prelude::*;
 
 use crate::document::{
@@ -956,12 +957,14 @@ fn output_plane(released: &mut Vec<Plane>, len: usize, capacity: usize) -> Plane
 }
 
 /// Multiplies R, G and B by two to the power of `stops` and shares A, each colour plane through
-/// the shared function, Exposure's definition for both devices. Inputs are never written: an
-/// output is a plane from `released` or a new one, and A is the input's.
+/// the map. Inputs are never written: an output is a plane from `released` or a new one, and A
+/// is the input's.
 fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Plane>) -> Image {
     // Exact for whole stops, and far inside f32's range at the limits.
-    let gain = stops.exp2() as f32;
-    let width = image.data_window().width as usize;
+    let op = Exposure {
+        gain: stops.exp2() as f32,
+    };
+    let window = image.data_window();
     let [r, g, b, a] = image.planes();
     let mut scaled = |plane: &Plane| -> Plane {
         // As roomy as its input, so that below a Blur whose Size is dragged it grows as rarely.
@@ -969,9 +972,7 @@ fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Plane>) -
         let dst = output
             .get_mut()
             .expect("nothing else holds an output plane");
-        pool.run(width, plane, dst, |level, src, dst| {
-            cpu::exposure(level, src, dst, gain);
-        });
+        cpu::map(pool, &op, [(plane, window)], window, [dst]);
         output
     };
     // A grey image's colour planes are one plane, and stay one.
