@@ -44,9 +44,8 @@ pub trait Map<const I: usize, const O: usize>: Params {
     /// Its GPU entry point.
     const ENTRY: &'static str;
 
-    /// The outputs at one position. An input whose placement does not cover it gives zero and
-    /// `false` in `inside`.
-    fn apply(&self, samples: [f32; I], inside: [bool; I]) -> [f32; O];
+    /// The outputs at one position. An input whose placement does not cover it gives zero.
+    fn apply(&self, samples: [f32; I]) -> [f32; O];
 }
 
 /// A map's parameters: where each input lies in the output, the output's size and the
@@ -165,6 +164,10 @@ pub trait LineReduce: Params {
     /// How much longer each pass's output line is than its input.
     #[inline(always)]
     fn growth(&self) -> u32 {
+        assert!(
+            self.shift() >= self.t(),
+            "a window starting at or before its output"
+        );
         2 * (self.shift() - self.t())
     }
 }

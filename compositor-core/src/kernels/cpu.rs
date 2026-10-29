@@ -142,17 +142,12 @@ pub fn map<M: Map<I, O>, const I: usize, const O: usize>(
             );
             for pair in cuts.windows(2) {
                 let columns = pair[0]..pair[1];
-                let inside = spans.each_ref().map(|span| covers(span, columns.start));
                 let src: [&[f32]; I] = std::array::from_fn(|k| {
                     samples(inputs[k].0, &spans[k], columns.clone(), &zeros)
                 });
                 let dst =
                     (chunk.each_mut()).map(|plane| &mut plane[index * width..][columns.clone()]);
-                at_level(
-                    level,
-                    #[inline(always)]
-                    || map_samples(op, src, inside, dst),
-                );
+                map_span(level, op, src, dst);
             }
         }
     });
@@ -266,12 +261,27 @@ fn cut<'a>(spans: impl Iterator<Item = &'a Range<usize>>, width: usize, cuts: &m
     cuts.dedup();
 }
 
-/// One span of a map: every input covers it or none of its samples, as `inside` says.
+/// One span of a map at `level` on the caller's thread: the map's kernel without the pool,
+/// which the kernels benchmark times alone.
+#[inline(always)]
+pub fn map_span<M: Map<I, O>, const I: usize, const O: usize>(
+    level: Level,
+    op: &M,
+    src: [&[f32]; I],
+    dst: [&mut [f32]; O],
+) {
+    at_level(
+        level,
+        #[inline(always)]
+        || map_samples(op, src, dst),
+    );
+}
+
+/// One span of a map: each input's samples, zero where it does not cover the span.
 #[inline(always)]
 fn map_samples<M: Map<I, O>, const I: usize, const O: usize>(
     op: &M,
     src: [&[f32]; I],
-    inside: [bool; I],
     dst: [&mut [f32]; O],
 ) {
     let len = dst[0].len();
@@ -279,7 +289,7 @@ fn map_samples<M: Map<I, O>, const I: usize, const O: usize>(
     let mut dst = dst.map(|dst| &mut dst[..len]);
     for i in 0..len {
         let samples = std::array::from_fn(|k| src[k][i]);
-        let results = op.apply(samples, inside);
+        let results = op.apply(samples);
         for (dst, result) in dst.iter_mut().zip(results) {
             dst[i] = result;
         }
@@ -381,11 +391,7 @@ mod tests {
             for gain in GAINS {
                 let mut dst = vec![unwritten; len];
                 let op = Exposure { gain };
-                at_level(
-                    level,
-                    #[inline(always)]
-                    || map_samples(&op, [&src], [true], [&mut dst]),
-                );
+                map_span(level, &op, [&src], [&mut dst]);
                 for (i, (&s, &d)) in src.iter().zip(&dst).enumerate() {
                     let expected = opencompositor_kernels::exposure(s, gain);
                     assert_eq!(

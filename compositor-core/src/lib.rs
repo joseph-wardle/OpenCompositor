@@ -25,7 +25,7 @@ mod worker;
 #[doc(hidden)]
 pub mod bench {
     pub use crate::evaluate::Pool;
-    pub use crate::kernels::cpu::{Level, Stopped, fold, line, map};
+    pub use crate::kernels::cpu::{Level, Stopped, fold, line, map, map_span};
 }
 
 pub use app::{Anchor, App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};

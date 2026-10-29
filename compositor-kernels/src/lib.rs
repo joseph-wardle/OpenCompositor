@@ -102,7 +102,7 @@ impl Map<1, 1> for Exposure {
     const ENTRY: &'static str = "gpu::exposure";
 
     #[inline(always)]
-    fn apply(&self, [v]: [f32; 1], _: [bool; 1]) -> [f32; 1] {
+    fn apply(&self, [v]: [f32; 1]) -> [f32; 1] {
         [exposure(v, self.gain)]
     }
 }
