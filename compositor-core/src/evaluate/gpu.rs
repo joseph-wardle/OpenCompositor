@@ -302,14 +302,29 @@ impl GpuEvaluation {
         }
     }
 
-    /// Submits the request's work and counts its completion when the GPU reports it.
-    fn submit(&mut self, encoder: wgpu::CommandEncoder) {
+    /// Submits a request recorded on this generation, retains what its recording chose, and
+    /// returns its image. Its completion is counted when the GPU reports it.
+    pub fn submit(&mut self, recorded: Recorded) -> GpuImage {
+        let Recorded {
+            encoder,
+            image,
+            to_retain,
+        } = recorded;
         self.queue.submit([encoder.finish()]);
         self.submitted += 1;
         let (completed, number) = (Arc::clone(&self.completed), self.submitted);
         self.queue.on_submitted_work_done(move || {
             completed.fetch_max(number, Ordering::Release);
         });
+        self.retained.extend(to_retain);
+        image
+    }
+
+    /// The keys of the retained results, for planning a request before this is at hand.
+    pub fn retained_keys(&self) -> Vec<ResultKey> {
+        (self.retained.iter())
+            .map(|retained| retained.key.clone())
+            .collect()
     }
 }
 
@@ -367,6 +382,27 @@ impl GpuPlane {
     }
 }
 
+/// A request recorded on one generation and not yet submitted: [`GpuEvaluation::submit`]
+/// submits it and retains its results, and dropping it submits and retains nothing. Its caller
+/// may record more into the same submission, reading the image.
+#[derive(Debug)]
+pub struct Recorded {
+    encoder: wgpu::CommandEncoder,
+    image: GpuImage,
+    to_retain: Vec<GpuRetained>,
+}
+
+impl Recorded {
+    pub fn image(&self) -> &GpuImage {
+        &self.image
+    }
+
+    /// The encoder, to record more into the request's submission, beside the image to read.
+    pub fn encoder_and_image(&mut self) -> (&mut wgpu::CommandEncoder, &GpuImage) {
+        (&mut self.encoder, &self.image)
+    }
+}
+
 impl Evaluator {
     /// The image a key names, computed on the GPU of `gpu`, its failure, or `None` if `stop`
     /// returned true before it was done.
@@ -384,9 +420,52 @@ impl Evaluator {
         key: &ResultKey,
         stop: impl Fn() -> bool,
     ) -> Option<Result<GpuImage, EvalError>> {
-        let gpu_keys: Vec<ResultKey> = (gpu.retained.iter())
-            .map(|retained| retained.key.clone())
-            .collect();
+        let recorded = self.record_on(gpu, key, stop)?;
+        Some(recorded.map(|recorded| gpu.submit(recorded)))
+    }
+
+    /// Reads the files of the Readers a request on a GPU retaining `on_gpu` would upload, unless
+    /// this evaluator retains them already, so that recording it decodes nothing. `None` if
+    /// `stop` returned true first. Fails as the first file that cannot be read.
+    ///
+    /// Like a request, it releases every retained result the key does not contain.
+    pub fn read_for_gpu(
+        &mut self,
+        key: &ResultKey,
+        on_gpu: &[ResultKey],
+        stop: impl Fn() -> bool,
+    ) -> Option<Result<(), EvalError>> {
+        let steps = self.plan(key, on_gpu);
+        let uploaded = |index: usize| {
+            let key = &steps[index].key;
+            on_gpu.iter().any(|held| Arc::ptr_eq(&held.0, &key.0))
+        };
+        let (needed, _) = needs(&steps, uploaded);
+        drop(self.release_except(&steps));
+        for (index, step) in steps.iter().enumerate() {
+            let unread = step.retained.is_none() && !uploaded(index);
+            if !needed[index] || !unread || !matches!(*step.key.0, Recipe::Reader { .. }) {
+                continue;
+            }
+            if stop() {
+                return None;
+            }
+            if let Err(error) = self.read_and_retain(&step.key) {
+                return Some(Err(error));
+            }
+        }
+        Some(Ok(()))
+    }
+
+    /// Records the image a key names on the GPU of `gpu`, as [`Evaluator::evaluate_on`] computes
+    /// it, without submitting it.
+    pub fn record_on(
+        &mut self,
+        gpu: &mut GpuEvaluation,
+        key: &ResultKey,
+        stop: impl Fn() -> bool,
+    ) -> Option<Result<Recorded, EvalError>> {
+        let gpu_keys = gpu.retained_keys();
         let steps = self.plan(key, &gpu_keys);
         let held: Vec<Option<GpuImage>> = steps.iter().map(|step| gpu.find(&step.key)).collect();
         let (needed, _) = needs(&steps, |index| held[index].is_some());
@@ -469,10 +548,12 @@ impl Evaluator {
             }
             images[index] = Some(image);
         }
-        gpu.submit(encoder);
-        gpu.retained.extend(to_retain);
-        let requested = images.pop().flatten().expect("the requested image");
-        Some(Ok(requested))
+        let image = images.pop().flatten().expect("the requested image");
+        Some(Ok(Recorded {
+            encoder,
+            image,
+            to_retain,
+        }))
     }
 
     /// Reads a Reader's file and retains the decoded image in this evaluator's table, under its

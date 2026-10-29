@@ -8,7 +8,7 @@ use crate::evaluate::EvalError;
 use crate::panel::ValueState;
 use crate::parameter::{Value, resolve};
 use crate::read::ReadError;
-use crate::worker::{Timing, ViewerImage};
+use crate::worker::{EvaluationDevice, Timing, ViewerImage};
 
 const NONE: Modifiers = Modifiers {
     shift: false,
@@ -26,7 +26,7 @@ const SHIFT: Modifiers = Modifiers {
 /// An app whose worker hands its results to the test, with a 400 × 300 graph pane at scale 2.
 fn app() -> (App, Receiver<Evaluated>) {
     let (delivered, deliveries) = mpsc::channel();
-    let mut app = App::new(move |notice| {
+    let mut app = App::new(EvaluationDevice::Cpu, move |notice| {
         if let Notice::Evaluated(evaluated) = notice {
             let _ = delivered.send(evaluated);
         }
@@ -386,7 +386,7 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     assert_eq!(
         requests.last(),
         Some(&Request::ShowViewerCaption(
-            "Slot 3 · a.exr · updating…".to_owned()
+            "Slot 3 · a.exr · updating… · CPU".to_owned()
         ))
     );
 
@@ -434,21 +434,21 @@ fn a_result_for_a_node_no_longer_viewed_is_not_shown() {
 
     // The first read finishes after the viewer moved on.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
-    assert_eq!(app.caption, "Slot 2 · b.exr · updating…");
+    assert_eq!(app.caption, "Slot 2 · b.exr · updating… · CPU");
 
     app.dispatch(read(&second, 8, 2));
-    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
+    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
 
     // Back to slot 1, which is read again, showing slot 2's image until then.
     app.dispatch(slot_key(1, NONE));
     assert_eq!(sent(&app).key, first.key);
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
     assert!(matches!(app.shown, Shown::Image { .. }));
     // Back to slot 2, which is shown already and asked for again, so that the worker lets slot
     // 1's read go.
     app.dispatch(slot_key(2, NONE));
     assert_eq!(sent(&app).key, second.key);
-    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
+    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
 }
 
 #[test]
@@ -465,13 +465,13 @@ fn an_edit_faster_than_evaluation_shows_each_later_result_as_it_finishes() {
     // Superseded, but later than anything shown.
     app.dispatch(read(&second, 8, 2));
     assert!(matches!(&app.shown, Shown::Image { info, .. } if info.data_window.width == 8));
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
     // Earlier than what is shown.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
     assert!(matches!(&app.shown, Shown::Image { info, .. } if info.data_window.width == 8));
 
     app.dispatch(read(&third, 5, 1));
-    assert_eq!(app.caption, "Slot 1 · a.exr · 5 × 1");
+    assert_eq!(app.caption, "Slot 1 · a.exr · 5 × 1 · CPU");
 }
 
 #[test]
@@ -499,7 +499,7 @@ fn a_superseded_failure_leaves_the_viewer_and_the_node_as_they_are() {
     app.dispatch(failed(superseded));
 
     assert!(matches!(app.shown, Shown::Image { .. }));
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
     assert_eq!(color(&app), unfailed);
     app.dispatch(failed(sent(&app)));
     assert!(matches!(app.shown, Shown::Failed { .. }));
@@ -685,7 +685,7 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     assert!(matches!(app.shown, Shown::Failed { .. }));
     assert_eq!(
         app.caption,
-        "Slot 1 · a.exr · /nonexistent/a.exr: not an EXR or PNG file"
+        "Slot 1 · a.exr · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let failed = app.session().graph().node(id.into()).unwrap().color;
 
@@ -712,7 +712,7 @@ fn undoing_a_mark_leaves_the_viewer_showing_nothing() {
 
     // Redo marks it again, and the file is read again.
     app.dispatch(Event::Command(Command::Redo));
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
 }
 
 #[test]
@@ -797,19 +797,19 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     app.dispatch(slot_key(2, CTRL));
     assert_eq!(
         app.caption,
-        "Slot 2 · Exposure · updating…; Source of Exposure is not connected"
+        "Slot 2 · Exposure · updating…; Source of Exposure is not connected · CPU"
     );
     // The empty image, which the viewer does not frame.
     app.dispatch(read(&sent(&app), 0, 0));
     assert_eq!(
         app.caption,
-        "Slot 2 · Exposure · Source of Exposure is not connected"
+        "Slot 2 · Exposure · Source of Exposure is not connected · CPU"
     );
     assert_eq!(app.shown.display_window(), None);
 
     app.session.connect(first, "source", reader).unwrap();
     app.dispatch(Event::Draw(Pane::Viewer));
-    assert_eq!(app.caption, "Slot 2 · Exposure · updating…");
+    assert_eq!(app.caption, "Slot 2 · Exposure · updating… · CPU");
     let key = |app: &App, id| {
         let session = app.session();
         result_key(session.document(), session.reloads(), id).unwrap()
@@ -826,7 +826,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
     assert_eq!(
         app.caption,
-        "Slot 2 · Exposure · /nonexistent/a.exr: not an EXR or PNG file"
+        "Slot 2 · Exposure · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
     assert_ne!(color(reader), color(second));
@@ -842,13 +842,16 @@ fn a_viewed_reader_without_a_file_says_so_where_it_is() {
     let reader = *changes.nodes.first().unwrap();
     app.dispatch(slot_key(1, CTRL));
     app.dispatch(read(&sent(&app), 0, 0));
-    assert_eq!(app.caption, "Slot 1 · Reader · File is not set");
+    assert_eq!(app.caption, "Slot 1 · Reader · File is not set · CPU");
 
     let exposure = create_exposure(&mut app);
     app.session.connect(exposure, "source", reader).unwrap();
     app.dispatch(slot_key(2, CTRL));
     app.dispatch(read(&sent(&app), 0, 0));
-    assert_eq!(app.caption, "Slot 2 · Exposure · File of Reader is not set");
+    assert_eq!(
+        app.caption,
+        "Slot 2 · Exposure · File of Reader is not set · CPU"
+    );
 }
 
 /// Presses Tab over the graph and chooses the type in the menu it opens.
@@ -1124,5 +1127,5 @@ fn a_viewed_merge_with_nothing_connected_is_empty_and_misses_nothing() {
         .unwrap();
     app.dispatch(Event::Draw(Pane::Viewer));
     app.dispatch(read(&sent(&app), 0, 0));
-    assert_eq!(app.caption, "Slot 1 · Merge · empty");
+    assert_eq!(app.caption, "Slot 1 · Merge · empty · CPU");
 }

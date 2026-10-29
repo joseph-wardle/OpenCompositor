@@ -24,7 +24,7 @@ pub(crate) mod blur;
 mod gpu;
 mod merge;
 
-pub use gpu::{GpuEvaluation, GpuImage};
+pub use gpu::{GpuEvaluation, GpuImage, Recorded};
 
 /// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
 /// undoable.
@@ -1110,4 +1110,4 @@ impl std::error::Error for EvalError {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

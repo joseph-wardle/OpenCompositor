@@ -279,3 +279,65 @@ fn a_reader_without_a_file_gives_the_empty_image() {
     assert!(image.info().data_window.is_empty());
     assert!(image.texture(Channel::R).is_none());
 }
+
+#[test]
+fn reading_for_the_gpu_reads_what_the_request_uploads_and_nothing_uploaded() {
+    let path = directory("read_for_gpu").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    // Retaining nothing on the CPU, so that only the GPU table can spare a read.
+    let mut evaluator = Evaluator::with_cap(0);
+    let [one, two] = [1.0, 2.0].map(|stops| key(&chain([reader(&path), exposure(Some(stops))]), 2));
+    run(&mut evaluator, &mut gpu, &one);
+    std::fs::remove_file(&path).unwrap();
+
+    let uploaded = gpu.retained_keys();
+    assert!(matches!(
+        evaluator.read_for_gpu(&two, &uploaded, || false),
+        Some(Ok(()))
+    ));
+    let read = evaluator.read_for_gpu(&two, &[], || false);
+    assert!(
+        matches!(read, Some(Err(EvalError::Read { .. }))),
+        "{read:?}"
+    );
+}
+
+#[test]
+fn a_request_read_for_the_gpu_decodes_nothing_when_recorded() {
+    let path = directory("read_then_record").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
+
+    assert!(matches!(
+        evaluator.read_for_gpu(&key, &[], || false),
+        Some(Ok(()))
+    ));
+    std::fs::remove_file(&path).unwrap();
+
+    let image = run(&mut evaluator, &mut gpu, &key);
+    assert_eq!(read_back(&gpu, &image, Channel::R), vec![2.0; 2]);
+}
+
+#[test]
+fn a_recorded_request_dropped_unsubmitted_submits_and_retains_nothing() {
+    let path = directory("recorded_dropped").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
+
+    let recorded = evaluator
+        .record_on(&mut gpu, &key, || false)
+        .unwrap()
+        .unwrap();
+    drop(recorded);
+
+    assert_eq!(gpu.submitted, 0);
+    assert!(gpu.retained_keys().is_empty());
+}

@@ -10,12 +10,12 @@ use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{ResultKey, result_key};
-use crate::gpu::{Drawn, FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
+use crate::gpu::{Drawn, FrameCheck, FrameTiming, Gpu, NativeWindow, PaneSize, ViewerFrame};
 use crate::image::{ImageInfo, Window};
 use crate::panel::Panel;
 use crate::parameter::Value;
 use crate::session::Session;
-use crate::worker::{Evaluated, ViewerError, Wanted, Worker};
+use crate::worker::{Evaluated, EvaluationDevice, ViewerError, Wanted, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,6 +355,8 @@ struct Recovered {
 pub struct App {
     session: Session,
     gpu: Gpu,
+    /// Where the worker evaluates, for the whole session.
+    device: EvaluationDevice,
     /// Nothing is delivered once the app has dropped.
     worker: Worker,
     /// What the worker was last asked for.
@@ -388,15 +390,18 @@ pub struct App {
 }
 
 impl App {
-    /// `wake` receives each [`Notice`] on the thread that raised it, which may hold wgpu's locks,
-    /// and must hand it to the GUI thread to dispatch.
-    pub fn new(wake: impl Fn(Notice) + Send + Sync + 'static) -> App {
+    /// An app evaluating on `device`. `wake` receives each [`Notice`] on the thread that raised
+    /// it, which may hold wgpu's locks, and must hand it to the GUI thread to dispatch.
+    pub fn new(device: EvaluationDevice, wake: impl Fn(Notice) + Send + Sync + 'static) -> App {
         let waker = Waker(Arc::new(wake));
         let deliver = waker.clone();
         App {
             session: Session::new(),
             gpu: Gpu::new(waker),
-            worker: Worker::start(move |evaluated| deliver.wake(Notice::Evaluated(evaluated))),
+            device,
+            worker: Worker::start(device, move |evaluated| {
+                deliver.wake(Notice::Evaluated(evaluated));
+            }),
             sent: None,
             followed: None,
             requests_sent: 0,
@@ -595,13 +600,13 @@ impl App {
         vec![self.request_attempt(delay)]
     }
 
-    /// Makes a device for every pane with a native window, which the worker then stages for. On
+    /// Makes a device for every pane with a native window, which the worker then uses. On
     /// failure, requests the next attempt. Why the first attempt failed is shown, and why a
     /// later one did is logged, so that retrying does not churn the status bar.
     fn make_device(&mut self) -> Vec<Request> {
         match self.gpu.make_device() {
             Ok(new) => {
-                self.worker.connect(new.device, new.generation);
+                self.worker.connect(new.device, new.queue, new.generation);
                 let mut requests = Vec::new();
                 if !new.pane_errors.is_empty() {
                     requests.push(Request::ShowError(new.pane_errors.join("; ")));
@@ -942,7 +947,7 @@ impl App {
         self.shown = match result {
             Ok(image) => {
                 match image.pixels {
-                    Some(staged) => self.gpu.show_image(staged),
+                    Some(pixels) => self.gpu.show_image(pixels),
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
@@ -1008,8 +1013,9 @@ impl App {
         }
     }
 
-    /// Names the viewed node from the document as it stands, then says what is shown of it and
-    /// what upstream of it is not connected. Called once the wanted key has been sent.
+    /// Names the viewed node from the document as it stands, then says what is shown of it, what
+    /// upstream of it is not connected, and the device evaluating it. Called once the wanted key
+    /// has been sent.
     fn caption(&self) -> String {
         let slot = self.session.viewer().slot().digit();
         let document = self.session.document();
@@ -1056,7 +1062,12 @@ impl App {
         if details.is_empty() {
             details.push("empty".to_owned());
         }
-        format!("Slot {slot} · {} · {}", node.name(), details.join("; "))
+        format!(
+            "Slot {slot} · {} · {} · {}",
+            node.name(),
+            details.join("; "),
+            self.device
+        )
     }
 }
 
@@ -1072,6 +1083,27 @@ impl App {
     /// surface is made readable where it allows.
     pub fn check_frames(&mut self) {
         self.gpu.check_frames();
+    }
+
+    /// Has every frame from now on record when it passed each stage, for the drag check.
+    pub fn time_frames(&mut self) {
+        self.gpu.time_frames();
+    }
+
+    /// The pane's last frame since [`App::time_frames`]; `None` before one.
+    pub fn frame_timing(&self, pane: Pane) -> Option<FrameTiming> {
+        self.gpu.frame_timing(pane)
+    }
+
+    /// Runs the callbacks of the GPU's completed work without waiting for any, so that the drag
+    /// check learns when frames complete while nothing else polls.
+    pub fn poll_gpu(&self) {
+        self.gpu.poll();
+    }
+
+    /// The device evaluating the session.
+    pub fn evaluation_device(&self) -> EvaluationDevice {
+        self.device
     }
 
     /// What the pane's frames have proved since [`App::check_frames`]; `None` before it.

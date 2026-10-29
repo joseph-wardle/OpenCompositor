@@ -41,8 +41,23 @@ fn write_png(path: &Path, width: u32, height: u32) {
 
 fn worker() -> (Worker, Receiver<Evaluated>) {
     let (delivered, deliveries) = mpsc::channel();
-    let worker = Worker::start(move |evaluated| delivered.send(evaluated).unwrap());
+    let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
+        delivered.send(evaluated).unwrap();
+    });
     (worker, deliveries)
+}
+
+/// Connects the worker to the device and its queue as the generation.
+fn connect(worker: &Worker, (device, queue): (wgpu::Device, wgpu::Queue), generation: u64) {
+    worker.connect(device, queue, generation);
+}
+
+/// The staged pixels of a CPU session's image.
+fn staged(evaluated: Evaluated) -> Staged {
+    match evaluated.result.expect("an image").pixels {
+        Some(Pixels::Staged(staged)) => staged,
+        pixels => panic!("staged pixels, not {pixels:?}"),
+    }
 }
 
 fn receive(deliveries: &Receiver<Evaluated>) -> Evaluated {
@@ -66,7 +81,7 @@ fn a_request_replaces_any_the_worker_has_not_started() {
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
     // Each delivery waits for the test, holding the worker as a long evaluation would.
-    let worker = Worker::start(move |evaluated| {
+    let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
         delivered.send(evaluated.wanted.key).unwrap();
         released.lock().unwrap().recv().unwrap();
     });
@@ -101,7 +116,7 @@ fn dropping_the_worker_waits_for_the_delivery_in_progress() {
     let (started, delivering) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
-    let worker = Worker::start(move |_| {
+    let worker = Worker::start(EvaluationDevice::Cpu, move |_| {
         started.send(()).unwrap();
         released.lock().unwrap().recv().unwrap();
     });
@@ -203,7 +218,7 @@ fn connecting_a_gpu_delivers_the_last_key_again_with_its_pixels() {
     worker.request(Some(on(1, key(&path))));
     assert!(receive(&deliveries).result.unwrap().pixels.is_none());
 
-    worker.connect(noop_device(None), 1);
+    connect(&worker, noop_device(None), 1);
 
     let evaluated = receive(&deliveries);
     assert_eq!(evaluated.wanted.key, key(&path));
@@ -242,10 +257,10 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
     let (_, first_height) = FIRST_STAGING_SIZE;
     write_png(&tall, 1, 2 * (row_bytes(4096) / 256) * first_height + 1);
     let (worker, deliveries) = worker();
-    worker.connect(noop_device(None), 1);
+    connect(&worker, noop_device(None), 1);
 
     worker.request(Some(on(1, key(&small))));
-    let first = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let first = staged(receive(&deliveries));
     assert_eq!(first.bytes_per_row, 256);
     assert_eq!(
         first.texture.size(),
@@ -264,12 +279,12 @@ fn the_staging_buffer_waits_for_its_return_and_fits_the_images_staged() {
         "staged while the buffer was held"
     );
     drop(first);
-    let second = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let second = staged(receive(&deliveries));
     assert_eq!(second.buffer(), &buffer);
     drop(second);
 
     worker.request(Some(on(1, key(&tall))));
-    let third = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let third = staged(receive(&deliveries));
     assert_ne!(third.buffer(), &buffer);
     assert!(third.buffer().size() > buffer.size());
     // When it shrinks again is `StagingSizing`'s to test.
@@ -324,13 +339,11 @@ fn an_image_larger_than_the_gpu_allows_is_read_but_cannot_be_shown() {
     let path = directory.join("wide.png");
     write_png(&path, 3, 2);
     let (worker, deliveries) = worker();
-    worker.connect(
-        noop_device(Some(wgpu::Limits {
-            max_texture_dimension_2d: 2,
-            ..wgpu::Limits::downlevel_defaults()
-        })),
-        1,
-    );
+    let limits = wgpu::Limits {
+        max_texture_dimension_2d: 2,
+        ..wgpu::Limits::downlevel_defaults()
+    };
+    connect(&worker, noop_device(Some(limits)), 1);
 
     worker.request(Some(on(1, key(&path))));
 
@@ -343,7 +356,7 @@ fn wait_until_finishing(worker: &Worker) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let state = worker.mailbox.lock();
-        if state.request.is_none() && state.finishing {
+        if state.request.is_none() && state.in_gpu_phase {
             break;
         }
         drop(state);
@@ -359,9 +372,9 @@ fn a_newer_request_for_another_node_ends_the_wait_for_the_staging_buffer() {
     write_png(&first, 3, 2);
     write_png(&second, 3, 2);
     let (worker, deliveries) = worker();
-    worker.connect(noop_device(None), 1);
+    connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
-    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let held = staged(receive(&deliveries));
 
     worker.request(Some(on(1, key(&second))));
     wait_until_finishing(&worker);
@@ -387,9 +400,9 @@ fn a_newer_request_for_the_same_node_lets_the_started_one_be_delivered() {
         write_png(path, 3, 2);
     }
     let (worker, deliveries) = worker();
-    worker.connect(noop_device(None), 1);
+    connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
-    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let held = staged(receive(&deliveries));
 
     // Waiting for the buffer the test holds when the edit goes on.
     worker.request(Some(on(1, key(&second))));
@@ -420,18 +433,18 @@ fn a_staging_buffer_returned_after_its_device_was_replaced_is_dropped() {
     let [first, second] = two_images("replaced-return");
     let (worker, deliveries) = worker();
     let [replaced, replacement] = noop_device_pair();
-    worker.connect(replaced, 1);
+    connect(&worker, replaced, 1);
     worker.request(Some(on(1, key(&first))));
-    let old = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let old = staged(receive(&deliveries));
 
-    worker.connect(replacement, 2);
-    let new = receive(&deliveries).result.unwrap().pixels.unwrap();
+    connect(&worker, replacement, 2);
+    let new = staged(receive(&deliveries));
     let buffer = new.buffer().clone();
     drop(new);
     drop(old);
 
     worker.request(Some(on(1, key(&second))));
-    let staged = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let staged = staged(receive(&deliveries));
     assert_eq!(staged.buffer(), &buffer);
 }
 
@@ -439,14 +452,14 @@ fn a_staging_buffer_returned_after_its_device_was_replaced_is_dropped() {
 fn an_image_finishing_for_a_replaced_device_is_staged_again_for_the_new_one() {
     let [first, second] = two_images("replaced-finishing");
     let (worker, deliveries) = worker();
-    worker.connect(noop_device(None), 1);
+    connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
-    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let held = staged(receive(&deliveries));
 
     // Waiting for the buffer the test holds when the device is replaced.
     worker.request(Some(on(1, key(&second))));
     wait_until_finishing(&worker);
-    worker.connect(noop_device(None), 2);
+    connect(&worker, noop_device(None), 2);
 
     let evaluated = receive(&deliveries);
     assert_eq!(evaluated.wanted.key, key(&second));
@@ -458,10 +471,10 @@ fn an_image_finishing_for_a_replaced_device_is_staged_again_for_the_new_one() {
 fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
     let [first, second] = two_images("lost-staging");
     let (worker, deliveries) = worker();
-    let device = noop_device(None);
-    worker.connect(device.clone(), 1);
+    let (device, queue) = noop_device(None);
+    worker.connect(device.clone(), queue, 1);
     worker.request(Some(on(1, key(&first))));
-    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let held = staged(receive(&deliveries));
 
     device.destroy();
     // Returned unmapped, the buffer must be mapped again on the lost device.
@@ -470,7 +483,7 @@ fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
     let error = receive(&deliveries).result.unwrap_err();
     assert!(matches!(error, ViewerError::CannotShow(_)), "{error}");
 
-    worker.connect(noop_device(None), 2);
+    connect(&worker, noop_device(None), 2);
     let evaluated = receive(&deliveries);
     assert_eq!(evaluated.wanted.key, key(&second));
     assert!(evaluated.result.unwrap().pixels.is_some());
@@ -480,9 +493,9 @@ fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
 fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels() {
     let [first, second] = two_images("disconnect");
     let (worker, deliveries) = worker();
-    worker.connect(noop_device(None), 1);
+    connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
-    let held = receive(&deliveries).result.unwrap().pixels.unwrap();
+    let held = staged(receive(&deliveries));
 
     // Waiting for the buffer the test holds when the device is lost.
     worker.request(Some(on(1, key(&second))));
@@ -577,4 +590,184 @@ fn a_file_is_staged_bottom_row_first() {
             assert!(staged.eq(expected), "({x}, {y})");
         }
     }
+}
+
+/// A GPU session's worker, connected to a device on the adapter the kernel tests use.
+fn gpu_worker() -> (Worker, Receiver<Evaluated>, wgpu::Device, wgpu::Queue) {
+    let (delivered, deliveries) = mpsc::channel();
+    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
+        delivered.send(evaluated).unwrap();
+    });
+    let (device, queue) = crate::kernels::headless::device();
+    worker.connect(device.clone(), queue.clone(), 1);
+    (worker, deliveries, device, queue)
+}
+
+/// The display texture of a GPU session's image, and its device's generation.
+fn converted(evaluated: Evaluated) -> (Arc<wgpu::Texture>, u64) {
+    match evaluated.result.expect("an image").pixels {
+        Some(Pixels::Converted {
+            texture,
+            device_generation,
+        }) => (texture, device_generation),
+        pixels => panic!("converted pixels, not {pixels:?}"),
+    }
+}
+
+/// Reader → Exposure of the path, at the stops.
+fn exposed(path: &Path, stops: f64) -> ResultKey {
+    use crate::evaluate::tests::{chain, exposure, key, reader};
+    key(&chain([reader(path), exposure(Some(stops))]), 2)
+}
+
+/// Waits until the worker has left its GPU phase.
+fn wait_until_out_of_gpu_phase(worker: &Worker) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while worker.mailbox.lock().in_gpu_phase {
+        assert!(Instant::now() < deadline, "the GPU phase never ended");
+        std::thread::yield_now();
+    }
+}
+
+/// The keys retained on the connected device.
+fn retained_on_gpu(worker: &Worker) -> Vec<ResultKey> {
+    wait_until_out_of_gpu_phase(worker);
+    worker.mailbox.retained_on_gpu()
+}
+
+#[test]
+fn a_gpu_session_delivers_the_display_copy_its_request_converted() {
+    use crate::display::tests::{expected, read_halves};
+    let path = directory("gpu-session").join("image.png");
+    write_png(&path, 3, 2);
+    let (worker, deliveries, device, queue) = gpu_worker();
+
+    worker.request(Some(on(1, exposed(&path, -1.0))));
+
+    let evaluated = receive(&deliveries);
+    assert!(evaluated.timing.read.is_some());
+    let (texture, generation) = converted(evaluated);
+    assert_eq!(generation, 1);
+    assert_eq!((texture.width(), texture.height()), (3, 2));
+    let halves = read_halves(&device, &queue, &texture);
+    // White, opaque, and half as bright; alpha is not exposed.
+    for pixel in halves.as_chunks::<4>().0 {
+        let want = [0.5, 0.5, 0.5, 1.0].map(expected);
+        assert_eq!(*pixel, want);
+    }
+}
+
+#[test]
+fn a_gpu_session_evaluates_nothing_until_a_device_is_connected() {
+    let path = directory("gpu-unconnected").join("image.png");
+    write_png(&path, 3, 2);
+    let (delivered, deliveries) = mpsc::channel();
+    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
+        delivered.send(evaluated).unwrap();
+    });
+
+    worker.request(Some(on(1, exposed(&path, 1.0))));
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        "evaluated without a device"
+    );
+    let (device, queue) = crate::kernels::headless::device();
+    worker.connect(device, queue, 1);
+
+    let (_, generation) = converted(receive(&deliveries));
+    assert_eq!(generation, 1);
+}
+
+#[test]
+fn a_gpu_session_refuses_an_operation_without_a_gpu_path() {
+    use crate::evaluate::tests::{graph, key, merge, reader};
+    let path = directory("gpu-refused").join("image.png");
+    write_png(&path, 3, 2);
+    let (worker, deliveries, _, _) = gpu_worker();
+    let merged = graph(
+        [reader(&path), merge(Some(0.5))],
+        &[(2, "background".into(), 1)],
+    );
+
+    worker.request(Some(on(1, key(&merged, 2))));
+
+    let error = receive(&deliveries).result.unwrap_err();
+    assert!(
+        matches!(error, ViewerError::Eval(EvalError::NoGpuPath { .. })),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_replaced_device_drops_its_state_and_the_new_one_shows_the_request_again() {
+    let path = directory("gpu-replaced").join("image.png");
+    write_png(&path, 3, 2);
+    let (worker, deliveries, _, _) = gpu_worker();
+    let requested = exposed(&path, 1.0);
+    worker.request(Some(on(1, requested.clone())));
+    let (first, _) = converted(receive(&deliveries));
+    assert!(!retained_on_gpu(&worker).is_empty());
+
+    let (device, queue) = crate::kernels::headless::device();
+    worker.connect(device, queue, 2);
+
+    let evaluated = receive(&deliveries);
+    assert_eq!(evaluated.wanted.key, requested);
+    let (second, generation) = converted(evaluated);
+    assert_eq!(generation, 2);
+    assert!(!Arc::ptr_eq(&first, &second));
+    // The first device's display texture is the test's alone: its state dropped with it.
+    assert_eq!(Arc::strong_count(&first), 1);
+}
+
+#[test]
+fn asking_for_nothing_releases_everything_on_the_gpu() {
+    let path = directory("gpu-release").join("image.png");
+    write_png(&path, 3, 2);
+    let (worker, deliveries, _, _) = gpu_worker();
+    worker.request(Some(on(1, exposed(&path, 1.0))));
+    drop(converted(receive(&deliveries)));
+    assert_eq!(retained_on_gpu(&worker).len(), 2);
+
+    worker.request(None);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !retained_on_gpu(&worker).is_empty() {
+        assert!(Instant::now() < deadline, "nothing was released");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn dropping_a_gpu_session_worker_waits_for_its_gpu_phase() {
+    let path = directory("gpu-drop").join("image.png");
+    write_png(&path, 3, 2);
+    let (started, delivering) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
+        started.send(evaluated).unwrap();
+        released.lock().unwrap().recv().unwrap();
+    });
+    let (device, queue) = crate::kernels::headless::device();
+    worker.connect(device, queue, 1);
+    worker.request(Some(on(1, exposed(&path, 1.0))));
+    let evaluated = delivering.recv().unwrap();
+
+    let drop_returned = drop_elsewhere(worker);
+    assert!(
+        drop_returned
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "the drop returned during the GPU phase"
+    );
+    release.send(()).unwrap();
+    drop_returned
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the drop returns once the phase ends");
+
+    // The worker made the display texture in its phase and dropped its own with the
+    // connection, on the dropping thread.
+    let (texture, _) = converted(evaluated);
+    assert_eq!(Arc::strong_count(&texture), 1);
 }

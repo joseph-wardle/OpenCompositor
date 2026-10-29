@@ -80,6 +80,10 @@ impl Kernels {
         clippy::too_many_arguments,
         reason = "a stack, its output and its scratch"
     )]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Merge records it from GPU slice 3")
+    )]
     pub(crate) fn fold<F: Fold<G, O>, const G: usize, const O: usize>(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -157,6 +161,10 @@ impl Kernels {
     #[expect(
         clippy::too_many_arguments,
         reason = "a plane, its size, its output and scratch"
+    )]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Blur records it from GPU slice 5")
     )]
     pub(crate) fn line<L: LineReduce>(
         &mut self,
@@ -402,8 +410,16 @@ fn place(input: Window, output: Window) -> Placement {
 /// Planes the primitives' intermediate results are written to, kept for reuse once recorded:
 /// a later dispatch in the same submission may write one again, since wgpu orders the two.
 #[derive(Debug, Default)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Merge and Blur use it from GPU slices 3 and 5")
+)]
 pub(crate) struct Planes(Vec<wgpu::Texture>);
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Merge and Blur use it from GPU slices 3 and 5")
+)]
 impl Planes {
     /// A plane over `window`'s size, readable and writable by the kernels, whose contents the
     /// caller overwrites.
@@ -540,30 +556,45 @@ impl std::error::Error for PlaneError {}
 pub(crate) mod headless {
     use super::PLANE_FORMAT;
 
+    use std::sync::{Mutex, OnceLock};
+
     /// A device on the Vulkan adapter `WGPU_ADAPTER_NAME` names, or else the first one, a CPU
     /// renderer included: the tests prove the kernels on whatever Mesa or driver is installed,
     /// and print which, so every log says what ran. No adapter is a failure, never a skip.
+    ///
+    /// Every device comes from one instance and adapter, made once, and one at a time: the
+    /// Vulkan loader's lists of instances and devices are not safe to change from several
+    /// threads at once, and with an instance per test, a test enumerating adapters crashed
+    /// another inside the loader as it created its device.
     pub(crate) fn device() -> (wgpu::Device, wgpu::Queue) {
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = wgpu::Backends::VULKAN;
-        let instance = wgpu::Instance::new(descriptor);
-        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
-        let adapter = match std::env::var("WGPU_ADAPTER_NAME") {
-            Ok(name) => {
-                let name = name.to_lowercase();
-                adapters
+        static ADAPTER: OnceLock<(wgpu::Instance, wgpu::Adapter)> = OnceLock::new();
+        static CREATING: Mutex<()> = Mutex::new(());
+        let _creating = CREATING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_, adapter) = ADAPTER.get_or_init(|| {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = wgpu::Backends::VULKAN;
+            let instance = wgpu::Instance::new(descriptor);
+            let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
+            let adapter = match std::env::var("WGPU_ADAPTER_NAME") {
+                Ok(name) => {
+                    let name = name.to_lowercase();
+                    adapters
+                        .into_iter()
+                        .find(|adapter| adapter.get_info().name.to_lowercase().contains(&name))
+                        .unwrap_or_else(|| panic!("no Vulkan adapter named {name:?}"))
+                }
+                Err(_) => adapters
                     .into_iter()
-                    .find(|adapter| adapter.get_info().name.to_lowercase().contains(&name))
-                    .unwrap_or_else(|| panic!("no Vulkan adapter named {name:?}"))
-            }
-            Err(_) => adapters
-                .into_iter()
-                .next()
-                .expect("a Vulkan adapter; the kernel tests need one"),
-        };
+                    .next()
+                    .expect("a Vulkan adapter; the kernel tests need one"),
+            };
+            (instance, adapter)
+        });
         let info = adapter.get_info();
         println!(
-            "kernel tests on {} ({:?}), {} {}",
+            "GPU tests on {} ({:?}), {} {}",
             info.name, info.device_type, info.driver, info.driver_info
         );
         pollster::block_on(adapter.request_device(&Default::default()))

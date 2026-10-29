@@ -1,4 +1,5 @@
-//! Evaluating the viewed image off the GUI thread, and staging its pixels for the GPU.
+//! Evaluating the viewed image off the GUI thread, on the session's device, and readying its
+//! pixels for the viewer: staged for the GPU in a CPU session, converted on it in a GPU session.
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
@@ -7,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use half::f16;
 
+use crate::display::Conversion;
 use crate::document::NodeId;
-use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, Pool, ResultKey};
+use crate::evaluate::{DEEP_STACK, EvalError, Evaluator, GpuEvaluation, Pool, ResultKey};
 use crate::gpu::wait_for_device;
 use crate::image::{ImageInfo, Plane, Window};
 
@@ -21,6 +23,30 @@ const IMAGES_BEFORE_SHRINKING: u32 = 3;
 /// The longest the worker waits on the GPU before checking that it still wants the device, so
 /// that a wait that never ends cannot hold the worker's drop, and with it the GUI thread.
 const LONGEST_GPU_WAIT: Duration = Duration::from_millis(100);
+
+/// How often a GPU session's worker asks whether the GPU has completed its submission. It never
+/// blocks on the GPU: a blocking wait would hold the device's lock against the GUI thread's
+/// present for as long.
+const COMPLETION_POLL: Duration = Duration::from_millis(1);
+
+/// Where a session evaluates. Every request runs on the one device, and results never mix
+/// devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationDevice {
+    /// The CPU, whose images are staged for the viewer.
+    Cpu,
+    /// The GPU the panes draw on. A request containing an operation without a GPU path fails.
+    Gpu,
+}
+
+impl fmt::Display for EvaluationDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            EvaluationDevice::Cpu => "CPU",
+            EvaluationDevice::Gpu => "GPU",
+        })
+    }
+}
 
 /// What the viewer asks the worker for: the image of the node its slot marks, as that node's key
 /// stood when asked. The app numbers its requests in the order it sends them.
@@ -56,7 +82,10 @@ impl Evaluated {
 pub struct Timing {
     /// The worker took the request.
     pub started: Instant,
-    /// The evaluator returned the image or its failure.
+    /// In a GPU session, the files of the Readers it uploads were read.
+    pub read: Option<Instant>,
+    /// The evaluator returned the image or its failure; in a GPU session, once its request and
+    /// display conversion were submitted.
     pub evaluated: Instant,
     pub staging: StagingTiming,
     /// The result left for the GUI thread.
@@ -81,6 +110,7 @@ impl Timing {
         let now = Instant::now();
         Timing {
             started: now,
+            read: None,
             evaluated: now,
             staging: StagingTiming::default(),
             delivered: now,
@@ -88,13 +118,39 @@ impl Timing {
     }
 }
 
-/// An image as the viewer receives it: its description, and its pixels staged for the GPU. Its
-/// planes stay with the evaluator.
+/// An image as the viewer receives it: its description, and its pixels for the GPU. Its planes
+/// stay with the evaluator.
 #[derive(Debug)]
 pub struct ViewerImage {
     pub info: ImageInfo,
     /// `None` before the GPU exists, as headless, or if the data window is empty.
-    pub(crate) pixels: Option<Staged>,
+    pub(crate) pixels: Option<Pixels>,
+}
+
+/// An image's display copy, for the device of one generation.
+#[derive(Debug)]
+pub(crate) enum Pixels {
+    /// Staged by a CPU session, for the GUI thread to copy into the texture.
+    Staged(Staged),
+    /// Converted on the GPU by the request's own submission, which queue order completes
+    /// before any frame the GUI thread submits after receiving it. Holding the texture keeps the
+    /// worker from converting into it again.
+    Converted {
+        texture: Arc<wgpu::Texture>,
+        device_generation: u64,
+    },
+}
+
+impl Pixels {
+    /// The generation of the device the pixels are for.
+    pub(crate) fn device_generation(&self) -> u64 {
+        match self {
+            Pixels::Staged(staged) => staged.staging.device_generation,
+            Pixels::Converted {
+                device_generation, ..
+            } => *device_generation,
+        }
+    }
 }
 
 /// An image's pixels, RGBA f16 rows bottom first in the worker's staging buffer, and the texture
@@ -110,11 +166,6 @@ pub(crate) struct Staged {
 }
 
 impl Staged {
-    /// The generation of the device the image was staged for.
-    pub(crate) fn device_generation(&self) -> u64 {
-        self.staging.device_generation
-    }
-
     pub(crate) fn buffer(&self) -> &wgpu::Buffer {
         self.staging.buffer.as_ref().expect("held until dropped")
     }
@@ -176,17 +227,20 @@ impl std::error::Error for ViewerError {
     }
 }
 
-/// One worker evaluating one key at a time with its own [`Evaluator`]. A request replaces any
-/// request it has not started, so after a burst of requests it evaluates at most the one in
-/// progress and the last.
+/// One worker evaluating one key at a time with its own [`Evaluator`], on the session's device. A
+/// request replaces any request it has not started, so after a burst of requests it evaluates at
+/// most the one in progress and the last.
 ///
 /// A newer request for the same node lets the evaluation in progress finish and be delivered, so
 /// that an edit faster than evaluation still shows its results as they finish. A newer request
-/// for another node, or for nothing, stops it between nodes, before staging and while waiting for
-/// the staging buffer, and skips its delivery after staging.
+/// for another node, or for nothing, stops it between nodes, before staging or submitting and
+/// while waiting for the staging buffer, and skips its delivery after.
 ///
-/// The worker never writes to a texture or submits to the queue: `Queue::write_texture` copies
-/// under a queue-wide lock that the GUI thread's submit then waits for.
+/// The worker never writes to a texture with `Queue::write_texture`, which copies under a
+/// queue-wide lock that the GUI thread's submit then waits for. In a CPU session it never
+/// submits; in a GPU session it submits each request once, its display conversion included, and
+/// submits the next only once the GPU has completed it, so that superseded work on the GPU is at
+/// most one request.
 #[derive(Debug)]
 pub struct Worker {
     mailbox: Arc<Mailbox>,
@@ -198,9 +252,10 @@ struct Mailbox {
     changed: Condvar,
 }
 
-/// The device and the staging buffer belong here rather than to the worker, which may still be
-/// running when the process exits: the last reference to a GPU object must not drop on its
-/// thread after the driver has begun tearing itself down.
+/// The device, the staging buffer and evaluation's state on the device belong here rather than
+/// to the worker, which may still be running when the process exits: the last reference to a GPU
+/// object must not drop on its thread after the driver has begun tearing itself down. The worker
+/// holds them only in a GPU phase, which the worker's drop waits for.
 #[derive(Debug, Default)]
 struct MailboxState {
     /// A request the worker has not started: what the viewer wants, or `None` for nothing,
@@ -209,18 +264,30 @@ struct MailboxState {
     /// The request the worker started last.
     started: Option<Wanted>,
     stopping: bool,
-    /// The device the worker stages for, from `connect` until the worker drops.
+    /// The device the worker evaluates or stages for, from `connect` until the worker drops.
     connection: Option<Connection>,
-    /// Whether the worker is staging or delivering a result, and so may hold GPU objects.
-    finishing: bool,
+    /// Whether the worker is in a GPU phase, and so may hold GPU objects.
+    in_gpu_phase: bool,
 }
 
 #[derive(Debug)]
 struct Connection {
-    /// Tells this device's staged images apart from those of the device it replaced.
+    /// Tells this device's images apart from those of the device it replaced.
     generation: u64,
     device: wgpu::Device,
+    queue: wgpu::Queue,
+    /// A CPU session's.
     staging: StagingSlot,
+    /// A GPU session's, which the worker makes in its first GPU phase on the device, off the GUI
+    /// thread, and holds during each. Dropping the connection drops the generation's GPU state.
+    on_device: Option<OnDevice>,
+}
+
+/// Evaluation's state on one device generation in a GPU session.
+#[derive(Debug)]
+struct OnDevice {
+    evaluation: GpuEvaluation,
+    conversion: Conversion,
 }
 
 /// Where a connection's staging buffer is.
@@ -235,8 +302,9 @@ enum StagingSlot {
 }
 
 impl Worker {
-    /// Starts the worker. It passes each result to `deliver` on its own thread.
-    pub fn start(deliver: impl Fn(Evaluated) + Send + 'static) -> Worker {
+    /// Starts the worker, evaluating on `device`. It passes each result to `deliver` on its own
+    /// thread.
+    pub fn start(device: EvaluationDevice, deliver: impl Fn(Evaluated) + Send + 'static) -> Worker {
         let mailbox = Arc::new(Mailbox::default());
         let worker = Arc::clone(&mailbox);
         std::thread::Builder::new()
@@ -246,11 +314,18 @@ impl Worker {
                 let mut evaluator = Evaluator::new();
                 let mut sizing = StagingSizing::default();
                 while let Some(request) = worker.next() {
-                    match request {
-                        Some(wanted) => {
+                    match (request, device) {
+                        (Some(wanted), EvaluationDevice::Cpu) => {
                             evaluate(&worker, &mut evaluator, wanted, &deliver, &mut sizing);
                         }
-                        None => evaluator.release_all(),
+                        (Some(wanted), EvaluationDevice::Gpu) => {
+                            evaluate_on_gpu(&worker, &mut evaluator, wanted, &deliver);
+                        }
+                        (None, EvaluationDevice::Cpu) => evaluator.release_all(),
+                        (None, EvaluationDevice::Gpu) => {
+                            evaluator.release_all();
+                            release_on_gpu(&worker);
+                        }
                     }
                 }
             })
@@ -264,20 +339,23 @@ impl Worker {
         self.mailbox.changed.notify_all();
     }
 
-    /// Lets the worker stage pixels for `device`, replacing any device connected before, and
-    /// delivers the last request again, under its number, now with its pixels. Until then it
-    /// evaluates images without them. The worker makes its staging buffer when it first stages,
+    /// Lets the worker evaluate or stage pixels on `device`, replacing any device connected
+    /// before, and delivers the last request again, under its number, now with its pixels. Until
+    /// then a CPU session evaluates images without them, and a GPU session evaluates nothing. The
+    /// worker makes its staging buffer, or its state on the device, when it first needs them,
     /// off the caller's thread.
-    pub(crate) fn connect(&self, device: wgpu::Device, device_generation: u64) {
+    pub(crate) fn connect(&self, device: wgpu::Device, queue: wgpu::Queue, device_generation: u64) {
         self.replace_connection(Some(Connection {
             generation: device_generation,
             device,
+            queue,
             staging: StagingSlot::Empty,
+            on_device: None,
         }));
     }
 
-    /// Stops staging pixels for the connected device, which was lost, and delivers the last
-    /// request again without them, since a result finished for that device is dropped.
+    /// Stops using the connected device, which was lost, and delivers the last request again,
+    /// without pixels in a CPU session, since a result finished for that device is dropped.
     pub(crate) fn disconnect(&self) {
         self.replace_connection(None);
     }
@@ -295,14 +373,14 @@ impl Worker {
 }
 
 impl Drop for Worker {
-    /// Stops the worker, waiting while it stages or delivers a result but not while it evaluates
-    /// one, and drops the device and the staging buffer on this thread. Nothing is delivered
-    /// after this returns.
+    /// Stops the worker, waiting while it is in a GPU phase but not while it evaluates on the
+    /// CPU, and drops the device and everything the worker made on it on this thread. Nothing is
+    /// delivered after this returns.
     fn drop(&mut self) {
         let mut state = self.mailbox.lock();
         state.stopping = true;
         self.mailbox.changed.notify_all();
-        while state.finishing {
+        while state.in_gpu_phase {
             state = self
                 .mailbox
                 .changed
@@ -383,19 +461,40 @@ impl Mailbox {
         self.lock().superseded()
     }
 
-    /// Begins staging and delivering a result, unless it is superseded.
-    fn start_finishing(self: &Arc<Mailbox>) -> Option<Finishing<'_>> {
+    /// Begins a GPU phase, in which the worker may hold GPU objects, unless the started request
+    /// is superseded.
+    fn start_gpu_phase(self: &Arc<Mailbox>) -> Option<GpuPhase<'_>> {
         let mut state = self.lock();
         if state.superseded() {
             return None;
         }
-        state.finishing = true;
-        let device = (state.connection.as_ref())
-            .map(|connection| (connection.device.clone(), connection.generation));
-        Some(Finishing {
+        state.in_gpu_phase = true;
+        let device = (state.connection.as_ref()).map(|connection| PhaseDevice {
+            device: connection.device.clone(),
+            queue: connection.queue.clone(),
+            generation: connection.generation,
+        });
+        Some(GpuPhase {
             mailbox: self,
             device,
         })
+    }
+
+    /// The keys of the results retained on the connected device, for planning a request before
+    /// its GPU phase.
+    fn retained_on_gpu(&self) -> Vec<ResultKey> {
+        let state = self.lock();
+        (state.connection.as_ref())
+            .and_then(|connection| connection.on_device.as_ref())
+            .map_or_else(Vec::new, |on_device| on_device.evaluation.retained_keys())
+    }
+
+    /// Waits until the state changes or for at most `timeout`.
+    fn pause(&self, timeout: Duration) {
+        let state = self.lock();
+        if !state.stopping {
+            drop(self.changed.wait_timeout(state, timeout));
+        }
     }
 }
 
@@ -417,14 +516,23 @@ impl MailboxState {
     }
 }
 
-/// The worker's staging and delivery of a result. The worker's drop waits for it to end.
-struct Finishing<'a> {
+/// The part of a request in which the worker may hold GPU objects: staging and delivering its
+/// result in a CPU session; recording, submitting and delivering it, then waiting for the GPU to
+/// complete it, in a GPU session. Never decoding or the CPU's kernels. The worker's drop waits for
+/// it to end.
+struct GpuPhase<'a> {
     mailbox: &'a Arc<Mailbox>,
-    /// The device connected when it began, and its generation.
-    device: Option<(wgpu::Device, u64)>,
+    /// The device connected when it began.
+    device: Option<PhaseDevice>,
 }
 
-impl Finishing<'_> {
+struct PhaseDevice {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    generation: u64,
+}
+
+impl GpuPhase<'_> {
     /// Whether another device, or none, has been connected since this began.
     fn device_replaced(&self) -> bool {
         let state = self.mailbox.lock();
@@ -434,7 +542,42 @@ impl Finishing<'_> {
             .map(|connection| connection.generation);
         self.device
             .as_ref()
-            .is_some_and(|&(_, began)| current != Some(began))
+            .is_some_and(|began| current != Some(began.generation))
+    }
+
+    /// Calls `use_on_device` with evaluation's state on the phase's device, taken out of the
+    /// connection, or made if the connection has none yet, then returns it there, or drops it
+    /// if another device has been connected since. `None` without a device, or once replaced.
+    fn with_on_device<R>(
+        &self,
+        use_on_device: impl FnOnce(&mut OnDevice, &PhaseDevice) -> R,
+    ) -> Option<R> {
+        let device = self.device.as_ref()?;
+        let taken = {
+            let mut state = self.mailbox.lock();
+            match &mut state.connection {
+                Some(connection) if connection.generation == device.generation => {
+                    connection.on_device.take()
+                }
+                _ => return None,
+            }
+        };
+        let mut on_device = taken.unwrap_or_else(|| OnDevice {
+            evaluation: GpuEvaluation::new(&device.device, &device.queue),
+            conversion: Conversion::new(&device.device),
+        });
+        let result = use_on_device(&mut on_device, device);
+        let mut state = self.mailbox.lock();
+        match &mut state.connection {
+            Some(connection) if connection.generation == device.generation => {
+                connection.on_device = Some(on_device);
+            }
+            _ => {
+                drop(state);
+                drop(on_device);
+            }
+        }
+        Some(result)
     }
 
     /// Whether the worker is stopping or another device, or none, has been connected since this
@@ -445,10 +588,10 @@ impl Finishing<'_> {
     }
 }
 
-impl Drop for Finishing<'_> {
+impl Drop for GpuPhase<'_> {
     fn drop(&mut self) {
         drop(self.device.take());
-        self.mailbox.lock().finishing = false;
+        self.mailbox.lock().in_gpu_phase = false;
         self.mailbox.changed.notify_all();
     }
 }
@@ -481,7 +624,7 @@ fn evaluate(
             })
         }
     };
-    let Some(finishing) = mailbox.start_finishing() else {
+    let Some(phase) = mailbox.start_gpu_phase() else {
         return;
     };
     let mut staging = StagingTiming::default();
@@ -489,46 +632,176 @@ fn evaluate(
         Ok(image) => {
             let (info, planes) = image.into_parts();
             let pool = evaluator.pool();
-            match stage(&finishing, &info, planes, pool, sizing, &mut staging) {
-                Ok(pixels) => Ok(ViewerImage { info, pixels }),
+            match stage(&phase, &info, planes, pool, sizing, &mut staging) {
+                Ok(pixels) => Ok(ViewerImage {
+                    info,
+                    pixels: pixels.map(Pixels::Staged),
+                }),
                 Err(reason) => Err(ViewerError::CannotShow(reason)),
             }
         }
         Err(error) => Err(ViewerError::Eval(error)),
     };
-    // The result's GPU objects, if any, go before the finishing ends. A result finished for a
-    // replaced device is dropped, even a failure, which may be that device's: connecting the
-    // new one asks for the request again.
-    if mailbox.superseded() || finishing.device_replaced() {
-        drop(result);
-    } else {
-        let timing = Timing {
-            started,
-            evaluated: evaluated_at,
-            staging,
-            delivered: Instant::now(),
-        };
-        deliver(Evaluated {
-            wanted,
-            result,
-            timing,
-        });
+    let timing = Timing {
+        started,
+        read: None,
+        evaluated: evaluated_at,
+        staging,
+        delivered: evaluated_at,
+    };
+    deliver_unless_superseded(&phase, wanted, result, timing, deliver);
+}
+
+/// Delivers a result, unless it is superseded or was finished for a replaced device, which drops
+/// it, even a failure, which may be that device's: connecting the new one asks for the request
+/// again. Its GPU objects, if any, go before the phase ends.
+fn deliver_unless_superseded(
+    phase: &GpuPhase,
+    wanted: Wanted,
+    result: Result<ViewerImage, ViewerError>,
+    mut timing: Timing,
+    deliver: &impl Fn(Evaluated),
+) {
+    if phase.mailbox.superseded() || phase.device_replaced() {
+        return;
     }
-    drop(finishing);
+    timing.delivered = Instant::now();
+    deliver(Evaluated {
+        wanted,
+        result,
+        timing,
+    });
+}
+
+/// Evaluates the wanted key in a GPU session: reads the files of the Readers it uploads on the
+/// worker's thread, then in a GPU phase records the request and its display conversion, submits
+/// them as one, delivers the result, and waits without blocking for the GPU to complete it, unless
+/// it is superseded first. Without a device it evaluates nothing: connecting one asks again.
+fn evaluate_on_gpu(
+    mailbox: &Arc<Mailbox>,
+    evaluator: &mut Evaluator,
+    wanted: Wanted,
+    deliver: &impl Fn(Evaluated),
+) {
+    let started = Instant::now();
+    let on_gpu = mailbox.retained_on_gpu();
+    let read = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        evaluator.read_for_gpu(&wanted.key, &on_gpu, || mailbox.superseded())
+    }));
+    drop(on_gpu);
+    let read_at = Instant::now();
+    let failure = match read {
+        Ok(None) => return,
+        Ok(Some(Ok(()))) => None,
+        Ok(Some(Err(error))) => Some(error),
+        // As in a CPU session: the evaluator's own panic, after which it starts again.
+        Err(_) => {
+            *evaluator = Evaluator::new();
+            Some(EvalError::Panicked {
+                origin: wanted.key.clone(),
+            })
+        }
+    };
+    let Some(phase) = mailbox.start_gpu_phase() else {
+        return;
+    };
+    let mut timing = Timing {
+        started,
+        read: Some(read_at),
+        evaluated: read_at,
+        staging: StagingTiming::default(),
+        delivered: read_at,
+    };
+    if let Some(error) = failure {
+        let result = Err(ViewerError::Eval(error));
+        deliver_unless_superseded(&phase, wanted, result, timing, deliver);
+        return;
+    }
+    phase.with_on_device(|on_device, device| {
+        let Some(result) = record_and_submit(mailbox, evaluator, on_device, device, &wanted.key)
+        else {
+            return;
+        };
+        timing.evaluated = Instant::now();
+        deliver_unless_superseded(&phase, wanted, result, timing, deliver);
+        // The next request is recorded only once this one is complete, so that superseded work
+        // on the GPU is at most one request, and so is its memory.
+        while !on_device.evaluation.idle() && !phase.abandoned() {
+            mailbox.pause(COMPLETION_POLL);
+        }
+    });
+}
+
+/// Records the key's request and its display conversion on the device, and submits them as one,
+/// unless the request is superseded first, which records or submits nothing more.
+fn record_and_submit(
+    mailbox: &Mailbox,
+    evaluator: &mut Evaluator,
+    on_device: &mut OnDevice,
+    device: &PhaseDevice,
+    key: &ResultKey,
+) -> Option<Result<ViewerImage, ViewerError>> {
+    let recorded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        evaluator.record_on(&mut on_device.evaluation, key, || mailbox.superseded())
+    }));
+    let mut recorded = match recorded {
+        Ok(None) => return None,
+        Ok(Some(Ok(recorded))) => recorded,
+        Ok(Some(Err(error))) => return Some(Err(ViewerError::Eval(error))),
+        // The evaluator's own panic, which may have left the GPU table half released: both
+        // start again with nothing retained.
+        Err(_) => {
+            *evaluator = Evaluator::new();
+            on_device.evaluation.release_all();
+            return Some(Err(ViewerError::Eval(EvalError::Panicked {
+                origin: key.clone(),
+            })));
+        }
+    };
+    let (encoder, image) = recorded.encoder_and_image();
+    let texture = on_device.conversion.record(encoder, image);
+    if mailbox.superseded() {
+        return None;
+    }
+    let image = on_device.evaluation.submit(recorded);
+    Some(Ok(ViewerImage {
+        info: image.info().clone(),
+        pixels: texture.map(|texture| Pixels::Converted {
+            texture,
+            device_generation: device.generation,
+        }),
+    }))
+}
+
+/// Releases everything retained on the connected device and every display texture the viewer
+/// does not hold, as when the viewer wants nothing.
+fn release_on_gpu(mailbox: &Arc<Mailbox>) {
+    let Some(phase) = mailbox.start_gpu_phase() else {
+        return;
+    };
+    phase.with_on_device(|on_device, _| {
+        on_device.evaluation.release_all();
+        on_device.conversion.release_unheld();
+    });
 }
 
 /// Converts the planes into the staging buffer and makes their texture. `Ok(None)` without a GPU
 /// or pixels, or if the request was superseded or the worker stopped while waiting for the buffer,
 /// which the check for a superseded result after this catches.
 fn stage(
-    finishing: &Finishing,
+    phase: &GpuPhase,
     info: &ImageInfo,
     planes: [Plane; 4],
     pool: &Pool,
     sizing: &mut StagingSizing,
     timing: &mut StagingTiming,
 ) -> Result<Option<Staged>, String> {
-    let Some((device, device_generation)) = &finishing.device else {
+    let Some(PhaseDevice {
+        device,
+        generation: device_generation,
+        ..
+    }) = &phase.device
+    else {
         return Ok(None);
     };
     let window = info.data_window;
@@ -552,14 +825,14 @@ fn stage(
             limits.max_buffer_size
         ));
     }
-    let Some(mut staging) = finishing.mailbox.take_staging(*device_generation) else {
+    let Some(mut staging) = phase.mailbox.take_staging(*device_generation) else {
         return Ok(None);
     };
     // Until the buffer is back in `staging`, a failure drops it, leaving the slot empty.
     let buffer = match staging.buffer.take() {
         Some(buffer) => match sizing.replacement(buffer.size(), size, limits.max_buffer_size) {
             None => {
-                map(finishing, device, &buffer).map_err(|error| {
+                map(phase, device, &buffer).map_err(|error| {
                     format!("the GPU could not map its staging buffer: {error}")
                 })?;
                 buffer
@@ -709,7 +982,7 @@ fn allocate<T>(device: &wgpu::Device, what: &str, make: impl FnOnce() -> T) -> R
 
 /// Maps the buffer for writing once the GPU has finished copying out of it, unless the staging is
 /// abandoned first.
-fn map(finishing: &Finishing, device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<(), String> {
+fn map(phase: &GpuPhase, device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
     buffer.map_async(wgpu::MapMode::Write, .., move |result| {
         let _ = sender.send(result);
@@ -719,7 +992,7 @@ fn map(finishing: &Finishing, device: &wgpu::Device, buffer: &wgpu::Buffer) -> R
         if let Ok(result) = receiver.try_recv() {
             return result.map_err(|error| error.to_string());
         }
-        if finishing.abandoned() {
+        if phase.abandoned() {
             return Err("the worker stopped waiting for the GPU".to_owned());
         }
     }

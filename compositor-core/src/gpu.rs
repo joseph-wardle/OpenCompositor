@@ -1,9 +1,9 @@
 //! The GPU: one device for every pane, and a surface for each pane while it has a native window.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use open_ng::{Graph, Renderer, View, ViewBuffers, Viewport};
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
@@ -11,7 +11,7 @@ use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
 use crate::app::{Notice, Pane, Waker};
 use crate::image::Window;
 use crate::viewer::Placement;
-use crate::worker::Staged;
+use crate::worker::Pixels;
 
 /// Behind everything a pane draws.
 const BACKGROUND: wgpu::Color = wgpu::Color {
@@ -69,6 +69,10 @@ pub(crate) struct Gpu {
     instance: Option<wgpu::Instance>,
     /// Only in the lifecycle check.
     checks: Option<FrameChecks>,
+    /// Each pane's last frame, only in the drag check.
+    timings: Option<[Option<FrameTiming>; Pane::COUNT]>,
+    /// Numbers the frames timed.
+    frames_timed: u64,
     /// Uncaptured errors on every device of the session.
     errors: Arc<AtomicU64>,
     /// Counts the attempts to make a device, telling each device's notices and staged images
@@ -84,10 +88,11 @@ struct PaneWindow {
     size: PaneSize,
 }
 
-/// A device made for the panes, for the worker to stage images for.
+/// A device made for the panes, for the worker to evaluate or stage images on.
 #[derive(Debug)]
 pub(crate) struct NewDevice {
     pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     pub(crate) generation: u64,
     /// Why panes with a native window cannot draw on it.
     pub(crate) pane_errors: Vec<String>,
@@ -113,6 +118,20 @@ struct FrameChecks {
     /// Counted from the queue, which can report finished work on the evaluator's thread.
     finished: [Arc<AtomicU64>; Pane::COUNT],
     centres: [Option<[u8; 4]>; Pane::COUNT],
+}
+
+/// When a pane's frame passed each stage, for the shell's drag check.
+#[derive(Clone, Debug)]
+pub struct FrameTiming {
+    /// The frame's number among the frames timed, of every pane, from 1.
+    pub number: u64,
+    /// The surface gave the frame's texture.
+    pub acquired: Instant,
+    /// The frame was submitted.
+    pub submitted: Instant,
+    /// When the GPU reported the frame complete, set by whichever thread's poll or submit ran
+    /// the report. Nothing polls an idle device, so the check polls while it waits.
+    pub completed: Arc<OnceLock<Instant>>,
 }
 
 /// What the viewer pane draws: the shown image's windows, and where they appear.
@@ -155,6 +174,8 @@ impl Gpu {
             windows: Default::default(),
             instance: None,
             checks: None,
+            timings: None,
+            frames_timed: 0,
             errors: Arc::default(),
             device_generation: 0,
             waker,
@@ -170,6 +191,23 @@ impl Gpu {
     /// made from now on are made readable where they allow it.
     pub(crate) fn check_frames(&mut self) {
         self.checks.get_or_insert_default();
+    }
+
+    /// Records when each frame from now on passes each stage.
+    pub(crate) fn time_frames(&mut self) {
+        self.timings.get_or_insert_default();
+    }
+
+    /// The pane's last timed frame; `None` before one or without [`Gpu::time_frames`].
+    pub(crate) fn frame_timing(&self, pane: Pane) -> Option<FrameTiming> {
+        self.timings.as_ref()?[pane.index()].clone()
+    }
+
+    /// Runs the callbacks of the device's completed work, without waiting for any.
+    pub(crate) fn poll(&self) {
+        if let Some(device) = &self.device {
+            let _ = device.device.poll(wgpu::PollType::Poll);
+        }
     }
 
     pub(crate) fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
@@ -277,6 +315,7 @@ impl Gpu {
         }
         let new = NewDevice {
             device: device.device.clone(),
+            queue: device.queue.clone(),
             generation: self.device_generation,
             pane_errors,
         };
@@ -313,41 +352,50 @@ impl Gpu {
         let _ = wait_for_device(&device.device, None);
     }
 
-    /// Copies a staged image into its texture and shows it in the viewer from the next frame.
+    /// Shows an image's pixels in the viewer from the next frame. Staged pixels are copied into
+    /// their texture first; converted ones are in theirs already, which the viewer holds while it
+    /// shows them. Pixels for an earlier device are dropped.
     ///
     /// The copy is submitted at once rather than with the viewer's next frame, which may never
     /// come while the viewer is closed, so that the staging buffer goes back to the worker.
-    /// An image staged for an earlier device is dropped.
-    pub(crate) fn show_image(&mut self, staged: Staged) {
+    pub(crate) fn show_image(&mut self, pixels: Pixels) {
         let Some(device) = &mut self.device else {
             return;
         };
-        if staged.device_generation() != self.device_generation {
+        if pixels.device_generation() != self.device_generation {
             return;
         }
-        let mut encoder = device.device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_texture(
-            wgpu::TexelCopyBufferInfo {
-                buffer: staged.buffer(),
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(staged.bytes_per_row),
-                    rows_per_image: None,
-                },
-            },
-            staged.texture.as_image_copy(),
-            staged.texture.size(),
-        );
-        device.queue.submit([encoder.finish()]);
-        let view = staged.texture.create_view(&Default::default());
-        device.viewer.image = Some(device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let (view, held) = match pixels {
+            Pixels::Staged(staged) => {
+                let mut encoder = device.device.create_command_encoder(&Default::default());
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: staged.buffer(),
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(staged.bytes_per_row),
+                            rows_per_image: None,
+                        },
+                    },
+                    staged.texture.as_image_copy(),
+                    staged.texture.size(),
+                );
+                device.queue.submit([encoder.finish()]);
+                (staged.texture.create_view(&Default::default()), None)
+            }
+            Pixels::Converted { texture, .. } => {
+                (texture.create_view(&Default::default()), Some(texture))
+            }
+        };
+        let group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("viewer image"),
             layout: &device.viewer.image_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(&view),
             }],
-        }));
+        });
+        device.viewer.image = Some(ShownImage { group, held });
     }
 
     /// Stops drawing the viewer's image, which a failed read or an unmarked slot replaces.
@@ -422,6 +470,7 @@ impl Gpu {
                 }
             }
         }
+        let acquired = Instant::now();
         let target = frame.texture.create_view(&Default::default());
         let mut encoder = device.device.create_command_encoder(&Default::default());
         {
@@ -454,6 +503,20 @@ impl Gpu {
             _ => None,
         };
         device.queue.submit([encoder.finish()]);
+        if let Some(timings) = &mut self.timings {
+            self.frames_timed += 1;
+            let completed = Arc::new(OnceLock::new());
+            let report = Arc::clone(&completed);
+            device.queue.on_submitted_work_done(move || {
+                let _ = report.set(Instant::now());
+            });
+            timings[pane.index()] = Some(FrameTiming {
+                number: self.frames_timed,
+                acquired,
+                submitted: Instant::now(),
+                completed,
+            });
+        }
         if let Some(checks) = &mut self.checks {
             checks.record(pane, device, readback);
         }
@@ -778,7 +841,16 @@ struct ViewerRenderer {
     frame_group: wgpu::BindGroup,
     image_layout: wgpu::BindGroupLayout,
     /// The shown image's texture, while the viewer has one.
-    image: Option<wgpu::BindGroup>,
+    image: Option<ShownImage>,
+}
+
+#[derive(Debug)]
+struct ShownImage {
+    group: wgpu::BindGroup,
+    /// A GPU session's display texture, held so that the worker does not convert into it while
+    /// it is shown.
+    #[expect(dead_code, reason = "held for its count, never read")]
+    held: Option<Arc<wgpu::Texture>>,
 }
 
 /// The size of the shader's `Frame`.
@@ -914,7 +986,7 @@ impl ViewerRenderer {
         pass.set_bind_group(0, &self.frame_group, &[]);
         if let Some(image) = &self.image {
             pass.set_pipeline(&self.image_pipeline);
-            pass.set_bind_group(1, image, &[]);
+            pass.set_bind_group(1, &image.group, &[]);
             pass.draw(0..4, 0..1);
         }
         pass.set_pipeline(&self.outline_pipeline);
@@ -934,24 +1006,25 @@ impl Drop for Gpu {
 }
 
 /// A device that keeps buffers in memory and draws nothing, with the limits given or the most
-/// permissive, for tests that need wgpu objects but no GPU.
+/// permissive, and its queue, for tests that need wgpu objects but no GPU.
 #[cfg(test)]
-pub(crate) fn noop_device(limits: Option<wgpu::Limits>) -> wgpu::Device {
-    noop_parts(limits).1
+pub(crate) fn noop_device(limits: Option<wgpu::Limits>) -> (wgpu::Device, wgpu::Queue) {
+    let (_, device, queue) = noop_parts(limits);
+    (device, queue)
 }
 
-/// Two noop devices from one adapter. Objects of devices from separate instances can compare
-/// equal, since each instance numbers its objects from the same start.
+/// Two noop devices from one adapter, with their queues. Objects of devices from separate
+/// instances can compare equal, since each instance numbers its objects from the same start.
 #[cfg(test)]
-pub(crate) fn noop_device_pair() -> [wgpu::Device; 2] {
-    let (adapter, first, _) = noop_parts(None);
+pub(crate) fn noop_device_pair() -> [(wgpu::Device, wgpu::Queue); 2] {
+    let (adapter, first, queue) = noop_parts(None);
     let descriptor = wgpu::DeviceDescriptor {
         required_limits: adapter.limits(),
         ..Default::default()
     };
-    let (second, _) = pollster::block_on(adapter.request_device(&descriptor))
+    let second = pollster::block_on(adapter.request_device(&descriptor))
         .expect("the noop adapter has a second device");
-    [first, second]
+    [(first, queue), second]
 }
 
 #[cfg(test)]
@@ -1093,10 +1166,11 @@ mod tests {
         use crate::evaluate::result_key;
         use crate::fixtures;
         use crate::session::Session;
-        use crate::worker::{Wanted, Worker};
+        use crate::worker::{EvaluationDevice, Wanted, Worker};
 
         let mut gpu = Gpu::with_noop_device(Waker::channel().0);
         let device = gpu.device.as_ref().expect("a device").device.clone();
+        let queue = gpu.device.as_ref().expect("a device").queue.clone();
         let path = fixtures::directory("staged").join("white.png");
         fixtures::write_png(&path, 1, 1, png::ColorType::Rgba, &[255; 4]);
         let mut session = Session::new();
@@ -1104,14 +1178,16 @@ mod tests {
         let node = *changes.nodes.first().expect("one Reader");
         let key = result_key(session.document(), session.reloads(), node).expect("a key");
         let (delivered, deliveries) = mpsc::channel();
-        let worker = Worker::start(move |evaluated| delivered.send(evaluated).unwrap());
+        let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
+            delivered.send(evaluated).unwrap()
+        });
         let staged = || {
             let evaluated = deliveries.recv_timeout(Duration::from_secs(10)).unwrap();
             evaluated.result.unwrap().pixels.expect("pixels staged")
         };
 
         // Staged for the generation before the GPU's own, as after a loss.
-        worker.connect(device.clone(), 0);
+        worker.connect(device.clone(), queue.clone(), 0);
         worker.request(Some(Wanted {
             node,
             key,
@@ -1121,14 +1197,14 @@ mod tests {
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_none());
 
         // Connecting delivers the last key again, now for the GPU's generation.
-        worker.connect(device, 1);
+        worker.connect(device, queue, 1);
         gpu.show_image(staged());
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_some());
     }
 
     #[test]
     fn the_viewers_shader_and_pipelines_validate() {
-        let device = noop_device(None);
+        let (device, _) = noop_device(None);
         ViewerRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb);
     }
 }

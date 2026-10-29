@@ -20,7 +20,8 @@ use std::time::Instant;
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
 use opencompositor_core::{
-    App, Command, Event, FileIntent, FrameCheck, Notice, Pane, Request, Session, Slot,
+    App, Command, EvaluationDevice, Event, FileIntent, FrameCheck, FrameTiming, Notice, Pane,
+    Request, Session, Slot,
 };
 
 use crate::qt::ffi;
@@ -65,16 +66,24 @@ enum Check {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur]]"
+        "usage: opencompositor [--gpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur]]"
     );
     std::process::exit(2)
 }
 
 fn main() {
-    let check = match &std::env::args_os().skip(1).collect::<Vec<_>>()[..] {
+    // The GPU evaluates only when chosen, until it runs every built-in operation and reads out.
+    let mut arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let device = if arguments.first().is_some_and(|flag| flag == "--gpu") {
+        arguments.remove(0);
+        EvaluationDevice::Gpu
+    } else {
+        EvaluationDevice::Cpu
+    };
+    let check = match &arguments[..] {
         [] => None,
         [flag, image] if flag == "--lifecycle-check" => Some(Check::Lifecycle(image.into())),
-        [flag, image] if flag == "--drag-check" => drag::run_chains(image.as_ref()),
+        [flag, image] if flag == "--drag-check" => drag::run_chains(image.as_ref(), device),
         [flag, image, name] if flag == "--drag-check" => {
             match name.to_str().and_then(drag::Chain::from_name) {
                 Some(chain) => Some(Check::Drag(image.into(), chain)),
@@ -97,12 +106,14 @@ fn main() {
     let waker = ffi::new_waker();
     // SAFETY: the waker is live. Its thread handle outlives it: queueing fails once it is deleted.
     let waker_thread = unsafe { &*waker }.qt_thread();
-    let mut app = App::new(move |notice| {
+    let mut app = App::new(device, move |notice| {
         // Fails only once the waker is deleted at exit, when nothing is left to tell.
         let _ = waker_thread.queue(move |_| receive(notice));
     });
-    if matches!(check, Some(Check::Lifecycle(_))) {
-        app.check_frames();
+    match check {
+        Some(Check::Lifecycle(_)) => app.check_frames(),
+        Some(Check::Drag(..)) => app.time_frames(),
+        None => {}
     }
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
@@ -246,13 +257,16 @@ fn main() {
 
 /// Hands an event to the app, then does what it asks.
 pub fn dispatch(event: Event) {
-    let draws_viewer = matches!(event, Event::Draw(Pane::Viewer));
+    let drawn = match event {
+        Event::Draw(pane) => Some(pane),
+        _ => None,
+    };
     let Some(requests) = APP.with(|cell| cell.borrow_mut().as_mut().map(|app| app.dispatch(event)))
     else {
         return;
     };
-    if draws_viewer {
-        drag::viewer_frame_drawn();
+    if let Some(pane) = drawn {
+        drag::frame_drawn(pane);
     }
     for request in requests {
         perform(request);
@@ -418,6 +432,25 @@ pub fn gpu_errors() -> u64 {
 /// The number of the latest request to the worker, in the drag check.
 pub fn latest_request() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, App::latest_request))
+}
+
+/// The pane's last frame, in the drag check.
+pub fn frame_timing(pane: Pane) -> Option<FrameTiming> {
+    APP.with(|cell| cell.borrow().as_ref()?.frame_timing(pane))
+}
+
+/// Runs the callbacks of the GPU's completed work, in the drag check.
+pub fn poll_gpu() {
+    APP.with(|cell| {
+        if let Some(app) = cell.borrow().as_ref() {
+            app.poll_gpu();
+        }
+    });
+}
+
+/// The device evaluating the session.
+pub fn evaluation_device() -> EvaluationDevice {
+    APP.with(|cell| (cell.borrow().as_ref()).map_or(EvaluationDevice::Cpu, App::evaluation_device))
 }
 
 /// The number of the request whose image the viewer last presented, in the drag check.
