@@ -103,6 +103,11 @@ impl BoxPass {
 /// the two ends, `edge (first + last) + inner core` fused, the line grown by `2 tmax`. The CPU
 /// sums in f64, whose products and sums of f32 samples round far below the f32 each pass
 /// stores; the GPU in f32.
+///
+/// Blur's input range on the GPU: magnitudes within `f32::MAX / max(2 tmax - 1, 2)`, where the
+/// GPU's unweighted f32 sums of a window cannot overflow. Beyond it the GPU may give an infinity,
+/// or NaN where infinities of both signs meet, where the CPU's result is finite. A pass's output
+/// stays within its input's magnitude, so the range holds for all of Blur's passes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct BoxSum {

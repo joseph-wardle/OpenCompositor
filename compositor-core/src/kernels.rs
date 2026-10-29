@@ -1244,6 +1244,53 @@ mod tests {
         );
     }
 
+    /// A flat plate through one box pass on the GPU, summed directly and by blocks: finite just
+    /// inside Blur's input range on the GPU, `f32::MAX / max(2 tmax - 1, 2)`, and an infinity
+    /// wherever the whole window lies on a plate just outside it, where the CPU's f64 sum is
+    /// finite.
+    #[test]
+    fn a_flat_plate_on_the_gpu_is_finite_only_within_blurs_input_range() {
+        let (device, queue) = headless::device();
+        let mut kernels = Kernels::new(&device);
+        let mut planes = Planes::default();
+        let (width, height) = (2800, 2);
+        for size in [2.0, 10.0, 180.0, 1000.0, 4096.0] {
+            let op = BoxSum::new(BoxPass::new(size));
+            let t = op.t();
+            let limit = f32::MAX / (2 * t - 1).max(2) as f32;
+            for (scale, inside) in [(0.999, true), (1.01, false)] {
+                let texels = vec![limit * scale; (width * height) as usize];
+                let input = headless::upload(&device, &queue, width, height, &texels);
+                let out_width = width + 2 * t;
+                let output = headless::output(&device, out_width, height);
+                let mut encoder = device.create_command_encoder(&Default::default());
+                kernels
+                    .line(
+                        &mut encoder,
+                        &op,
+                        Axis::Rows,
+                        1,
+                        &input,
+                        (width, height),
+                        &output,
+                        &mut planes,
+                    )
+                    .expect("an output grown by the pass");
+                queue.submit([encoder.finish()]);
+                let result = headless::readback(&device, &queue, &output);
+                for (i, &actual) in result.iter().enumerate() {
+                    let x = i as u32 % out_width;
+                    let whole_window = (2 * t..width).contains(&x);
+                    if inside {
+                        assert!(actual.is_finite(), "size {size} at {x} gave {actual}");
+                    } else if whole_window {
+                        assert_eq!(actual, f32::INFINITY, "size {size} at {x}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Three passes in one call, through the intermediate planes, are the three passes one at
     /// a time, bit for bit, along each axis and by both reductions.
     #[test]
