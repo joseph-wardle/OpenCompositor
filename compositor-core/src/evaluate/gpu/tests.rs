@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use opencompositor_kernels::ulp_distance;
 
 use super::*;
-use crate::document::{Node, NodeKind, ReaderVersion};
+use crate::document::{InputSlot, Node, NodeKind, ReaderVersion};
 use crate::evaluate::tests::{blur, chain, exposure, graph, key, merge, reader, write_png};
 use crate::fixtures::{directory, write_exr};
 use crate::kernels::headless;
@@ -214,28 +214,165 @@ fn a_new_generation_uploads_again_without_decoding() {
     assert_eq!(read_back(&gpu, &image, Channel::R), before);
 }
 
+/// Values for Merge whose every product and sum is exact, so that a driver splitting the fused
+/// multiply-add cannot differ from the CPU: small dyadic magnitudes of both signs, with the
+/// non-finite classes, alpha among 0, ½, ¼ and 1. `seed` rotates them, so that each input
+/// differs.
+fn exact_merge_values(count: usize, seed: usize, alpha: bool) -> Vec<f32> {
+    const COLOUR: [f32; 9] = [
+        0.0,
+        -0.0,
+        0.5,
+        0.25,
+        1.0,
+        2.0,
+        -0.75,
+        f32::INFINITY,
+        f32::NAN,
+    ];
+    const ALPHA: [f32; 4] = [0.0, 0.5, 0.25, 1.0];
+    (0..count)
+        .map(|i| {
+            let i = i * 7 + seed;
+            if alpha {
+                ALPHA[i % ALPHA.len()]
+            } else {
+                COLOUR[i % COLOUR.len()]
+            }
+        })
+        .collect()
+}
+
+/// An EXR over `origin` and `size` of Merge's exact values, its display window the first's.
+fn merge_exr(path: &Path, origin: (i32, i32), size: (usize, usize), seed: usize) {
+    let count = size.0 * size.1;
+    let channels = ["R", "G", "B", "A"]
+        .into_iter()
+        .zip(0..)
+        .map(|(name, channel)| {
+            let values = exact_merge_values(count, seed + channel, name == "A");
+            (name, values)
+        })
+        .collect();
+    write_exr(path, ((0, 0), (32, 16)), origin, size, channels);
+}
+
+/// A Reader with no file, whose image is empty.
+fn reader_without_a_file() -> Node {
+    Node::new(
+        NodeKind::Reader {
+            version: ReaderVersion::V1,
+        },
+        open_ng::Point { x: 0.0, y: 0.0 },
+    )
+}
+
+/// Merge on the GPU against the CPU's result over whole images, bit for bit: offset inputs
+/// whose union is larger than each, two layers through the stack between them, an empty
+/// background and an empty layer, at Mix 1 and two dissolves.
 #[test]
-fn an_operation_without_a_gpu_path_is_refused_before_anything_is_recorded() {
-    let directory = directory("refused");
-    let path = directory.join("image.png");
+fn merge_on_the_gpu_is_the_cpu_result_over_whole_images() {
+    let directory = directory("merge");
+    let [background, first, second] =
+        ["background", "first", "second"].map(|name| directory.join(format!("{name}.exr")));
+    merge_exr(&background, (-3, -2), (37, 19), 0);
+    merge_exr(&first, (5, 4), (23, 29), 3);
+    merge_exr(&second, (-9, 10), (17, 6), 5);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let mut cpu = Evaluator::new();
+    // Nodes 1 to 3 read the files, 4 reads nothing and 5 merges.
+    let layer = |slot| ("layer", slot).into();
+    let stacks: [&[(u64, InputSlot<'static>, u64)]; 4] = [
+        &[(5, "background".into(), 1), (5, layer(1), 2)],
+        &[
+            (5, "background".into(), 1),
+            (5, layer(1), 2),
+            (5, layer(2), 3),
+        ],
+        &[(5, "background".into(), 4), (5, layer(1), 2)],
+        &[(5, "background".into(), 1), (5, layer(1), 4)],
+    ];
+    for (stack, wires) in stacks.iter().enumerate() {
+        for mix in [1.0, 0.5, 0.25] {
+            let nodes = [
+                reader(&background),
+                reader(&first),
+                reader(&second),
+                reader_without_a_file(),
+                merge(Some(mix)),
+            ];
+            let key = key(&graph(nodes, wires), 5);
+            let expected = cpu.evaluate(&key, || false).unwrap().unwrap();
+            let image = run(&mut evaluator, &mut gpu, &key);
+            assert_eq!(image.info().data_window, expected.data_window());
+            assert_eq!(image.info().display_window, expected.display_window());
+            for channel in Channel::ALL {
+                let actual = read_back(&gpu, &image, channel);
+                let expected = expected.plane(channel);
+                assert_eq!(actual.len(), expected.len());
+                for (i, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                    let what = format!("stack {stack} at Mix {mix}, {channel:?} sample {i}");
+                    assert_eq!(
+                        ulp_distance(actual, expected),
+                        0,
+                        "{what}: {actual:?}, not {expected:?}"
+                    );
+                    if expected == 0.0 {
+                        assert_eq!(actual.to_bits(), expected.to_bits(), "{what}: zero sign");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The base alone and Mix 0 are the base itself, as on the CPU: its textures, nothing computed.
+#[test]
+fn merge_of_the_base_alone_or_at_mix_0_is_the_base_itself() {
+    let path = directory("merge_base").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
     let mut gpu = GpuEvaluation::new(&device, &queue);
     let mut evaluator = Evaluator::new();
-    let merged = graph(
+    let alone = graph(
         [reader(&path), merge(Some(0.5))],
         &[(2, "background".into(), 1)],
     );
-    let blurred = graph([reader(&path), blur(Some(4.0))], &[(2, "source".into(), 1)]);
-    for document in [merged, blurred] {
-        let requested = key(&document, 2);
-        let error = evaluator
-            .evaluate_on(&mut gpu, &requested, || false)
-            .expect("nothing stops it")
-            .expect_err("refused");
-        assert!(matches!(error, EvalError::NoGpuPath { .. }), "{error:?}");
-        assert!(*error.origin() == requested);
+    let mix_0 = graph(
+        [reader(&path), merge(Some(0.0))],
+        &[(2, "background".into(), 1), (2, ("layer", 1).into(), 1)],
+    );
+    let read = run(&mut evaluator, &mut gpu, &key(&alone, 1));
+    for document in [alone, mix_0] {
+        let merged = run(&mut evaluator, &mut gpu, &key(&document, 2));
+        for channel in Channel::ALL {
+            assert!(std::ptr::eq(
+                read.texture(channel).unwrap(),
+                merged.texture(channel).unwrap()
+            ));
+        }
     }
+}
+
+#[test]
+fn an_operation_without_a_gpu_path_is_refused_before_anything_is_recorded() {
+    let path = directory("refused").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut evaluator = Evaluator::new();
+    let blurred = graph([reader(&path), blur(Some(4.0))], &[(2, "source".into(), 1)]);
+    let requested = key(&blurred, 2);
+
+    let error = evaluator
+        .evaluate_on(&mut gpu, &requested, || false)
+        .expect("nothing stops it")
+        .expect_err("refused");
+
+    assert!(matches!(error, EvalError::NoGpuPath { .. }), "{error:?}");
+    assert!(*error.origin() == requested);
     assert_eq!(gpu.uploaded_bytes(), 0);
     assert_eq!(gpu.submitted, 0);
 }
@@ -263,16 +400,10 @@ fn a_stopped_request_submits_and_retains_nothing() {
 
 #[test]
 fn a_reader_without_a_file_gives_the_empty_image() {
-    let without_file = Node::new(
-        NodeKind::Reader {
-            version: ReaderVersion::V1,
-        },
-        open_ng::Point { x: 0.0, y: 0.0 },
-    );
     let (device, queue) = headless::device();
     let mut gpu = GpuEvaluation::new(&device, &queue);
     let mut evaluator = Evaluator::new();
-    let document = chain([without_file, exposure(Some(1.0))]);
+    let document = chain([reader_without_a_file(), exposure(Some(1.0))]);
 
     let image = run(&mut evaluator, &mut gpu, &key(&document, 2));
 

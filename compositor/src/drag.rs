@@ -94,7 +94,7 @@ impl Chain {
 
     /// Whether the chain's operations all run on the device.
     fn runs_on(self, device: EvaluationDevice) -> bool {
-        device == EvaluationDevice::Cpu || self == Chain::Exposure
+        device == EvaluationDevice::Cpu || self != Chain::Blur
     }
 
     /// What the latencies' p95 and the final edit's latency must meet on the workstation, whose

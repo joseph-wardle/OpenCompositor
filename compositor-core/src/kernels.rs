@@ -80,10 +80,6 @@ impl Kernels {
         clippy::too_many_arguments,
         reason = "a stack, its output and its scratch"
     )]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Merge records it from GPU slice 3")
-    )]
     pub(crate) fn fold<F: Fold<G, O>, const G: usize, const O: usize>(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -410,16 +406,8 @@ fn place(input: Window, output: Window) -> Placement {
 /// Planes the primitives' intermediate results are written to, kept for reuse once recorded:
 /// a later dispatch in the same submission may write one again, since wgpu orders the two.
 #[derive(Debug, Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Merge and Blur use it from GPU slices 3 and 5")
-)]
 pub(crate) struct Planes(Vec<wgpu::Texture>);
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Merge and Blur use it from GPU slices 3 and 5")
-)]
 impl Planes {
     /// A plane over `window`'s size, readable and writable by the kernels, whose contents the
     /// caller overwrites.
@@ -455,10 +443,11 @@ pub(crate) fn extent(window: Window) -> wgpu::Extent3d {
 }
 
 /// Checks an input plane before anything is recorded, rather than leaving it to wgpu, whose
-/// validation error would count as a bug on the device.
+/// validation error would count as a bug on the device. No texture is empty, so a plane over an
+/// empty window may be any plane: its placement covers nothing and it is never read.
 fn check_input(texture: &wgpu::Texture, window: Window) -> Result<(), PlaneError> {
     check_plane(Role::Input, texture, wgpu::TextureUsages::TEXTURE_BINDING)?;
-    if texture.size() != extent(window) {
+    if !window.is_empty() && texture.size() != extent(window) {
         return Err(PlaneError::Size {
             role: Role::Input,
             plane: texture.size(),

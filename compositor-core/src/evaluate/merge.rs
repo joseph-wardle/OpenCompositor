@@ -22,27 +22,10 @@ pub(super) fn merge(
     let Some((base, layers)) = inputs.split_first() else {
         return Ok(Image::empty());
     };
-    // The base alone, or Mix 0, is the base: special cases, since the kernel's products by zero
-    // would turn an infinite operand into NaN where the artist asked for the base unchanged. Mix
-    // is compared as the kernel receives it, so a Mix within f32 rounding of 0 or 1 is the case.
-    if layers.is_empty() || mix == 0.0 {
+    if is_the_base(layers.len(), mix) {
         return Ok((*base).clone());
     }
-    let mut window = base.data_window();
-    for layer in layers {
-        window = (window.union(layer.data_window())).map_err(|oversize| EvalError::Oversize {
-            origin: key.clone(),
-            oversize,
-        })?;
-    }
-    let bytes = window.plane_bytes(4);
-    if bytes > NODE_BYTES_CAP {
-        return Err(EvalError::OverCap {
-            origin: key.clone(),
-            window,
-            bytes,
-        });
-    }
+    let window = merged_window(key, inputs.iter().map(|input| input.data_window()))?;
     let len = window.area() as usize;
     let mut outputs: [Plane; 4] = [(); 4].map(|()| output_plane(released, len, len));
     let stack: Vec<([&[f32]; 4], Window)> = (layers.iter())
@@ -58,14 +41,50 @@ pub(super) fn merge(
             .each_mut()
             .map(|plane| plane.get_mut().expect("nothing else holds an output plane")),
     );
-    // Each once: a diamond brings one file's warnings by every branch.
+    let warnings = merged_warnings(inputs.iter().map(|input| input.warnings()));
+    Ok(Image::new(base.display_window(), window, outputs, warnings))
+}
+
+/// Whether Merge of a base and `layers` layers at `mix` is the base unchanged: the base alone,
+/// or Mix 0. Special cases, since the kernel's products by zero would turn an infinite operand
+/// into NaN where the artist asked for the base unchanged. Mix is compared as the kernel
+/// receives it, so a Mix within f32 rounding of 0 or 1 is the case.
+pub(super) fn is_the_base(layers: usize, mix: f32) -> bool {
+    layers == 0 || mix == 0.0
+}
+
+/// The data window Merge writes, the union of its inputs', checked against what an image can
+/// hold and the cap on one node's allocation before anything is allocated.
+pub(super) fn merged_window(
+    key: &ResultKey,
+    mut windows: impl Iterator<Item = Window>,
+) -> Result<Window, EvalError> {
+    let base = windows.next().expect("Merge has a base");
+    let window =
+        (windows.try_fold(base, Window::union)).map_err(|oversize| EvalError::Oversize {
+            origin: key.clone(),
+            oversize,
+        })?;
+    let bytes = window.plane_bytes(4);
+    if bytes > NODE_BYTES_CAP {
+        return Err(EvalError::OverCap {
+            origin: key.clone(),
+            window,
+            bytes,
+        });
+    }
+    Ok(window)
+}
+
+/// The inputs' warnings, each once: a diamond brings one file's warnings by every branch.
+pub(super) fn merged_warnings<'a>(inputs: impl Iterator<Item = &'a [Warning]>) -> Vec<Warning> {
     let mut warnings: Vec<Warning> = Vec::new();
-    for warning in inputs.iter().flat_map(|input| input.warnings()) {
+    for warning in inputs.flatten() {
         if !warnings.contains(warning) {
             warnings.push(warning.clone());
         }
     }
-    Ok(Image::new(base.display_window(), window, outputs, warnings))
+    warnings
 }
 
 /// An image's four planes as the fold reads them.
