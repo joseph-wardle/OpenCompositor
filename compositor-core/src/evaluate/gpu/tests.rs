@@ -59,8 +59,9 @@ fn read_back(gpu: &GpuEvaluation, image: &GpuImage, channel: Channel) -> Vec<f32
         .texture(channel)
         .expect("a texture over the data window");
     let values = headless::readback(&gpu.device, &gpu.queue, texture);
-    assert!(
+    assert_eq!(
         gpu.idle(),
+        Ok(true),
         "evaluation's work completed before the read back"
     );
     values
@@ -123,7 +124,7 @@ fn exposure_on_the_gpu_is_the_cpu_result_over_whole_images() {
     let path = directory("exposure").join("special.exr");
     special_exr(&path);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let mut cpu = Evaluator::new();
     // Whole and fractional stops, and one that flushes the smallest values to zero.
@@ -158,7 +159,7 @@ fn exposure_on_the_gpu_shares_alpha_and_keeps_a_grey_image_one_plane() {
     let grey = directory.join("grey.png");
     crate::evaluate::tests::write_grey_png(&grey, 200);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let document = chain([reader(&grey), exposure(Some(1.0))]);
 
@@ -177,7 +178,7 @@ fn a_stops_edit_uploads_nothing_and_reuses_the_released_output() {
     let path = directory("stops_edit").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let [one, two] = [1.0, 2.0].map(|stops| key(&chain([reader(&path), exposure(Some(stops))]), 2));
     let first = run(&mut evaluator, &mut gpu, &one);
@@ -204,7 +205,7 @@ fn a_released_texture_held_by_an_image_is_reused_only_once_let_go() {
     let path = directory("held").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let [one, two, three] =
         [1.0, 2.0, 3.0].map(|stops| key(&chain([reader(&path), exposure(Some(stops))]), 2));
@@ -231,7 +232,7 @@ fn a_new_generation_uploads_again_without_decoding() {
     let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
     let before = {
         let (device, queue) = headless::device();
-        let mut gpu = GpuEvaluation::new(&device, &queue);
+        let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
         let image = run(&mut evaluator, &mut gpu, &key);
         read_back(&gpu, &image, Channel::R)
     };
@@ -239,7 +240,7 @@ fn a_new_generation_uploads_again_without_decoding() {
     write_png(&path, 0);
 
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let image = run(&mut evaluator, &mut gpu, &key);
 
     assert!(
@@ -314,7 +315,7 @@ fn merge_on_the_gpu_is_the_cpu_result_over_whole_images() {
     merge_exr(&first, (5, 4), (23, 29), 3);
     merge_exr(&second, (-9, 10), (17, 6), 5);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let mut cpu = Evaluator::new();
     // Nodes 1 to 3 read the files, 4 reads nothing and 5 merges.
@@ -369,7 +370,7 @@ fn merge_of_the_base_alone_or_at_mix_0_is_the_base_itself() {
     let path = directory("merge_base").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let alone = graph(
         [reader(&path), merge(Some(0.5))],
@@ -571,7 +572,7 @@ fn assert_gpu_blur_matches_the_definition(
 fn blur_on_the_gpu_is_within_its_bound_of_the_composed_kernel() {
     let directory = directory("blur");
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let mut cpu = Evaluator::new();
     let mut worst: f64 = 0.0;
@@ -629,7 +630,7 @@ fn blur_on_the_gpu_keeps_a_grey_image_one_plane_and_shares_a_source_it_leaves() 
     let grey = directory("blur_sharing").join("grey.png");
     crate::evaluate::tests::write_grey_png(&grey, 200);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let texture = |image: &GpuImage, channel| image.texture(channel).unwrap() as *const _;
 
@@ -674,7 +675,7 @@ fn a_size_edit_uploads_nothing_and_reuses_the_released_outputs() {
     let path = directory("size_edit").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     // Three taps each side at both.
     let [one, two] = [10.0, 10.5].map(|size| key(&blurred(reader(&path), size), 2));
@@ -703,7 +704,7 @@ fn a_blur_over_the_cap_fails_before_recording() {
     let path = directory("blur_cap").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let requested = key(&blurred(reader(&path), 4096.0), 2);
 
@@ -730,7 +731,7 @@ fn a_stopped_request_submits_and_retains_nothing() {
     let path = directory("stopped").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
     let asked = std::cell::Cell::new(0);
@@ -749,7 +750,7 @@ fn a_stopped_request_submits_and_retains_nothing() {
 #[test]
 fn a_reader_without_a_file_gives_the_empty_image() {
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let document = chain([reader_without_a_file(), exposure(Some(1.0))]);
 
@@ -764,7 +765,7 @@ fn reading_for_the_gpu_reads_what_the_request_uploads_and_nothing_uploaded() {
     let path = directory("read_for_gpu").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     // Retaining nothing on the CPU, so that only the GPU table can spare a read.
     let mut evaluator = Evaluator::with_cap(0);
     let [one, two] = [1.0, 2.0].map(|stops| key(&chain([reader(&path), exposure(Some(stops))]), 2));
@@ -788,7 +789,7 @@ fn a_request_read_for_the_gpu_decodes_nothing_when_recorded() {
     let path = directory("read_then_record").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
 
@@ -807,7 +808,7 @@ fn a_recorded_request_dropped_unsubmitted_submits_and_retains_nothing() {
     let path = directory("recorded_dropped").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
 
@@ -826,7 +827,7 @@ fn a_request_out_of_gpu_memory_releases_what_it_does_not_read_and_fits_on_its_re
     let path = directory("out_of_memory_retry").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let document = chain([reader(&path), exposure(Some(1.0)), exposure(Some(2.0))]);
     drop(run(&mut evaluator, &mut gpu, &key(&document, 2)));
@@ -861,7 +862,7 @@ fn a_request_out_of_gpu_memory_after_its_retry_fails_and_submits_nothing() {
     let path = directory("out_of_memory").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
     gpu.shortage.cap = Some(0);
@@ -883,7 +884,7 @@ fn a_request_wgpu_rejects_fails_and_retains_nothing() {
     let path = directory("rejected").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue);
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
     let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
     let mut recorded = evaluator
@@ -905,4 +906,76 @@ fn a_request_wgpu_rejects_fails_and_retains_nothing() {
     assert!(matches!(rejected, Err(EvalError::GpuValidation { .. })));
     assert!(gpu.retained_keys().is_empty());
     run(&mut evaluator, &mut gpu, &key);
+}
+
+#[test]
+fn a_lost_device_fails_each_request_as_lost_and_is_never_idle() {
+    let path = directory("lost").join("image.png");
+    write_png(&path, 255);
+    let (device, queue) = headless::device();
+    let lost = Arc::default();
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::clone(&lost));
+    let mut evaluator = Evaluator::new();
+    let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
+    run(&mut evaluator, &mut gpu, &key);
+
+    lost.store(true, Ordering::Relaxed);
+
+    assert_eq!(gpu.idle(), Err(DeviceLost));
+    let failed = evaluator.evaluate_on(&mut gpu, &key, || false).unwrap();
+    assert!(
+        matches!(&failed, Err(EvalError::GpuLost { origin }) if *origin == key),
+        "{failed:?}"
+    );
+}
+
+/// A device whose lost callback sets the flag returned, as the app's does.
+fn watched_device() -> (wgpu::Device, wgpu::Queue, Arc<AtomicBool>) {
+    let (device, queue) = headless::device();
+    let lost = Arc::new(AtomicBool::new(false));
+    let callback_lost = Arc::clone(&lost);
+    device.set_device_lost_callback(move |_, _| callback_lost.store(true, Ordering::Relaxed));
+    (device, queue, lost)
+}
+
+#[test]
+fn a_request_submitted_to_a_destroyed_device_fails_as_lost() {
+    let path = directory("destroyed").join("image.png");
+    write_png(&path, 255);
+    let (device, queue, lost) = watched_device();
+    let mut gpu = GpuEvaluation::new(&device, &queue, lost);
+    let mut evaluator = Evaluator::new();
+    let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
+    let recorded = (evaluator.record_on(&mut gpu, &key, || false))
+        .unwrap()
+        .unwrap();
+
+    device.destroy();
+    let failed = gpu.submit(recorded);
+
+    assert!(
+        matches!(failed, Err(EvalError::GpuLost { .. })),
+        "{failed:?}"
+    );
+    assert!(gpu.retained_keys().is_empty());
+    assert_eq!(gpu.idle(), Err(DeviceLost));
+}
+
+#[test]
+fn a_request_recorded_on_a_destroyed_device_fails_as_lost_rather_than_rejected() {
+    let path = directory("destroyed-first").join("image.png");
+    write_png(&path, 255);
+    let (device, queue, lost) = watched_device();
+    let mut gpu = GpuEvaluation::new(&device, &queue, lost);
+    let mut evaluator = Evaluator::new();
+    let key = key(&chain([reader(&path), exposure(Some(1.0))]), 2);
+
+    device.destroy();
+    let failed = evaluator.evaluate_on(&mut gpu, &key, || false).unwrap();
+
+    assert!(
+        matches!(failed, Err(EvalError::GpuLost { .. })),
+        "{failed:?}"
+    );
+    assert!(gpu.retained_keys().is_empty());
 }

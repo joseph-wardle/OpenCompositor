@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -272,6 +273,8 @@ struct Connection {
     generation: u64,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Set by the device's lost callback.
+    lost: Arc<AtomicBool>,
     /// A CPU session's.
     staging: StagingSlot,
     /// A GPU session's, which the worker makes in its first GPU phase on the device, off the GUI
@@ -343,12 +346,19 @@ impl Worker {
     /// before, and delivers the last request again, under its number, now with its pixels. Until
     /// then a CPU session evaluates images without them, and a GPU session evaluates nothing. The
     /// worker makes its staging buffer, or its state on the device, when it first needs them,
-    /// off the caller's thread.
-    pub(crate) fn connect(&self, device: wgpu::Device, queue: wgpu::Queue, device_generation: u64) {
+    /// off the caller's thread. `lost` is for the device's lost callback to set.
+    pub(crate) fn connect(
+        &self,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        lost: Arc<AtomicBool>,
+        device_generation: u64,
+    ) {
         self.replace_connection(Some(Connection {
             generation: device_generation,
             device,
             queue,
+            lost,
             staging: StagingSlot::Empty,
             evaluation: None,
         }));
@@ -527,6 +537,7 @@ impl Mailbox {
         let device = (state.connection.as_ref()).map(|connection| PhaseDevice {
             device: connection.device.clone(),
             queue: connection.queue.clone(),
+            lost: Arc::clone(&connection.lost),
             generation: connection.generation,
         });
         Some(GpuPhase {
@@ -584,6 +595,7 @@ struct GpuPhase<'a> {
 struct PhaseDevice {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    lost: Arc<AtomicBool>,
     generation: u64,
 }
 
@@ -618,8 +630,9 @@ impl GpuPhase<'_> {
                 _ => return None,
             }
         };
-        let mut evaluation =
-            taken.unwrap_or_else(|| GpuEvaluation::new(&device.device, &device.queue));
+        let mut evaluation = taken.unwrap_or_else(|| {
+            GpuEvaluation::new(&device.device, &device.queue, Arc::clone(&device.lost))
+        });
         let result = use_evaluation(&mut evaluation, device);
         let mut state = self.mailbox.lock();
         let on_gpu = state.device == EvaluationDevice::Gpu;
@@ -779,11 +792,12 @@ fn evaluate_on_gpu(
         timing.evaluated = Instant::now();
         deliver_unless_superseded(&phase, wanted, result, timing, deliver);
         // The next request is recorded only once this one is complete, so that superseded work
-        // on the GPU is at most one request, and so is its memory.
-        while !evaluation.idle() && !phase.abandoned() {
+        // on the GPU is at most one request, and so is its memory. A lost device's work never
+        // completes; its lost callback has the app replace it.
+        while evaluation.idle() == Ok(false) && !phase.abandoned() {
             mailbox.pause(COMPLETION_POLL);
         }
-        if evaluation.idle()
+        if evaluation.idle() == Ok(true)
             && let Some(submission) = &mut mailbox.lock().last_submission
         {
             submission.completed.get_or_insert_with(Instant::now);

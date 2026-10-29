@@ -703,7 +703,7 @@ impl App {
     fn make_device(&mut self) -> Vec<Request> {
         match self.gpu.make_device() {
             Ok(new) => {
-                self.worker.connect(new.device, new.queue, new.generation);
+                (self.worker).connect(new.device, new.queue, new.lost, new.generation);
                 let mut requests = Vec::new();
                 if !new.pane_errors.is_empty() {
                     requests.push(Request::ShowError(new.pane_errors.join("; ")));
@@ -1069,6 +1069,14 @@ impl App {
             }
             return Vec::new();
         }
+        // Not the node's failure either: the device's lost callback has the next device show the
+        // request again.
+        if let Err(ViewerError::Eval(EvalError::GpuLost { .. })) = result {
+            return Vec::new();
+        }
+        if let Err(ViewerError::Eval(error @ EvalError::GpuValidation { .. })) = &result {
+            self.gpu.count_error(error);
+        }
         // Not only later: connecting the GPU delivers the request shown again, with its pixels.
         let not_older = (self.shown.wanted()).is_none_or(|shown| wanted.number >= shown.number);
         if self.session.viewed() != Some(wanted.node) || !not_older {
@@ -1313,7 +1321,7 @@ impl App {
         self.gpu.frame_check(pane)
     }
 
-    /// How many GPU errors this session went uncaptured. Each is a bug, logged on standard error
+    /// How many GPU errors there were this session. Each is a bug, logged on standard error
     /// up to a limit, after which drawing continues.
     pub fn gpu_errors(&self) -> u64 {
         self.gpu.errors()

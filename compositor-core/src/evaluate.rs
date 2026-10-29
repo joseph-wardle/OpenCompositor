@@ -24,7 +24,8 @@ pub(crate) mod blur;
 mod gpu;
 mod merge;
 
-pub use gpu::{GpuEvaluation, GpuImage, Recorded};
+pub(crate) use gpu::poll_device;
+pub use gpu::{DeviceLost, GpuEvaluation, GpuImage, Recorded};
 
 /// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
 /// undoable.
@@ -1043,6 +1044,10 @@ pub enum EvalError {
     OutOfGpuMemory {
         origin: ResultKey,
     },
+    /// The GPU device was lost, so the request needs a new one.
+    GpuLost {
+        origin: ResultKey,
+    },
     /// wgpu rejected the request's commands, a bug, so the GPU ran none of them.
     GpuValidation {
         origin: ResultKey,
@@ -1059,6 +1064,7 @@ impl EvalError {
             | EvalError::OverCap { origin, .. }
             | EvalError::BeyondDevice { origin, .. }
             | EvalError::OutOfGpuMemory { origin }
+            | EvalError::GpuLost { origin }
             | EvalError::GpuValidation { origin, .. } => origin,
         }
     }
@@ -1094,6 +1100,7 @@ impl fmt::Display for EvalError {
                 window.width, window.height
             ),
             EvalError::OutOfGpuMemory { .. } => write!(f, "the GPU ran out of memory"),
+            EvalError::GpuLost { .. } => DeviceLost.fmt(f),
             EvalError::GpuValidation { message, .. } => {
                 write!(f, "the GPU refused the request: {message}")
             }
@@ -1110,6 +1117,7 @@ impl std::error::Error for EvalError {
             | EvalError::OverCap { .. }
             | EvalError::BeyondDevice { .. }
             | EvalError::OutOfGpuMemory { .. }
+            | EvalError::GpuLost { .. }
             | EvalError::GpuValidation { .. } => None,
         }
     }

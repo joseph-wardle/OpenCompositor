@@ -1,5 +1,6 @@
 //! The GPU: one device for every pane, and a surface for each pane while it has a native window.
 
+use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -9,6 +10,7 @@ use open_ng::{Graph, Renderer, View, ViewBuffers, Viewport};
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
 
 use crate::app::{Notice, Pane, Waker};
+use crate::evaluate::poll_device;
 use crate::image::Window;
 use crate::viewer::Placement;
 use crate::worker::Pixels;
@@ -73,7 +75,8 @@ pub(crate) struct Gpu {
     timings: Option<[Option<FrameTiming>; Pane::COUNT]>,
     /// Numbers the frames timed.
     frames_timed: u64,
-    /// Uncaptured errors on every device of the session.
+    /// Errors on every device of the session that are bugs: those no error scope captured, and
+    /// evaluation's rejected commands.
     errors: Arc<AtomicU64>,
     /// Counts the attempts to make a device, telling each device's notices and staged images
     /// apart.
@@ -93,6 +96,8 @@ struct PaneWindow {
 pub(crate) struct NewDevice {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
+    /// Set by the device's lost callback.
+    pub(crate) lost: Arc<AtomicBool>,
     pub(crate) generation: u64,
     /// Why panes with a native window cannot draw on it.
     pub(crate) pane_errors: Vec<String>,
@@ -178,6 +183,8 @@ struct Device {
     queue: wgpu::Queue,
     device: wgpu::Device,
     adapter: wgpu::Adapter,
+    /// Set by the device's lost callback.
+    lost: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -201,9 +208,15 @@ impl Gpu {
         }
     }
 
-    /// How many GPU errors no error scope captured this session: each is a bug.
+    /// How many GPU errors there were this session: each is a bug.
     pub(crate) fn errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Counts an error an error scope captured that is a bug all the same, as wgpu's rejecting
+    /// evaluation's commands.
+    pub(crate) fn count_error(&self, error: &dyn fmt::Display) {
+        count_error(&self.errors, error);
     }
 
     /// Records what every frame from now on proves, waiting for the GPU after each. Surfaces
@@ -225,7 +238,8 @@ impl Gpu {
     /// Runs the callbacks of the device's completed work, without waiting for any.
     pub(crate) fn poll(&self) {
         if let Some(device) = &self.device {
-            let _ = device.device.poll(wgpu::PollType::Poll);
+            // A loss runs the lost callback, which notices it.
+            let _ = poll_device(&device.device);
         }
     }
 
@@ -335,6 +349,7 @@ impl Gpu {
         let new = NewDevice {
             device: device.device.clone(),
             queue: device.queue.clone(),
+            lost: Arc::clone(&device.lost),
             generation: self.device_generation,
             pane_errors,
         };
@@ -442,7 +457,8 @@ impl Gpu {
     /// shown, and starts the next one asked for.
     pub(crate) fn take_pixel_read(&mut self) -> Option<PixelRead> {
         let device = self.device.as_mut()?;
-        let _ = device.device.poll(wgpu::PollType::Poll);
+        // Nothing more is read from a lost device; its lost callback noticed the loss.
+        poll_device(&device.device).ok()?;
         let reader = &mut device.viewer.reader;
         let image = device.viewer.image.as_ref();
         let read = reader.finish()?;
@@ -661,11 +677,9 @@ pub(crate) fn wait_for_device(
         submission_index: None,
         timeout,
     };
-    // wgpu 30 panics rather than returning an error when the driver reports the device lost
-    // during a poll, because `WaitIdleError::Device` has no `PollError`. The panic is raised after
-    // wgpu has released its locks, so catching it leaves wgpu usable. Hypothesis, untested since
-    // it needs a real reset: Vulkan's waits return `DEVICE_LOST` promptly after one, rather than
-    // holding the frame checks here. The worker bounds its waits, so it does not rely on this.
+    // A loss panics as `poll_device` says. Hypothesis, untested since it needs a real reset:
+    // Vulkan's waits return `DEVICE_LOST` promptly after one, rather than holding the frame
+    // checks here. The worker bounds its waits, so it does not rely on this.
     match std::panic::catch_unwind(AssertUnwindSafe(|| device.poll(wait))) {
         Ok(Ok(_)) => Ok(true),
         Ok(Err(wgpu::PollError::Timeout)) => Ok(false),
@@ -735,7 +749,7 @@ const LOGGED_ERRORS: u64 = 20;
 #[derive(Debug)]
 struct ErrorCounter {
     counted: Arc<AtomicU64>,
-    lost: AtomicBool,
+    lost: Arc<AtomicBool>,
 }
 
 impl ErrorCounter {
@@ -746,10 +760,18 @@ impl ErrorCounter {
     /// A real loss calls the lost callback at once, in the call that failed; `destroy` calls it
     /// only at a later poll. Nothing polls while the panes are idle or hidden: a loss then is
     /// noticed at the next use of the GPU, and until then nothing visible depends on it.
-    fn install(device: &wgpu::Device, counted: &Arc<AtomicU64>, generation: u64, waker: &Waker) {
+    ///
+    /// Returns the flag the lost callback sets.
+    fn install(
+        device: &wgpu::Device,
+        counted: &Arc<AtomicU64>,
+        generation: u64,
+        waker: &Waker,
+    ) -> Arc<AtomicBool> {
+        let lost = Arc::new(AtomicBool::new(false));
         let counter = Arc::new(ErrorCounter {
             counted: Arc::clone(counted),
-            lost: AtomicBool::new(false),
+            lost: Arc::clone(&lost),
         });
         let handler = Arc::clone(&counter);
         device.on_uncaptured_error(Arc::new(move |error| handler.count(&error)));
@@ -761,19 +783,24 @@ impl ErrorCounter {
                 at: Instant::now(),
             });
         });
+        lost
     }
 
     fn count(&self, error: &wgpu::Error) {
-        if self.lost.load(Ordering::Relaxed) {
-            return;
+        if !self.lost.load(Ordering::Relaxed) {
+            count_error(&self.counted, error);
         }
-        let number = self.counted.fetch_add(1, Ordering::Relaxed) + 1;
-        if number <= LOGGED_ERRORS {
-            eprintln!("GPU error {number}: {error}");
-        }
-        if number == LOGGED_ERRORS {
-            eprintln!("later GPU errors are counted, not logged");
-        }
+    }
+}
+
+/// Counts a GPU error, a bug, logging it unless too many were.
+fn count_error(counted: &AtomicU64, error: &dyn fmt::Display) {
+    let number = counted.fetch_add(1, Ordering::Relaxed) + 1;
+    if number <= LOGGED_ERRORS {
+        eprintln!("GPU error {number}: {error}");
+    }
+    if number == LOGGED_ERRORS {
+        eprintln!("later GPU errors are counted, not logged");
     }
 }
 
@@ -800,7 +827,7 @@ impl Device {
             .map_err(|error| format!("no GPU device: {error}"))?;
         // Before any other call on the device: wgpu notices a loss only when a call reaches the
         // driver, so with nothing in between, none goes unnoticed.
-        ErrorCounter::install(&device, errors, generation, waker);
+        let lost = ErrorCounter::install(&device, errors, generation, waker);
         // Panes draw clamped linear values, which an sRGB format encodes. Encoding in a shader too
         // would encode twice.
         let formats = surface.get_capabilities(&adapter).formats;
@@ -809,7 +836,7 @@ impl Device {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .ok_or("the surface offers no sRGB format")?;
-        Ok(Device::for_format(adapter, device, queue, format))
+        Ok(Device::for_format(adapter, device, queue, lost, format))
     }
 
     /// Configures the pane's surface at its size. Its errors are the pane's, not bugs, so they
@@ -865,6 +892,7 @@ impl Device {
         adapter: wgpu::Adapter,
         device: wgpu::Device,
         queue: wgpu::Queue,
+        lost: Arc<AtomicBool>,
         format: wgpu::TextureFormat,
     ) -> Device {
         let renderer = Renderer::new(&device, format, 1);
@@ -879,6 +907,7 @@ impl Device {
             queue,
             device,
             adapter,
+            lost,
         }
     }
 }
@@ -1241,9 +1270,9 @@ impl Gpu {
         };
         gpu.windows[Pane::Viewer.index()] = Some(window);
         let (adapter, device, queue) = noop_parts(None);
-        ErrorCounter::install(&device, &gpu.errors, 1, &gpu.waker);
+        let lost = ErrorCounter::install(&device, &gpu.errors, 1, &gpu.waker);
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        gpu.device = Some(Device::for_format(adapter, device, queue, format));
+        gpu.device = Some(Device::for_format(adapter, device, queue, lost, format));
         gpu
     }
 
@@ -1370,7 +1399,7 @@ mod tests {
         };
 
         // Staged for the generation before the GPU's own, as after a loss.
-        worker.connect(device.clone(), queue.clone(), 0);
+        worker.connect(device.clone(), queue.clone(), Arc::default(), 0);
         worker.request(Some(Wanted {
             node,
             key,
@@ -1380,7 +1409,7 @@ mod tests {
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_none());
 
         // Connecting delivers the last key again, now for the GPU's generation.
-        worker.connect(device, queue, 1);
+        worker.connect(device, queue, Arc::default(), 1);
         gpu.show_image(staged(), 1);
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_some());
     }

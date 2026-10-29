@@ -6,9 +6,10 @@
 //! table its upload, so a new device generation uploads again without decoding. Nothing is read
 //! back.
 
+use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, LineReduce, Merge};
@@ -55,6 +56,8 @@ pub struct GpuEvaluation {
     /// the queue advances.
     submitted: u64,
     completed: Arc<AtomicU64>,
+    /// Set by the device's lost callback, or by a poll that found the device lost.
+    lost: Arc<AtomicBool>,
     uploaded_bytes: u64,
     #[cfg(test)]
     shortage: tests::Shortage,
@@ -67,7 +70,10 @@ struct GpuRetained {
 }
 
 impl GpuEvaluation {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> GpuEvaluation {
+    /// Evaluation's state on the device. `lost` is for the device's lost callback to set:
+    /// wgpu keeps one callback a device, so its owner installs it. Without one, a loss is
+    /// noticed only when a poll finds it.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, lost: Arc<AtomicBool>) -> GpuEvaluation {
         GpuEvaluation {
             device: device.clone(),
             queue: queue.clone(),
@@ -77,6 +83,7 @@ impl GpuEvaluation {
             cap: RETAINED_TEXTURE_BYTES_CAP,
             submitted: 0,
             completed: Arc::new(AtomicU64::new(0)),
+            lost,
             uploaded_bytes: 0,
             #[cfg(test)]
             shortage: tests::Shortage::default(),
@@ -85,24 +92,39 @@ impl GpuEvaluation {
 
     /// Whether the GPU has completed every submission evaluation made, checked without
     /// blocking: waiting would hold the device's lock against the GUI thread's present for the
-    /// whole wait.
-    pub fn idle(&self) -> bool {
-        // A lost device fails the poll; the loss is noticed where the device is.
-        let _ = self.device.poll(wgpu::PollType::Poll);
-        self.completed.load(Ordering::Acquire) >= self.submitted
+    /// whole wait. Fails once the device is lost, whose work never completes.
+    pub fn idle(&self) -> Result<bool, DeviceLost> {
+        self.poll()?;
+        Ok(self.completed.load(Ordering::Acquire) >= self.submitted)
     }
 
     /// Waits without blocking until the GPU has completed evaluation's submissions, so that the
     /// textures they used and nothing holds any longer are freed. False if `stop` returned true
     /// first.
-    pub fn wait_until_idle(&self, stop: impl Fn() -> bool) -> bool {
-        while !self.idle() {
+    pub fn wait_until_idle(&self, stop: impl Fn() -> bool) -> Result<bool, DeviceLost> {
+        while !self.idle()? {
             if stop() {
-                return false;
+                return Ok(false);
             }
             std::thread::sleep(IDLE_POLL);
         }
-        true
+        Ok(true)
+    }
+
+    /// Runs the callbacks of the device's completed work, its lost callback among them, without
+    /// waiting for any. Fails if the device is lost.
+    fn poll(&self) -> Result<(), DeviceLost> {
+        if poll_device(&self.device).is_err() {
+            self.lost.store(true, Ordering::Relaxed);
+        }
+        self.check_lost()
+    }
+
+    fn check_lost(&self) -> Result<(), DeviceLost> {
+        if self.lost.load(Ordering::Relaxed) {
+            return Err(DeviceLost);
+        }
+        Ok(())
     }
 
     /// The bytes of planes uploaded since this generation began.
@@ -509,8 +531,8 @@ impl GpuEvaluation {
 
     /// Submits a request recorded on this generation, retains what its recording chose, and
     /// returns its image. Its completion is counted when the GPU reports it. Fails if wgpu
-    /// rejected anything in the submission, which then runs none of it, so that nothing is
-    /// retained.
+    /// rejected anything in the submission, which then runs none of it, or the device is lost,
+    /// so that nothing is retained.
     pub fn submit(&mut self, recorded: Recorded) -> Result<GpuImage, EvalError> {
         let Recorded {
             origin,
@@ -525,7 +547,12 @@ impl GpuEvaluation {
         self.queue.on_submitted_work_done(move || {
             completed.fetch_max(number, Ordering::Release);
         });
-        if let Some(error) = pollster::block_on(validation.pop()) {
+        let rejected = pollster::block_on(validation.pop());
+        // A lost device drops the submission unrun, or fails its validation without a bug.
+        if self.poll().is_err() {
+            return Err(EvalError::GpuLost { origin });
+        }
+        if let Some(error) = rejected {
             return Err(EvalError::GpuValidation {
                 origin,
                 message: error.to_string(),
@@ -631,6 +658,31 @@ impl GpuPlane {
     }
 }
 
+/// The device was lost: nothing more runs on it, and evaluation needs a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceLost;
+
+impl fmt::Display for DeviceLost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the GPU device was lost")
+    }
+}
+
+impl std::error::Error for DeviceLost {}
+
+/// Runs the callbacks of the device's completed work without waiting for any. Fails if the
+/// device is lost.
+pub(crate) fn poll_device(device: &wgpu::Device) -> Result<(), DeviceLost> {
+    // wgpu 30 panics rather than returning an error when the driver reports the device lost
+    // during a poll, because `WaitIdleError::Device` has no `PollError`. The panic is raised
+    // after wgpu has released its locks and run the device's lost callback, so catching it
+    // leaves wgpu usable and the loss already reported.
+    match std::panic::catch_unwind(AssertUnwindSafe(|| device.poll(wgpu::PollType::Poll))) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(DeviceLost),
+    }
+}
+
 /// A request recorded on one generation and not yet submitted: [`GpuEvaluation::submit`]
 /// submits it and retains its results, and dropping it submits and retains nothing. It is
 /// submitted on the thread that recorded it: the validation scope that decides whether its
@@ -721,14 +773,21 @@ impl Evaluator {
         key: &ResultKey,
         stop: impl Fn() -> bool,
     ) -> Option<Result<Recorded, EvalError>> {
+        let lost = || EvalError::GpuLost {
+            origin: key.clone(),
+        };
+        if gpu.check_lost().is_err() {
+            return Some(Err(lost()));
+        }
         match self.record_attempt(gpu, key, &stop)? {
             Err(EvalError::OutOfGpuMemory { .. }) => {}
             recorded => return Some(recorded),
         }
-        if !gpu.wait_until_idle(&stop) {
-            return None;
+        match gpu.wait_until_idle(&stop) {
+            Ok(true) => self.record_attempt(gpu, key, &stop),
+            Ok(false) => None,
+            Err(DeviceLost) => Some(Err(lost())),
         }
-        self.record_attempt(gpu, key, &stop)
     }
 
     /// Records the request once, or fails, out of GPU memory, having released every retained

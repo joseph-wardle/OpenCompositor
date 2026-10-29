@@ -33,7 +33,8 @@ pub use document::{
     Slot, missing, node_types,
 };
 pub use evaluate::{
-    EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, Reloads, ResultKey, result_key,
+    DeviceLost, EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, Reloads, ResultKey,
+    result_key,
 };
 pub use gpu::{FrameCheck, FrameTiming, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};

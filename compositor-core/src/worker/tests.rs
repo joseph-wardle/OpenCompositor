@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -49,7 +50,7 @@ fn worker() -> (Worker, Receiver<Evaluated>) {
 
 /// Connects the worker to the device and its queue as the generation.
 fn connect(worker: &Worker, (device, queue): (wgpu::Device, wgpu::Queue), generation: u64) {
-    worker.connect(device, queue, generation);
+    worker.connect(device, queue, Arc::default(), generation);
 }
 
 /// The staged planes of a CPU session's image.
@@ -496,7 +497,7 @@ fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
     let [first, second] = two_images("lost-staging");
     let (worker, deliveries) = worker();
     let (device, queue) = noop_device(None);
-    worker.connect(device.clone(), queue, 1);
+    worker.connect(device.clone(), queue, Arc::default(), 1);
     worker.request(Some(on(1, key(&first))));
     let held = staged(receive(&deliveries));
 
@@ -622,7 +623,7 @@ fn gpu_worker() -> (Worker, Receiver<Evaluated>, wgpu::Device, wgpu::Queue) {
         delivered.send(evaluated).unwrap();
     });
     let (device, queue) = crate::kernels::headless::device();
-    worker.connect(device.clone(), queue.clone(), 1);
+    worker.connect(device.clone(), queue.clone(), Arc::default(), 1);
     (worker, deliveries, device, queue)
 }
 
@@ -690,10 +691,41 @@ fn a_gpu_session_evaluates_nothing_until_a_device_is_connected() {
         "evaluated without a device"
     );
     let (device, queue) = crate::kernels::headless::device();
-    worker.connect(device, queue, 1);
+    worker.connect(device, queue, Arc::default(), 1);
 
     let (_, generation) = evaluated_planes(receive(&deliveries));
     assert_eq!(generation, 1);
+}
+
+#[test]
+fn a_gpu_session_fails_a_request_on_a_lost_device_and_shows_it_on_the_next() {
+    let path = directory("gpu-lost").join("image.png");
+    write_png(&path, 3, 2);
+    let (delivered, deliveries) = mpsc::channel();
+    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
+        delivered.send(evaluated).unwrap();
+    });
+    let (device, queue) = crate::kernels::headless::device();
+    worker.connect(device, queue, Arc::new(AtomicBool::new(true)), 1);
+    let requested = exposed(&path, 1.0);
+
+    worker.request(Some(on(1, requested.clone())));
+
+    let failed = receive(&deliveries);
+    assert!(
+        matches!(
+            failed.result,
+            Err(ViewerError::Eval(EvalError::GpuLost { .. }))
+        ),
+        "{:?}",
+        failed.result
+    );
+    let (device, queue) = crate::kernels::headless::device();
+    worker.connect(device, queue, Arc::default(), 2);
+    let evaluated = receive(&deliveries);
+    assert_eq!(evaluated.wanted.key, requested);
+    let (_, generation) = evaluated_planes(evaluated);
+    assert_eq!(generation, 2);
 }
 
 #[test]
@@ -707,7 +739,7 @@ fn a_replaced_device_drops_its_state_and_the_new_one_shows_the_request_again() {
     assert!(!retained_on_gpu(&worker).is_empty());
 
     let (device, queue) = crate::kernels::headless::device();
-    worker.connect(device, queue, 2);
+    worker.connect(device, queue, Arc::default(), 2);
 
     let evaluated = receive(&deliveries);
     assert_eq!(evaluated.wanted.key, requested);
@@ -750,7 +782,7 @@ fn dropping_a_gpu_session_worker_waits_for_its_gpu_phase() {
         released.lock().unwrap().recv().unwrap();
     });
     let (device, queue) = crate::kernels::headless::device();
-    worker.connect(device, queue, 1);
+    worker.connect(device, queue, Arc::default(), 1);
     worker.request(Some(on(1, exposed(&path, 1.0))));
     let evaluated = delivering.recv().unwrap();
 

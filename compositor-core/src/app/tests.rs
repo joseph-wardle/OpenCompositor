@@ -1173,6 +1173,53 @@ fn out_of_gpu_memory_moves_evaluation_to_the_cpu_until_the_artist_chooses_the_gp
 }
 
 #[test]
+fn a_request_failed_by_a_lost_device_leaves_the_frame_and_fails_no_node() {
+    let (mut app, _deliveries) = app();
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let wanted = sent(&app);
+    app.dispatch(read(&wanted, 4, 4));
+    let caption = app.caption.clone();
+
+    let requests = app.dispatch(Event::Evaluated(Evaluated {
+        timing: Timing::now(),
+        wanted: wanted.clone(),
+        result: Err(ViewerError::Eval(EvalError::GpuLost {
+            origin: wanted.key.clone(),
+        })),
+    }));
+
+    assert_eq!(requests, []);
+    assert!(matches!(app.shown, Shown::Image { .. }), "the frame stays");
+    assert_eq!(app.caption, caption);
+    assert_eq!(app.evaluation_device(), EvaluationDevice::Gpu);
+    assert_eq!(app.gpu_errors(), 0);
+}
+
+#[test]
+fn a_request_wgpu_rejects_fails_its_node_and_counts_a_gpu_error() {
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let wanted = sent(&app);
+
+    let requests = app.dispatch(Event::Evaluated(Evaluated {
+        timing: Timing::now(),
+        wanted: wanted.clone(),
+        result: Err(ViewerError::Eval(EvalError::GpuValidation {
+            origin: wanted.key.clone(),
+            message: "rejected".to_owned(),
+        })),
+    }));
+
+    assert!(matches!(app.shown, Shown::Failed { .. }));
+    let label = Request::ShowGpuLabel(Some("1 GPU error, logged on standard error".to_owned()));
+    assert!(requests.contains(&label), "{requests:?}");
+    assert_eq!(app.gpu.take_errors(), 1);
+}
+
+#[test]
 fn two_losses_while_evaluation_had_work_on_the_gpu_move_it_to_the_cpu() {
     let (mut app, _deliveries) = app();
     app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
@@ -1184,7 +1231,7 @@ fn two_losses_while_evaluation_had_work_on_the_gpu_move_it_to_the_cpu() {
     ] {
         app.gpu = Gpu::with_noop_device(Waker::channel().0);
         let (noop, queue) = crate::gpu::noop_device(None);
-        app.worker.connect(noop, queue, 1);
+        app.worker.connect(noop, queue, Arc::default(), 1);
         if submitting {
             app.worker.submitting_on(1);
         }
