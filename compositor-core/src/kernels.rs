@@ -1139,6 +1139,20 @@ mod tests {
         (sum, magnitude)
     }
 
+    /// The scan's block and totals within the workgroup memory every device is asked for,
+    /// which wgpu does not check, and its block over Blur's widest window.
+    #[test]
+    fn the_scan_fits_the_default_workgroup_memory_and_the_widest_blur() {
+        let bytes = (SCAN_BLOCK + 2 * opencompositor_kernels::SCAN_THREADS) * 4;
+        let limit = wgpu::Limits::default().max_compute_workgroup_storage_size;
+        assert!(
+            bytes <= limit,
+            "{bytes} bytes of workgroup memory, over {limit}"
+        );
+        let widest = BoxSum::new(BoxPass::new(4096.0));
+        assert!(2 * widest.t() <= SCAN_BLOCK, "t = {}", widest.t());
+    }
+
     /// The GPU's K for a box pass: an f32 sum's worst case grows with the tap count, and 256
     /// keeps the error within 2⁻¹⁶ of the magnitude sum. The test prints the factor the
     /// adapter needed.

@@ -212,4 +212,7 @@ pub const SCAN_THREADS: u32 = 64;
 
 /// The longest block the scan holds in workgroup memory: the widest window it reduces has
 /// `2 t - 1` below this. Its entry points declare the array's length as this.
-pub const SCAN_BLOCK: u32 = 4608;
+///
+/// Blur's largest Size, 4096, has `t = 1365`. With the scan's totals the workgroup holds
+/// 11,520 bytes, inside the 16,384 that Vulkan guarantees and wgpu's default limits ask for.
+pub const SCAN_BLOCK: u32 = 2752;
