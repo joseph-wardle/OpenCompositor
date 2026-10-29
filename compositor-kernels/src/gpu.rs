@@ -34,8 +34,8 @@ fn map_1_1<M: Map<1, 1>>(id: UVec3, params: &MapParams<M, 1>, a: &Input, output:
         return;
     }
     let at = IVec2::new(id.x as i32, id.y as i32);
-    let (a, inside) = placed(a, at, &params.places[0]);
-    let [v] = params.op.apply([a], [inside]);
+    let (a, _) = placed(a, at, &params.places[0]);
+    let [v] = params.op.apply([a]);
     // SAFETY: `at` is inside the output, which the host sizes to the params, and the output is
     // bound as R32Float, the format this image type declares.
     unsafe { output.write(at, v) };
@@ -202,7 +202,7 @@ fn line_scan<L: LineReduce>(
     params: &LineParams<L>,
     input: &Input,
     output: &Output,
-    block: &mut [f32; 4608],
+    block: &mut [f32; 2752],
     totals: &mut [f32; 128],
 ) {
     // A copy out of the storage buffer, whose fields the loops would otherwise reread; it
@@ -374,7 +374,7 @@ pub fn blur_scan(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] params: &LineParams<crate::BoxSum>,
     #[spirv(descriptor_set = 0, binding = 1)] input: &Input,
     #[spirv(descriptor_set = 0, binding = 2)] output: &Output,
-    #[spirv(workgroup)] block: &mut [f32; 4608], // SCAN_BLOCK
+    #[spirv(workgroup)] block: &mut [f32; 2752], // SCAN_BLOCK
     #[spirv(workgroup)] totals: &mut [f32; 128], // 2 SCAN_THREADS
 ) {
     line_scan(group, local, params, input, output, block, totals);

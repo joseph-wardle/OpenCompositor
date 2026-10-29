@@ -44,9 +44,8 @@ pub trait Map<const I: usize, const O: usize>: Params {
     /// Its GPU entry point.
     const ENTRY: &'static str;
 
-    /// The outputs at one position. An input whose placement does not cover it gives zero and
-    /// `false` in `inside`.
-    fn apply(&self, samples: [f32; I], inside: [bool; I]) -> [f32; O];
+    /// The outputs at one position. An input whose placement does not cover it gives zero.
+    fn apply(&self, samples: [f32; I]) -> [f32; O];
 }
 
 /// A map's parameters: where each input lies in the output, the output's size and the
@@ -165,6 +164,10 @@ pub trait LineReduce: Params {
     /// How much longer each pass's output line is than its input.
     #[inline(always)]
     fn growth(&self) -> u32 {
+        assert!(
+            self.shift() >= self.t(),
+            "a window starting at or before its output"
+        );
         2 * (self.shift() - self.t())
     }
 }
@@ -212,4 +215,7 @@ pub const SCAN_THREADS: u32 = 64;
 
 /// The longest block the scan holds in workgroup memory: the widest window it reduces has
 /// `2 t - 1` below this. Its entry points declare the array's length as this.
-pub const SCAN_BLOCK: u32 = 4608;
+///
+/// Blur's largest Size, 4096, has `t = 1365`. With the scan's totals the workgroup holds
+/// 11,520 bytes, inside the 16,384 that Vulkan guarantees and wgpu's default limits ask for.
+pub const SCAN_BLOCK: u32 = 2752;

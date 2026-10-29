@@ -1,17 +1,18 @@
 //! The CPU primitives' throughput on this machine, as `cargo bench -p opencompositor-core` runs
-//! them, each through an operation over the evaluator's pool. Exposure through the map, with
-//! reused and with fresh outputs, and a copy of the same planes through the same pool and
-//! chunking, the reference a pointwise kernel is held to. Merge through the fold, one layer
-//! over a background dissolved by Mix, held to the copy by the bytes it moves. Blur through the
-//! line reduction, its passes along rows and along columns, each over three planes, held to the
-//! copy by the bytes it moves at the fraction a window sum reaches. It runs on the workstation
-//! before each PR to `main`, never in CI: each gate is a fraction of the copy measured in the
-//! same run, so it holds on any machine and never blesses a number.
+//! them, each through an operation over the evaluator's pool. Exposure through the map: its
+//! kernel alone on one thread, and over the pool with reused and with fresh outputs, and a copy
+//! of the same planes through the same pool and chunking, the reference a pointwise kernel is
+//! held to. Merge through the fold, one layer over a background dissolved by Mix, held to the
+//! copy by the bytes it moves. Blur through the line reduction, its passes along rows and along
+//! columns, each over three planes, held to the copy by the bytes it moves at the fraction a
+//! window sum reaches. It runs on the workstation before each PR to `main`, never in CI: each
+//! gate is a fraction of the copy measured in the same run, so it holds on any machine and never
+//! blesses a number.
 
 use std::time::{Duration, Instant};
 
 use opencompositor_core::Window;
-use opencompositor_core::bench::{Pool, fold, line, map};
+use opencompositor_core::bench::{Pool, fold, line, map, map_span};
 use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, Merge};
 
 /// A 4K plate. Its three colour planes go through; alpha is shared unchanged, so neither
@@ -57,6 +58,11 @@ fn main() {
     let inputs: Vec<Vec<f32>> = (1..=PLANES as u32).map(|seed| plate(seed, area)).collect();
     let mut outputs: Vec<Vec<f32>> = (0..PLANES).map(|_| vec![0.0; area]).collect();
 
+    let alone = median(|| {
+        for (src, dst) in inputs.iter().zip(&mut outputs) {
+            map_span(level, &op, [src], [dst]);
+        }
+    });
     let reused = median(|| {
         for (src, dst) in inputs.iter().zip(&mut outputs) {
             map(&pool, &op, [(src, plate_window)], plate_window, [dst]);
@@ -93,6 +99,7 @@ fn main() {
         pool.threads()
     );
     for (what, time) in [
+        ("kernel alone, one thread", alone),
         ("pool, reused outputs", reused),
         ("pool, fresh outputs", fresh),
         ("copy, reused outputs", copy),
