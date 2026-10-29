@@ -3,10 +3,8 @@
 //! SPIR-V over the evaluator's per-plane R32Float textures.
 //!
 //! Recording goes into the caller's encoder and never submits, so one submission can carry an
-//! evaluation's dispatches and copies together. Nothing here uploads or reads back: the tests
-//! do, as test support until the worker stages the GPU's inputs. The GPU primitives have no
-//! production caller yet: they establish that naga accepts the module and that the numbers
-//! land within their bounds, ahead of the GPU step.
+//! evaluation's dispatches and copies together. Nothing here uploads or reads back: the
+//! evaluator's GPU half uploads, and the tests read back.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -432,7 +430,7 @@ impl Planes {
 }
 
 /// The texture size of a plane over `window`.
-fn extent(window: Window) -> wgpu::Extent3d {
+pub(crate) fn extent(window: Window) -> wgpu::Extent3d {
     wgpu::Extent3d {
         width: window.width,
         height: window.height,
@@ -536,16 +534,16 @@ impl fmt::Display for PlaneError {
 
 impl std::error::Error for PlaneError {}
 
-/// A device on a real adapter, and the upload and readback the kernel tests need: the worker
-/// stages differently, through mapped buffers, so these stay test support.
+/// A device on a real adapter, and the upload and readback the GPU tests need: evaluation
+/// uploads through mapped buffers instead, and reads nothing back, so these stay test support.
 #[cfg(test)]
-mod headless {
+pub(crate) mod headless {
     use super::PLANE_FORMAT;
 
     /// A device on the Vulkan adapter `WGPU_ADAPTER_NAME` names, or else the first one, a CPU
     /// renderer included: the tests prove the kernels on whatever Mesa or driver is installed,
     /// and print which, so every log says what ran. No adapter is a failure, never a skip.
-    pub(super) fn device() -> (wgpu::Device, wgpu::Queue) {
+    pub(crate) fn device() -> (wgpu::Device, wgpu::Queue) {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN;
         let instance = wgpu::Instance::new(descriptor);
@@ -573,7 +571,7 @@ mod headless {
     }
 
     /// A plane the kernels can read, holding `texels` in row-major order.
-    pub(super) fn upload(
+    pub(crate) fn upload(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         width: u32,
@@ -602,7 +600,7 @@ mod headless {
     }
 
     /// A plane the kernels can write and the test read back.
-    pub(super) fn output(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    pub(crate) fn output(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
         plane(
             device,
             width,
@@ -611,7 +609,7 @@ mod headless {
         )
     }
 
-    pub(super) fn plane(
+    pub(crate) fn plane(
         device: &wgpu::Device,
         width: u32,
         height: u32,
@@ -635,7 +633,7 @@ mod headless {
 
     /// The plane's texels in row-major order, once the GPU has finished with it. Rows are
     /// copied out padded to the copy alignment and the padding dropped.
-    pub(super) fn readback(
+    pub(crate) fn readback(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         texture: &wgpu::Texture,

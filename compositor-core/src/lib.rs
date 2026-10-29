@@ -34,7 +34,7 @@ pub use document::{
     MAX_SLOTS, MergeVersion, Missing, Node, NodeId, NodeInput, NodeKind, NodeType, ReaderVersion,
     Slot, missing, node_types,
 };
-pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
+pub use evaluate::{EvalError, Evaluator, GpuEvaluation, GpuImage, Reloads, ResultKey, result_key};
 pub use gpu::{FrameCheck, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
 pub use panel::{Panel, Row, ValueState};

@@ -21,7 +21,10 @@ use crate::parameter::resolve;
 use crate::read::{ReadError, read_image};
 
 pub(crate) mod blur;
+mod gpu;
 mod merge;
+
+pub use gpu::{GpuEvaluation, GpuImage};
 
 /// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
 /// undoable.
@@ -451,24 +454,13 @@ impl Evaluator {
         key: &ResultKey,
         stop: impl Fn() -> bool + Sync,
     ) -> Option<Result<Image, EvalError>> {
-        let steps = self.plan(key);
+        let steps = self.plan(key, &[]);
         // Planes for this request's outputs; whatever it does not take drops with it. Nothing is
         // kept for the next request, so a change of image size or a `release_all` needs no rule.
         let mut released = self.release_except(&steps);
         let mut retained_bytes = self.retained_bytes();
         let requested = steps.len() - 1;
-        // What the request needs, and how many nodes still to compute take each image.
-        let mut needed = vec![false; steps.len()];
-        let mut uses = vec![0_usize; steps.len()];
-        needed[requested] = true;
-        for (index, step) in steps.iter().enumerate().rev() {
-            if needed[index] && step.retained.is_none() {
-                for &input in &step.inputs {
-                    needed[input] = true;
-                    uses[input] += 1;
-                }
-            }
-        }
+        let (needed, mut uses) = needs(&steps, |index| steps[index].retained.is_some());
         let mut images: Vec<Option<Image>> = steps.iter().map(|_| None).collect();
         let mut kept: Vec<bool> = steps.iter().map(|step| step.retained.is_some()).collect();
         for (index, step) in steps.iter().enumerate() {
@@ -522,9 +514,10 @@ impl Evaluator {
 
     /// The request's nodes, inputs before the nodes that take them and the requested node last.
     ///
-    /// Each key is replaced by an equal retained key, or by an equal key earlier in the request,
-    /// so equal keys become the same key and inputs compare by address alone.
-    fn plan(&self, key: &ResultKey) -> Vec<Step> {
+    /// Each key is replaced by an equal retained key, of this table or of `also_retained`, or by
+    /// an equal key earlier in the request, so equal keys become the same key and inputs compare
+    /// by address alone. A step's image is this table's.
+    fn plan(&self, key: &ResultKey, also_retained: &[ResultKey]) -> Vec<Step> {
         let mut steps: Vec<Step> = Vec::new();
         // The step of each key of the request, by address.
         let mut placed: BTreeMap<*const Recipe, usize> = BTreeMap::new();
@@ -551,10 +544,12 @@ impl Evaluator {
             let retained = (self.retained.iter()).find(|retained| retained.key.0.same_as(&recipe));
             let unchanged =
                 (current.0.inputs().zip(&input_keys)).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0));
-            let key = match retained {
-                Some(retained) => retained.key.clone(),
-                None if unchanged => current.clone(),
-                None => ResultKey(Arc::new(recipe)),
+            let elsewhere = also_retained.iter().find(|key| key.0.same_as(&recipe));
+            let key = match (retained, elsewhere) {
+                (Some(retained), _) => retained.key.clone(),
+                (None, Some(key)) => key.clone(),
+                (None, None) if unchanged => current.clone(),
+                (None, None) => ResultKey(Arc::new(recipe)),
             };
             steps.push(Step {
                 key,
@@ -600,6 +595,24 @@ impl Evaluator {
                 .flat_map(|retained| retained.image.planes()),
         )
     }
+}
+
+/// What a request needs computed or taken from a table, the requested node last, and how many of
+/// the nodes it computes take each image. `held` says whether a step's image is retained, which
+/// leaves its inputs unneeded.
+fn needs(steps: &[Step], held: impl Fn(usize) -> bool) -> (Vec<bool>, Vec<usize>) {
+    let mut needed = vec![false; steps.len()];
+    let mut uses = vec![0_usize; steps.len()];
+    needed[steps.len() - 1] = true;
+    for (index, step) in steps.iter().enumerate().rev() {
+        if needed[index] && !held(index) {
+            for &input in &step.inputs {
+                needed[input] = true;
+                uses[input] += 1;
+            }
+        }
+    }
+    (needed, uses)
 }
 
 /// The bytes of the planes' storage, each counted once however often it appears.
@@ -1018,6 +1031,17 @@ pub enum EvalError {
         window: Window,
         bytes: u64,
     },
+    /// The operation runs only on the CPU so far, and the request was for a GPU.
+    NoGpuPath {
+        origin: ResultKey,
+    },
+    /// The data window has a side longer than the device's textures.
+    BeyondDevice {
+        origin: ResultKey,
+        window: Window,
+        /// The longest side the device's textures may have.
+        side: u32,
+    },
 }
 
 impl EvalError {
@@ -1026,7 +1050,9 @@ impl EvalError {
             EvalError::Read { origin, .. }
             | EvalError::Panicked { origin }
             | EvalError::Oversize { origin, .. }
-            | EvalError::OverCap { origin, .. } => origin,
+            | EvalError::OverCap { origin, .. }
+            | EvalError::NoGpuPath { origin }
+            | EvalError::BeyondDevice { origin, .. } => origin,
         }
     }
 }
@@ -1054,6 +1080,18 @@ impl fmt::Display for EvalError {
                 window.height,
                 NODE_BYTES_CAP >> 20
             ),
+            EvalError::NoGpuPath { .. } => {
+                write!(
+                    f,
+                    "runs only on the CPU so far; choose the CPU to evaluate it"
+                )
+            }
+            EvalError::BeyondDevice { window, side, .. } => write!(
+                f,
+                "its data window is {} × {} pixels, and this GPU's images are at most {side} \
+                 pixels on a side",
+                window.width, window.height
+            ),
         }
     }
 }
@@ -1062,9 +1100,11 @@ impl std::error::Error for EvalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             EvalError::Read { error, .. } => Some(error),
-            EvalError::Panicked { .. } | EvalError::Oversize { .. } | EvalError::OverCap { .. } => {
-                None
-            }
+            EvalError::Panicked { .. }
+            | EvalError::Oversize { .. }
+            | EvalError::OverCap { .. }
+            | EvalError::NoGpuPath { .. }
+            | EvalError::BeyondDevice { .. } => None,
         }
     }
 }

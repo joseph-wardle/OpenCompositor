@@ -14,7 +14,7 @@ const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 /// A key at most this deep is dropped on a thread with a `DEEP_STACK`.
 const DEEP_CHAIN: u64 = 10_000;
 
-fn reader(path: impl AsRef<Path>) -> Node {
+pub(super) fn reader(path: impl AsRef<Path>) -> Node {
     let mut node = Node::new(
         NodeKind::Reader {
             version: ReaderVersion::V1,
@@ -26,7 +26,7 @@ fn reader(path: impl AsRef<Path>) -> Node {
     node
 }
 
-fn exposure(stops: Option<f64>) -> Node {
+pub(super) fn exposure(stops: Option<f64>) -> Node {
     let mut node = Node::new(
         NodeKind::Exposure {
             version: ExposureVersion::V1,
@@ -41,13 +41,13 @@ fn exposure(stops: Option<f64>) -> Node {
 
 /// A 2 × 1 opaque PNG whose red is one 8-bit code and green and blue lower ones, replacing any
 /// file at `path`.
-fn write_png(path: &Path, code: u8) {
+pub(super) fn write_png(path: &Path, code: u8) {
     let pixel = [code, code / 2, code / 4, 255];
     write(path, png::ColorType::Rgba, &[pixel, pixel].concat());
 }
 
 /// A 2 × 1 opaque grey PNG of one 8-bit code.
-fn write_grey_png(path: &Path, code: u8) {
+pub(super) fn write_grey_png(path: &Path, code: u8) {
     write(
         path,
         png::ColorType::GrayscaleAlpha,
@@ -59,7 +59,7 @@ fn write(path: &Path, color: png::ColorType, data: &[u8]) {
     fixtures::write_png(path, 2, 1, color, data);
 }
 
-fn merge(mix: Option<f64>) -> Node {
+pub(super) fn merge(mix: Option<f64>) -> Node {
     let mut node = Node::new(
         NodeKind::Merge {
             version: MergeVersion::V1,
@@ -72,7 +72,7 @@ fn merge(mix: Option<f64>) -> Node {
     node
 }
 
-fn blur(size: Option<f64>) -> Node {
+pub(super) fn blur(size: Option<f64>) -> Node {
     let mut node = Node::new(
         NodeKind::Blur {
             version: BlurVersion::V1,
@@ -87,7 +87,7 @@ fn blur(size: Option<f64>) -> Node {
 
 /// A document of these nodes, with IDs from 1, and these wires, each a consumer, its input and
 /// the source.
-fn graph(
+pub(super) fn graph(
     nodes: impl IntoIterator<Item = Node>,
     wires: &[(u64, InputSlot<'static>, u64)],
 ) -> Document {
@@ -108,7 +108,7 @@ fn graph(
 
 /// A document of these nodes, with IDs from 1, each Exposure taking the image of the node before
 /// it.
-fn chain(nodes: impl IntoIterator<Item = Node>) -> Document {
+pub(super) fn chain(nodes: impl IntoIterator<Item = Node>) -> Document {
     let mut document = Document::default();
     let mut previous = None;
     let mut assignments = Vec::new();
@@ -130,7 +130,7 @@ fn chain(nodes: impl IntoIterator<Item = Node>) -> Document {
     document
 }
 
-fn key(document: &Document, id: u64) -> ResultKey {
+pub(super) fn key(document: &Document, id: u64) -> ResultKey {
     result_key(document, &Reloads::default(), NodeId(id)).unwrap()
 }
 
