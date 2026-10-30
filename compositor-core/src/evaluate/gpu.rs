@@ -512,6 +512,8 @@ impl GpuEvaluation {
         self.queue.submit([encoder.finish()]);
         self.submitted += 1;
         let (completed, number) = (Arc::clone(&self.completed), self.submitted);
+        // Every submit polls the device, so this may run on the GUI thread inside its submit:
+        // it must stay this small.
         self.queue.on_submitted_work_done(move || {
             completed.fetch_max(number, Ordering::Release);
         });

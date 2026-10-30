@@ -437,6 +437,8 @@ impl Drop for Worker {
     /// Stops the worker, waiting while it is in a GPU phase but not while it evaluates on the
     /// CPU, and drops the device and everything the worker made on it on this thread. Nothing is
     /// delivered after this returns.
+    // The worker's thread can outlive its handle: a wgpu object it dropped after the GUI began
+    // tearing down the device, or after the driver's exit handlers ran, would crash the quit.
     fn drop(&mut self) {
         let mut state = self.mailbox.lock();
         state.stopping = true;

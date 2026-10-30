@@ -823,6 +823,9 @@ impl Device {
     ) -> Result<Device, String> {
         let adapter = choose_adapter(instance, surface)?;
         // Images take the largest textures and staging buffers the adapter allows.
+        // No memory budget threshold: wgpu predicts against the heap it expects, and on the RTX
+        // mapped buffers prefer a small host-visible heap without resizable BAR, so a threshold
+        // at 90% refused uploads, swapchains and this request itself. It is instance-wide.
         let supported = adapter.limits();
         let descriptor = wgpu::DeviceDescriptor {
             required_limits: wgpu::Limits {
