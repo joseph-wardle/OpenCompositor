@@ -66,7 +66,8 @@ fn shown(value: f32) -> f32 {
 
 @fragment
 fn image_fragment(vertex: ImageVertex) -> @location(0) vec4<f32> {
-    let last = vec2<i32>(textureDimensions(red)) - 1;
+    // The planes may be larger than the data window; nothing beyond it is drawn.
+    let last = vec2<i32>(frame.data_window.zw) - 1;
     let texel = clamp(vec2<i32>(floor(vertex.pixel)), vec2(0), last);
     // Premultiplied over black is the colour itself.
     return vec4(

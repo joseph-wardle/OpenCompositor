@@ -1115,7 +1115,10 @@ impl App {
             Ok(image) => {
                 self.images_shown += 1;
                 match image.pixels {
-                    Some(pixels) => self.gpu.show_image(pixels, self.images_shown),
+                    Some(pixels) => {
+                        self.gpu
+                            .show_image(pixels, image.info.data_window, self.images_shown)
+                    }
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {

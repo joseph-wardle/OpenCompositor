@@ -19,7 +19,7 @@ use super::{
     EvalError, Evaluator, Recipe, ResultKey, Retained, check_node_bytes, distinct_bytes, needs,
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
-use crate::kernels::{Kernels, Planes};
+use crate::kernels::{Kernels, Planes, plane_bytes};
 use crate::read::read_image;
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
@@ -368,7 +368,11 @@ impl GpuEvaluation {
         // The outputs, and the stack between layers: the planes the last layer's dispatch reads
         // and those it writes, each four over the union.
         let stacks = (layers.len() - 1).min(2) as u64;
-        check_node_bytes(key, window, window.plane_bytes(4 * (1 + stacks)))?;
+        check_node_bytes(
+            key,
+            window,
+            plane_bytes(window).saturating_mul(4 * (1 + stacks)),
+        )?;
         self.check_side(key, window)?;
         // An empty input has no textures, and covers nothing, so its planes are never read; the
         // fold still binds four, another input's.
@@ -440,9 +444,9 @@ impl GpuEvaluation {
                 sources.push(plane);
             }
         }
-        let bytes = window
-            .plane_bytes(sources.len() as u64)
-            .saturating_add(scratch_window.plane_bytes(1))
+        let bytes = plane_bytes(window)
+            .saturating_mul(sources.len() as u64)
+            .saturating_add(plane_bytes(scratch_window))
             .saturating_add(intermediate_bytes(&op, input, window));
         check_node_bytes(key, window, bytes)?;
         self.check_side(key, window)?;
@@ -556,7 +560,7 @@ fn intermediate_bytes(op: &BoxSum, input: Window, window: Window) -> u64 {
                 height: input.height + growth,
                 ..window
             };
-            rows.plane_bytes(1).saturating_add(columns.plane_bytes(1))
+            plane_bytes(rows).saturating_add(plane_bytes(columns))
         })
         .fold(0, u64::saturating_add)
 }
@@ -610,7 +614,9 @@ impl GpuImage {
     }
 
     /// The channel's R32Float texture over the data window, bottom row first, or `None` if the
-    /// data window is empty. Channels that share values share a texture.
+    /// data window is empty. Channels that share values share a texture. The texture may be
+    /// larger than the data window, which then covers its texels from the origin; the rest are
+    /// undefined.
     pub fn texture(&self, channel: Channel) -> Option<&wgpu::Texture> {
         (self.planes.as_ref()).map(|planes| &*planes[channel as usize].0)
     }

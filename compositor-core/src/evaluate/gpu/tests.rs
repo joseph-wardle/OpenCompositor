@@ -46,13 +46,19 @@ fn run(evaluator: &mut Evaluator, gpu: &mut GpuEvaluation, key: &ResultKey) -> G
         .expect("the request runs on the GPU")
 }
 
-/// The channel's values. The read back waits for every earlier submission, so evaluation is
-/// idle afterwards: its completion callbacks have run.
+/// The channel's values over the data window. The read back waits for every earlier submission,
+/// so evaluation is idle afterwards: its completion callbacks have run.
 fn read_back(gpu: &GpuEvaluation, image: &GpuImage, channel: Channel) -> Vec<f32> {
     let texture = image
         .texture(channel)
         .expect("a texture over the data window");
-    let values = headless::readback(&gpu.device, &gpu.queue, texture);
+    let window = image.info().data_window;
+    let values: Vec<f32> = headless::readback(&gpu.device, &gpu.queue, texture)
+        .chunks_exact(texture.width() as usize)
+        .take(window.height as usize)
+        .flat_map(|row| &row[..window.width as usize])
+        .copied()
+        .collect();
     assert_eq!(
         gpu.idle(),
         Ok(true),
@@ -744,9 +750,12 @@ fn a_blur_over_the_cap_fails_before_recording() {
         .expect_err("over the cap");
 
     // Four distinct planes over the 2 × 1 source grown by 4095 each side, the rows' scratch,
-    // and the planes after the first and second passes along each axis.
-    let (width, height) = (8192u64, 8191u64);
-    let intermediates = (2 + 2730) + (2 + 5460) + width * (1 + 2730) + width * (1 + 5460);
+    // and the planes after the first and second passes along each axis, each side rounded up
+    // to its size class.
+    let class = |length: u32| u64::from(crate::kernels::class(length));
+    let (width, height) = (class(8192), class(8191));
+    let intermediates =
+        class(2 + 2730) + class(2 + 5460) + width * class(1 + 2730) + width * class(1 + 5460);
     let bytes = 4 * (4 * width * height + width + intermediates);
     assert!(
         matches!(&error, EvalError::OverCap { origin, bytes: needed, .. }

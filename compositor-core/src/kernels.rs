@@ -419,11 +419,17 @@ pub(crate) struct Planes {
 }
 
 impl Planes {
-    /// A plane over `window`'s size whose contents the caller overwrites: a free one of that
-    /// size, else a new one. wgpu clears every new texture, which costs several times Exposure's
-    /// own dispatch at 4K, so free planes go first.
+    /// A plane covering `window`'s size whose contents the caller overwrites: a free one of its
+    /// size class, else a new one. wgpu clears every new texture, which costs several times
+    /// Exposure's own dispatch at 4K, so free planes go first.
     pub(crate) fn take(&mut self, device: &wgpu::Device, window: Window) -> Arc<wgpu::Texture> {
+        let side = device.limits().max_texture_dimension_2d;
         let size = extent(window);
+        let size = wgpu::Extent3d {
+            width: size.width.max(class(window.width).min(side)),
+            height: size.height.max(class(window.height).min(side)),
+            ..size
+        };
         if let Some(index) = self.free.iter().position(|plane| plane.size() == size) {
             return self.free.swap_remove(index);
         }
@@ -449,7 +455,26 @@ impl Planes {
     }
 }
 
-/// The texture size of a plane over `window`.
+/// A plane's side for a window's side of `length`: rounded up to a multiple of a 32nd of its
+/// next power of two, at most a sixteenth more.
+///
+/// Blur's output grows with its reach, so without classes every edit that changes the reach
+/// would free its planes and allocate new ones. Allocating and freeing hold wgpu's allocator
+/// for milliseconds, and the GUI thread's submits wait on it.
+pub(crate) fn class(length: u32) -> u32 {
+    let step = (length.next_power_of_two() / 32).max(1);
+    length.next_multiple_of(step)
+}
+
+/// The bytes of a plane taken for `window`.
+pub(crate) fn plane_bytes(window: Window) -> u64 {
+    if window.is_empty() {
+        return 0;
+    }
+    u64::from(class(window.width)) * u64::from(class(window.height)) * size_of::<f32>() as u64
+}
+
+/// The texture size of `window`.
 pub(crate) fn extent(window: Window) -> wgpu::Extent3d {
     wgpu::Extent3d {
         width: window.width,
@@ -458,12 +483,18 @@ pub(crate) fn extent(window: Window) -> wgpu::Extent3d {
     }
 }
 
+/// Whether `texture` covers `window` from its origin: a plane may be larger than its window,
+/// beyond which nothing reads it.
+fn covers(texture: &wgpu::Texture, window: Window) -> bool {
+    texture.width() >= window.width && texture.height() >= window.height
+}
+
 /// Checks an input plane before anything is recorded, rather than leaving it to wgpu, whose
 /// validation error would count as a bug on the device. No texture is empty, so a plane over an
 /// empty window may be any plane: its placement covers nothing and it is never read.
 fn check_input(texture: &wgpu::Texture, window: Window) -> Result<(), PlaneError> {
     check_plane(Role::Input, texture, wgpu::TextureUsages::TEXTURE_BINDING)?;
-    if !window.is_empty() && texture.size() != extent(window) {
+    if !window.is_empty() && !covers(texture, window) {
         return Err(PlaneError::Size {
             role: Role::Input,
             plane: texture.size(),
@@ -475,7 +506,7 @@ fn check_input(texture: &wgpu::Texture, window: Window) -> Result<(), PlaneError
 
 fn check_output(texture: &wgpu::Texture, window: Window) -> Result<(), PlaneError> {
     check_plane(Role::Output, texture, wgpu::TextureUsages::STORAGE_BINDING)?;
-    if texture.size() != extent(window) {
+    if !covers(texture, window) {
         return Err(PlaneError::Size {
             role: Role::Output,
             plane: texture.size(),
@@ -523,7 +554,7 @@ pub(crate) enum PlaneError {
         role: Role,
         missing: wgpu::TextureUsages,
     },
-    /// The plane is not the size of its window.
+    /// The plane is smaller than its window.
     Size {
         role: Role,
         plane: wgpu::Extent3d,
@@ -546,7 +577,7 @@ impl fmt::Display for PlaneError {
                 needed,
             } => write!(
                 f,
-                "the {role:?} plane is {} by {}, not the {} by {} of its window",
+                "the {role:?} plane is {} by {}, smaller than the {} by {} of its window",
                 plane.width, plane.height, needed.width, needed.height
             ),
         }
@@ -786,6 +817,38 @@ mod tests {
     }
 
     #[test]
+    fn a_size_class_covers_its_length_with_at_most_a_sixteenth_more() {
+        for length in 1..=20_000 {
+            let side = class(length);
+            assert!(
+                side >= length && side - length <= length / 16,
+                "{length}: {side}"
+            );
+            assert_eq!(class(side), side, "{length}: a class is its own class");
+        }
+        assert_eq!([class(31), class(2160), class(3840)], [31, 2176, 3840]);
+    }
+
+    /// A Blur edit that changes the reach changes its planes' windows by a few texels, which
+    /// stay within their classes, so the request writes the planes it freed.
+    #[test]
+    fn a_plane_is_taken_again_for_a_window_of_its_class() {
+        let (_, device, _queue) = noop_parts(None);
+        let mut planes = Planes::default();
+        let plane = planes.take(&device, at_origin(3846, 2166));
+        assert_eq!((plane.width(), plane.height()), (3968, 2176));
+        let made = Arc::as_ptr(&plane);
+        planes.keep(plane);
+
+        let again = planes.take(&device, at_origin(3852, 2172));
+        assert_eq!(Arc::as_ptr(&again), made);
+        planes.keep(again);
+        let beyond = planes.take(&device, at_origin(3972, 2172));
+        assert_ne!(Arc::as_ptr(&beyond), made);
+        assert_eq!((beyond.width(), beyond.height()), (4096, 2176));
+    }
+
+    #[test]
     fn a_wrong_plane_is_refused_before_anything_is_recorded() {
         let (_, device, _queue) = noop_parts(None);
         let mut kernels = Kernels::new(&device);
@@ -824,7 +887,13 @@ mod tests {
             })
         );
 
-        // An input placed anywhere must be its window's size, and an output the output's.
+        // An input placed anywhere must cover its window, and an output the output's; larger
+        // planes are read and written over their windows only.
+        let larger = headless::plane(&device, 5, 6, writable);
+        assert_eq!(
+            kernels.map(&mut encoder, &op, [(&input, size)], size, [&larger]),
+            Ok(())
+        );
         let wider = window(-1, 0, 5, 4);
         assert_eq!(
             kernels.map(&mut encoder, &op, [(&input, wider)], size, [&output]),

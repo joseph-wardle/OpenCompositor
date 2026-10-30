@@ -36,7 +36,7 @@ fn map_1_1<M: Map<1, 1>>(id: UVec3, params: &MapParams<M, 1>, a: &Input, output:
     let at = IVec2::new(id.x as i32, id.y as i32);
     let (a, _) = placed(a, at, &params.places[0]);
     let [v] = params.op.apply([a]);
-    // SAFETY: `at` is inside the output, which the host sizes to the params, and the output is
+    // SAFETY: `at` is inside the output, which covers the params' size, and the output is
     // bound as R32Float, the format this image type declares.
     unsafe { output.write(at, v) };
 }
@@ -99,7 +99,7 @@ fn fold_4_step<F: Fold<4, 4>>(
     }
     let at = IVec2::new(id.x as i32, id.y as i32);
     let stack = folded_4(at, params, below, layer);
-    // SAFETY: `at` is inside the outputs, which the host sizes to the params, and each is bound
+    // SAFETY: `at` is inside the outputs, which cover the params' size, and each is bound
     // as R32Float.
     unsafe { write_4(outputs, at, stack) };
 }
@@ -184,7 +184,7 @@ fn line_direct<L: LineReduce>(id: UVec3, params: &LineParams<L>, input: &Input, 
     }
     let first = padded(input, reach, line, o);
     let last = padded(input, reach, line, o + 2 * t);
-    // SAFETY: `at` is inside the output, which the host sizes to the params, and the output is
+    // SAFETY: `at` is inside the output, which covers the params' size, and the output is
     // bound as R32Float.
     unsafe { output.write(at, op.finish(core, first, last)) };
 }

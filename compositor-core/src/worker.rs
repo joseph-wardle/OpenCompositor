@@ -124,8 +124,8 @@ pub struct ViewerImage {
 /// from. Holding them keeps the worker from writing into them again.
 #[derive(Debug)]
 pub(crate) struct Pixels {
-    /// R32Float textures over the data window, bottom row first, in `Channel::ALL`'s order.
-    /// Channels that share values share a texture.
+    /// R32Float textures over the data window, bottom row first, in `Channel::ALL`'s order,
+    /// which a GPU session's may exceed. Channels that share values share a texture.
     pub(crate) planes: [Arc<wgpu::Texture>; 4],
     pub(crate) device_generation: u64,
     /// A CPU session's planes, still to be copied from the worker's staging buffer; a GPU

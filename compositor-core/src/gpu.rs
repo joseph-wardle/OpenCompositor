@@ -394,7 +394,7 @@ impl Gpu {
     ///
     /// The copy is submitted at once rather than with the viewer's next frame, which may never
     /// come while the viewer is closed, so that the staging buffer goes back to the worker.
-    pub(crate) fn show_image(&mut self, pixels: Pixels, number: u64) {
+    pub(crate) fn show_image(&mut self, pixels: Pixels, window: Window, number: u64) {
         let Some(device) = &mut self.device else {
             return;
         };
@@ -420,7 +420,13 @@ impl Gpu {
             }
             device.queue.submit([encoder.finish()]);
         }
-        let image = ShownImage::new(&device.device, &device.viewer, pixels.planes, number);
+        let image = ShownImage::new(
+            &device.device,
+            &device.viewer,
+            pixels.planes,
+            window,
+            number,
+        );
         device.viewer.image = Some(image);
     }
 
@@ -934,6 +940,8 @@ struct ShownImage {
     /// Held so that the worker writes no later result into them while they are shown, and for
     /// reading their pixels.
     planes: [Arc<wgpu::Texture>; 4],
+    /// The data window's width and height, which the planes may exceed.
+    size: [u32; 2],
     number: u64,
 }
 
@@ -942,6 +950,7 @@ impl ShownImage {
         device: &wgpu::Device,
         viewer: &ViewerRenderer,
         planes: [Arc<wgpu::Texture>; 4],
+        window: Window,
         number: u64,
     ) -> ShownImage {
         let views = planes
@@ -962,6 +971,7 @@ impl ShownImage {
         ShownImage {
             group,
             planes,
+            size: [window.width, window.height],
             number,
         }
     }
@@ -1008,8 +1018,8 @@ impl PixelReader {
             return;
         };
         let [x, y] = probe.texel;
-        let size = image.planes[0].size();
-        if x >= size.width || y >= size.height {
+        let [width, height] = image.size;
+        if x >= width || y >= height {
             return;
         }
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -1400,7 +1410,8 @@ mod tests {
         });
         let staged = || {
             let evaluated = deliveries.recv_timeout(Duration::from_secs(10)).unwrap();
-            evaluated.result.unwrap().pixels.expect("pixels staged")
+            let image = evaluated.result.unwrap();
+            (image.pixels.expect("pixels staged"), image.info.data_window)
         };
 
         // Staged for the generation before the GPU's own, as after a loss.
@@ -1410,12 +1421,14 @@ mod tests {
             key,
             number: 1,
         }));
-        gpu.show_image(staged(), 1);
+        let (pixels, window) = staged();
+        gpu.show_image(pixels, window, 1);
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_none());
 
         // Connecting delivers the last key again, now for the GPU's generation.
         worker.connect(device, queue, Arc::default(), 1);
-        gpu.show_image(staged(), 1);
+        let (pixels, window) = staged();
+        gpu.show_image(pixels, window, 1);
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_some());
     }
 
@@ -1425,7 +1438,8 @@ mod tests {
 
         let (device, queue) = headless::device();
         let viewer = ViewerRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb);
-        // 3 × 2, with values a display copy could not hold at the probed texel, (2, 1).
+        // A 3 × 2 window on 4 × 3 planes, as the evaluator's may be larger than their windows,
+        // with values a display copy could not hold at the probed texel, (2, 1).
         let special = [
             f32::from_bits(0x7fc0_1234),
             f32::NEG_INFINITY,
@@ -1435,41 +1449,46 @@ mod tests {
         let plane = |value: f32| {
             let texture = headless::plane(
                 &device,
+                4,
                 3,
-                2,
                 wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_DST
                     | wgpu::TextureUsages::COPY_SRC,
             );
-            let mut texels = [0.5f32; 6];
-            texels[5] = value;
+            let mut texels = [0.5f32; 12];
+            texels[4 + 2] = value;
             let bytes: Vec<u8> = texels.iter().flat_map(|v| v.to_ne_bytes()).collect();
             queue.write_texture(
                 texture.as_image_copy(),
                 &bytes,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(12),
+                    bytes_per_row: Some(16),
                     rows_per_image: None,
                 },
                 texture.size(),
             );
             Arc::new(texture)
         };
-        let image = ShownImage::new(&device, &viewer, special.map(plane), 7);
+        let window = Window {
+            x: 0,
+            y: 0,
+            width: 3,
+            height: 2,
+        };
+        let image = ShownImage::new(&device, &viewer, special.map(plane), window, 7);
         let mut reader = PixelReader::new(&device);
 
-        // Another image's probe, and a texel outside this one, read nothing.
+        // Another image's probe, and texels outside this one's window though inside its planes,
+        // read nothing.
         for probe in [[2, 1], [3, 0]].map(|texel| Probe { image: 8, texel }) {
             reader.start(&device, &queue, Some(&image), probe);
             assert!(reader.in_flight.is_none());
         }
-        let outside = Probe {
-            image: 7,
-            texel: [0, 2],
-        };
-        reader.start(&device, &queue, Some(&image), outside);
-        assert!(reader.in_flight.is_none());
+        for outside in [[0, 2], [3, 1]].map(|texel| Probe { image: 7, texel }) {
+            reader.start(&device, &queue, Some(&image), outside);
+            assert!(reader.in_flight.is_none());
+        }
 
         let probe = Probe {
             image: 7,
