@@ -20,7 +20,8 @@ use std::time::Instant;
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
 use opencompositor_core::{
-    App, Command, Event, FileIntent, FrameCheck, Notice, Pane, Request, Session, Slot,
+    App, Command, EXPOSURE_STEP, EvaluationDevice, Event, FileIntent, FrameCheck, FrameTiming,
+    MAX_EXPOSURE, Notice, Pane, Request, Session, Slot,
 };
 
 use crate::qt::ffi;
@@ -49,7 +50,9 @@ pub struct Widgets {
     pub panes: [*mut qt::Pane; Pane::COUNT],
     pub panel: *mut ffi::ParameterPanel,
     pub creation_menu: *mut ffi::CreationMenu,
-    /// Under the viewer.
+    /// Under the viewer: its caption, readout and exposure.
+    pub strip: *mut ffi::ViewerStrip,
+    /// The strip's first line.
     pub caption: *mut ffi::QLabel,
     /// At the status bar's right, while the GPU is unavailable or has reported errors.
     pub gpu_label: *mut ffi::QLabel,
@@ -65,16 +68,23 @@ enum Check {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur]]"
+        "usage: opencompositor [--cpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur]]"
     );
     std::process::exit(2)
 }
 
 fn main() {
-    let check = match &std::env::args_os().skip(1).collect::<Vec<_>>()[..] {
+    let mut arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let device = if arguments.first().is_some_and(|flag| flag == "--cpu") {
+        arguments.remove(0);
+        EvaluationDevice::Cpu
+    } else {
+        EvaluationDevice::Gpu
+    };
+    let check = match &arguments[..] {
         [] => None,
         [flag, image] if flag == "--lifecycle-check" => Some(Check::Lifecycle(image.into())),
-        [flag, image] if flag == "--drag-check" => drag::run_chains(image.as_ref()),
+        [flag, image] if flag == "--drag-check" => drag::run_chains(image.as_ref(), device),
         [flag, image, name] if flag == "--drag-check" => {
             match name.to_str().and_then(drag::Chain::from_name) {
                 Some(chain) => Some(Check::Drag(image.into(), chain)),
@@ -97,12 +107,14 @@ fn main() {
     let waker = ffi::new_waker();
     // SAFETY: the waker is live. Its thread handle outlives it: queueing fails once it is deleted.
     let waker_thread = unsafe { &*waker }.qt_thread();
-    let mut app = App::new(move |notice| {
+    let mut app = App::new(device, move |notice| {
         // Fails only once the waker is deleted at exit, when nothing is left to tell.
         let _ = waker_thread.queue(move |_| receive(notice));
     });
-    if matches!(check, Some(Check::Lifecycle(_))) {
-        app.check_frames();
+    match check {
+        Some(Check::Lifecycle(_)) => app.check_frames(),
+        Some(Check::Drag(..)) => app.time_frames(),
+        None => {}
     }
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
@@ -172,6 +184,30 @@ fn main() {
     );
     // SAFETY: the viewer menu is live; it owns the note.
     unsafe { ffi::add_note(viewer_menu, &QString::from("Pan\tSpace+Drag, Middle-Drag")) };
+    // SAFETY: the viewer menu is live.
+    unsafe { ffi::add_separator(viewer_menu) };
+    add(viewer_menu, "&Brighten\tE", "", Command::ExposureUp);
+    add(viewer_menu, "&Darken\tShift+E", "", Command::ExposureDown);
+    add(
+        viewer_menu,
+        "&Reset the Exposure\tCtrl+E",
+        "",
+        Command::ResetExposure,
+    );
+    // SAFETY: the viewer menu is live.
+    unsafe { ffi::add_separator(viewer_menu) };
+    add(
+        viewer_menu,
+        "Evaluate on the &GPU",
+        "",
+        Command::EvaluateOn(EvaluationDevice::Gpu),
+    );
+    add(
+        viewer_menu,
+        "Evaluate on the &CPU",
+        "",
+        Command::EvaluateOn(EvaluationDevice::Cpu),
+    );
     COMMANDS.with(|cell| cell.set(commands).expect("menus are made once"));
     // In one area, which the parameter panel's dock then divides.
     let docks = Pane::ALL.map(|pane| {
@@ -201,10 +237,17 @@ fn main() {
             panel::gesture,
         )
     };
-    // SAFETY: the docks are live; each owns its pane, and the viewer's its caption, from here on.
-    let caption = unsafe {
+    // SAFETY: the docks are live; each owns its pane, and the viewer's its strip, from here on.
+    let (strip, caption) = unsafe {
         ffi::container(panes[Pane::Graph.index()], graph_dock);
-        ffi::container_with_caption(panes[Pane::Viewer.index()], viewer_dock)
+        let strip = ffi::container_with_strip(
+            panes[Pane::Viewer.index()],
+            viewer_dock,
+            f64::from(MAX_EXPOSURE),
+            f64::from(EXPOSURE_STEP),
+            exposure_set,
+        );
+        (strip, ffi::strip_caption(strip))
     };
     // SAFETY: the window is live; it owns the menu.
     let creation_menu = unsafe { ffi::new_creation_menu(window_ptr, creation::chosen) };
@@ -217,6 +260,7 @@ fn main() {
             panes,
             panel,
             creation_menu,
+            strip,
             caption,
             gpu_label,
             undo,
@@ -246,13 +290,16 @@ fn main() {
 
 /// Hands an event to the app, then does what it asks.
 pub fn dispatch(event: Event) {
-    let draws_viewer = matches!(event, Event::Draw(Pane::Viewer));
+    let drawn = match event {
+        Event::Draw(pane) => Some(pane),
+        _ => None,
+    };
     let Some(requests) = APP.with(|cell| cell.borrow_mut().as_mut().map(|app| app.dispatch(event)))
     else {
         return;
     };
-    if draws_viewer {
-        drag::viewer_frame_drawn();
+    if let Some(pane) = drawn {
+        drag::frame_drawn(pane);
     }
     for request in requests {
         perform(request);
@@ -292,6 +339,10 @@ fn show_undo_labels(labels: [Option<&str>; 2]) {
         // SAFETY: the Edit menu owns the action, and lives as long as the window.
         unsafe { ffi::set_action(action, &QString::from(&text), label.is_some()) };
     }
+}
+
+fn exposure_set(stops: f64) {
+    dispatch(Event::ViewerExposureSet(stops as f32));
 }
 
 fn run_command(index: usize) {
@@ -337,6 +388,14 @@ pub fn perform(request: Request) {
         Request::ShowViewerCaption(text) => unsafe {
             ffi::set_caption(widgets.caption, &QString::from(&text))
         },
+        // SAFETY: the strip lives as long as the viewer's dock.
+        Request::ShowReadout(text) => unsafe {
+            ffi::set_readout(widgets.strip, &QString::from(&text))
+        },
+        // SAFETY: the strip lives as long as the viewer's dock.
+        Request::ShowViewerExposure(stops) => unsafe {
+            ffi::show_viewer_exposure(widgets.strip, f64::from(stops))
+        },
         Request::ShowUndoLabels { undo, redo } => show_undo_labels([undo, redo]),
         Request::ShowCreationMenu(anchor) => creation::show(anchor),
         Request::ShowPanel(shown) => panel::show(shown.as_ref()),
@@ -349,20 +408,24 @@ pub fn perform(request: Request) {
             let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
             ffi::single_shot(milliseconds, retry_device_creation, attempt as usize);
         }
+        Request::CollectPixelRead { after } => {
+            let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
+            ffi::single_shot(milliseconds, collect_pixel_read, 0);
+        }
     }
 }
 
 /// Dispatches a notice from another thread. Retiring a lost device blocks the GUI thread, so
 /// the lifecycle check reports how long; the drag check records each result's arrival.
 fn receive(notice: Notice) {
-    let lost = matches!(notice, Notice::DeviceLost(_));
+    let lost = matches!(notice, Notice::DeviceLost { .. });
     let evaluated = match &notice {
         Notice::Evaluated(evaluated) => Some((
             evaluated.request(),
             evaluated.timing,
             evaluated.data_window(),
         )),
-        Notice::DeviceLost(_) => None,
+        Notice::DeviceLost { .. } => None,
     };
     let started = Instant::now();
     dispatch(Event::from(notice));
@@ -380,6 +443,11 @@ fn retry_device_creation(attempt: usize) {
     let started = Instant::now();
     dispatch(Event::RetryDeviceCreation(attempt as u64));
     lifecycle::attempt_took(started.elapsed());
+}
+
+/// One whose timer fires after the app has dropped dispatches to nothing.
+fn collect_pixel_read(_: usize) {
+    dispatch(Event::CollectPixelRead);
 }
 
 pub fn path(name: &QString) -> PathBuf {
@@ -418,6 +486,25 @@ pub fn gpu_errors() -> u64 {
 /// The number of the latest request to the worker, in the drag check.
 pub fn latest_request() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, App::latest_request))
+}
+
+/// The pane's last frame, in the drag check.
+pub fn frame_timing(pane: Pane) -> Option<FrameTiming> {
+    APP.with(|cell| cell.borrow().as_ref()?.frame_timing(pane))
+}
+
+/// Runs the callbacks of the GPU's completed work, in the drag check.
+pub fn poll_gpu() {
+    APP.with(|cell| {
+        if let Some(app) = cell.borrow().as_ref() {
+            app.poll_gpu();
+        }
+    });
+}
+
+/// The device evaluating the session.
+pub fn evaluation_device() -> EvaluationDevice {
+    APP.with(|cell| (cell.borrow().as_ref()).map_or(EvaluationDevice::Cpu, App::evaluation_device))
 }
 
 /// The number of the request whose image the viewer last presented, in the drag check.

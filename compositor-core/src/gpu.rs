@@ -1,17 +1,19 @@
 //! The GPU: one device for every pane, and a surface for each pane while it has a native window.
 
+use std::fmt;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use open_ng::{Graph, Renderer, View, ViewBuffers, Viewport};
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle};
 
 use crate::app::{Notice, Pane, Waker};
+use crate::evaluate::poll_device;
 use crate::image::Window;
 use crate::viewer::Placement;
-use crate::worker::Staged;
+use crate::worker::Pixels;
 
 /// Behind everything a pane draws.
 const BACKGROUND: wgpu::Color = wgpu::Color {
@@ -69,7 +71,12 @@ pub(crate) struct Gpu {
     instance: Option<wgpu::Instance>,
     /// Only in the lifecycle check.
     checks: Option<FrameChecks>,
-    /// Uncaptured errors on every device of the session.
+    /// Each pane's last frame, only in the drag check.
+    timings: Option<[Option<FrameTiming>; Pane::COUNT]>,
+    /// Numbers the frames timed.
+    frames_timed: u64,
+    /// Errors on every device of the session that are bugs: those no error scope captured, and
+    /// evaluation's rejected commands.
     errors: Arc<AtomicU64>,
     /// Counts the attempts to make a device, telling each device's notices and staged images
     /// apart.
@@ -84,10 +91,13 @@ struct PaneWindow {
     size: PaneSize,
 }
 
-/// A device made for the panes, for the worker to stage images for.
+/// A device made for the panes, for the worker to evaluate or stage images on.
 #[derive(Debug)]
 pub(crate) struct NewDevice {
     pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    /// Set by the device's lost callback.
+    pub(crate) lost: Arc<AtomicBool>,
     pub(crate) generation: u64,
     /// Why panes with a native window cannot draw on it.
     pub(crate) pane_errors: Vec<String>,
@@ -115,6 +125,22 @@ struct FrameChecks {
     centres: [Option<[u8; 4]>; Pane::COUNT],
 }
 
+/// When a pane's frame passed each stage, for the shell's drag check.
+#[derive(Clone, Debug)]
+pub struct FrameTiming {
+    /// The frame's number among the frames timed, of every pane, from 1.
+    pub number: u64,
+    /// The surface gave the frame's texture.
+    pub acquired: Instant,
+    /// The frame was submitted.
+    pub submitted: Instant,
+    /// The frame was handed to the display, which shows it at a later refresh.
+    pub presented: Instant,
+    /// When the GPU reported the frame complete, set by whichever thread's poll or submit ran
+    /// the report. Nothing polls an idle device, so the check polls while it waits.
+    pub completed: Arc<OnceLock<Instant>>,
+}
+
 /// What the viewer pane draws: the shown image's windows, and where they appear.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ViewerFrame {
@@ -123,6 +149,25 @@ pub(crate) struct ViewerFrame {
     pub(crate) data_window: Window,
     /// The pane's physical pixels per logical pixel, which sets the outline's width.
     pub(crate) scale_factor: f32,
+    /// The viewer's exposure as a factor on the working values, before they are clamped.
+    pub(crate) gain: f32,
+}
+
+/// A pixel of a shown image to read its working values at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Probe {
+    /// The image, numbered as [`Gpu::show_image`] was given it.
+    pub(crate) image: u64,
+    /// The pixel's texel in the image's planes, from the data window's bottom-left corner.
+    pub(crate) texel: [u32; 2],
+}
+
+/// A probe's pixel, read back once the GPU had copied it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PixelRead {
+    pub(crate) probe: Probe,
+    /// In `Channel::ALL`'s order.
+    pub(crate) values: [f32; 4],
 }
 
 /// Everything made once there is a surface to choose an adapter for, which goes with the device.
@@ -140,6 +185,8 @@ struct Device {
     queue: wgpu::Queue,
     device: wgpu::Device,
     adapter: wgpu::Adapter,
+    /// Set by the device's lost callback.
+    lost: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -155,21 +202,47 @@ impl Gpu {
             windows: Default::default(),
             instance: None,
             checks: None,
+            timings: None,
+            frames_timed: 0,
             errors: Arc::default(),
             device_generation: 0,
             waker,
         }
     }
 
-    /// How many GPU errors no error scope captured this session: each is a bug.
+    /// How many GPU errors there were this session: each is a bug.
     pub(crate) fn errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Counts an error an error scope captured that is a bug all the same, as wgpu's rejecting
+    /// evaluation's commands.
+    pub(crate) fn count_error(&self, error: &dyn fmt::Display) {
+        count_error(&self.errors, error);
     }
 
     /// Records what every frame from now on proves, waiting for the GPU after each. Surfaces
     /// made from now on are made readable where they allow it.
     pub(crate) fn check_frames(&mut self) {
         self.checks.get_or_insert_default();
+    }
+
+    /// Records when each frame from now on passes each stage.
+    pub(crate) fn time_frames(&mut self) {
+        self.timings.get_or_insert_default();
+    }
+
+    /// The pane's last timed frame; `None` before one or without [`Gpu::time_frames`].
+    pub(crate) fn frame_timing(&self, pane: Pane) -> Option<FrameTiming> {
+        self.timings.as_ref()?[pane.index()].clone()
+    }
+
+    /// Runs the callbacks of the device's completed work, without waiting for any.
+    pub(crate) fn poll(&self) {
+        if let Some(device) = &self.device {
+            // A loss runs the lost callback, which notices it.
+            let _ = poll_device(&device.device);
+        }
     }
 
     pub(crate) fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
@@ -277,6 +350,8 @@ impl Gpu {
         }
         let new = NewDevice {
             device: device.device.clone(),
+            queue: device.queue.clone(),
+            lost: Arc::clone(&device.lost),
             generation: self.device_generation,
             pane_errors,
         };
@@ -310,44 +385,49 @@ impl Gpu {
         device.device.destroy();
         // `destroy` loses the device only at a later poll, and work on it until then would be
         // counted as errors.
-        let _ = wait_for_device(&device.device, None);
+        let _ = wait_for_device(&device.device);
     }
 
-    /// Copies a staged image into its texture and shows it in the viewer from the next frame.
+    /// Shows an image's planes in the viewer from the next frame, numbered for the probes that
+    /// read it. Staged planes are copied into their textures first. Planes for an earlier device
+    /// are dropped.
     ///
     /// The copy is submitted at once rather than with the viewer's next frame, which may never
     /// come while the viewer is closed, so that the staging buffer goes back to the worker.
-    /// An image staged for an earlier device is dropped.
-    pub(crate) fn show_image(&mut self, staged: Staged) {
+    pub(crate) fn show_image(&mut self, pixels: Pixels, window: Window, number: u64) {
         let Some(device) = &mut self.device else {
             return;
         };
-        if staged.device_generation() != self.device_generation {
+        if pixels.device_generation != self.device_generation {
             return;
         }
-        let mut encoder = device.device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_texture(
-            wgpu::TexelCopyBufferInfo {
-                buffer: staged.buffer(),
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(staged.bytes_per_row),
-                    rows_per_image: None,
-                },
-            },
-            staged.texture.as_image_copy(),
-            staged.texture.size(),
+        if let Some(staged) = &pixels.staged {
+            let mut encoder = device.device.create_command_encoder(&Default::default());
+            for &(channel, offset) in &staged.copies {
+                let texture = &pixels.planes[channel];
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: staged.buffer(),
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset,
+                            bytes_per_row: Some(staged.bytes_per_row),
+                            rows_per_image: None,
+                        },
+                    },
+                    texture.as_image_copy(),
+                    texture.size(),
+                );
+            }
+            device.queue.submit([encoder.finish()]);
+        }
+        let image = ShownImage::new(
+            &device.device,
+            &device.viewer,
+            pixels.planes,
+            window,
+            number,
         );
-        device.queue.submit([encoder.finish()]);
-        let view = staged.texture.create_view(&Default::default());
-        device.viewer.image = Some(device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("viewer image"),
-            layout: &device.viewer.image_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            }],
-        }));
+        device.viewer.image = Some(image);
     }
 
     /// Stops drawing the viewer's image, which a failed read or an unmarked slot replaces.
@@ -355,6 +435,46 @@ impl Gpu {
         if let Some(device) = &mut self.device {
             device.viewer.image = None;
         }
+    }
+
+    /// Reads the working values at the probe's pixel of the image shown, if it is the probe's,
+    /// once the reads already asked for are done: one at a time, the latest asked for next.
+    pub(crate) fn read_pixel(&mut self, probe: Probe) {
+        let Some(device) = &mut self.device else {
+            return;
+        };
+        let reader = &mut device.viewer.reader;
+        if reader.in_flight.is_some() {
+            reader.next = Some(probe);
+        } else {
+            reader.start(
+                &device.device,
+                &device.queue,
+                device.viewer.image.as_ref(),
+                probe,
+            );
+        }
+    }
+
+    /// Whether a pixel read is waiting for the GPU.
+    pub(crate) fn reading_pixel(&self) -> bool {
+        (self.device.as_ref()).is_some_and(|device| device.viewer.reader.in_flight.is_some())
+    }
+
+    /// The pixel read the GPU has finished, without waiting for it, if its image is still
+    /// shown, and starts the next one asked for.
+    pub(crate) fn take_pixel_read(&mut self) -> Option<PixelRead> {
+        let device = self.device.as_mut()?;
+        // Nothing more is read from a lost device; its lost callback noticed the loss.
+        poll_device(&device.device).ok()?;
+        let reader = &mut device.viewer.reader;
+        let image = device.viewer.image.as_ref();
+        let read = reader.finish()?;
+        if let Some(next) = reader.next.take() {
+            reader.start(&device.device, &device.queue, image, next);
+        }
+        let shown = image.map(|image| image.number);
+        read.filter(|read| Some(read.probe.image) == shown)
     }
 
     /// Drops the pane's surface, if it has one, and its native window, before the window goes.
@@ -408,6 +528,7 @@ impl Gpu {
             // Only under an error scope or handler, which this code does not install.
             wgpu::CurrentSurfaceTexture::Validation => return Drawn::Skipped,
         };
+        let acquired = Instant::now();
         match pane {
             Pane::Graph => device.renderer.prepare(
                 &device.device,
@@ -454,10 +575,29 @@ impl Gpu {
             _ => None,
         };
         device.queue.submit([encoder.finish()]);
+        let submitted = Instant::now();
+        let completed = self.timings.is_some().then(|| {
+            let completed = Arc::new(OnceLock::new());
+            let report = Arc::clone(&completed);
+            device.queue.on_submitted_work_done(move || {
+                let _ = report.set(Instant::now());
+            });
+            completed
+        });
         if let Some(checks) = &mut self.checks {
             checks.record(pane, device, readback);
         }
         device.queue.present(frame);
+        if let (Some(timings), Some(completed)) = (&mut self.timings, completed) {
+            self.frames_timed += 1;
+            timings[pane.index()] = Some(FrameTiming {
+                number: self.frames_timed,
+                acquired,
+                submitted,
+                presented: Instant::now(),
+                completed,
+            });
+        }
         Drawn::Presented
     }
 }
@@ -523,7 +663,7 @@ impl FrameChecks {
         if let Some(buffer) = &readback {
             buffer.map_async(wgpu::MapMode::Read, .., |_| {});
         }
-        if wait_for_device(&device.device, None).is_err() {
+        if wait_for_device(&device.device).is_err() {
             return;
         }
         let Some(view) = readback
@@ -540,24 +680,18 @@ impl FrameChecks {
     }
 }
 
-/// Waits until the device has finished its submitted work, or for at most `timeout`, and runs the
-/// callbacks it made ready. Returns whether the work finished.
-pub(crate) fn wait_for_device(
-    device: &wgpu::Device,
-    timeout: Option<Duration>,
-) -> Result<bool, String> {
+/// Waits until the device has finished its submitted work, and runs the callbacks it made ready.
+/// Only the GUI thread's frame checks and teardown wait so; the worker polls instead.
+pub(crate) fn wait_for_device(device: &wgpu::Device) -> Result<(), String> {
     let wait = wgpu::PollType::Wait {
         submission_index: None,
-        timeout,
+        timeout: None,
     };
-    // wgpu 30 panics rather than returning an error when the driver reports the device lost
-    // during a poll, because `WaitIdleError::Device` has no `PollError`. The panic is raised after
-    // wgpu has released its locks, so catching it leaves wgpu usable. Hypothesis, untested since
-    // it needs a real reset: Vulkan's waits return `DEVICE_LOST` promptly after one, rather than
-    // holding the frame checks here. The worker bounds its waits, so it does not rely on this.
+    // A loss panics as `poll_device` says. Hypothesis, untested since it needs a real reset:
+    // Vulkan's waits return `DEVICE_LOST` promptly after one, rather than holding the frame
+    // checks here.
     match std::panic::catch_unwind(AssertUnwindSafe(|| device.poll(wait))) {
-        Ok(Ok(_)) => Ok(true),
-        Ok(Err(wgpu::PollError::Timeout)) => Ok(false),
+        Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err("the GPU device was lost".to_owned()),
     }
@@ -624,7 +758,7 @@ const LOGGED_ERRORS: u64 = 20;
 #[derive(Debug)]
 struct ErrorCounter {
     counted: Arc<AtomicU64>,
-    lost: AtomicBool,
+    lost: Arc<AtomicBool>,
 }
 
 impl ErrorCounter {
@@ -635,31 +769,47 @@ impl ErrorCounter {
     /// A real loss calls the lost callback at once, in the call that failed; `destroy` calls it
     /// only at a later poll. Nothing polls while the panes are idle or hidden: a loss then is
     /// noticed at the next use of the GPU, and until then nothing visible depends on it.
-    fn install(device: &wgpu::Device, counted: &Arc<AtomicU64>, generation: u64, waker: &Waker) {
+    ///
+    /// Returns the flag the lost callback sets.
+    fn install(
+        device: &wgpu::Device,
+        counted: &Arc<AtomicU64>,
+        generation: u64,
+        waker: &Waker,
+    ) -> Arc<AtomicBool> {
+        let lost = Arc::new(AtomicBool::new(false));
         let counter = Arc::new(ErrorCounter {
             counted: Arc::clone(counted),
-            lost: AtomicBool::new(false),
+            lost: Arc::clone(&lost),
         });
         let handler = Arc::clone(&counter);
         device.on_uncaptured_error(Arc::new(move |error| handler.count(&error)));
         let waker = waker.clone();
         device.set_device_lost_callback(move |_, _| {
             counter.lost.store(true, Ordering::Relaxed);
-            waker.wake(Notice::DeviceLost(generation));
+            waker.wake(Notice::DeviceLost {
+                generation,
+                at: Instant::now(),
+            });
         });
+        lost
     }
 
     fn count(&self, error: &wgpu::Error) {
-        if self.lost.load(Ordering::Relaxed) {
-            return;
+        if !self.lost.load(Ordering::Relaxed) {
+            count_error(&self.counted, error);
         }
-        let number = self.counted.fetch_add(1, Ordering::Relaxed) + 1;
-        if number <= LOGGED_ERRORS {
-            eprintln!("GPU error {number}: {error}");
-        }
-        if number == LOGGED_ERRORS {
-            eprintln!("later GPU errors are counted, not logged");
-        }
+    }
+}
+
+/// Counts a GPU error, a bug, logging it unless too many were.
+fn count_error(counted: &AtomicU64, error: &dyn fmt::Display) {
+    let number = counted.fetch_add(1, Ordering::Relaxed) + 1;
+    if number <= LOGGED_ERRORS {
+        eprintln!("GPU error {number}: {error}");
+    }
+    if number == LOGGED_ERRORS {
+        eprintln!("later GPU errors are counted, not logged");
     }
 }
 
@@ -673,6 +823,9 @@ impl Device {
     ) -> Result<Device, String> {
         let adapter = choose_adapter(instance, surface)?;
         // Images take the largest textures and staging buffers the adapter allows.
+        // No memory budget threshold: wgpu predicts against the heap it expects, and on the RTX
+        // mapped buffers prefer a small host-visible heap without resizable BAR, so a threshold
+        // at 90% refused uploads, swapchains and this request itself. It is instance-wide.
         let supported = adapter.limits();
         let descriptor = wgpu::DeviceDescriptor {
             required_limits: wgpu::Limits {
@@ -686,7 +839,7 @@ impl Device {
             .map_err(|error| format!("no GPU device: {error}"))?;
         // Before any other call on the device: wgpu notices a loss only when a call reaches the
         // driver, so with nothing in between, none goes unnoticed.
-        ErrorCounter::install(&device, errors, generation, waker);
+        let lost = ErrorCounter::install(&device, errors, generation, waker);
         // Panes draw clamped linear values, which an sRGB format encodes. Encoding in a shader too
         // would encode twice.
         let formats = surface.get_capabilities(&adapter).formats;
@@ -695,7 +848,7 @@ impl Device {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .ok_or("the surface offers no sRGB format")?;
-        Ok(Device::for_format(adapter, device, queue, format))
+        Ok(Device::for_format(adapter, device, queue, lost, format))
     }
 
     /// Configures the pane's surface at its size. Its errors are the pane's, not bugs, so they
@@ -751,6 +904,7 @@ impl Device {
         adapter: wgpu::Adapter,
         device: wgpu::Device,
         queue: wgpu::Queue,
+        lost: Arc<AtomicBool>,
         format: wgpu::TextureFormat,
     ) -> Device {
         let renderer = Renderer::new(&device, format, 1);
@@ -765,11 +919,12 @@ impl Device {
             queue,
             device,
             adapter,
+            lost,
         }
     }
 }
 
-/// Draws the viewer's image and the outline of its display window.
+/// Draws the viewer's image and the outline of its display window, and reads its pixels.
 #[derive(Debug)]
 struct ViewerRenderer {
     image_pipeline: wgpu::RenderPipeline,
@@ -777,8 +932,151 @@ struct ViewerRenderer {
     frame_buffer: wgpu::Buffer,
     frame_group: wgpu::BindGroup,
     image_layout: wgpu::BindGroupLayout,
-    /// The shown image's texture, while the viewer has one.
-    image: Option<wgpu::BindGroup>,
+    /// The shown image's planes, while the viewer has one.
+    image: Option<ShownImage>,
+    reader: PixelReader,
+}
+
+#[derive(Debug)]
+struct ShownImage {
+    group: wgpu::BindGroup,
+    /// Held so that the worker writes no later result into them while they are shown, and for
+    /// reading their pixels.
+    planes: [Arc<wgpu::Texture>; 4],
+    /// The data window's width and height, which the planes may exceed.
+    size: [u32; 2],
+    number: u64,
+}
+
+impl ShownImage {
+    fn new(
+        device: &wgpu::Device,
+        viewer: &ViewerRenderer,
+        planes: [Arc<wgpu::Texture>; 4],
+        window: Window,
+        number: u64,
+    ) -> ShownImage {
+        let views = planes
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+        let entries: Vec<wgpu::BindGroupEntry> = (0..)
+            .zip(&views)
+            .map(|(binding, view)| wgpu::BindGroupEntry {
+                binding,
+                resource: wgpu::BindingResource::TextureView(view),
+            })
+            .collect();
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("viewer image"),
+            layout: &viewer.image_layout,
+            entries: &entries,
+        });
+        ShownImage {
+            group,
+            planes,
+            size: [window.width, window.height],
+            number,
+        }
+    }
+}
+
+/// Reads one pixel of each plane of the shown image at a time, into a small buffer the GUI
+/// thread maps without waiting.
+#[derive(Debug)]
+struct PixelReader {
+    buffer: wgpu::Buffer,
+    /// The probe being read, and once the GPU is done, whether its buffer mapped.
+    in_flight: Option<(Probe, Arc<OnceLock<bool>>)>,
+    /// The latest probe asked for while one was in flight.
+    next: Option<Probe>,
+}
+
+/// Bytes of one pixel of a plane.
+const PLANE_PIXEL_BYTES: u64 = 4;
+
+impl PixelReader {
+    fn new(device: &wgpu::Device) -> PixelReader {
+        PixelReader {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pixel read"),
+                size: 4 * PLANE_PIXEL_BYTES,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            in_flight: None,
+            next: None,
+        }
+    }
+
+    /// Copies the probe's pixel of each plane and maps the copies, unless the image is not the
+    /// probe's or the pixel is outside it.
+    fn start(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: Option<&ShownImage>,
+        probe: Probe,
+    ) {
+        let Some(image) = image.filter(|image| image.number == probe.image) else {
+            return;
+        };
+        let [x, y] = probe.texel;
+        let [width, height] = image.size;
+        if x >= width || y >= height {
+            return;
+        }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for (plane, offset) in image.planes.iter().zip((0..).step_by(4)) {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: plane,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &self.buffer,
+                    // One row needs no row pitch.
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset,
+                        ..Default::default()
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit([encoder.finish()]);
+        let mapped = Arc::new(OnceLock::new());
+        let report = Arc::clone(&mapped);
+        (self.buffer).map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = report.set(result.is_ok());
+        });
+        self.in_flight = Some((probe, mapped));
+    }
+
+    /// The read in flight, once its mapping is done: `Some(None)` if it failed.
+    fn finish(&mut self) -> Option<Option<PixelRead>> {
+        let (probe, mapped) = self.in_flight.as_ref()?;
+        let (probe, mapped) = (*probe, *mapped.get()?);
+        self.in_flight = None;
+        if !mapped {
+            return Some(None);
+        }
+        let values = self.buffer.get_mapped_range(..).ok().map(|view| {
+            let bytes: [[u8; 4]; 4] = *view
+                .as_chunks::<4>()
+                .0
+                .first_chunk()
+                .expect("four planes were copied");
+            bytes.map(f32::from_ne_bytes)
+        });
+        self.buffer.unmap();
+        Some(values.map(|values| PixelRead { probe, values }))
+    }
 }
 
 /// The size of the shader's `Frame`.
@@ -791,7 +1089,7 @@ impl ViewerRenderer {
             label: Some("viewer frame"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -800,18 +1098,19 @@ impl ViewerRenderer {
                 count: None,
             }],
         });
+        let plane = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("viewer image"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            }],
+            entries: &[plane(0), plane(1), plane(2), plane(3)],
         });
         let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("viewer frame"),
@@ -865,6 +1164,7 @@ impl ViewerRenderer {
             frame_group,
             image_layout,
             image: None,
+            reader: PixelReader::new(device),
         }
     }
 
@@ -892,7 +1192,7 @@ impl ViewerRenderer {
             frame.scale_factor.round().max(1.0),
             config.width as f32,
             config.height as f32,
-            0.0,
+            frame.gain,
             0.0,
             data[0],
             data[1],
@@ -914,7 +1214,7 @@ impl ViewerRenderer {
         pass.set_bind_group(0, &self.frame_group, &[]);
         if let Some(image) = &self.image {
             pass.set_pipeline(&self.image_pipeline);
-            pass.set_bind_group(1, image, &[]);
+            pass.set_bind_group(1, &image.group, &[]);
             pass.draw(0..4, 0..1);
         }
         pass.set_pipeline(&self.outline_pipeline);
@@ -934,24 +1234,25 @@ impl Drop for Gpu {
 }
 
 /// A device that keeps buffers in memory and draws nothing, with the limits given or the most
-/// permissive, for tests that need wgpu objects but no GPU.
+/// permissive, and its queue, for tests that need wgpu objects but no GPU.
 #[cfg(test)]
-pub(crate) fn noop_device(limits: Option<wgpu::Limits>) -> wgpu::Device {
-    noop_parts(limits).1
+pub(crate) fn noop_device(limits: Option<wgpu::Limits>) -> (wgpu::Device, wgpu::Queue) {
+    let (_, device, queue) = noop_parts(limits);
+    (device, queue)
 }
 
-/// Two noop devices from one adapter. Objects of devices from separate instances can compare
-/// equal, since each instance numbers its objects from the same start.
+/// Two noop devices from one adapter, with their queues. Objects of devices from separate
+/// instances can compare equal, since each instance numbers its objects from the same start.
 #[cfg(test)]
-pub(crate) fn noop_device_pair() -> [wgpu::Device; 2] {
-    let (adapter, first, _) = noop_parts(None);
+pub(crate) fn noop_device_pair() -> [(wgpu::Device, wgpu::Queue); 2] {
+    let (adapter, first, queue) = noop_parts(None);
     let descriptor = wgpu::DeviceDescriptor {
         required_limits: adapter.limits(),
         ..Default::default()
     };
-    let (second, _) = pollster::block_on(adapter.request_device(&descriptor))
+    let second = pollster::block_on(adapter.request_device(&descriptor))
         .expect("the noop adapter has a second device");
-    [first, second]
+    [(first, queue), second]
 }
 
 #[cfg(test)]
@@ -985,9 +1286,9 @@ impl Gpu {
         };
         gpu.windows[Pane::Viewer.index()] = Some(window);
         let (adapter, device, queue) = noop_parts(None);
-        ErrorCounter::install(&device, &gpu.errors, 1, &gpu.waker);
+        let lost = ErrorCounter::install(&device, &gpu.errors, 1, &gpu.waker);
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        gpu.device = Some(Device::for_format(adapter, device, queue, format));
+        gpu.device = Some(Device::for_format(adapter, device, queue, lost, format));
         gpu
     }
 
@@ -1048,6 +1349,8 @@ pub(crate) fn noop_parts(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -1057,7 +1360,7 @@ mod tests {
 
         assert!(!gpu.retire_lost_device(0));
         gpu.destroy_device();
-        let Ok(Notice::DeviceLost(generation)) = notices.try_recv() else {
+        let Ok(Notice::DeviceLost { generation, .. }) = notices.try_recv() else {
             panic!("the lost callback sent no notice");
         };
 
@@ -1093,10 +1396,11 @@ mod tests {
         use crate::evaluate::result_key;
         use crate::fixtures;
         use crate::session::Session;
-        use crate::worker::{Wanted, Worker};
+        use crate::worker::{EvaluationDevice, Wanted, Worker};
 
         let mut gpu = Gpu::with_noop_device(Waker::channel().0);
         let device = gpu.device.as_ref().expect("a device").device.clone();
+        let queue = gpu.device.as_ref().expect("a device").queue.clone();
         let path = fixtures::directory("staged").join("white.png");
         fixtures::write_png(&path, 1, 1, png::ColorType::Rgba, &[255; 4]);
         let mut session = Session::new();
@@ -1104,31 +1408,116 @@ mod tests {
         let node = *changes.nodes.first().expect("one Reader");
         let key = result_key(session.document(), session.reloads(), node).expect("a key");
         let (delivered, deliveries) = mpsc::channel();
-        let worker = Worker::start(move |evaluated| delivered.send(evaluated).unwrap());
+        let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
+            delivered.send(evaluated).unwrap()
+        });
         let staged = || {
             let evaluated = deliveries.recv_timeout(Duration::from_secs(10)).unwrap();
-            evaluated.result.unwrap().pixels.expect("pixels staged")
+            let image = evaluated.result.unwrap();
+            (image.pixels.expect("pixels staged"), image.info.data_window)
         };
 
         // Staged for the generation before the GPU's own, as after a loss.
-        worker.connect(device.clone(), 0);
+        worker.connect(device.clone(), queue.clone(), Arc::default(), 0);
         worker.request(Some(Wanted {
             node,
             key,
             number: 1,
         }));
-        gpu.show_image(staged());
+        let (pixels, window) = staged();
+        gpu.show_image(pixels, window, 1);
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_none());
 
         // Connecting delivers the last key again, now for the GPU's generation.
-        worker.connect(device, 1);
-        gpu.show_image(staged());
+        worker.connect(device, queue, Arc::default(), 1);
+        let (pixels, window) = staged();
+        gpu.show_image(pixels, window, 1);
         assert!(gpu.device.as_ref().unwrap().viewer.image.is_some());
     }
 
     #[test]
+    fn a_pixel_read_returns_each_planes_working_value_at_the_probe_of_its_image() {
+        use crate::kernels::headless;
+
+        let (device, queue) = headless::device();
+        let viewer = ViewerRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb);
+        // A 3 × 2 window on 4 × 3 planes, as the evaluator's may be larger than their windows,
+        // with values a display copy could not hold at the probed texel, (2, 1).
+        let special = [
+            f32::from_bits(0x7fc0_1234),
+            f32::NEG_INFINITY,
+            3e38,
+            f32::from_bits(1),
+        ];
+        let plane = |value: f32| {
+            let texture = headless::plane(
+                &device,
+                4,
+                3,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+            );
+            let mut texels = [0.5f32; 12];
+            texels[4 + 2] = value;
+            let bytes: Vec<u8> = texels.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            queue.write_texture(
+                texture.as_image_copy(),
+                &bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(16),
+                    rows_per_image: None,
+                },
+                texture.size(),
+            );
+            Arc::new(texture)
+        };
+        let window = Window {
+            x: 0,
+            y: 0,
+            width: 3,
+            height: 2,
+        };
+        let image = ShownImage::new(&device, &viewer, special.map(plane), window, 7);
+        let mut reader = PixelReader::new(&device);
+
+        // Another image's probe, and texels outside this one's window though inside its planes,
+        // read nothing.
+        for probe in [[2, 1], [3, 0]].map(|texel| Probe { image: 8, texel }) {
+            reader.start(&device, &queue, Some(&image), probe);
+            assert!(reader.in_flight.is_none());
+        }
+        for outside in [[0, 2], [3, 1]].map(|texel| Probe { image: 7, texel }) {
+            reader.start(&device, &queue, Some(&image), outside);
+            assert!(reader.in_flight.is_none());
+        }
+
+        let probe = Probe {
+            image: 7,
+            texel: [2, 1],
+        };
+        reader.start(&device, &queue, Some(&image), probe);
+        let start = Instant::now();
+        let read = loop {
+            let _ = device.poll(wgpu::PollType::Poll);
+            if let Some(read) = reader.finish() {
+                break read.expect("the buffer maps");
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the read finishes"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(read.probe, probe);
+        assert_eq!(read.values.map(f32::to_bits), special.map(f32::to_bits));
+        assert!(reader.in_flight.is_none());
+    }
+
+    #[test]
     fn the_viewers_shader_and_pipelines_validate() {
-        let device = noop_device(None);
+        let (device, _) = noop_device(None);
         ViewerRenderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb);
     }
 }

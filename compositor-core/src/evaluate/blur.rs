@@ -4,7 +4,7 @@
 
 use opencompositor_kernels::{Axis, BoxPass, BoxSum};
 
-use crate::evaluate::{EvalError, NODE_BYTES_CAP, Pool, ResultKey, output_plane};
+use crate::evaluate::{EvalError, Pool, ResultKey, check_node_bytes, output_plane};
 use crate::image::{Image, Plane, Window};
 use crate::kernels::cpu::{self, Stopped};
 
@@ -51,13 +51,7 @@ pub(super) fn blur(
         .saturating_mul(distinct as u64)
         .saturating_add(scratch_window.plane_bytes(1))
         .saturating_add((pool.threads() as u64).saturating_mul(thread_scratch_bytes(pass, input)));
-    if bytes > NODE_BYTES_CAP {
-        return Err(EvalError::OverCap {
-            origin: key.clone(),
-            window,
-            bytes,
-        });
-    }
+    check_node_bytes(key, window, bytes)?;
     // The outputs before the scratch plane, which would otherwise take a released output's
     // storage and leave one output to be made anew every edit.
     let mut blurred: [Option<Plane>; 4] = std::array::from_fn(|index| {

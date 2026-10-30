@@ -3,17 +3,16 @@
 //! SPIR-V over the evaluator's per-plane R32Float textures.
 //!
 //! Recording goes into the caller's encoder and never submits, so one submission can carry an
-//! evaluation's dispatches and copies together. Nothing here uploads or reads back: the tests
-//! do, as test support until the worker stages the GPU's inputs. The GPU primitives have no
-//! production caller yet: they establish that naga accepts the module and that the numbers
-//! land within their bounds, ahead of the GPU step.
+//! evaluation's dispatches and copies together. Nothing here uploads or reads back: the
+//! evaluator's GPU half uploads, and the tests read back.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use opencompositor_kernels::{
     Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Params, Placement,
-    SCAN_BLOCK, SPIRV, WORKGROUP,
+    SCAN_BLOCK, SPIRV, WORKGROUP, scan_lines,
 };
 
 use crate::image::Window;
@@ -22,6 +21,13 @@ pub(crate) mod cpu;
 
 /// The format of every plane texture.
 pub(crate) const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
+/// What every plane texture may be used for: read and written by the kernels, uploaded to, and
+/// copied from by the viewer, so that any free plane can serve any role.
+pub(crate) const PLANE_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
+    .union(wgpu::TextureUsages::STORAGE_BINDING)
+    .union(wgpu::TextureUsages::COPY_DST)
+    .union(wgpu::TextureUsages::COPY_SRC);
 
 /// The primitives on one device: the module, and each entry point's pipeline, built the first
 /// time an operation is recorded.
@@ -106,10 +112,10 @@ impl Kernels {
             check_output(plane, output)?;
         }
         // The stack below the next layer, the base's planes until a layer has been recorded.
-        let mut below: Option<([wgpu::Texture; O], Window)> = None;
+        let mut below: Option<([Arc<wgpu::Texture>; O], Window)> = None;
         for (index, (layer, window)) in layers.iter().enumerate() {
             let (below_planes, below_window) = match &below {
-                Some((planes, window)) => (planes.each_ref(), *window),
+                Some((planes, window)) => (planes.each_ref().map(|plane| &**plane), *window),
                 None => base,
             };
             let params = FoldParams {
@@ -130,14 +136,14 @@ impl Kernels {
             } else {
                 let textures: Vec<&wgpu::Texture> =
                     (below_planes.iter().chain(layer)).copied().collect();
-                let targets: [wgpu::Texture; O] =
+                let targets: [Arc<wgpu::Texture>; O] =
                     std::array::from_fn(|_| planes.take(&self.device, output));
                 self.dispatch(
                     encoder,
                     F::STEP,
                     &params,
                     &textures,
-                    &targets.each_ref(),
+                    &targets.each_ref().map(|plane| &**plane),
                     groups,
                 );
                 if let Some((previous, _)) = below.replace((targets, output)) {
@@ -191,7 +197,7 @@ impl Kernels {
             },
         };
         check_output(output, grown)?;
-        let mut current: Option<wgpu::Texture> = None;
+        let mut current: Option<Arc<wgpu::Texture>> = None;
         for pass in 0..passes {
             let len = match axis {
                 Axis::Rows => size.width,
@@ -209,8 +215,8 @@ impl Kernels {
                 len,
                 op: *op,
             };
-            let source = current.as_ref().unwrap_or(input);
-            let written = target.as_ref().unwrap_or(output);
+            let source = current.as_deref().unwrap_or(input);
+            let written = target.as_deref().unwrap_or(output);
             if op.t() <= DIRECT_T {
                 let groups = per_texel(size);
                 self.dispatch(encoder, L::DIRECT, &params, &[source], &[written], groups);
@@ -220,7 +226,7 @@ impl Kernels {
                     Axis::Columns => (size.height, size.width),
                 };
                 let blocks = extent / (2 * op.t() - 1) + 1;
-                let groups = [blocks, lines];
+                let groups = [lines.div_ceil(scan_lines(op.t())), blocks];
                 self.dispatch(encoder, L::SCAN, &params, &[source], &[written], groups);
             }
             if let Some(previous) = std::mem::replace(&mut current, target) {
@@ -348,12 +354,11 @@ impl Pipeline {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: true,
         });
-        buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .expect("a buffer mapped at creation")
-            .slice(..)
-            .copy_from_slice(bytes);
+        // Mapping fails only when creating the buffer did, out of memory, which the caller's
+        // error scope reports.
+        if let Ok(mut view) = buffer.slice(..).get_mapped_range_mut() {
+            view.slice(..).copy_from_slice(bytes);
+        }
         buffer.unmap();
         let views: Vec<wgpu::TextureView> = (inputs.iter().chain(outputs))
             .map(|texture| texture.create_view(&Default::default()))
@@ -401,38 +406,76 @@ fn place(input: Window, output: Window) -> Placement {
     }
 }
 
-/// Planes the primitives' intermediate results are written to, kept for reuse once recorded:
-/// a later dispatch in the same submission may write one again, since wgpu orders the two.
+/// One submission's free planes: those whose last reader is recorded, and nothing else holds,
+/// for later dispatches of the submission to write, since wgpu orders a write after the reads
+/// recorded before it. The primitives' intermediate planes and the evaluator's results come from
+/// and go back to the same list.
 #[derive(Debug, Default)]
-pub(crate) struct Planes(Vec<wgpu::Texture>);
+pub(crate) struct Planes {
+    free: Vec<Arc<wgpu::Texture>>,
+    /// Every plane made, for the evaluator's tests to count what a submission allocates.
+    #[cfg(test)]
+    pub(crate) made: Vec<std::sync::Weak<wgpu::Texture>>,
+}
 
 impl Planes {
-    /// A plane over `window`'s size, readable and writable by the kernels, whose contents the
-    /// caller overwrites.
-    fn take(&mut self, device: &wgpu::Device, window: Window) -> wgpu::Texture {
+    /// A plane covering `window`'s size whose contents the caller overwrites: a free one of its
+    /// size class, else a new one. wgpu clears every new texture, which costs several times
+    /// Exposure's own dispatch at 4K, so free planes go first.
+    pub(crate) fn take(&mut self, device: &wgpu::Device, window: Window) -> Arc<wgpu::Texture> {
+        let side = device.limits().max_texture_dimension_2d;
         let size = extent(window);
-        match self.0.iter().position(|plane| plane.size() == size) {
-            Some(index) => self.0.swap_remove(index),
-            None => device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("intermediate"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: PLANE_FORMAT,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
-                view_formats: &[],
-            }),
+        let size = wgpu::Extent3d {
+            width: size.width.max(class(window.width).min(side)),
+            height: size.height.max(class(window.height).min(side)),
+            ..size
+        };
+        if let Some(index) = self.free.iter().position(|plane| plane.size() == size) {
+            return self.free.swap_remove(index);
         }
+        let plane = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("plane"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PLANE_FORMAT,
+            usage: PLANE_USAGE,
+            view_formats: &[],
+        }));
+        #[cfg(test)]
+        self.made.push(Arc::downgrade(&plane));
+        plane
     }
 
-    fn keep(&mut self, plane: wgpu::Texture) {
-        self.0.push(plane);
+    /// Frees a plane nothing else holds.
+    pub(crate) fn keep(&mut self, plane: Arc<wgpu::Texture>) {
+        debug_assert_eq!(Arc::strong_count(&plane), 1, "a plane nothing else holds");
+        self.free.push(plane);
     }
 }
 
-/// The texture size of a plane over `window`.
-fn extent(window: Window) -> wgpu::Extent3d {
+/// A plane's side for a window's side of `length`: rounded up to a multiple of a 32nd of its
+/// next power of two, at most a sixteenth more.
+///
+/// Blur's output grows with its reach, so without classes every edit that changes the reach
+/// would free its planes and allocate new ones. Allocating and freeing hold wgpu's allocator
+/// for milliseconds, and the GUI thread's submits wait on it.
+pub(crate) fn class(length: u32) -> u32 {
+    let step = (length.next_power_of_two() / 32).max(1);
+    length.next_multiple_of(step)
+}
+
+/// The bytes of a plane taken for `window`.
+pub(crate) fn plane_bytes(window: Window) -> u64 {
+    if window.is_empty() {
+        return 0;
+    }
+    u64::from(class(window.width)) * u64::from(class(window.height)) * size_of::<f32>() as u64
+}
+
+/// The texture size of `window`.
+pub(crate) fn extent(window: Window) -> wgpu::Extent3d {
     wgpu::Extent3d {
         width: window.width,
         height: window.height,
@@ -440,11 +483,18 @@ fn extent(window: Window) -> wgpu::Extent3d {
     }
 }
 
+/// Whether `texture` covers `window` from its origin: a plane may be larger than its window,
+/// beyond which nothing reads it.
+fn covers(texture: &wgpu::Texture, window: Window) -> bool {
+    texture.width() >= window.width && texture.height() >= window.height
+}
+
 /// Checks an input plane before anything is recorded, rather than leaving it to wgpu, whose
-/// validation error would count as a bug on the device.
+/// validation error would count as a bug on the device. No texture is empty, so a plane over an
+/// empty window may be any plane: its placement covers nothing and it is never read.
 fn check_input(texture: &wgpu::Texture, window: Window) -> Result<(), PlaneError> {
     check_plane(Role::Input, texture, wgpu::TextureUsages::TEXTURE_BINDING)?;
-    if texture.size() != extent(window) {
+    if !window.is_empty() && !covers(texture, window) {
         return Err(PlaneError::Size {
             role: Role::Input,
             plane: texture.size(),
@@ -456,7 +506,7 @@ fn check_input(texture: &wgpu::Texture, window: Window) -> Result<(), PlaneError
 
 fn check_output(texture: &wgpu::Texture, window: Window) -> Result<(), PlaneError> {
     check_plane(Role::Output, texture, wgpu::TextureUsages::STORAGE_BINDING)?;
-    if texture.size() != extent(window) {
+    if !covers(texture, window) {
         return Err(PlaneError::Size {
             role: Role::Output,
             plane: texture.size(),
@@ -504,7 +554,7 @@ pub(crate) enum PlaneError {
         role: Role,
         missing: wgpu::TextureUsages,
     },
-    /// The plane is not the size of its window.
+    /// The plane is smaller than its window.
     Size {
         role: Role,
         plane: wgpu::Extent3d,
@@ -527,7 +577,7 @@ impl fmt::Display for PlaneError {
                 needed,
             } => write!(
                 f,
-                "the {role:?} plane is {} by {}, not the {} by {} of its window",
+                "the {role:?} plane is {} by {}, smaller than the {} by {} of its window",
                 plane.width, plane.height, needed.width, needed.height
             ),
         }
@@ -536,36 +586,51 @@ impl fmt::Display for PlaneError {
 
 impl std::error::Error for PlaneError {}
 
-/// A device on a real adapter, and the upload and readback the kernel tests need: the worker
-/// stages differently, through mapped buffers, so these stay test support.
+/// A device on a real adapter, and the upload and readback the GPU tests need: evaluation
+/// uploads through mapped buffers instead, and reads nothing back, so these stay test support.
 #[cfg(test)]
-mod headless {
+pub(crate) mod headless {
     use super::PLANE_FORMAT;
+
+    use std::sync::{Mutex, OnceLock};
 
     /// A device on the Vulkan adapter `WGPU_ADAPTER_NAME` names, or else the first one, a CPU
     /// renderer included: the tests prove the kernels on whatever Mesa or driver is installed,
     /// and print which, so every log says what ran. No adapter is a failure, never a skip.
-    pub(super) fn device() -> (wgpu::Device, wgpu::Queue) {
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = wgpu::Backends::VULKAN;
-        let instance = wgpu::Instance::new(descriptor);
-        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
-        let adapter = match std::env::var("WGPU_ADAPTER_NAME") {
-            Ok(name) => {
-                let name = name.to_lowercase();
-                adapters
+    ///
+    /// Every device comes from one instance and adapter, made once, and one at a time: the
+    /// Vulkan loader's lists of instances and devices are not safe to change from several
+    /// threads at once, and with an instance per test, a test enumerating adapters crashed
+    /// another inside the loader as it created its device.
+    pub(crate) fn device() -> (wgpu::Device, wgpu::Queue) {
+        static ADAPTER: OnceLock<(wgpu::Instance, wgpu::Adapter)> = OnceLock::new();
+        static CREATING: Mutex<()> = Mutex::new(());
+        let _creating = CREATING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_, adapter) = ADAPTER.get_or_init(|| {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = wgpu::Backends::VULKAN;
+            let instance = wgpu::Instance::new(descriptor);
+            let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
+            let adapter = match std::env::var("WGPU_ADAPTER_NAME") {
+                Ok(name) => {
+                    let name = name.to_lowercase();
+                    adapters
+                        .into_iter()
+                        .find(|adapter| adapter.get_info().name.to_lowercase().contains(&name))
+                        .unwrap_or_else(|| panic!("no Vulkan adapter named {name:?}"))
+                }
+                Err(_) => adapters
                     .into_iter()
-                    .find(|adapter| adapter.get_info().name.to_lowercase().contains(&name))
-                    .unwrap_or_else(|| panic!("no Vulkan adapter named {name:?}"))
-            }
-            Err(_) => adapters
-                .into_iter()
-                .next()
-                .expect("a Vulkan adapter; the kernel tests need one"),
-        };
+                    .next()
+                    .expect("a Vulkan adapter; the kernel tests need one"),
+            };
+            (instance, adapter)
+        });
         let info = adapter.get_info();
         println!(
-            "kernel tests on {} ({:?}), {} {}",
+            "GPU tests on {} ({:?}), {} {}",
             info.name, info.device_type, info.driver, info.driver_info
         );
         pollster::block_on(adapter.request_device(&Default::default()))
@@ -573,7 +638,7 @@ mod headless {
     }
 
     /// A plane the kernels can read, holding `texels` in row-major order.
-    pub(super) fn upload(
+    pub(crate) fn upload(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         width: u32,
@@ -602,7 +667,7 @@ mod headless {
     }
 
     /// A plane the kernels can write and the test read back.
-    pub(super) fn output(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    pub(crate) fn output(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
         plane(
             device,
             width,
@@ -611,7 +676,7 @@ mod headless {
         )
     }
 
-    pub(super) fn plane(
+    pub(crate) fn plane(
         device: &wgpu::Device,
         width: u32,
         height: u32,
@@ -635,7 +700,7 @@ mod headless {
 
     /// The plane's texels in row-major order, once the GPU has finished with it. Rows are
     /// copied out padded to the copy alignment and the padding dropped.
-    pub(super) fn readback(
+    pub(crate) fn readback(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         texture: &wgpu::Texture,
@@ -752,6 +817,38 @@ mod tests {
     }
 
     #[test]
+    fn a_size_class_covers_its_length_with_at_most_a_sixteenth_more() {
+        for length in 1..=20_000 {
+            let side = class(length);
+            assert!(
+                side >= length && side - length <= length / 16,
+                "{length}: {side}"
+            );
+            assert_eq!(class(side), side, "{length}: a class is its own class");
+        }
+        assert_eq!([class(31), class(2160), class(3840)], [31, 2176, 3840]);
+    }
+
+    /// A Blur edit that changes the reach changes its planes' windows by a few texels, which
+    /// stay within their classes, so the request writes the planes it freed.
+    #[test]
+    fn a_plane_is_taken_again_for_a_window_of_its_class() {
+        let (_, device, _queue) = noop_parts(None);
+        let mut planes = Planes::default();
+        let plane = planes.take(&device, at_origin(3846, 2166));
+        assert_eq!((plane.width(), plane.height()), (3968, 2176));
+        let made = Arc::as_ptr(&plane);
+        planes.keep(plane);
+
+        let again = planes.take(&device, at_origin(3852, 2172));
+        assert_eq!(Arc::as_ptr(&again), made);
+        planes.keep(again);
+        let beyond = planes.take(&device, at_origin(3972, 2172));
+        assert_ne!(Arc::as_ptr(&beyond), made);
+        assert_eq!((beyond.width(), beyond.height()), (4096, 2176));
+    }
+
+    #[test]
     fn a_wrong_plane_is_refused_before_anything_is_recorded() {
         let (_, device, _queue) = noop_parts(None);
         let mut kernels = Kernels::new(&device);
@@ -790,7 +887,13 @@ mod tests {
             })
         );
 
-        // An input placed anywhere must be its window's size, and an output the output's.
+        // An input placed anywhere must cover its window, and an output the output's; larger
+        // planes are read and written over their windows only.
+        let larger = headless::plane(&device, 5, 6, writable);
+        assert_eq!(
+            kernels.map(&mut encoder, &op, [(&input, size)], size, [&larger]),
+            Ok(())
+        );
         let wider = window(-1, 0, 5, 4);
         assert_eq!(
             kernels.map(&mut encoder, &op, [(&input, wider)], size, [&output]),
@@ -1140,17 +1243,24 @@ mod tests {
     }
 
     /// The scan's block and totals within the workgroup memory every device is asked for,
-    /// which wgpu does not check, and its block over Blur's widest window.
+    /// which wgpu does not check, its invocations within the default limits, and its block over
+    /// Blur's widest window.
     #[test]
     fn the_scan_fits_the_default_workgroup_memory_and_the_widest_blur() {
-        let bytes = (SCAN_BLOCK + 2 * opencompositor_kernels::SCAN_THREADS) * 4;
-        let limit = wgpu::Limits::default().max_compute_workgroup_storage_size;
+        let threads = opencompositor_kernels::SCAN_THREADS;
+        let segments = opencompositor_kernels::SCAN_MIN_LINES.pow(2);
+        let bytes = (SCAN_BLOCK + 2 * threads + segments) * 4;
+        let limits = wgpu::Limits::default();
+        let limit = limits.max_compute_workgroup_storage_size;
         assert!(
             bytes <= limit,
             "{bytes} bytes of workgroup memory, over {limit}"
         );
+        assert!(threads <= limits.max_compute_invocations_per_workgroup);
+        assert!(threads <= limits.max_compute_workgroup_size_x);
         let widest = BoxSum::new(BoxPass::new(4096.0));
         assert!(2 * widest.t() <= SCAN_BLOCK, "t = {}", widest.t());
+        assert_eq!(SCAN_BLOCK % opencompositor_kernels::SCAN_MIN_LINES, 0);
     }
 
     /// The GPU's K for a box pass: an f32 sum's worst case grows with the tap count, and 256

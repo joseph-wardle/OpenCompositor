@@ -21,7 +21,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cxx_qt_lib::QString;
 use open_ng::{Modifiers, Point};
@@ -33,8 +33,10 @@ use crate::keys::qt_key;
 use crate::qt::ffi;
 
 /// Each step, when it runs in milliseconds from the start, and the panes it makes draw: each of
-/// those has a surface and has finished a new frame by the next step.
-const STEPS: [(i32, &str, &[Pane]); 23] = [
+/// those has a surface and has finished a new frame by the next step. Each step schedules the
+/// next from its own start, since Qt's timers may fire 5% early or late, which from the check's
+/// start would reorder the steps half a second apart.
+const STEPS: [(i32, &str, &[Pane]); 22] = [
     (1000, "resize the window", &[Pane::Graph, Pane::Viewer]),
     (2000, "float the viewer", &[Pane::Viewer]),
     (3000, "dock the viewer again", &[Pane::Viewer]),
@@ -51,8 +53,11 @@ const STEPS: [(i32, &str, &[Pane]); 23] = [
         &[Pane::Viewer],
     ),
     (15_000, "close the dialog", &[]),
-    (16_000, "press Tab over the graph", &[]),
-    (16_500, "press Escape in the creation menu", &[]),
+    (
+        16_000,
+        "press Tab over the graph, then Escape in the creation menu",
+        &[],
+    ),
     (
         17_000,
         "choose Exposure in the creation menu",
@@ -76,6 +81,9 @@ const STEPS: [(i32, &str, &[Pane]); 23] = [
 /// Configuring the panes' swapchains is most of it and varies most from run to run.
 /// Hypothesis, untested: after a real reset the same adapter returns, so its shader cache is warm.
 const REBUILD_BUDGET: Duration = Duration::from_millis(350);
+/// The longest from the loss to the viewer's first frame showing the image again, re-uploaded and
+/// re-evaluated, in a GPU session on the workstation's desktop.
+const TOTAL_RECOVERY_BUDGET: Duration = Duration::from_millis(700);
 
 thread_local! {
     static IMAGE: RefCell<PathBuf> = RefCell::default();
@@ -84,6 +92,10 @@ thread_local! {
     static CHECKED: Cell<[Option<FrameCheck>; Pane::COUNT]> = const { Cell::new([None; Pane::COUNT]) };
     /// What each pane's frames proved on the device the check destroyed.
     static DESTROYED: Cell<Option<[Option<FrameCheck>; Pane::COUNT]>> = const { Cell::new(None) };
+    /// When the check destroyed the device, and how long until the viewer's first frame on a
+    /// new one finished showing the image again.
+    static DESTROYED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+    static RECOVERED_IN: Cell<Option<Duration>> = const { Cell::new(None) };
     /// The longest an attempt to make a device took.
     static LONGEST_ATTEMPT: Cell<Option<Duration>> = const { Cell::new(None) };
     /// How long retiring the lost device took, which has no budget yet.
@@ -94,9 +106,7 @@ thread_local! {
 
 pub fn start(image: PathBuf) {
     IMAGE.with(|cell| *cell.borrow_mut() = image);
-    for (index, &(at, ..)) in STEPS.iter().enumerate() {
-        ffi::single_shot(at, step, index);
-    }
+    ffi::single_shot(STEPS[0].0, step, 0);
 }
 
 /// Records how long an attempt to make a GPU device blocked the GUI thread.
@@ -110,6 +120,10 @@ pub fn retirement_took(duration: Duration) {
 }
 
 fn step(index: usize) {
+    // Before the step, which may wait in a dialog for the next.
+    if let Some(&(next, ..)) = STEPS.get(index + 1) {
+        ffi::single_shot(next - STEPS[index].0, step, index + 1);
+    }
     let checks = Pane::ALL.map(crate::frame_check);
     let finished = checks.map(|check| check.map_or(0, |check| check.finished));
     eprintln!(
@@ -191,33 +205,34 @@ fn step(index: usize) {
             }
             ffi::close_modal_dialog();
         }
-        12 => press_tab_over_the_graph(),
-        13 => {
+        12 => {
+            press_tab_over_the_graph();
+            // At once: a compositor may dismiss a popup that no real input opened.
             if !ffi::popup_open() {
                 fail("Tab over the graph opened no menu".to_owned());
             }
             press_key(qt_key::ESCAPE, "");
         }
-        14 => {
+        13 => {
             if ffi::popup_open() {
                 fail("Escape left the creation menu open".to_owned());
             }
             check_undo_label("Mark", "after the menu was dismissed");
             choose_in_menu("exp");
         }
-        15 => {
+        14 => {
             check_undo_label("Create Exposure", "after Exposure was chosen");
             let exposure = check_inserted_exposure();
             if let Some(exposure) = exposure {
                 edit_stops(exposure);
             }
         }
-        16 => with_panel_dock(|dock| dock.set_floating(true)),
-        17 => {
+        15 => with_panel_dock(|dock| dock.set_floating(true)),
+        16 => {
             with_panel_dock(|dock| dock.close());
         }
-        18 => with_panel_dock(|dock| dock.show()),
-        19 => {
+        17 => with_panel_dock(|dock| dock.show()),
+        18 => {
             let tick = stops_slider().map(|slider| slider.value());
             if tick.is_none() || tick != STOPS_TICK.with(Cell::get) {
                 fail(format!(
@@ -230,8 +245,8 @@ fn step(index: usize) {
             // Returns once the next step cancels the dialog.
             choose_in_menu("read");
         }
-        20 => ffi::close_modal_dialog(),
-        21 => {
+        19 => ffi::close_modal_dialog(),
+        20 => {
             check_undo_label("Stops", "after the Reader's dialog was cancelled");
             let nodes = crate::read_app(|app| app.session().document().nodes().count());
             if nodes != 2 {
@@ -240,7 +255,9 @@ fn step(index: usize) {
                 ));
             }
             DESTROYED.with(|cell| cell.set(Some(checks)));
+            DESTROYED_AT.with(|cell| cell.set(Some(Instant::now())));
             crate::destroy_device();
+            ffi::single_shot(1, watch_recovery, 0);
         }
         _ => {
             check_recovery(checks);
@@ -358,6 +375,31 @@ fn new_frames(before: Option<FrameCheck>, now: Option<FrameCheck>) -> u64 {
     }
 }
 
+/// Records when the viewer's last finished frame is on a new device and has the centre it had
+/// before the loss, so shows the image again, re-evaluated in a GPU session; until then looks
+/// again each millisecond.
+fn watch_recovery(_: usize) {
+    let (Some(destroyed), Some(at)) = (DESTROYED.with(Cell::get), DESTROYED_AT.with(Cell::get))
+    else {
+        return;
+    };
+    let before = destroyed[Pane::Viewer.index()];
+    let now = crate::frame_check(Pane::Viewer);
+    let recovered = match (before, now) {
+        (Some(before), Some(now)) => {
+            now.generation > before.generation
+                && before.centre.is_some()
+                && now.centre == before.centre
+        }
+        _ => false,
+    };
+    if recovered {
+        RECOVERED_IN.with(|cell| cell.set(Some(at.elapsed())));
+    } else {
+        ffi::single_shot(1, watch_recovery, 0);
+    }
+}
+
 /// Checks that a new device replaced the destroyed one: both panes drew on it with the same
 /// centre as before, the viewer's not black, the GPU label is gone, and making it kept within the
 /// budget.
@@ -410,6 +452,21 @@ fn check_recovery(checks: [Option<FrameCheck>; Pane::COUNT]) {
     }
     if let Some(retirement) = RETIREMENT.with(Cell::get) {
         eprintln!("lifecycle check: retiring the lost device took {retirement:?}");
+    }
+    match RECOVERED_IN.with(Cell::get) {
+        None => fail("the viewer did not show the image again on a new device".to_owned()),
+        Some(recovered) => {
+            eprintln!(
+                "lifecycle check: from the loss to the viewer's first frame showing the image \
+                 again took {recovered:?} ({} evaluation)",
+                crate::evaluation_device()
+            );
+            if recovered > TOTAL_RECOVERY_BUDGET {
+                fail(format!(
+                    "recovery took {recovered:?}, over {TOTAL_RECOVERY_BUDGET:?}"
+                ));
+            }
+        }
     }
     match LONGEST_ATTEMPT.with(Cell::get) {
         None => fail("no attempt made a device after the loss".to_owned()),

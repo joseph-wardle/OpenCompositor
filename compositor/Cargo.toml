@@ -1,6 +1,6 @@
 [package]
 name = "opencompositor"
-version = "0.1.4"
+version = "0.1.5"
 description = "A node-based compositor."
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ cxx = "1.0.205"
 cxx-qt = "0.10.0"
 cxx-qt-lib = { version = "0.10.0", features = ["qt_gui"] }
 open-ng = { path = "../open-ng", version = "0.4.1" }
-opencompositor-core = { path = "../compositor-core", version = "0.4.0" }
+opencompositor-core = { path = "../compositor-core", version = "0.5.0" }
 # The backends the shell draws with. The core leaves them to it.
 wgpu = "30"
 

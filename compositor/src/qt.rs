@@ -210,6 +210,8 @@ pub mod ffi {
         type ParameterPanel;
         #[allow(missing_debug_implementations)]
         type CreationMenu;
+        #[allow(missing_debug_implementations)]
+        type ViewerStrip;
 
         fn new_application();
         fn exec() -> i32;
@@ -248,8 +250,21 @@ pub mod ffi {
         ) -> *mut QDockWidget;
         /// Puts the pane in the dock, which owns it from then on.
         unsafe fn container(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QWidget;
-        /// Puts the pane in the dock above a one-line caption, which the dock owns too.
-        unsafe fn container_with_caption(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QLabel;
+        /// Puts the pane in the dock above the viewer's strip, which the dock owns too: its
+        /// caption, readout and exposure control, from `-limit` to `limit` stops by `step`. The
+        /// control sends each value the artist sets to `exposure_set`.
+        unsafe fn container_with_strip(
+            pane: *mut Pane,
+            dock: *mut QDockWidget,
+            limit: f64,
+            step: f64,
+            exposure_set: fn(f64),
+        ) -> *mut ViewerStrip;
+        /// The strip's one-line caption.
+        unsafe fn strip_caption(strip: *mut ViewerStrip) -> *mut QLabel;
+        unsafe fn set_readout(strip: *mut ViewerStrip, text: &QString);
+        /// Shows the stops in the exposure control without sending them.
+        unsafe fn show_viewer_exposure(strip: *mut ViewerStrip, stops: f64);
         /// The parameter panel, in a "Parameters" dock listed in `menu`, which divides the
         /// viewer's dock area: the viewer over the graph, the panel beside both. The window owns
         /// the dock, and the dock the panel. It sends each gesture to `send`.

@@ -1,6 +1,6 @@
 // What cxx cannot bind: one-liners for constructors, statics, templates and casts, and the
-// parameter panel and creation menu, plain Qt classes that Rust fills and that send its gestures
-// back.
+// parameter panel, creation menu and viewer strip, plain Qt classes that Rust fills and that send
+// its gestures back.
 #pragma once
 #include <QtCore/QByteArray>
 #include <QtCore/QEvent>
@@ -28,6 +28,7 @@ struct PanelData;
 struct PanelRow;
 struct PanelGesture;
 enum class PanelGestureKind : uint8_t;
+class QDoubleSpinBox;
 class QLineEdit;
 class QListWidget;
 class QListWidgetItem;
@@ -82,6 +83,16 @@ class ParameterPanel : public QWidget {
     std::vector<Row> rows;
 };
 
+// Under the viewer: its caption, then the readout and the viewer's exposure, which sends each value
+// the artist sets in stops. Nothing is sent when Rust shows a value.
+class ViewerStrip : public QWidget {
+  public:
+    ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set, QWidget *parent);
+    QLabel *caption;
+    QLabel *readout;
+    QDoubleSpinBox *exposure;
+};
+
 // The node creation menu: a field over the types, which typing filters. Choosing a type sends
 // its index among the labels it was opened with; closing it any other way sends nothing.
 class CreationMenu : public QFrame {
@@ -122,7 +133,11 @@ QAction *new_action(QMenu *menu, const QString &text, const QString &shortcut,
 void set_action(QAction *action, const QString &text, bool enabled);
 QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area);
 QWidget *container(Pane *pane, QDockWidget *dock);
-QLabel *container_with_caption(Pane *pane, QDockWidget *dock);
+ViewerStrip *container_with_strip(Pane *pane, QDockWidget *dock, double limit, double step,
+                                  rust::Fn<void(double)> exposure_set);
+QLabel *strip_caption(ViewerStrip *strip);
+void set_readout(ViewerStrip *strip, const QString &text);
+void show_viewer_exposure(ViewerStrip *strip, double stops);
 ParameterPanel *new_parameter_panel(QMainWindow *window, QMenu *menu, QDockWidget *viewer,
                                     QDockWidget *graph, rust::Fn<void(PanelGesture)> send);
 void show_panel(ParameterPanel *panel, const PanelData &data);

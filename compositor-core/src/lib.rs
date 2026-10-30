@@ -9,8 +9,6 @@ mod evaluate;
 mod fixtures;
 mod gpu;
 mod image;
-// The GPU half is used by the worker once it dispatches; until then only the tests do.
-#[cfg_attr(not(test), expect(dead_code))]
 mod kernels;
 mod panel;
 mod parameter;
@@ -34,8 +32,11 @@ pub use document::{
     MAX_SLOTS, MergeVersion, Missing, Node, NodeId, NodeInput, NodeKind, NodeType, ReaderVersion,
     Slot, missing, node_types,
 };
-pub use evaluate::{EvalError, Evaluator, Reloads, ResultKey, result_key};
-pub use gpu::{FrameCheck, NativeWindow, PaneSize};
+pub use evaluate::{
+    DeviceLost, EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, Reloads, ResultKey,
+    result_key,
+};
+pub use gpu::{FrameCheck, FrameTiming, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
@@ -43,5 +44,5 @@ pub use parameter::{
 };
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Session};
-pub use viewer::{Placement, Viewer};
-pub use worker::{Evaluated, StagingTiming, Timing, ViewerError, ViewerImage};
+pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};
+pub use worker::{Evaluated, EvaluationDevice, StagingTiming, Timing, ViewerError, ViewerImage};

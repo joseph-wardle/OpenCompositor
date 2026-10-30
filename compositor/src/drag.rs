@@ -11,14 +11,25 @@
 //! shown, how long the GUI thread took to dispatch each mouse event from the slider to the
 //! requests performed, the stages of the worker's path for the edits whose result it delivered,
 //! the same stages for the delivered edits whose data window differed from the one delivered
-//! before, which Blur's growing reach makes of some edits, and the process's resident memory.
+//! before, which Blur's growing reach makes of some edits, every stage of the edits that set the
+//! p95, the longest latency and the final edit's, and the process's resident memory.
 //! Then it checks that the drag undoes as one step and that a drag cancelled with Escape leaves
 //! the value as it was. It exits 0 if those held and the chain's latencies' p95 and final edit
 //! met the chain's budget, and 1 otherwise.
 //!
+//! The session evaluates on the GPU unless `--cpu` comes first. An edit's latency then ends when
+//! the GPU completes the frame, not when it is submitted, since a frame queued behind the worker's
+//! compute completes only after it; the check polls the GPU every millisecond to learn when.
+//! The budget is two of the viewer's refreshes for every chain, and the GUI's frames must meet
+//! theirs during the drag: from acquiring a frame to submitting it p99 1 ms and at most 4 ms,
+//! and to the GPU's completion at most two refreshes. Both sessions report those frame times,
+//! and how long the first image took from marking the chain's node to its frame, cold.
+//!
 //! Run it in a release build on the workstation, and twice, since the first run's shader and
-//! file caches are cold. A frame counts when the GUI thread submits it, not when the display
-//! shows it, which needs the display.
+//! file caches are cold. In a CPU session an edit's latency ends when the GUI thread has
+//! presented the frame, handing it to the display; when the display shows it would need the
+//! display. Blur shows two Sizes before the drag, one summed directly and one by blocks, so that
+//! the images shown before it have built the pipelines the drag uses.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -26,7 +37,10 @@ use std::time::{Duration, Instant};
 
 use cxx_qt_lib::QString;
 use open_ng::Point;
-use opencompositor_core::{Changes, Command, Event, NodeId, Pane, Slot, Timing, Window};
+use opencompositor_core::{
+    Changes, Command, EvaluationDevice, Event, FrameTiming, NodeId, Pane, Slot, Timing, Value,
+    Window,
+};
 
 use crate::qt::ffi;
 
@@ -39,6 +53,16 @@ const MOUSE_MOVE: i32 = 5;
 /// and for how long at most.
 const POLL: Duration = Duration::from_millis(100);
 const LONGEST_WAIT: Duration = Duration::from_secs(60);
+
+/// The Blur's Sizes shown in turn before the drag, the last its starting value: the first is
+/// summed directly on the GPU and the second by blocks, either side of `DIRECT_T`.
+const BLUR_SIZES: [f64; 2] = [3.0, 30.0];
+
+/// The GUI's frame budget in a GPU session: from acquiring a frame to submitting it, p99 and
+/// at most, but for one frame per drag: the driver alone occasionally takes milliseconds to
+/// submit.
+const FRAME_GUI_P99: Duration = Duration::from_millis(1);
+const FRAME_GUI_MAX: Duration = Duration::from_millis(4);
 
 /// A chain the check drags a slider on, from its Reader to the node whose panel has the slider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,13 +99,15 @@ impl Chain {
         }
     }
 
-    /// What the latencies' p95 and the final edit's latency must meet in a CPU session on the
-    /// workstation. Blur's evaluation takes about as long as the gap between slider events, so
-    /// edits wait behind the one running; its budget is set from that, measured.
-    fn budget(self) -> Duration {
-        match self {
-            Chain::Exposure | Chain::Merge => Duration::from_millis(50),
-            Chain::Blur => Duration::from_millis(70),
+    /// What the latencies' p95 and the final edit's latency must meet on the workstation, whose
+    /// viewer refreshes every `refresh`. In a CPU session, Blur's evaluation takes about as long
+    /// as the gap between slider events, so edits wait behind the one running; its budget is set
+    /// from that, measured.
+    fn budget(self, device: EvaluationDevice, refresh: Duration) -> Duration {
+        match (device, self) {
+            (EvaluationDevice::Cpu, Chain::Exposure | Chain::Merge) => Duration::from_millis(50),
+            (EvaluationDevice::Cpu, Chain::Blur) => Duration::from_millis(70),
+            (EvaluationDevice::Gpu, _) => refresh * 2,
         }
     }
 }
@@ -89,18 +115,46 @@ impl Chain {
 struct Check {
     image: PathBuf,
     chain: Chain,
+    device: EvaluationDevice,
     /// The chain's nodes: the Reader and the node whose slider is dragged.
     nodes: Vec<NodeId>,
-    /// The request marking the chain's node made, which the viewer must show before the drag.
+    /// The dragged parameter's authored value before the drag, which one undo restores.
+    before: Option<Value>,
+    /// The request marking the chain's node made, which the viewer must show before the drag,
+    /// and when.
     marked: u64,
+    marked_at: Option<Instant>,
+    /// How many of `BLUR_SIZES` the viewer has shown.
+    blur_sizes_shown: usize,
+    /// The viewer's first frame showing the marked node's image.
+    first_frame: Option<FrameTiming>,
     /// The panel's slider, and how many pixels its drag covers.
     slider: *mut ffi::QSlider,
     span: i32,
-    /// Between moves: the viewer's refresh period, to Qt's millisecond timers.
+    /// The viewer's refresh period, and between moves the same to Qt's millisecond timers.
+    refresh: Duration,
     period: i32,
     edits: Vec<Edit>,
     /// How long each mouse event took the GUI thread.
     dispatches: Vec<Duration>,
+    /// The number of the last frame recorded, of any pane.
+    last_frame: u64,
+    /// Every pane's frames from the drag's start.
+    frames: Vec<FrameTiming>,
+    dragging: bool,
+}
+
+impl Check {
+    /// From the edit to the first frame showing its result or a later one: to the frame's
+    /// presentation in a CPU session, to its completion in a GPU session. `None` until then.
+    fn latency(&self, edit: &Edit) -> Option<Duration> {
+        let frame = &edit.answer.as_ref()?.frame;
+        let end = match self.device {
+            EvaluationDevice::Cpu => frame.presented,
+            EvaluationDevice::Gpu => *frame.completed.get()?,
+        };
+        Some(end - edit.at)
+    }
 }
 
 struct Edit {
@@ -110,10 +164,23 @@ struct Edit {
     /// When its result arrived on the GUI thread, with the worker's record and the image's data
     /// window, `None` for a failure; `None` if the worker discarded it.
     delivered: Option<(Instant, Timing, Option<Window>)>,
-    /// When the first viewer frame sampling its result, or a later one, was submitted.
-    framed: Option<Instant>,
+    /// The first viewer frame sampling its result or a later one.
+    answer: Option<Answer>,
+}
+
+impl Edit {
     /// Whether a frame sampled its own result.
-    shown: bool,
+    fn shown(&self) -> bool {
+        self.answer
+            .as_ref()
+            .is_some_and(|answer| answer.request == self.request)
+    }
+}
+
+struct Answer {
+    /// The request whose result the frame sampled.
+    request: u64,
+    frame: FrameTiming,
 }
 
 thread_local! {
@@ -121,15 +188,19 @@ thread_local! {
 }
 
 /// Runs every chain, each as a child process of this binary dragging that chain alone, and
-/// exits: 1 if any child did not exit 0, else 0. One process per chain because a chain run after
-/// another in the same process showed its f16 conversion several times slower, whichever chain
+/// exits: 1 if any child did not exit 0, else 0. One process per chain because a chain run
+/// after another in the same process showed its staging several times slower, whichever chain
 /// it was; the hypothesis is that the staging buffer, recreated for the second chain, lands in a
 /// slower heap. Either way the chains are only comparable from equal starts.
-pub fn run_chains(image: &Path) -> ! {
+pub fn run_chains(image: &Path, device: EvaluationDevice) -> ! {
     let binary = std::env::current_exe().expect("the binary knows its own path");
     let mut failed = false;
     for chain in CHAINS {
-        let status = std::process::Command::new(&binary)
+        let mut command = std::process::Command::new(&binary);
+        if device == EvaluationDevice::Cpu {
+            command.arg("--cpu");
+        }
+        let status = command
             .arg("--drag-check")
             .arg(image)
             .arg(chain.type_name())
@@ -153,20 +224,43 @@ pub fn run_chains(image: &Path) -> ! {
 }
 
 pub fn start(image: PathBuf, chain: Chain) {
+    let device = crate::evaluation_device();
     CHECK.with(|cell| {
         *cell.borrow_mut() = Some(Check {
             image,
             chain,
+            device,
             nodes: Vec::new(),
+            before: None,
             marked: 0,
+            marked_at: None,
+            blur_sizes_shown: 0,
+            first_frame: None,
             slider: std::ptr::null_mut(),
             span: 0,
+            refresh: Duration::ZERO,
             period: 0,
             edits: Vec::new(),
             dispatches: Vec::new(),
+            last_frame: 0,
+            frames: Vec::new(),
+            dragging: false,
         })
     });
+    if device == EvaluationDevice::Gpu {
+        ffi::single_shot(1, poll_gpu, 0);
+    }
     ffi::single_shot(1000, setup, 0);
+}
+
+/// Polls the GPU every millisecond while the check runs, so that a frame's completion is
+/// learned as it happens rather than at the next submit.
+fn poll_gpu(_: usize) {
+    if CHECK.with(|cell| cell.borrow().is_none()) {
+        return;
+    }
+    crate::poll_gpu();
+    ffi::single_shot(1, poll_gpu, 0);
 }
 
 /// Records a result's arrival on the GUI thread, if the drag check is running and an edit asked
@@ -175,22 +269,36 @@ pub fn delivered(request: u64, timing: Timing, window: Option<Window>, at: Insta
     with_edit(request, |edit| edit.delivered = Some((at, timing, window)));
 }
 
-/// Records the viewer's last presented frame as the first for every edit its result answers,
-/// which is each edit it is from or supersedes, if the drag check is running. A draw that
-/// presented nothing leaves the last frame, whose edits are already recorded.
-pub fn viewer_frame_drawn() {
-    let Some(shown) = crate::presented_request() else {
+/// Records the pane's frame, if the drag check is running and the draw made one. A viewer frame
+/// is the first for every edit its result answers, which is each edit it is from or supersedes.
+pub fn frame_drawn(pane: Pane) {
+    let Some(frame) = crate::frame_timing(pane) else {
         return;
     };
-    let now = Instant::now();
+    let shown = crate::presented_request();
     CHECK.with(|cell| {
         let mut check = cell.borrow_mut();
         let Some(check) = check.as_mut() else {
             return;
         };
-        for edit in check.edits.iter_mut().filter(|edit| edit.request <= shown) {
-            edit.framed.get_or_insert(now);
-            edit.shown |= edit.request == shown;
+        // A draw that presented nothing leaves the pane's last frame, recorded already.
+        if frame.number <= check.last_frame {
+            return;
+        }
+        check.last_frame = frame.number;
+        if let (Pane::Viewer, Some(shown)) = (pane, shown) {
+            if shown >= check.marked && check.marked_at.is_some() && check.first_frame.is_none() {
+                check.first_frame = Some(frame.clone());
+            }
+            for edit in check.edits.iter_mut().filter(|edit| edit.request <= shown) {
+                edit.answer.get_or_insert_with(|| Answer {
+                    request: shown,
+                    frame: frame.clone(),
+                });
+            }
+        }
+        if check.dragging {
+            check.frames.push(frame);
         }
     });
 }
@@ -225,6 +333,11 @@ fn setup(_: usize) {
             (session.create_node(chain.type_name(), Point::default(), Some(reader)))
                 .expect("the type exists and the Reader exists"),
         );
+        if chain == Chain::Blur {
+            session
+                .set_value(node, "size", Value::Float(BLUR_SIZES[0]))
+                .expect("a Blur has a Size");
+        }
         if chain == Chain::Merge {
             session
                 .connect(node, ("layer", 1), reader)
@@ -239,6 +352,7 @@ fn setup(_: usize) {
     with(|check| {
         check.nodes = nodes;
         check.marked = marked;
+        check.marked_at = Some(Instant::now());
     });
     ffi::single_shot(poll_in(1), wait_for_image, 1);
 }
@@ -251,6 +365,28 @@ fn created(changes: Changes) -> NodeId {
 fn wait_for_image(tries: usize) {
     let marked = with(|check| check.marked);
     if crate::presented_request().is_some_and(|shown| shown >= marked) {
+        let (chain, node, shown) = with(|check| {
+            if check.chain == Chain::Blur {
+                check.blur_sizes_shown += 1;
+            }
+            (check.chain, check.nodes[1], check.blur_sizes_shown)
+        });
+        if chain == Chain::Blur && shown < BLUR_SIZES.len() {
+            crate::edit(|session| {
+                session
+                    .set_value(node, "size", Value::Float(BLUR_SIZES[shown]))
+                    .expect("a Blur has a Size")
+            });
+            with(|check| check.marked = crate::latest_request());
+            ffi::single_shot(poll_in(1), wait_for_image, 1);
+            return;
+        }
+        let (parameter, _) = chain.parameter();
+        let before = crate::read_app(|app| {
+            let node = app.session().document().node(node);
+            node.and_then(|node| node.authored_value(parameter).cloned())
+        });
+        with(|check| check.before = before);
         begin();
     } else if POLL * tries as u32 >= LONGEST_WAIT {
         report(vec![format!(
@@ -282,7 +418,9 @@ fn begin() {
     with(|check| {
         check.slider = slider;
         check.span = span;
+        check.refresh = refresh;
         check.period = period;
+        check.dragging = true;
     });
     if let Some(failure) = input_blocked() {
         return report(vec![failure]);
@@ -323,8 +461,7 @@ fn send(kind: i32, pixel: i32) {
                 request: latest,
                 at,
                 delivered: None,
-                framed: None,
-                shown: false,
+                answer: None,
             });
         }
     });
@@ -348,7 +485,10 @@ fn step(pixel: usize) {
 }
 
 fn wait_for_final(tries: usize) {
-    let framed = with(|check| check.edits.last().is_some_and(|edit| edit.framed.is_some()));
+    let framed = with(|check| {
+        let last = check.edits.last();
+        last.is_some_and(|edit| check.latency(edit).is_some())
+    });
     if framed {
         report(check_steps());
     } else if POLL * tries as u32 >= LONGEST_WAIT {
@@ -364,9 +504,16 @@ fn wait_for_final(tries: usize) {
 /// Checks that the drag was one step, which one undo removes, and that a drag cancelled with
 /// Escape changes nothing. Returns the failures.
 fn check_steps() -> Vec<String> {
-    let (node, slider, span, (parameter, label)) = with(|check| {
+    let (node, before, slider, span, (parameter, label)) = with(|check| {
         let node = *check.nodes.last().expect("set up");
-        (node, check.slider, check.span, check.chain.parameter())
+        let before = check.before.clone();
+        (
+            node,
+            before,
+            check.slider,
+            check.span,
+            check.chain.parameter(),
+        )
     });
     let state = || {
         crate::read_app(|app| {
@@ -416,9 +563,9 @@ fn check_steps() -> Vec<String> {
     }
     crate::dispatch(Event::Command(Command::Undo));
     let undone = state().0;
-    if undone.is_some() {
+    if undone != before {
         failures.push(format!(
-            "one undo after the drag left {label} at {undone:?}"
+            "one undo after the drag left {label} at {undone:?}, not {before:?}"
         ));
     }
     failures
@@ -436,13 +583,15 @@ fn report(mut failures: Vec<String>) {
         .with(|cell| cell.borrow_mut().take())
         .expect("the check has started");
     let name = format!("drag check ({:?})", check.chain);
+    let gpu = check.device == EvaluationDevice::Gpu;
+    let budget = check.chain.budget(check.device, check.refresh);
     let edits = &check.edits;
-    let latency = |edit: &Edit| Some(edit.framed? - edit.at);
+    let latency = |edit: &Edit| check.latency(edit);
     // Every edit once the final one is framed, since that frame answers them all.
     let mut latencies: Vec<Duration> = edits.iter().filter_map(latency).collect();
     latencies.sort();
     let final_latency = edits.last().and_then(latency);
-    let shown = edits.iter().filter(|edit| edit.shown).count();
+    let shown = edits.iter().filter(|edit| edit.shown()).count();
     let mut spacing: Vec<Duration> = edits
         .windows(2)
         .map(|pair| pair[1].at - pair[0].at)
@@ -451,6 +600,26 @@ fn report(mut failures: Vec<String>) {
     let mut dispatches = check.dispatches.clone();
     dispatches.sort();
     eprintln!("{name}: {}", caption());
+    let end = if gpu {
+        "the GPU completes"
+    } else {
+        "the GUI thread presents"
+    };
+    eprintln!(
+        "{name}: evaluated on the {}, an edit's latency ending when {end} its first frame; \
+         budget {budget:.1?}",
+        check.device
+    );
+    if let (Some(marked_at), Some(first)) = (check.marked_at, &check.first_frame) {
+        let end = match first.completed.get().filter(|_| gpu) {
+            Some(&completed) => format!("completed {:.1?}", completed - marked_at),
+            None => format!("presented {:.1?}", first.presented - marked_at),
+        };
+        eprintln!(
+            "{name}: the first image, cold: marked → frame submitted {:.1?}, {end}",
+            first.submitted - marked_at
+        );
+    }
     if let (Some(first), Some(last)) = (edits.first(), edits.last()) {
         eprintln!(
             "{name}: {} edits {:.1?} apart (asked {} ms) over {:.1?}",
@@ -481,27 +650,43 @@ fn report(mut failures: Vec<String>) {
         &'static str,
         fn(&Edit, &Timing, Instant) -> Option<Duration>,
     );
-    let stages: [Stage; 7] = [
+    let stages: [Stage; 10] = [
         ("worker wait", |edit, timing, _| {
             Some(timing.started - edit.at)
         }),
+        ("read", |_, timing, _| Some(timing.read? - timing.started)),
         ("evaluate", |_, timing, _| {
-            Some(timing.evaluated - timing.started)
+            Some(timing.evaluated - timing.read.unwrap_or(timing.started))
         }),
         ("staging wait", |_, timing, _| {
             Some(timing.staging.mapped? - timing.evaluated)
         }),
-        ("f16 conversion", |_, timing, _| {
-            Some(timing.staging.converted? - timing.staging.mapped?)
+        ("planes written", |_, timing, _| {
+            Some(timing.staging.written? - timing.staging.mapped?)
         }),
-        ("texture", |_, timing, _| {
-            Some(timing.staging.staged? - timing.staging.converted?)
+        ("textures", |_, timing, _| {
+            Some(timing.staging.staged? - timing.staging.written?)
         }),
         ("delivery", |_, timing, received| {
             Some(received - timing.delivered)
         }),
-        ("frame", |edit, _, received| Some(edit.framed? - received)),
+        ("frame", |edit, _, received| {
+            Some(edit.answer.as_ref()?.frame.submitted - received)
+        }),
+        ("present", |edit, _, _| {
+            let frame = &edit.answer.as_ref()?.frame;
+            Some(frame.presented - frame.submitted)
+        }),
+        ("GPU completion", |edit, _, _| {
+            let frame = &edit.answer.as_ref()?.frame;
+            Some(*frame.completed.get()? - frame.submitted)
+        }),
     ];
+    // The stages on each session's path to the end of a latency, which they sum to for an edit
+    // whose own result was shown.
+    let stages: Vec<&Stage> = (stages.iter())
+        .filter(|(name, _)| *name != if gpu { "present" } else { "GPU completion" })
+        .collect();
     let delivered: Vec<(&Edit, Instant, Timing, Option<Window>)> = edits
         .iter()
         .filter_map(|edit| {
@@ -512,7 +697,7 @@ fn report(mut failures: Vec<String>) {
     let medians = |selected: &dyn Fn(usize) -> bool| -> String {
         let medians: Vec<String> = stages
             .iter()
-            .map(|(name, stage)| {
+            .filter_map(|(name, stage)| {
                 let mut values: Vec<Duration> = delivered
                     .iter()
                     .enumerate()
@@ -520,7 +705,9 @@ fn report(mut failures: Vec<String>) {
                     .filter_map(|(_, (edit, received, timing, _))| stage(edit, timing, *received))
                     .collect();
                 values.sort();
-                format!("{name} {:.1?}", percentile(&values, 0.5))
+                // A stage the evaluation does not pass through, such as staging on the GPU, has
+                // no values.
+                (!values.is_empty()).then(|| format!("{name} {:.1?}", percentile(&values, 0.5)))
             })
             .collect();
         medians.join(", ")
@@ -545,10 +732,112 @@ fn report(mut failures: Vec<String>) {
         "{name}: stage medians of the {changes} of them whose data window changed: {}",
         medians(&|index| changed[index])
     );
+    // The edits that set the latencies the budget is checked against, each with every stage of
+    // the result that answered it, which for a superseded edit is a later edit's.
+    let p95 = percentile(&latencies, 0.95);
+    let longest_latency = percentile(&latencies, 1.0);
+    let mut attributed: Vec<(Vec<&str>, &Edit)> = Vec::new();
+    for (role, edit) in [
+        ("p95", edits.iter().find(|edit| latency(edit) == Some(p95))),
+        (
+            "longest",
+            (edits.iter()).find(|edit| latency(edit) == Some(longest_latency)),
+        ),
+        ("final", edits.last()),
+    ] {
+        let Some(edit) = edit.filter(|edit| latency(edit).is_some()) else {
+            continue;
+        };
+        match attributed
+            .iter_mut()
+            .find(|(_, e)| e.request == edit.request)
+        {
+            Some((roles, _)) => roles.push(role),
+            None => attributed.push((vec![role], edit)),
+        }
+    }
+    for (roles, edit) in attributed {
+        let answer = edit
+            .answer
+            .as_ref()
+            .expect("an edit with a latency was answered");
+        let answering = edits.iter().find(|e| e.request == answer.request);
+        let by = if answer.request == edit.request {
+            "its own result".to_owned()
+        } else {
+            let later = answering.map_or_else(String::new, |answering| {
+                format!(", edited {:.1?} later", answering.at - edit.at)
+            });
+            format!("request {}'s result{later}", answer.request)
+        };
+        let stages = answering
+            .and_then(|answering| {
+                let (received, timing, _) = answering.delivered.as_ref()?;
+                let stages: Vec<String> = (stages.iter())
+                    .filter_map(|(name, stage)| {
+                        Some(format!(
+                            "{name} {:.1?}",
+                            stage(answering, timing, *received)?
+                        ))
+                    })
+                    .collect();
+                Some(stages.join(", "))
+            })
+            .unwrap_or_else(|| "its stages were not recorded".to_owned());
+        eprintln!(
+            "{name}: the {} edit, request {}: {:.1?}, answered by {by}: {stages}",
+            roles.join(" and "),
+            edit.request,
+            latency(edit).expect("filtered"),
+        );
+    }
+    let mut gui: Vec<Duration> = (check.frames.iter())
+        .map(|frame| frame.submitted - frame.acquired)
+        .collect();
+    gui.sort();
+    eprintln!(
+        "{name}: {} frames of either pane during the drag, acquired → submitted p50 {:.2?}, p99 \
+         {:.2?}, max {:.2?}",
+        gui.len(),
+        percentile(&gui, 0.5),
+        percentile(&gui, 0.99),
+        percentile(&gui, 1.0),
+    );
+    if gpu {
+        let mut to_completion: Vec<Duration> = (check.frames.iter())
+            .filter_map(|frame| Some(*frame.completed.get()? - frame.acquired))
+            .collect();
+        to_completion.sort();
+        let longest = percentile(&to_completion, 1.0);
+        eprintln!(
+            "{name}: {} of them completed, acquired → completed p50 {:.1?}, p99 {:.1?}, max \
+             {longest:.1?}",
+            to_completion.len(),
+            percentile(&to_completion, 0.5),
+            percentile(&to_completion, 0.99),
+        );
+        let p99 = percentile(&gui, 0.99);
+        if p99 > FRAME_GUI_P99 {
+            failures.push(format!(
+                "frames acquired → submitted p99 {p99:.2?}, over {FRAME_GUI_P99:?}"
+            ));
+        }
+        let over: Vec<&Duration> = gui.iter().filter(|&&time| time > FRAME_GUI_MAX).collect();
+        if over.len() > 1 {
+            failures.push(format!(
+                "{} frames acquired → submitted over {FRAME_GUI_MAX:?}: {over:.2?}",
+                over.len()
+            ));
+        }
+        if longest > check.refresh * 2 {
+            failures.push(format!(
+                "a frame acquired → completed {longest:.1?}, over two refreshes, {:.1?}",
+                check.refresh * 2
+            ));
+        }
+    }
     eprintln!("{name}: resident memory {}", resident_memory());
     if let Some(final_latency) = final_latency {
-        let p95 = percentile(&latencies, 0.95);
-        let budget = check.chain.budget();
         if p95 > budget {
             failures.push(format!(
                 "edit → frame p95 {p95:.1?}, over the {budget:?} budget"

@@ -8,7 +8,8 @@ use crate::evaluate::EvalError;
 use crate::panel::ValueState;
 use crate::parameter::{Value, resolve};
 use crate::read::ReadError;
-use crate::worker::{Timing, ViewerImage};
+use crate::viewer::MAX_EXPOSURE;
+use crate::worker::{EvaluationDevice, Timing, ViewerImage};
 
 const NONE: Modifiers = Modifiers {
     shift: false,
@@ -26,7 +27,7 @@ const SHIFT: Modifiers = Modifiers {
 /// An app whose worker hands its results to the test, with a 400 × 300 graph pane at scale 2.
 fn app() -> (App, Receiver<Evaluated>) {
     let (delivered, deliveries) = mpsc::channel();
-    let mut app = App::new(move |notice| {
+    let mut app = App::new(EvaluationDevice::Cpu, move |notice| {
         if let Notice::Evaluated(evaluated) = notice {
             let _ = delivered.send(evaluated);
         }
@@ -386,7 +387,7 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     assert_eq!(
         requests.last(),
         Some(&Request::ShowViewerCaption(
-            "Slot 3 · a.exr · updating…".to_owned()
+            "Slot 3 · a.exr · updating… · CPU".to_owned()
         ))
     );
 
@@ -434,21 +435,21 @@ fn a_result_for_a_node_no_longer_viewed_is_not_shown() {
 
     // The first read finishes after the viewer moved on.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
-    assert_eq!(app.caption, "Slot 2 · b.exr · updating…");
+    assert_eq!(app.caption, "Slot 2 · b.exr · updating… · CPU");
 
     app.dispatch(read(&second, 8, 2));
-    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
+    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
 
     // Back to slot 1, which is read again, showing slot 2's image until then.
     app.dispatch(slot_key(1, NONE));
     assert_eq!(sent(&app).key, first.key);
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
     assert!(matches!(app.shown, Shown::Image { .. }));
     // Back to slot 2, which is shown already and asked for again, so that the worker lets slot
     // 1's read go.
     app.dispatch(slot_key(2, NONE));
     assert_eq!(sent(&app).key, second.key);
-    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2");
+    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
 }
 
 #[test]
@@ -465,13 +466,13 @@ fn an_edit_faster_than_evaluation_shows_each_later_result_as_it_finishes() {
     // Superseded, but later than anything shown.
     app.dispatch(read(&second, 8, 2));
     assert!(matches!(&app.shown, Shown::Image { info, .. } if info.data_window.width == 8));
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
     // Earlier than what is shown.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
     assert!(matches!(&app.shown, Shown::Image { info, .. } if info.data_window.width == 8));
 
     app.dispatch(read(&third, 5, 1));
-    assert_eq!(app.caption, "Slot 1 · a.exr · 5 × 1");
+    assert_eq!(app.caption, "Slot 1 · a.exr · 5 × 1 · CPU");
 }
 
 #[test]
@@ -499,7 +500,7 @@ fn a_superseded_failure_leaves_the_viewer_and_the_node_as_they_are() {
     app.dispatch(failed(superseded));
 
     assert!(matches!(app.shown, Shown::Image { .. }));
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
     assert_eq!(color(&app), unfailed);
     app.dispatch(failed(sent(&app)));
     assert!(matches!(app.shown, Shown::Failed { .. }));
@@ -592,7 +593,10 @@ fn a_pane_opened_while_the_gpu_is_unavailable_is_tried_without_waiting_out_the_b
 fn a_stale_attempt_is_ignored_so_attempts_never_overlap() {
     let (mut app, _deliveries) = app();
     app.gpu = Gpu::with_noop_device(Waker::channel().0);
-    let (attempt, _) = retry(&app.dispatch(Event::DeviceLost(1)));
+    let (attempt, _) = retry(&app.dispatch(Event::DeviceLost {
+        generation: 1,
+        at: Instant::now(),
+    }));
     let (next, _) = retry(&app.dispatch(Event::RetryDeviceCreation(attempt)));
 
     assert_eq!(app.dispatch(Event::RetryDeviceCreation(attempt)), []);
@@ -621,7 +625,10 @@ fn a_device_lost_soon_after_recovering_waits_longer_than_the_attempt_that_made_i
             }),
         };
 
-        let requests = app.dispatch(Event::DeviceLost(1));
+        let requests = app.dispatch(Event::DeviceLost {
+            generation: 1,
+            at: Instant::now(),
+        });
 
         assert_eq!(retry(&requests).1, delay);
     }
@@ -641,7 +648,10 @@ fn the_gpu_label_shows_while_the_panes_cannot_draw_and_names_each_new_error_coun
     let requests = app.dispatch(Event::FocusLost(Pane::Viewer));
     assert_eq!(requests, [label("2 GPU errors, logged on standard error")]);
 
-    let requests = app.dispatch(Event::DeviceLost(1));
+    let requests = app.dispatch(Event::DeviceLost {
+        generation: 1,
+        at: Instant::now(),
+    });
     let expected = format!("{GPU_UNAVAILABLE}. 2 GPU errors, logged on standard error");
     assert!(requests.contains(&label(&expected)), "{requests:?}");
     assert_eq!(app.gpu.take_errors(), 2);
@@ -654,7 +664,10 @@ fn closing_during_recovery_notices_no_loss() {
     app.gpu = Gpu::with_noop_device(waker);
     create(&mut app, "missing.png");
     app.dispatch(slot_key(1, CTRL));
-    retry(&app.dispatch(Event::DeviceLost(1)));
+    retry(&app.dispatch(Event::DeviceLost {
+        generation: 1,
+        at: Instant::now(),
+    }));
 
     drop(app);
 
@@ -685,7 +698,7 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     assert!(matches!(app.shown, Shown::Failed { .. }));
     assert_eq!(
         app.caption,
-        "Slot 1 · a.exr · /nonexistent/a.exr: not an EXR or PNG file"
+        "Slot 1 · a.exr · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let failed = app.session().graph().node(id.into()).unwrap().color;
 
@@ -712,7 +725,7 @@ fn undoing_a_mark_leaves_the_viewer_showing_nothing() {
 
     // Redo marks it again, and the file is read again.
     app.dispatch(Event::Command(Command::Redo));
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating…");
+    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
 }
 
 #[test]
@@ -797,19 +810,19 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     app.dispatch(slot_key(2, CTRL));
     assert_eq!(
         app.caption,
-        "Slot 2 · Exposure · updating…; Source of Exposure is not connected"
+        "Slot 2 · Exposure · updating…; Source of Exposure is not connected · CPU"
     );
     // The empty image, which the viewer does not frame.
     app.dispatch(read(&sent(&app), 0, 0));
     assert_eq!(
         app.caption,
-        "Slot 2 · Exposure · Source of Exposure is not connected"
+        "Slot 2 · Exposure · Source of Exposure is not connected · CPU"
     );
     assert_eq!(app.shown.display_window(), None);
 
     app.session.connect(first, "source", reader).unwrap();
     app.dispatch(Event::Draw(Pane::Viewer));
-    assert_eq!(app.caption, "Slot 2 · Exposure · updating…");
+    assert_eq!(app.caption, "Slot 2 · Exposure · updating… · CPU");
     let key = |app: &App, id| {
         let session = app.session();
         result_key(session.document(), session.reloads(), id).unwrap()
@@ -826,7 +839,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
     assert_eq!(
         app.caption,
-        "Slot 2 · Exposure · /nonexistent/a.exr: not an EXR or PNG file"
+        "Slot 2 · Exposure · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
     assert_ne!(color(reader), color(second));
@@ -842,13 +855,16 @@ fn a_viewed_reader_without_a_file_says_so_where_it_is() {
     let reader = *changes.nodes.first().unwrap();
     app.dispatch(slot_key(1, CTRL));
     app.dispatch(read(&sent(&app), 0, 0));
-    assert_eq!(app.caption, "Slot 1 · Reader · File is not set");
+    assert_eq!(app.caption, "Slot 1 · Reader · File is not set · CPU");
 
     let exposure = create_exposure(&mut app);
     app.session.connect(exposure, "source", reader).unwrap();
     app.dispatch(slot_key(2, CTRL));
     app.dispatch(read(&sent(&app), 0, 0));
-    assert_eq!(app.caption, "Slot 2 · Exposure · File of Reader is not set");
+    assert_eq!(
+        app.caption,
+        "Slot 2 · Exposure · File of Reader is not set · CPU"
+    );
 }
 
 /// Presses Tab over the graph and chooses the type in the menu it opens.
@@ -1124,5 +1140,326 @@ fn a_viewed_merge_with_nothing_connected_is_empty_and_misses_nothing() {
         .unwrap();
     app.dispatch(Event::Draw(Pane::Viewer));
     app.dispatch(read(&sent(&app), 0, 0));
-    assert_eq!(app.caption, "Slot 1 · Merge · empty");
+    assert_eq!(app.caption, "Slot 1 · Merge · empty · CPU");
+}
+
+#[test]
+fn out_of_gpu_memory_moves_evaluation_to_the_cpu_until_the_artist_chooses_the_gpu() {
+    let (mut app, deliveries) = app();
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let wanted = sent(&app);
+    app.dispatch(read(&wanted, 4, 4));
+
+    app.dispatch(Event::Evaluated(Evaluated {
+        timing: Timing::now(),
+        wanted: wanted.clone(),
+        result: Err(ViewerError::Eval(EvalError::OutOfGpuMemory {
+            origin: wanted.key.clone(),
+        })),
+    }));
+
+    assert_eq!(app.evaluation_device(), EvaluationDevice::Cpu);
+    assert!(matches!(app.shown, Shown::Image { .. }), "the frame stays");
+    assert_eq!(
+        app.caption,
+        "Slot 1 · a.exr · 4 × 4 · CPU (the GPU ran out of memory)"
+    );
+    assert_eq!(receive(&deliveries).wanted.number, wanted.number);
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+    assert_eq!(app.evaluation_device(), EvaluationDevice::Gpu);
+    assert_eq!(app.caption, "Slot 1 · a.exr · 4 × 4 · GPU");
+}
+
+#[test]
+fn a_request_failed_by_a_lost_device_leaves_the_frame_and_fails_no_node() {
+    let (mut app, _deliveries) = app();
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let wanted = sent(&app);
+    app.dispatch(read(&wanted, 4, 4));
+    let caption = app.caption.clone();
+
+    let requests = app.dispatch(Event::Evaluated(Evaluated {
+        timing: Timing::now(),
+        wanted: wanted.clone(),
+        result: Err(ViewerError::Eval(EvalError::GpuLost {
+            origin: wanted.key.clone(),
+        })),
+    }));
+
+    assert_eq!(requests, []);
+    assert!(matches!(app.shown, Shown::Image { .. }), "the frame stays");
+    assert_eq!(app.caption, caption);
+    assert_eq!(app.evaluation_device(), EvaluationDevice::Gpu);
+    assert_eq!(app.gpu_errors(), 0);
+}
+
+#[test]
+fn a_request_wgpu_rejects_fails_its_node_and_counts_a_gpu_error() {
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let wanted = sent(&app);
+
+    let requests = app.dispatch(Event::Evaluated(Evaluated {
+        timing: Timing::now(),
+        wanted: wanted.clone(),
+        result: Err(ViewerError::Eval(EvalError::GpuValidation {
+            origin: wanted.key.clone(),
+            message: "rejected".to_owned(),
+        })),
+    }));
+
+    assert!(matches!(app.shown, Shown::Failed { .. }));
+    let label = Request::ShowGpuLabel(Some("1 GPU error, logged on standard error".to_owned()));
+    assert!(requests.contains(&label), "{requests:?}");
+    assert_eq!(app.gpu.take_errors(), 1);
+}
+
+#[test]
+fn two_losses_while_evaluation_had_work_on_the_gpu_move_it_to_the_cpu() {
+    let (mut app, _deliveries) = app();
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+    // Each loss on generation 1 of a new noop device, the first without work in flight.
+    for (submitting, device) in [
+        (false, EvaluationDevice::Gpu),
+        (true, EvaluationDevice::Gpu),
+        (true, EvaluationDevice::Cpu),
+    ] {
+        app.gpu = Gpu::with_noop_device(Waker::channel().0);
+        let (noop, queue) = crate::gpu::noop_device(None);
+        app.worker.connect(noop, queue, Arc::default(), 1);
+        if submitting {
+            app.worker.submitting_on(1);
+        }
+
+        app.dispatch(Event::DeviceLost {
+            generation: 1,
+            at: Instant::now(),
+        });
+
+        assert_eq!(app.evaluation_device(), device);
+    }
+    assert_eq!(app.left_gpu, Some(LeftGpu::Lost));
+}
+
+/// The readout the requests show, if they change it.
+fn shown_readout(requests: &[Request]) -> Option<&str> {
+    requests.iter().find_map(|request| match request {
+        Request::ShowReadout(text) => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+/// An app viewing a 4000 × 2000 image, fitted in a 1000 × 500 viewer so that a physical pixel
+/// is 1 / 0.225 image pixels from (50, 475), whose data window is the 2000 × 1000 at (1000, 500).
+fn viewing_a_cropped_image() -> (App, Receiver<Evaluated>) {
+    let (mut app, deliveries) = app();
+    app.dispatch(Event::Resized {
+        pane: Pane::Viewer,
+        size: PaneSize {
+            width: 1000,
+            height: 500,
+            scale_factor: 1.0,
+        },
+    });
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(cropped(&sent(&app)));
+    (app, deliveries)
+}
+
+fn cropped(wanted: &Wanted) -> Event {
+    let Event::Evaluated(mut evaluated) = read(wanted, 4000, 2000) else {
+        unreachable!("an evaluation");
+    };
+    if let Ok(image) = &mut evaluated.result {
+        image.info.data_window = Window {
+            x: 1000,
+            y: 500,
+            width: 2000,
+            height: 1000,
+        };
+    }
+    Event::Evaluated(evaluated)
+}
+
+fn pointer_at(x: f32, y: f32) -> Event {
+    input(
+        Pane::Viewer,
+        Input::PointerMoved {
+            position: PhysicalPoint { x, y },
+        },
+    )
+}
+
+/// The GPU's read of the probe last asked for arriving.
+fn read_arrives(app: &mut App, values: [f32; 4]) -> Vec<Request> {
+    let probe = app.probed.expect("a probe");
+    let info = app.shown.framed().expect("a framed image");
+    app.last_read = Some(LastRead::new(PixelRead { probe, values }, info.data_window));
+    app.dispatch(Event::CollectPixelRead)
+}
+
+#[test]
+fn the_readout_follows_the_pointer_and_keeps_the_last_read_marked_until_the_next_arrives() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+
+    // Outside the data window: zeros, said so, with nothing to read.
+    let requests = app.dispatch(pointer_at(51.0, 474.0));
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 6 y 2 · R 0 G 0 B 0 A 0, outside the data window")
+    );
+    assert_eq!(app.probed, None);
+
+    // Inside: the pixel, until its values are read.
+    let requests = app.dispatch(pointer_at(500.0, 250.0));
+    assert_eq!(shown_readout(&requests), Some("x 2002 y 997"));
+    let probe = app.probed.expect("a probe");
+    assert_eq!(probe.texel, [1002, 497]);
+    let requests = read_arrives(&mut app, [0.18017578, -2.5, 1e9, f32::NAN]);
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2002 y 997 · R 0.1802 G -2.5 B 1.000e9 A NaN")
+    );
+
+    // Another pixel keeps the last read, labelled with the pixel it read, until its own arrives.
+    let requests = app.dispatch(pointer_at(501.0, 250.0));
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2002 y 997 · R 0.1802 G -2.5 B 1.000e9 A NaN · reading")
+    );
+    let probe = app.probed.expect("a probe");
+    assert_eq!(probe.texel, [1006, 497]);
+    let requests = read_arrives(&mut app, [1.0; 4]);
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2006 y 997 · R 1 G 1 B 1 A 1")
+    );
+
+    // So does a newer image, whose own read of the pixel replaces it.
+    let requests = app.dispatch(cropped(&sent(&app)));
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2006 y 997 · R 1 G 1 B 1 A 1 · reading")
+    );
+    let requests = read_arrives(&mut app, [2.0; 4]);
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2006 y 997 · R 2 G 2 B 2 A 2")
+    );
+}
+
+#[test]
+fn the_readout_stays_on_the_pixel_the_pointer_left_the_viewer_from() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+    app.dispatch(pointer_at(500.0, 250.0));
+    read_arrives(&mut app, [1.0; 4]);
+
+    let requests = app.dispatch(input(Pane::Viewer, Input::PointerLeft));
+    assert_eq!(shown_readout(&requests), None);
+    // One to one moves another pixel under where the pointer was, but not the readout.
+    app.dispatch(Event::Command(Command::ActualSize));
+    assert_eq!(app.readout, "x 2002 y 997 · R 1 G 1 B 1 A 1");
+
+    // A newer image is read at the same pixel.
+    let requests = app.dispatch(cropped(&sent(&app)));
+    assert_eq!(
+        shown_readout(&requests),
+        Some("x 2002 y 997 · R 1 G 1 B 1 A 1 · reading")
+    );
+    let probe = app.probed.expect("a probe");
+    assert_eq!(probe.texel, [1002, 497]);
+}
+
+#[test]
+fn at_one_to_one_the_readout_names_the_pixel_drawn_under_the_pointer() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+    // The display window's centre, (2000, 1000), at the pane's, (500, 250): physical pixel
+    // (500, 250) is drawn from its centre, (500.5, 250.5), which is image point
+    // (2000.5, 999.5), in pixel (2000, 999). Its top-left corner is in the pixel above.
+    app.dispatch(Event::Command(Command::ActualSize));
+
+    for (x, y) in [(500.0, 250.0), (500.75, 250.75)] {
+        app.dispatch(pointer_at(x, y));
+        assert_eq!(app.readout, "x 2000 y 999");
+    }
+    app.dispatch(pointer_at(501.0, 251.0));
+    assert_eq!(app.readout, "x 2001 y 998");
+}
+
+#[test]
+fn a_device_loss_drops_the_read_of_its_copy_of_the_image() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+    app.dispatch(pointer_at(500.0, 250.0));
+    read_arrives(&mut app, [1.0; 4]);
+    app.gpu = Gpu::with_noop_device(Waker::channel().0);
+
+    let requests = app.dispatch(Event::DeviceLost {
+        generation: 1,
+        at: std::time::Instant::now(),
+    });
+
+    assert_eq!(shown_readout(&requests), Some("x 2002 y 997"));
+}
+
+#[test]
+fn e_steps_the_viewers_exposure_and_its_control_follows_without_editing_the_document() {
+    let (mut app, _deliveries) = viewing_a_cropped_image();
+    app.dispatch(input(Pane::Viewer, Input::PointerEntered));
+    let version = app.session().version();
+    let undo = app.session().undo_label();
+    let key = |modifiers| Event::KeyPressed {
+        key: Key::E,
+        modifiers,
+    };
+
+    assert_eq!(
+        app.dispatch(key(NONE)),
+        [
+            Request::Redraw(Pane::Viewer),
+            Request::ShowViewerExposure(0.5)
+        ]
+    );
+    app.dispatch(key(SHIFT));
+    app.dispatch(key(SHIFT));
+    assert_eq!(app.session().viewer().exposure(), -0.5);
+    assert_eq!(app.session().viewer().gain(), 0.5f32.sqrt());
+    app.dispatch(key(CTRL));
+    assert_eq!(app.session().viewer().exposure(), 0.0);
+
+    // What the artist typed is not echoed back to the control, but is clamped where it holds.
+    assert_eq!(
+        app.dispatch(Event::ViewerExposureSet(3.25)),
+        [Request::Redraw(Pane::Viewer)]
+    );
+    app.dispatch(Event::ViewerExposureSet(f32::NAN));
+    assert_eq!(app.session().viewer().exposure(), 3.25);
+    app.dispatch(Event::ViewerExposureSet(1e9));
+    assert_eq!(app.session().viewer().exposure(), MAX_EXPOSURE);
+
+    assert_eq!(app.session().version(), version);
+    assert_eq!(app.session().undo_label(), undo);
+}
+
+#[test]
+fn working_values_read_with_four_decimals_or_an_exponent() {
+    let cases = [
+        (0.0, "0"),
+        (-0.0, "0"),
+        (1.0, "1"),
+        (0.18017578, "0.1802"),
+        (-123456.5, "-123456.5"),
+        (0.00001, "1.000e-5"),
+        (3e38, "3.000e38"),
+        (f32::INFINITY, "inf"),
+        (f32::NEG_INFINITY, "-inf"),
+    ];
+    for (value, text) in cases {
+        assert_eq!(working_value(value), text, "{value}");
+    }
 }

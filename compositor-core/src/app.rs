@@ -9,13 +9,16 @@ use std::time::{Duration, Instant};
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{Missing, NodeId, Slot, missing};
-use crate::evaluate::{ResultKey, result_key};
-use crate::gpu::{Drawn, FrameCheck, Gpu, NativeWindow, PaneSize, ViewerFrame};
+use crate::evaluate::{EvalError, ResultKey, result_key};
+use crate::gpu::{
+    Drawn, FrameCheck, FrameTiming, Gpu, NativeWindow, PaneSize, PixelRead, Probe, ViewerFrame,
+};
 use crate::image::{ImageInfo, Window};
 use crate::panel::Panel;
 use crate::parameter::Value;
 use crate::session::Session;
-use crate::worker::{Evaluated, ViewerError, Wanted, Worker};
+use crate::viewer::EXPOSURE_STEP;
+use crate::worker::{Evaluated, EvaluationDevice, ViewerError, Wanted, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,10 +90,17 @@ pub enum Event {
     },
     /// An evaluation finished on the evaluator's thread.
     Evaluated(Evaluated),
-    /// The GPU device of the generation was lost.
-    DeviceLost(u64),
+    /// The GPU device of the generation was lost, when wgpu reported it.
+    DeviceLost {
+        generation: u64,
+        at: Instant,
+    },
     /// The time for the attempt, after [`Request::RetryDeviceCreation`].
     RetryDeviceCreation(u64),
+    /// The time to collect the pixel read in flight, after [`Request::CollectPixelRead`].
+    CollectPixelRead,
+    /// The artist set the viewer's exposure, in stops, in the viewer's own control.
+    ViewerExposureSet(f32),
 }
 
 /// What another thread, or wgpu inside a call, tells the GUI thread through the waker
@@ -102,14 +112,14 @@ pub enum Event {
 )]
 pub enum Notice {
     Evaluated(Evaluated),
-    DeviceLost(u64),
+    DeviceLost { generation: u64, at: Instant },
 }
 
 impl From<Notice> for Event {
     fn from(notice: Notice) -> Event {
         match notice {
             Notice::Evaluated(evaluated) => Event::Evaluated(evaluated),
-            Notice::DeviceLost(generation) => Event::DeviceLost(generation),
+            Notice::DeviceLost { generation, at } => Event::DeviceLost { generation, at },
         }
     }
 }
@@ -156,6 +166,12 @@ pub enum Request {
     ShowError(String),
     /// Describe under the viewer what it shows, or why it shows nothing.
     ShowViewerCaption(String),
+    /// Show under the caption the shown image's working values at the pixel under the pointer,
+    /// or nothing with an empty text.
+    ShowReadout(String),
+    /// Show the viewer's exposure, in stops, in its control, without dispatching
+    /// [`Event::ViewerExposureSet`]. It starts at 0.
+    ShowViewerExposure(f32),
     /// Name in the Edit menu what undo and redo would undo and redo, and disable either with
     /// `None`. Both start disabled.
     ShowUndoLabels {
@@ -174,6 +190,8 @@ pub enum Request {
     /// Dispatch [`Event::RetryDeviceCreation`] with the attempt after the delay. An attempt not
     /// the last one requested is ignored, so dispatching every one is safe.
     RetryDeviceCreation { attempt: u64, after: Duration },
+    /// Dispatch [`Event::CollectPixelRead`] after the delay.
+    CollectPixelRead { after: Duration },
 }
 
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
@@ -202,6 +220,14 @@ pub enum Command {
     FitImage,
     /// Shows the viewed image one pixel to a physical pixel.
     ActualSize,
+    /// Raises the viewer's exposure by half a stop.
+    ExposureUp,
+    /// Lowers the viewer's exposure by half a stop.
+    ExposureDown,
+    /// Sets the viewer's exposure back to 0.
+    ResetExposure,
+    /// Evaluates on the device from now on, also after the app moved evaluation off the GPU.
+    EvaluateOn(EvaluationDevice),
 }
 
 /// The keys the window uses. The pane under the pointer receives all but the slot keys.
@@ -209,6 +235,7 @@ pub enum Command {
 pub enum Key {
     Space,
     Escape,
+    E,
     G,
     H,
     Y,
@@ -230,7 +257,7 @@ impl Key {
             Key::G => open_ng::Key::G,
             Key::H => open_ng::Key::H,
             Key::Y => open_ng::Key::Y,
-            Key::Delete | Key::Tab | Key::Slot(_) => return None,
+            Key::E | Key::Delete | Key::Tab | Key::Slot(_) => return None,
         })
     }
 }
@@ -334,6 +361,11 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(1);
 /// again from the first wait.
 const LONGEST_RETRY: Duration = Duration::from_secs(30);
 
+/// Waited for between looks at a pixel read in flight. Its copy is tiny, but waits behind the
+/// evaluation's work on the queue; and nothing else polls an idle device, which a wait for the
+/// map callback alone would need.
+const PIXEL_READ_POLL: Duration = Duration::from_millis(4);
+
 /// Whether the panes have a device to draw on.
 #[derive(Debug)]
 enum Drawing {
@@ -342,6 +374,27 @@ enum Drawing {
     /// No device: the attempt numbered `attempt` makes one after `delay`. Editing continues
     /// unseen, since the panes are not redrawn: a fallback drawn by Qt is not worth its cost.
     Unavailable { attempt: u64, delay: Duration },
+}
+
+/// Losses of the device while evaluation had work on its GPU, since the artist last chose the
+/// GPU, after which evaluation moves to the CPU: likely its own work lost them. A heuristic: a
+/// display driver that fails during evaluation moves it too.
+const LOSSES_BEFORE_LEAVING_THE_GPU: u32 = 2;
+
+/// Why the app moved evaluation off the GPU the artist chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeftGpu {
+    OutOfMemory,
+    Lost,
+}
+
+impl fmt::Display for LeftGpu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LeftGpu::OutOfMemory => "the GPU ran out of memory",
+            LeftGpu::Lost => "the GPU device was lost twice during evaluation",
+        })
+    }
 }
 
 /// A device made after a loss: when, and after what wait.
@@ -355,6 +408,12 @@ struct Recovered {
 pub struct App {
     session: Session,
     gpu: Gpu,
+    /// Where the worker evaluates: where the artist chose, or the CPU once the GPU failed it.
+    device: EvaluationDevice,
+    /// Why evaluation left the GPU, until the artist next chooses a device.
+    left_gpu: Option<LeftGpu>,
+    /// Losses while evaluation had work on the GPU since the artist last chose it.
+    losses_during_evaluation: u32,
     /// Nothing is delivered once the app has dropped.
     worker: Worker,
     /// What the worker was last asked for.
@@ -373,6 +432,20 @@ pub struct App {
     shown: Shown,
     /// The request whose image the viewer's last presented frame showed.
     presented: Option<u64>,
+    /// Images given to the GPU to show, which numbers them for their pixel reads.
+    images_shown: u64,
+    /// The pointer's last position over the viewer pane.
+    viewer_pointer: Option<PhysicalPoint>,
+    /// The image pixel the pointer last left the viewer from, which the readout stays on.
+    left_pixel: Option<[i32; 2]>,
+    /// The probe last asked of the GPU.
+    probed: Option<Probe>,
+    /// The last pixel read back, shown until a newer read arrives.
+    last_read: Option<LastRead>,
+    /// The readout as last requested.
+    readout: String,
+    /// The viewer's exposure as its control last showed it.
+    exposure_shown: f32,
     /// The viewer's caption as last requested.
     caption: String,
     /// The Edit menu's undo and redo labels as last requested.
@@ -388,15 +461,20 @@ pub struct App {
 }
 
 impl App {
-    /// `wake` receives each [`Notice`] on the thread that raised it, which may hold wgpu's locks,
-    /// and must hand it to the GUI thread to dispatch.
-    pub fn new(wake: impl Fn(Notice) + Send + Sync + 'static) -> App {
+    /// An app evaluating on `device`. `wake` receives each [`Notice`] on the thread that raised
+    /// it, which may hold wgpu's locks, and must hand it to the GUI thread to dispatch.
+    pub fn new(device: EvaluationDevice, wake: impl Fn(Notice) + Send + Sync + 'static) -> App {
         let waker = Waker(Arc::new(wake));
         let deliver = waker.clone();
         App {
             session: Session::new(),
             gpu: Gpu::new(waker),
-            worker: Worker::start(move |evaluated| deliver.wake(Notice::Evaluated(evaluated))),
+            device,
+            left_gpu: None,
+            losses_during_evaluation: 0,
+            worker: Worker::start(device, move |evaluated| {
+                deliver.wake(Notice::Evaluated(evaluated));
+            }),
             sent: None,
             followed: None,
             requests_sent: 0,
@@ -406,6 +484,13 @@ impl App {
             graph_pointer: None,
             shown: Shown::Nothing,
             presented: None,
+            images_shown: 0,
+            viewer_pointer: None,
+            left_pixel: None,
+            probed: None,
+            last_read: None,
+            readout: String::new(),
+            exposure_shown: 0.0,
             caption: String::new(),
             undo_labels: [None, None],
             gpu_label: None,
@@ -469,7 +554,7 @@ impl App {
             }
             Event::FilesChosen { intent, paths } => self.files_chosen(intent, paths),
             Event::Evaluated(evaluated) => self.evaluated(evaluated),
-            Event::DeviceLost(generation) => self.device_lost(generation),
+            Event::DeviceLost { generation, at } => self.device_lost(generation, at),
             Event::RetryDeviceCreation(attempt) => match self.drawing {
                 Drawing::Unavailable { attempt: last, .. } if attempt == last => {
                     let mut requests = self.make_device();
@@ -482,6 +567,20 @@ impl App {
                 }
                 _ => Vec::new(),
             },
+            Event::CollectPixelRead => {
+                if let Some(read) = self.gpu.take_pixel_read()
+                    && let Some(info) = self.shown.framed()
+                {
+                    self.last_read = Some(LastRead::new(read, info.data_window));
+                }
+                self.poll_pixel_read()
+            }
+            Event::ViewerExposureSet(stops) => {
+                self.session.viewer_mut().set_exposure(stops);
+                // The control shows what the artist typed, which echoing could rewrite.
+                self.exposure_shown = self.session.viewer().exposure();
+                vec![Request::Redraw(Pane::Viewer)]
+            }
         };
         self.after_change(requests)
     }
@@ -516,6 +615,12 @@ impl App {
     /// shell shows.
     fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
         self.follow_viewer(&mut requests);
+        self.follow_readout(&mut requests);
+        let exposure = self.session.viewer().exposure();
+        if exposure != self.exposure_shown {
+            self.exposure_shown = exposure;
+            requests.push(Request::ShowViewerExposure(exposure));
+        }
         // These go first, since performing another request may dispatch again and show newer
         // ones.
         self.follow_panel(&mut requests);
@@ -580,12 +685,22 @@ impl App {
 
     /// Retires the lost device, which stops the panes drawing, and requests the first attempt to
     /// replace it. A device lost before it worked for the longest wait counts as a failed
-    /// attempt, so that a device lost again at once is not rebuilt at once forever.
-    fn device_lost(&mut self, generation: u64) -> Vec<Request> {
+    /// attempt, so that a device lost again at once is not rebuilt at once forever. Evaluation
+    /// stays on the GPU, since nothing could show a CPU result meanwhile, unless this loss makes
+    /// too many while it had work there.
+    fn device_lost(&mut self, generation: u64, at: Instant) -> Vec<Request> {
         if !self.gpu.retire_lost_device(generation) {
             return Vec::new();
         }
-        self.worker.disconnect();
+        // Read from the lost device's copy of the image, which the next device shows anew.
+        self.last_read = None;
+        self.probed = None;
+        if self.worker.disconnect(at) && self.device == EvaluationDevice::Gpu {
+            self.losses_during_evaluation += 1;
+            if self.losses_during_evaluation >= LOSSES_BEFORE_LEAVING_THE_GPU {
+                self.leave_gpu(LeftGpu::Lost);
+            }
+        }
         let delay = match self.drawing {
             Drawing::Ready {
                 recovered: Some(recovered),
@@ -595,13 +710,20 @@ impl App {
         vec![self.request_attempt(delay)]
     }
 
-    /// Makes a device for every pane with a native window, which the worker then stages for. On
+    /// Moves evaluation to the CPU, which evaluates the last request again, saying why.
+    fn leave_gpu(&mut self, why: LeftGpu) {
+        self.device = EvaluationDevice::Cpu;
+        self.left_gpu = Some(why);
+        self.worker.evaluate_on(EvaluationDevice::Cpu);
+    }
+
+    /// Makes a device for every pane with a native window, which the worker then uses. On
     /// failure, requests the next attempt. Why the first attempt failed is shown, and why a
     /// later one did is logged, so that retrying does not churn the status bar.
     fn make_device(&mut self) -> Vec<Request> {
         match self.gpu.make_device() {
             Ok(new) => {
-                self.worker.connect(new.device, new.generation);
+                (self.worker).connect(new.device, new.queue, new.lost, new.generation);
                 let mut requests = Vec::new();
                 if !new.pane_errors.is_empty() {
                     requests.push(Request::ShowError(new.pane_errors.join("; ")));
@@ -639,11 +761,13 @@ impl App {
     }
 
     fn draw(&mut self, pane: Pane) -> Vec<Request> {
+        let viewer = self.session.viewer();
         let frame = self.shown.framed().map(|info| ViewerFrame {
-            placement: self.session.viewer().placement(info.display_window),
+            placement: viewer.placement(info.display_window),
             display_window: info.display_window,
             data_window: info.data_window,
-            scale_factor: self.session.viewer().scale_factor(),
+            scale_factor: viewer.scale_factor(),
+            gain: viewer.gain(),
         });
         match self
             .gpu
@@ -711,6 +835,17 @@ impl App {
     }
 
     fn viewer_input(&mut self, input: Input) -> Vec<Request> {
+        match input {
+            Input::PointerMoved { position }
+            | Input::PointerPressed { position, .. }
+            | Input::PointerReleased { position, .. }
+            | Input::Scrolled { position, .. } => self.viewer_pointer = Some(position),
+            Input::PointerLeft => {
+                self.left_pixel = self.pointed().map(|(pixel, _)| pixel);
+                self.viewer_pointer = None;
+            }
+            Input::PointerEntered => {}
+        }
         let display = self.shown.display_window();
         let viewer = self.session.viewer_mut();
         let moved = match input {
@@ -777,6 +912,9 @@ impl App {
             }
             Key::H if modifiers.shift => self.command(Command::ActualSize),
             Key::H => self.command(Command::FitImage),
+            Key::E if modifiers.ctrl => self.command(Command::ResetExposure),
+            Key::E if modifiers.shift => self.command(Command::ExposureDown),
+            Key::E => self.command(Command::ExposureUp),
             _ => Vec::new(),
         }
     }
@@ -866,6 +1004,23 @@ impl App {
                 }
                 vec![Request::Redraw(Pane::Viewer)]
             }
+            Command::ExposureUp | Command::ExposureDown | Command::ResetExposure => {
+                let viewer = self.session.viewer_mut();
+                let stops = match command {
+                    Command::ExposureUp => viewer.exposure() + EXPOSURE_STEP,
+                    Command::ExposureDown => viewer.exposure() - EXPOSURE_STEP,
+                    _ => 0.0,
+                };
+                viewer.set_exposure(stops);
+                vec![Request::Redraw(Pane::Viewer)]
+            }
+            Command::EvaluateOn(device) => {
+                self.device = device;
+                self.left_gpu = None;
+                self.losses_during_evaluation = 0;
+                self.worker.evaluate_on(device);
+                Vec::new()
+            }
         }
     }
 
@@ -924,6 +1079,23 @@ impl App {
     /// buffer to the worker.
     fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
         let Evaluated { wanted, result, .. } = evaluated;
+        // Not the node's failure, nor shown: the CPU evaluates the request again, and the last
+        // frame stays until it does. One evaluated on the GPU before a move to the CPU may
+        // still arrive.
+        if let Err(ViewerError::Eval(EvalError::OutOfGpuMemory { .. })) = result {
+            if self.device == EvaluationDevice::Gpu {
+                self.leave_gpu(LeftGpu::OutOfMemory);
+            }
+            return Vec::new();
+        }
+        // Not the node's failure either: the device's lost callback has the next device show the
+        // request again.
+        if let Err(ViewerError::Eval(EvalError::GpuLost { .. })) = result {
+            return Vec::new();
+        }
+        if let Err(ViewerError::Eval(error @ EvalError::GpuValidation { .. })) = &result {
+            self.gpu.count_error(error);
+        }
         // Not only later: connecting the GPU delivers the request shown again, with its pixels.
         let not_older = (self.shown.wanted()).is_none_or(|shown| wanted.number >= shown.number);
         if self.session.viewed() != Some(wanted.node) || !not_older {
@@ -941,8 +1113,12 @@ impl App {
         }
         self.shown = match result {
             Ok(image) => {
+                self.images_shown += 1;
                 match image.pixels {
-                    Some(staged) => self.gpu.show_image(staged),
+                    Some(pixels) => {
+                        self.gpu
+                            .show_image(pixels, image.info.data_window, self.images_shown)
+                    }
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
@@ -1008,8 +1184,78 @@ impl App {
         }
     }
 
-    /// Names the viewed node from the document as it stands, then says what is shown of it and
-    /// what upstream of it is not connected. Called once the wanted key has been sent.
+    /// Keeps the readout on the shown image's pixel under the pointer, or the one it left the
+    /// viewer from: asks the GPU to read it, and describes the last read until a newer arrives.
+    fn follow_readout(&mut self, requests: &mut Vec<Request>) {
+        let pointed = self.pointed();
+        if let Some((_, Some(probe))) = pointed
+            && self.probed != Some(probe)
+        {
+            self.probed = Some(probe);
+            let reading = self.gpu.reading_pixel();
+            self.gpu.read_pixel(probe);
+            // A read already in flight polls until the one queued behind it is done.
+            if !reading {
+                requests.extend(self.poll_pixel_read());
+            }
+        }
+        let readout = match pointed {
+            None => String::new(),
+            Some(([x, y], None)) => {
+                format!("x {x} y {y} · R 0 G 0 B 0 A 0, outside the data window")
+            }
+            Some((pixel, Some(probe))) => match self.last_read {
+                Some(read) if read.image == probe.image && read.pixel == pixel => read.describe(),
+                // Labelled with the pixel it read, which may be another, or of an older image.
+                Some(read) => format!("{} · reading", read.describe()),
+                None => format!("x {} y {}", pixel[0], pixel[1]),
+            },
+        };
+        if readout != self.readout {
+            self.readout.clone_from(&readout);
+            requests.push(Request::ShowReadout(readout));
+        }
+    }
+
+    /// Asks to collect the pixel read in flight once the GPU may have done it.
+    fn poll_pixel_read(&self) -> Vec<Request> {
+        if self.gpu.reading_pixel() {
+            vec![Request::CollectPixelRead {
+                after: PIXEL_READ_POLL,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The shown image's pixel the readout describes, in image pixels with y up, and the probe
+    /// that reads it, or `None` for a pixel outside the data window, whose values are zero.
+    fn pointed(&self) -> Option<([i32; 2], Option<Probe>)> {
+        let info = self.shown.framed()?;
+        let [x, y] = match self.viewer_pointer {
+            // The pixel drawn at the centre of the physical pixel the pointer is in, where the
+            // viewer's shader samples.
+            Some(pointer) => {
+                let centre = PhysicalPoint {
+                    x: pointer.x.floor() + 0.5,
+                    y: pointer.y.floor() + 0.5,
+                };
+                let placement = self.session.viewer().placement(info.display_window);
+                placement.to_image(centre).map(|value| value.floor() as i32)
+            }
+            None => self.left_pixel?,
+        };
+        let window = info.data_window;
+        let probe = window.contains(x, y).then(|| Probe {
+            image: self.images_shown,
+            texel: [(x - window.x) as u32, (y - window.y) as u32],
+        });
+        Some(([x, y], probe))
+    }
+
+    /// Names the viewed node from the document as it stands, then says what is shown of it, what
+    /// upstream of it is not connected, and the device evaluating it. Called once the wanted key
+    /// has been sent.
     fn caption(&self) -> String {
         let slot = self.session.viewer().slot().digit();
         let document = self.session.document();
@@ -1056,7 +1302,15 @@ impl App {
         if details.is_empty() {
             details.push("empty".to_owned());
         }
-        format!("Slot {slot} · {} · {}", node.name(), details.join("; "))
+        let device = match self.left_gpu {
+            Some(why) => format!("{} ({why})", self.device),
+            None => self.device.to_string(),
+        };
+        format!(
+            "Slot {slot} · {} · {} · {device}",
+            node.name(),
+            details.join("; ")
+        )
     }
 }
 
@@ -1074,12 +1328,33 @@ impl App {
         self.gpu.check_frames();
     }
 
+    /// Has every frame from now on record when it passed each stage, for the drag check.
+    pub fn time_frames(&mut self) {
+        self.gpu.time_frames();
+    }
+
+    /// The pane's last frame since [`App::time_frames`]; `None` before one.
+    pub fn frame_timing(&self, pane: Pane) -> Option<FrameTiming> {
+        self.gpu.frame_timing(pane)
+    }
+
+    /// Runs the callbacks of the GPU's completed work without waiting for any, so that the drag
+    /// check learns when frames complete while nothing else polls.
+    pub fn poll_gpu(&self) {
+        self.gpu.poll();
+    }
+
+    /// The device evaluating the session.
+    pub fn evaluation_device(&self) -> EvaluationDevice {
+        self.device
+    }
+
     /// What the pane's frames have proved since [`App::check_frames`]; `None` before it.
     pub fn frame_check(&self, pane: Pane) -> Option<FrameCheck> {
         self.gpu.frame_check(pane)
     }
 
-    /// How many GPU errors this session went uncaptured. Each is a bug, logged on standard error
+    /// How many GPU errors there were this session. Each is a bug, logged on standard error
     /// up to a limit, after which drawing continues.
     pub fn gpu_errors(&self) -> u64 {
         self.gpu.errors()
@@ -1098,12 +1373,59 @@ impl App {
     }
 }
 
+/// A pixel read back, at its pixel in image pixels, which a later image's data window would
+/// not give from its texel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LastRead {
+    image: u64,
+    pixel: [i32; 2],
+    values: [f32; 4],
+}
+
+impl LastRead {
+    fn new(read: PixelRead, data_window: Window) -> LastRead {
+        let [x, y] = read.probe.texel.map(|texel| texel as i32);
+        LastRead {
+            image: read.probe.image,
+            pixel: [data_window.x + x, data_window.y + y],
+            values: read.values,
+        }
+    }
+
+    fn describe(&self) -> String {
+        let [x, y] = self.pixel;
+        let values = (["R", "G", "B", "A"].iter().zip(self.values))
+            .map(|(channel, value)| format!("{channel} {}", working_value(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("x {x} y {y} · {values}")
+    }
+}
+
 const GPU_UNAVAILABLE: &str = "GPU unavailable: the panes draw again once it recovers";
 
 /// Names the session's GPU errors, which are bugs, for the status bar.
 fn gpu_errors(errors: u64) -> String {
     let noun = if errors == 1 { "error" } else { "errors" };
     format!("{errors} GPU {noun}, logged on standard error")
+}
+
+/// A working value for the readout: four decimals at most, without trailing zeros, or with an
+/// exponent where that would hide it.
+fn working_value(value: f32) -> String {
+    let magnitude = value.abs();
+    if value == 0.0 {
+        "0".to_owned()
+    } else if !value.is_finite() || (1e-4..1e6).contains(&magnitude) {
+        let fixed = format!("{value:.4}");
+        if fixed.contains('.') {
+            fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
+        } else {
+            fixed
+        }
+    } else {
+        format!("{value:.3e}")
+    }
 }
 
 /// The wait after a failed attempt that waited `delay`.
