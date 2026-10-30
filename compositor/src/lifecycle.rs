@@ -33,8 +33,10 @@ use crate::keys::qt_key;
 use crate::qt::ffi;
 
 /// Each step, when it runs in milliseconds from the start, and the panes it makes draw: each of
-/// those has a surface and has finished a new frame by the next step.
-const STEPS: [(i32, &str, &[Pane]); 23] = [
+/// those has a surface and has finished a new frame by the next step. Each step schedules the
+/// next from its own start, since Qt's timers may fire 5% early or late, which from the check's
+/// start would reorder the steps half a second apart.
+const STEPS: [(i32, &str, &[Pane]); 22] = [
     (1000, "resize the window", &[Pane::Graph, Pane::Viewer]),
     (2000, "float the viewer", &[Pane::Viewer]),
     (3000, "dock the viewer again", &[Pane::Viewer]),
@@ -51,8 +53,11 @@ const STEPS: [(i32, &str, &[Pane]); 23] = [
         &[Pane::Viewer],
     ),
     (15_000, "close the dialog", &[]),
-    (16_000, "press Tab over the graph", &[]),
-    (16_500, "press Escape in the creation menu", &[]),
+    (
+        16_000,
+        "press Tab over the graph, then Escape in the creation menu",
+        &[],
+    ),
     (
         17_000,
         "choose Exposure in the creation menu",
@@ -101,9 +106,7 @@ thread_local! {
 
 pub fn start(image: PathBuf) {
     IMAGE.with(|cell| *cell.borrow_mut() = image);
-    for (index, &(at, ..)) in STEPS.iter().enumerate() {
-        ffi::single_shot(at, step, index);
-    }
+    ffi::single_shot(STEPS[0].0, step, 0);
 }
 
 /// Records how long an attempt to make a GPU device blocked the GUI thread.
@@ -117,6 +120,10 @@ pub fn retirement_took(duration: Duration) {
 }
 
 fn step(index: usize) {
+    // Before the step, which may wait in a dialog for the next.
+    if let Some(&(next, ..)) = STEPS.get(index + 1) {
+        ffi::single_shot(next - STEPS[index].0, step, index + 1);
+    }
     let checks = Pane::ALL.map(crate::frame_check);
     let finished = checks.map(|check| check.map_or(0, |check| check.finished));
     eprintln!(
@@ -198,33 +205,34 @@ fn step(index: usize) {
             }
             ffi::close_modal_dialog();
         }
-        12 => press_tab_over_the_graph(),
-        13 => {
+        12 => {
+            press_tab_over_the_graph();
+            // At once: a compositor may dismiss a popup that no real input opened.
             if !ffi::popup_open() {
                 fail("Tab over the graph opened no menu".to_owned());
             }
             press_key(qt_key::ESCAPE, "");
         }
-        14 => {
+        13 => {
             if ffi::popup_open() {
                 fail("Escape left the creation menu open".to_owned());
             }
             check_undo_label("Mark", "after the menu was dismissed");
             choose_in_menu("exp");
         }
-        15 => {
+        14 => {
             check_undo_label("Create Exposure", "after Exposure was chosen");
             let exposure = check_inserted_exposure();
             if let Some(exposure) = exposure {
                 edit_stops(exposure);
             }
         }
-        16 => with_panel_dock(|dock| dock.set_floating(true)),
-        17 => {
+        15 => with_panel_dock(|dock| dock.set_floating(true)),
+        16 => {
             with_panel_dock(|dock| dock.close());
         }
-        18 => with_panel_dock(|dock| dock.show()),
-        19 => {
+        17 => with_panel_dock(|dock| dock.show()),
+        18 => {
             let tick = stops_slider().map(|slider| slider.value());
             if tick.is_none() || tick != STOPS_TICK.with(Cell::get) {
                 fail(format!(
@@ -237,8 +245,8 @@ fn step(index: usize) {
             // Returns once the next step cancels the dialog.
             choose_in_menu("read");
         }
-        20 => ffi::close_modal_dialog(),
-        21 => {
+        19 => ffi::close_modal_dialog(),
+        20 => {
             check_undo_label("Stops", "after the Reader's dialog was cancelled");
             let nodes = crate::read_app(|app| app.session().document().nodes().count());
             if nodes != 2 {

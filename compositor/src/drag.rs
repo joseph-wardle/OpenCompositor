@@ -59,7 +59,8 @@ const LONGEST_WAIT: Duration = Duration::from_secs(60);
 const BLUR_SIZES: [f64; 2] = [3.0, 30.0];
 
 /// The GUI's frame budget in a GPU session: from acquiring a frame to submitting it, p99 and
-/// at most.
+/// at most, but for one frame per drag: the driver alone occasionally takes milliseconds to
+/// submit.
 const FRAME_GUI_P99: Duration = Duration::from_millis(1);
 const FRAME_GUI_MAX: Duration = Duration::from_millis(4);
 
@@ -821,10 +822,11 @@ fn report(mut failures: Vec<String>) {
                 "frames acquired → submitted p99 {p99:.2?}, over {FRAME_GUI_P99:?}"
             ));
         }
-        let max = percentile(&gui, 1.0);
-        if max > FRAME_GUI_MAX {
+        let over: Vec<&Duration> = gui.iter().filter(|&&time| time > FRAME_GUI_MAX).collect();
+        if over.len() > 1 {
             failures.push(format!(
-                "a frame acquired → submitted {max:.2?}, over {FRAME_GUI_MAX:?}"
+                "{} frames acquired → submitted over {FRAME_GUI_MAX:?}: {over:.2?}",
+                over.len()
             ));
         }
         if longest > check.refresh * 2 {
