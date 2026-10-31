@@ -315,6 +315,19 @@ pub enum Input {
     },
 }
 
+/// What the viewer shows, as [`App::displayed`] describes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Displayed {
+    /// The node the image is of, which the viewer may no longer mark.
+    pub node: NodeId,
+    /// The frame the image is of.
+    pub frame: f64,
+    /// The session's frame, which the viewer is following.
+    pub requested: f64,
+    /// Whether the frame failed, and shows no image.
+    pub failed: bool,
+}
+
 /// What the viewer shows.
 #[derive(Debug)]
 enum Shown {
@@ -654,10 +667,11 @@ impl App {
             return;
         }
         self.panel_followed = followed;
+        let frame = self.session.frame();
         let panel = match self.pinned {
-            Some(pinned) => Panel::of(document, pinned, true),
+            Some(pinned) => Panel::of(document, pinned, true, frame),
             None => (document.selection().last())
-                .and_then(|&current| Panel::of(document, current, false)),
+                .and_then(|&current| Panel::of(document, current, false, frame)),
         };
         if panel != self.panel {
             self.panel.clone_from(&panel);
@@ -668,6 +682,18 @@ impl App {
     /// The parameter panel as last shown.
     pub fn panel(&self) -> Option<&Panel> {
         self.panel.as_ref()
+    }
+
+    /// What the viewer shows, if anything: the frame of the image, which may not be the frame
+    /// asked for while the asked-for one is evaluated.
+    pub fn displayed(&self) -> Option<Displayed> {
+        let wanted = self.shown.wanted()?;
+        Some(Displayed {
+            node: wanted.node,
+            frame: wanted.frame,
+            requested: self.session.frame(),
+            failed: matches!(self.shown, Shown::Failed { .. }),
+        })
     }
 
     /// Whether the panes cannot draw, and how many GPU errors there were, which the status bar
@@ -1078,7 +1104,9 @@ impl App {
     /// progress never blanks the viewer. What is not shown is dropped, which returns its staging
     /// buffer to the worker.
     fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
-        let Evaluated { wanted, result, .. } = evaluated;
+        let Evaluated {
+            mut wanted, result, ..
+        } = evaluated;
         // Not the node's failure, nor shown: the CPU evaluates the request again, and the last
         // frame stays until it does. One evaluated on the GPU before a move to the CPU may
         // still arrive.
@@ -1103,6 +1131,10 @@ impl App {
         }
         // What was sent is current: the viewer follows every change before this runs.
         let current = (self.sent.as_ref()).is_some_and(|sent| sent.key == wanted.key);
+        // A current image is the current frame's, whichever frame asked for it.
+        if let Some(sent) = self.sent.as_ref().filter(|_| current) {
+            wanted.frame = sent.frame;
+        }
         let graph_changed = match &result {
             Err(ViewerError::Eval(error)) => self.session.record_failure(error.origin()),
             // What the GPU cannot hold is the viewer's limitation, not the node's failure.
@@ -1141,10 +1173,11 @@ impl App {
         requests
     }
 
-    /// The node the viewer's slot marks, and its key.
+    /// The node the viewer's slot marks, and its key at the current frame.
     fn wanted(&self) -> Option<(NodeId, ResultKey)> {
         let node = self.session.viewed()?;
-        let key = result_key(self.session.document(), self.session.reloads(), node)?;
+        let session = &self.session;
+        let key = result_key(session.document(), session.reloads(), node, session.frame())?;
         Some((node, key))
     }
 
@@ -1174,13 +1207,28 @@ impl App {
         // Compared with what was sent, not with what is shown: a key already shown is sent again
         // so that the worker releases what the last request retained, and stops working on it.
         // Nothing is sent too, which releases everything.
+        let frame = self.session.frame();
         let sent = (self.sent.as_ref()).map(|sent| (sent.node, &sent.key));
         if wanted.as_ref().map(|(node, key)| (*node, key)) != sent {
             self.requests_sent += 1;
             let number = self.requests_sent;
-            let wanted = wanted.map(|(node, key)| Wanted { node, key, number });
+            let wanted = wanted.map(|(node, key)| Wanted {
+                node,
+                key,
+                frame,
+                number,
+            });
             self.worker.request(wanted.clone());
             self.sent = wanted;
+        } else if let Some(sent) = &mut self.sent {
+            // Another frame with an equal key is not asked for: its image is the same, and what
+            // is shown of the key is that frame's.
+            sent.frame = frame;
+            if let Shown::Image { wanted, .. } | Shown::Failed { wanted, .. } = &mut self.shown
+                && wanted.key == sent.key
+            {
+                wanted.frame = frame;
+            }
         }
     }
 
@@ -1287,7 +1335,7 @@ impl App {
             // The previous image stays until then.
             _ => details.push("updating…".to_owned()),
         }
-        for (id, what) in missing(document, viewed) {
+        for (id, what) in missing(document, viewed, self.session.frame()) {
             let (label, lack) = match what {
                 Missing::Input(input) => (input.label, "is not connected"),
                 Missing::File(parameter) => (parameter.label, "is not set"),

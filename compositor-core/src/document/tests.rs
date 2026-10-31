@@ -154,7 +154,7 @@ fn what_is_missing_is_found_up_the_chain() {
         .assign_inputs(&[connect(3, 2), connect(1, 0)])
         .unwrap();
     let names = |document: &Document, id: u64| -> Vec<(u64, &str)> {
-        (missing(document, NodeId(id)).into_iter())
+        (missing(document, NodeId(id), 1.0).into_iter())
             .map(|(node, missing)| match missing {
                 Missing::Input(input) => (node.0, input.name),
                 Missing::File(parameter) => (node.0, parameter.name),
@@ -266,15 +266,15 @@ fn an_input_has_only_the_slots_its_kind_declares() {
 #[test]
 fn a_merge_is_never_missing_an_input_but_reports_what_is_missing_through_its_slots() {
     let document = document_with_merge();
-    assert!(missing(&document, NodeId(2)).is_empty());
+    assert!(missing(&document, NodeId(2), 1.0).is_empty());
     let document = document.assign_inputs(&[layer(2, 2, 0)]).unwrap();
-    assert!(missing(&document, NodeId(2)).is_empty());
+    assert!(missing(&document, NodeId(2), 1.0).is_empty());
 
     let mut unset = document.clone();
     let reader = unset.nodes.get_mut(&NodeId(0)).unwrap();
     Arc::make_mut(reader).reset("file").unwrap();
     assert_eq!(
-        missing(&unset, NodeId(2)),
+        missing(&unset, NodeId(2), 1.0),
         [(NodeId(0), Missing::File(&READER_V1[0]))]
     );
 }

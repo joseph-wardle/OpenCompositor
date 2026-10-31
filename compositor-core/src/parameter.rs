@@ -164,7 +164,10 @@ impl Resolved {
 ///
 /// Setting a value equal to its default and resetting it resolve alike, though only the first
 /// keeps the value authored.
-pub fn resolve(node: &Node) -> Resolved {
+///
+/// Values are resolved at a frame, so that animated values can be sampled there; until a
+/// parameter can be animated, every value is the same at every frame.
+pub fn resolve(node: &Node, _time: f64) -> Resolved {
     let values = node
         .kind
         .parameters()

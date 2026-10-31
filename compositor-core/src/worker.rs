@@ -42,12 +42,14 @@ impl fmt::Display for EvaluationDevice {
     }
 }
 
-/// What the viewer asks the worker for: the image of the node its slot marks, as that node's key
-/// stood when asked. The app numbers its requests in the order it sends them.
+/// What the viewer asks the worker for: the image of the node its slot marks at a frame, as that
+/// node's key stood when asked. The app numbers its requests in the order it sends them.
 #[derive(Clone, Debug)]
 pub(crate) struct Wanted {
     pub(crate) node: NodeId,
     pub(crate) key: ResultKey,
+    /// Not the key's: the worker evaluates the key, and the frame says what its image is of.
+    pub(crate) frame: f64,
     pub(crate) number: u64,
 }
 

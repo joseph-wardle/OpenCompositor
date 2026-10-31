@@ -280,25 +280,39 @@ impl Recipe {
     }
 }
 
-/// The key of a node's image in the document as it stands, or `None` if the document has no
-/// such node.
+/// The key of a node's image at a frame in the document as it stands, or `None` if the document
+/// has no such node.
+///
+/// A key holds what the frame resolves to, not the frame, so a branch that is the same at two
+/// frames has equal keys at both and its image is computed once. Building one never reads the
+/// filesystem.
 ///
 /// Each upstream node is visited once, however many nodes take its image, and without recursion,
 /// however deep the chain.
-pub fn result_key(document: &Document, reloads: &Reloads, node: NodeId) -> Option<ResultKey> {
+pub fn result_key(
+    document: &Document,
+    reloads: &Reloads,
+    node: NodeId,
+    time: f64,
+) -> Option<ResultKey> {
     document.node(node)?;
-    keys(document, reloads, [node]).remove(&node)
+    keys(document, reloads, time, [node]).remove(&node)
 }
 
-/// The key of every node in the document, each upstream node visited once.
-pub(crate) fn result_keys(document: &Document, reloads: &Reloads) -> BTreeMap<NodeId, ResultKey> {
-    keys(document, reloads, document.nodes().map(|(id, _)| id))
+/// The key of every node in the document at a frame, each upstream node visited once.
+pub(crate) fn result_keys(
+    document: &Document,
+    reloads: &Reloads,
+    time: f64,
+) -> BTreeMap<NodeId, ResultKey> {
+    keys(document, reloads, time, document.nodes().map(|(id, _)| id))
 }
 
 /// The keys of existing nodes and of everything upstream of them.
 fn keys(
     document: &Document,
     reloads: &Reloads,
+    time: f64,
     nodes: impl IntoIterator<Item = NodeId>,
 ) -> BTreeMap<NodeId, ResultKey> {
     let mut built: BTreeMap<NodeId, ResultKey> = BTreeMap::new();
@@ -315,15 +329,20 @@ fn keys(
         }
         pending.pop();
         if !built.contains_key(&id) {
-            let key = ResultKey(Arc::new(recipe(current, reloads, &built)));
+            let key = ResultKey(Arc::new(recipe(current, reloads, time, &built)));
             built.insert(id, key);
         }
     }
     built
 }
 
-/// A node's recipe, from the keys of its inputs.
-fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -> Recipe {
+/// A node's recipe at a frame, from the keys of its inputs at that frame.
+fn recipe(
+    node: &Node,
+    reloads: &Reloads,
+    time: f64,
+    built: &BTreeMap<NodeId, ResultKey>,
+) -> Recipe {
     let key_of = |source: NodeId| -> ResultKey {
         built
             .get(&source)
@@ -331,9 +350,10 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
             .clone()
     };
     let input = |input: InputSlot<'_>| node.input(input).map(key_of);
+    let resolved = resolve(node, time);
     match &node.kind {
         NodeKind::Reader { version } => {
-            let path = resolve(node).file("file").cloned();
+            let path = resolved.file("file").cloned();
             Recipe::Reader {
                 version: *version,
                 reload: path.as_deref().map_or(0, |path| reloads.count(path)),
@@ -341,7 +361,7 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
             }
         }
         NodeKind::Exposure { version } => {
-            let stops = resolve(node).float("stops").expect("Exposure has Stops");
+            let stops = resolved.float("stops").expect("Exposure has Stops");
             Recipe::Exposure {
                 version: *version,
                 stops: stops.to_bits(),
@@ -349,7 +369,7 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
             }
         }
         NodeKind::Merge { version } => {
-            let mix = resolve(node).float("mix").expect("Merge has Mix");
+            let mix = resolved.float("mix").expect("Merge has Mix");
             Recipe::Merge {
                 version: *version,
                 mix: mix.to_bits(),
@@ -361,7 +381,7 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
             }
         }
         NodeKind::Blur { version } => {
-            let size = resolve(node).float("size").expect("Blur has Size");
+            let size = resolved.float("size").expect("Blur has Size");
             Recipe::Blur {
                 version: *version,
                 size: size.to_bits(),
@@ -400,7 +420,8 @@ const NODE_BYTES_CAP: u64 = 1 << 30;
 /// Operations run on the evaluator's own threads, a chunk of rows at a time, and a request's
 /// outputs take the planes of the results it releases before making new ones.
 ///
-/// Time is fixed, the whole data window is computed and every channel produced.
+/// A key is one frame's, so the evaluator never sees time. The whole data window is computed and
+/// every channel produced.
 #[derive(Debug)]
 pub struct Evaluator {
     retained: Vec<Retained>,

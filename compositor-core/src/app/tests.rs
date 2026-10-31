@@ -54,7 +54,7 @@ fn input(pane: Pane, input: Input) -> Event {
 
 fn file(app: &App, id: NodeId) -> Option<Arc<Path>> {
     let node = app.session().document().node(id)?;
-    resolve(node).file("file").cloned()
+    resolve(node, 1.0).file("file").cloned()
 }
 
 /// Creates a Reader for the path, selected, and returns it.
@@ -825,7 +825,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     assert_eq!(app.caption, "Slot 2 · Exposure · updating… · CPU");
     let key = |app: &App, id| {
         let session = app.session();
-        result_key(session.document(), session.reloads(), id).unwrap()
+        result_key(session.document(), session.reloads(), id, session.frame()).unwrap()
     };
     let requests = app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
@@ -1462,4 +1462,55 @@ fn working_values_read_with_four_decimals_or_an_exponent() {
     for (value, text) in cases {
         assert_eq!(working_value(value), text, "{value}");
     }
+}
+
+#[test]
+fn displayed_names_the_frame_its_image_is_of() {
+    let (mut app, _deliveries) = app();
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    let exposure = create_exposure(&mut app);
+    app.session.connect(exposure, "source", reader).unwrap();
+    app.dispatch(slot_key(1, CTRL));
+    assert_eq!(app.displayed(), None);
+    let first = sent(&app);
+    app.dispatch(read(&first, 4, 4));
+    let shown = |frame, requested| {
+        Some(Displayed {
+            node: exposure,
+            frame,
+            requested,
+            failed: false,
+        })
+    };
+    assert_eq!(app.displayed(), shown(1.0, 1.0));
+
+    // Another frame whose key is the same is not asked for: what is shown is its image.
+    app.edit(|session| session.set_frame(5.0).unwrap());
+    assert_eq!(sent(&app).number, first.number);
+    assert_eq!(app.displayed(), shown(5.0, 5.0));
+
+    // An edit at another frame shows the frame asked for before, until its image arrives.
+    app.edit(|session| {
+        session.set_frame(9.0).unwrap();
+        session
+            .set_value(exposure, "stops", Value::Float(1.0))
+            .unwrap();
+    });
+    let second = sent(&app);
+    assert_eq!(second.frame, 9.0);
+    assert_eq!(app.displayed(), shown(5.0, 9.0));
+    app.dispatch(read(&second, 4, 4));
+    assert_eq!(app.displayed(), shown(9.0, 9.0));
+}
+
+#[test]
+fn an_image_finishing_after_a_move_to_a_frame_with_its_key_is_shown_as_that_frame() {
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let first = sent(&app);
+    app.edit(|session| session.set_frame(30.0).unwrap());
+
+    app.dispatch(read(&first, 4, 4));
+    assert_eq!(app.displayed().map(|shown| shown.frame), Some(30.0));
 }

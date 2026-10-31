@@ -131,7 +131,7 @@ pub(crate) fn chain(nodes: impl IntoIterator<Item = Node>) -> Document {
 }
 
 pub(crate) fn key(document: &Document, id: u64) -> ResultKey {
-    result_key(document, &Reloads::default(), NodeId(id)).unwrap()
+    result_key(document, &Reloads::default(), NodeId(id), 1.0).unwrap()
 }
 
 /// An image of these planes over `width` × `height`, as a reader would make it.
@@ -218,10 +218,10 @@ fn an_unconnected_input_keys_apart_from_any_connection() {
 fn reloading_a_path_changes_the_key_of_everything_downstream_of_it() {
     let document = chain([reader("a.exr"), exposure(None), reader("b.exr")]);
     let mut reloads = Reloads::default();
-    let before = |id| result_key(&document, &Reloads::default(), NodeId(id));
+    let before = |id| result_key(&document, &Reloads::default(), NodeId(id), 1.0);
 
     reloads.reload(Path::new("a.exr").into());
-    let after = |id| result_key(&document, &reloads, NodeId(id));
+    let after = |id| result_key(&document, &reloads, NodeId(id), 1.0);
     assert_ne!(after(1), before(1));
     assert_ne!(after(2), before(2));
     assert_eq!(after(3), before(3));
@@ -231,7 +231,10 @@ fn reloading_a_path_changes_the_key_of_everything_downstream_of_it() {
 #[test]
 fn a_missing_node_has_no_key() {
     let document = chain([reader("a.exr")]);
-    assert_eq!(result_key(&document, &Reloads::default(), NodeId(2)), None);
+    assert_eq!(
+        result_key(&document, &Reloads::default(), NodeId(2), 1.0),
+        None
+    );
 }
 
 #[test]
@@ -378,7 +381,7 @@ fn a_stops_edit_reuses_the_read_and_reload_reads_again() {
     let mut reloads = Reloads::default();
     reloads.reload(path.as_path().into());
     let document = chain([reader(&path), exposure(Some(2.0))]);
-    let reloaded = result_key(&document, &reloads, NodeId(2)).unwrap();
+    let reloaded = result_key(&document, &reloads, NodeId(2), 1.0).unwrap();
     assert_eq!(red(&run(&mut evaluator, &reloaded).unwrap()), 0.0);
 }
 

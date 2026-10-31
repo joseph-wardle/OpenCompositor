@@ -19,7 +19,8 @@ pub struct Panel {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub parameter: &'static Parameter,
-    /// What evaluation reads: the authored value or the default, or none for a file not set.
+    /// What evaluation reads at the frame: the authored value or the default, or none for a file
+    /// not set.
     pub value: Option<Value>,
     pub state: ValueState,
 }
@@ -33,10 +34,10 @@ pub enum ValueState {
 }
 
 impl Panel {
-    /// The node's panel, or `None` if the document has no such node.
-    pub(crate) fn of(document: &Document, node: NodeId, pinned: bool) -> Option<Panel> {
+    /// The node's panel at a frame, or `None` if the document has no such node.
+    pub(crate) fn of(document: &Document, node: NodeId, pinned: bool, time: f64) -> Option<Panel> {
         let shown = document.node(node)?;
-        let resolved = resolve(shown);
+        let resolved = resolve(shown, time);
         let rows = (shown.kind.parameters().iter())
             .map(|parameter| Row {
                 parameter,

@@ -26,11 +26,13 @@ pub mod bench {
     pub use crate::kernels::cpu::{Level, Stopped, fold, line, map, map_span};
 }
 
-pub use app::{Anchor, App, Command, Event, FileIntent, Input, Key, Notice, Pane, Request};
+pub use app::{
+    Anchor, App, Command, Displayed, Event, FileIntent, Input, Key, Notice, Pane, Request,
+};
 pub use document::{
     Assignment, BlurVersion, Changes, ConnectionError, Document, ExposureVersion, InputSlot,
     MAX_SLOTS, MergeVersion, Missing, Node, NodeId, NodeInput, NodeKind, NodeType, ReaderVersion,
-    Slot, missing, node_types,
+    Slot, Timeline, TimelineError, missing, node_types,
 };
 pub use evaluate::{
     DeviceLost, EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, Reloads, ResultKey,

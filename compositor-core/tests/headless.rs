@@ -35,7 +35,8 @@ fn reader(session: &mut Session, path: PathBuf) -> NodeId {
 
 /// The node's image as the session's document and reloads describe it.
 fn evaluate(evaluator: &mut Evaluator, session: &Session, id: NodeId) -> Result<Image, EvalError> {
-    let key = result_key(session.document(), session.reloads(), id).expect("the node exists");
+    let key = result_key(session.document(), session.reloads(), id, session.frame())
+        .expect("the node exists");
     evaluator
         .evaluate(&key, || false)
         .expect("nothing stops it")
@@ -88,12 +89,15 @@ fn evaluation_reports_what_went_wrong_and_where() {
     );
     assert_eq!(
         Some(error.origin()),
-        result_key(session.document(), session.reloads(), id).as_ref()
+        result_key(session.document(), session.reloads(), id, session.frame()).as_ref()
     );
     assert!(error.to_string().contains("missing.exr"), "{error}");
 
     session.delete_nodes(&[id]).unwrap();
-    assert_eq!(result_key(session.document(), session.reloads(), id), None);
+    assert_eq!(
+        result_key(session.document(), session.reloads(), id, session.frame()),
+        None
+    );
 }
 
 #[test]
@@ -116,4 +120,36 @@ fn an_exposure_node_scales_its_source_by_its_stops() {
         assert_eq!(pixel(&image), [expected, expected, expected, 1.0]);
     }
     session.finish_edit();
+}
+
+#[test]
+fn a_still_image_is_read_once_for_every_frame_until_something_upstream_changes() {
+    let white = directory("still").join("white.png");
+    write_png(&white, 255);
+    let mut session = Session::new();
+    let mut evaluator = Evaluator::new();
+    let source = reader(&mut session, white.clone());
+    let exposure = create_exposure(&mut session);
+    session.connect(exposure, "source", source).unwrap();
+    evaluate(&mut evaluator, &session, exposure).unwrap();
+
+    // Gone from disk, the file is not read again at other frames: their keys are the same.
+    std::fs::remove_file(&white).unwrap();
+    for frame in [2.0, -40.0, 1001.0] {
+        session.set_frame(frame).unwrap();
+        let image = evaluate(&mut evaluator, &session, exposure).unwrap();
+        assert_eq!(pixel(&image), [1.0; 4]);
+    }
+
+    // An edit downstream of the Reader computes again from what it read.
+    session
+        .set_value(exposure, "stops", Value::Float(1.0))
+        .unwrap();
+    let image = evaluate(&mut evaluator, &session, exposure).unwrap();
+    assert_eq!(pixel(&image), [2.0, 2.0, 2.0, 1.0]);
+
+    // Reloading changes the Reader's key at every frame, so it reads the file again.
+    session.reload(&[source]);
+    let error = evaluate(&mut evaluator, &session, exposure).unwrap_err();
+    assert!(matches!(error, EvalError::Read { .. }), "{error:?}");
 }

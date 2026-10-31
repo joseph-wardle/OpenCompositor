@@ -377,11 +377,12 @@ impl Node {
     /// What the artist calls the node: a Reader's file name, or the node's kind.
     pub fn name(&self) -> String {
         match &self.kind {
-            NodeKind::Reader { .. } => match resolve(self).file("file") {
-                Some(path) => (path.file_name().unwrap_or(path.as_os_str()))
+            // A file is never a default, so the authored value is the one every frame reads.
+            NodeKind::Reader { .. } => match self.authored_value("file") {
+                Some(Value::File(path)) => (path.file_name().unwrap_or(path.as_os_str()))
                     .to_string_lossy()
                     .into_owned(),
-                None => self.kind.label().to_owned(),
+                Some(Value::Float(_)) | None => self.kind.label().to_owned(),
             },
             NodeKind::Exposure { .. } | NodeKind::Merge { .. } | NodeKind::Blur { .. } => {
                 self.kind.label().to_owned()
@@ -444,13 +445,13 @@ pub enum Missing {
     File(&'static Parameter),
 }
 
-/// Everything missing on the node and upstream of it: the node's own first, its files before its
-/// inputs, each in declaration order, and each upstream node once, without recursion. Empty if
-/// the document has no such node.
+/// Everything missing on the node and upstream of it at a frame: the node's own first, its files
+/// before its inputs, each in declaration order, and each upstream node once, without recursion.
+/// Empty if the document has no such node.
 ///
 /// What is missing gives the empty image, so this, not the image, says what is incomplete. An
 /// input a node makes do without, such as a Merge's slots, is never missing.
-pub fn missing(document: &Document, node: NodeId) -> Vec<(NodeId, Missing)> {
+pub fn missing(document: &Document, node: NodeId, time: f64) -> Vec<(NodeId, Missing)> {
     let mut missing = Vec::new();
     let mut visited = BTreeSet::new();
     let mut pending = vec![node];
@@ -458,7 +459,7 @@ pub fn missing(document: &Document, node: NodeId) -> Vec<(NodeId, Missing)> {
         let Some(current) = document.node(id).filter(|_| visited.insert(id)) else {
             continue;
         };
-        let resolved = resolve(current);
+        let resolved = resolve(current, time);
         for parameter in current.kind.parameters() {
             if matches!(parameter.kind, ParameterKind::File)
                 && resolved.get(parameter.name).is_none()
@@ -478,8 +479,94 @@ pub fn missing(document: &Document, node: NodeId) -> Vec<(NodeId, Missing)> {
     missing
 }
 
+/// The frames a project spans and the rate it plays at; with USD, a stage's `startTimeCode`,
+/// `endTimeCode` and `framesPerSecond`. Frames are `f64`, as USD's time codes are, and may be
+/// negative.
+///
+/// The rate only paces playback. A source's own rate is never used to retime it, and the range
+/// bounds neither the current frame nor what a source can read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Timeline {
+    first: f64,
+    last: f64,
+    /// Frames per second.
+    rate: f64,
+}
+
+impl Default for Timeline {
+    fn default() -> Timeline {
+        Timeline {
+            first: 1.0,
+            last: 100.0,
+            rate: 24.0,
+        }
+    }
+}
+
+impl Timeline {
+    pub fn first(&self) -> f64 {
+        self.first
+    }
+
+    pub fn last(&self) -> f64 {
+        self.last
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    /// This timeline spanning other frames, refused unless both are finite and the last is not
+    /// before the first.
+    pub fn with_range(self, first: f64, last: f64) -> Result<Timeline, TimelineError> {
+        if !first.is_finite() || !last.is_finite() {
+            return Err(TimelineError::NotFinite);
+        }
+        if last < first {
+            return Err(TimelineError::LastBeforeFirst);
+        }
+        // Adding zero stores -0 as 0, as parameter values are.
+        Ok(Timeline {
+            first: first + 0.0,
+            last: last + 0.0,
+            ..self
+        })
+    }
+
+    /// This timeline playing at another rate, refused unless it is finite and positive.
+    pub fn with_rate(self, rate: f64) -> Result<Timeline, TimelineError> {
+        if !rate.is_finite() {
+            return Err(TimelineError::NotFinite);
+        }
+        if rate <= 0.0 {
+            return Err(TimelineError::RateNotPositive);
+        }
+        Ok(Timeline { rate, ..self })
+    }
+}
+
+/// Why a timeline was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineError {
+    NotFinite,
+    LastBeforeFirst,
+    RateNotPositive,
+}
+
+impl fmt::Display for TimelineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TimelineError::NotFinite => write!(f, "the value is not a finite number"),
+            TimelineError::LastBeforeFirst => write!(f, "the last frame is before the first"),
+            TimelineError::RateNotPositive => write!(f, "the rate is not above zero"),
+        }
+    }
+}
+
+impl std::error::Error for TimelineError {}
+
 /// Everything undo restores, and nothing else. Decoded images, GPU resources, Qt objects, the ID
-/// counter and viewer state stay out of it.
+/// counter, the current frame and viewer state stay out of it.
 ///
 /// Persistent maps of shared nodes make a copy one pointer copy, and an edit copies only the
 /// nodes it changes.
@@ -491,6 +578,7 @@ pub struct Document {
     pub(crate) selection: Arc<[NodeId]>,
     /// Each names a node the document has: deleting a node clears its marks.
     pub(crate) marks: [Option<NodeId>; Slot::COUNT],
+    pub(crate) timeline: Timeline,
 }
 
 impl Document {
@@ -505,6 +593,10 @@ impl Document {
 
     pub fn selection(&self) -> &[NodeId] {
         &self.selection
+    }
+
+    pub fn timeline(&self) -> Timeline {
+        self.timeline
     }
 
     /// The node marked in a slot.
@@ -658,6 +750,7 @@ impl Document {
             nodes,
             selection: !Arc::ptr_eq(&self.selection, &after.selection)
                 && self.selection != after.selection,
+            timeline: self.timeline != after.timeline,
         }
     }
 }
@@ -740,17 +833,20 @@ pub struct Changes {
     /// Nodes added, removed, or changed in content, position or marks.
     pub nodes: BTreeSet<NodeId>,
     pub selection: bool,
+    /// The frame range or the rate.
+    pub timeline: bool,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && !self.selection
+        self.nodes.is_empty() && !self.selection && !self.timeline
     }
 
     /// Adds what a later change touched.
     pub(crate) fn extend(&mut self, later: Changes) {
         self.nodes.extend(later.nodes);
         self.selection |= later.selection;
+        self.timeline |= later.timeline;
     }
 }
 
