@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use open_ng::Point;
 use opencompositor_core::{
-    Channel, EvalError, Evaluator, Image, NodeId, ReadError, Session, Value, result_key,
+    Channel, EvalError, Evaluator, Image, Missing, NodeId, ReadError, Scan, Session, Value, held,
+    missing, result_key,
 };
 
 /// A directory of this test's own, emptied first.
@@ -35,7 +36,7 @@ fn reader(session: &mut Session, path: PathBuf) -> NodeId {
 
 /// The node's image as the session's document and reloads describe it.
 fn evaluate(evaluator: &mut Evaluator, session: &Session, id: NodeId) -> Result<Image, EvalError> {
-    let key = result_key(session.document(), session.reloads(), id, session.frame())
+    let key = result_key(session.document(), session.files(), id, session.frame())
         .expect("the node exists");
     evaluator
         .evaluate(&key, || false)
@@ -89,13 +90,13 @@ fn evaluation_reports_what_went_wrong_and_where() {
     );
     assert_eq!(
         Some(error.origin()),
-        result_key(session.document(), session.reloads(), id, session.frame()).as_ref()
+        result_key(session.document(), session.files(), id, session.frame()).as_ref()
     );
     assert!(error.to_string().contains("missing.exr"), "{error}");
 
     session.delete_nodes(&[id]).unwrap();
     assert_eq!(
-        result_key(session.document(), session.reloads(), id, session.frame()),
+        result_key(session.document(), session.files(), id, session.frame()),
         None
     );
 }
@@ -149,7 +150,169 @@ fn a_still_image_is_read_once_for_every_frame_until_something_upstream_changes()
     assert_eq!(pixel(&image), [2.0, 2.0, 2.0, 1.0]);
 
     // Reloading changes the Reader's key at every frame, so it reads the file again.
-    session.reload(&[source]);
+    assert!(session.reload(&[source]).sequences.is_empty());
     let error = evaluate(&mut evaluator, &session, exposure).unwrap_err();
     assert!(matches!(error, EvalError::Read { .. }), "{error:?}");
+}
+
+/// Writes a frame of a sequence as an image whose width tells which frame it is.
+fn write_frame(directory: &Path, frame: i64) {
+    write_frame_wide(directory, frame, width(frame));
+}
+
+fn write_frame_wide(directory: &Path, frame: i64, width: u32) {
+    let path = directory.join(format!("plate.{frame:04}.png"));
+    let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), width, 1);
+    encoder.set_color(png::ColorType::Grayscale);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&vec![0; width as usize]).unwrap();
+    writer.finish().unwrap();
+}
+
+fn width(frame: i64) -> u32 {
+    (frame + 10) as u32
+}
+
+/// Records a scan of every sequence the session reads that has none, as the app does off the GUI
+/// thread.
+fn scan_unscanned(session: &mut Session) {
+    for sequence in session.unscanned() {
+        let scan = Scan::of(&sequence).unwrap();
+        session.record_scan(&sequence, scan);
+    }
+}
+
+/// The width of the node's image at a frame, which names the frame of a sequence read.
+fn width_at(evaluator: &mut Evaluator, session: &mut Session, id: NodeId, frame: f64) -> u32 {
+    session.set_frame(frame).unwrap();
+    evaluate(evaluator, session, id)
+        .unwrap()
+        .data_window()
+        .width
+}
+
+fn key_at(session: &mut Session, id: NodeId, frame: f64) -> opencompositor_core::ResultKey {
+    session.set_frame(frame).unwrap();
+    result_key(session.document(), session.files(), id, frame).unwrap()
+}
+
+#[test]
+fn a_sequence_reads_the_frame_its_offset_maps_the_time_to_and_holds_its_ends() {
+    let directory = directory("sequence");
+    for frame in [-1, 0, 1, 2, 4] {
+        write_frame(&directory, frame);
+    }
+    let mut session = Session::new();
+    let mut evaluator = Evaluator::new();
+    let id = reader(&mut session, directory.join("plate.%04d.png"));
+
+    // Until scanned, each frame reads its own file, with nothing held.
+    session.set_frame(10.0).unwrap();
+    let error = evaluate(&mut evaluator, &session, id).unwrap_err();
+    assert!(error.to_string().contains("plate.0010.png"), "{error}");
+    assert_eq!(session.unscanned().len(), 1);
+    scan_unscanned(&mut session);
+    assert!(session.unscanned().is_empty());
+
+    for (frame, read) in [
+        (-5.0, -1),
+        (-1.0, -1),
+        (0.0, 0),
+        (2.0, 2),
+        (4.0, 4),
+        (10.0, 4),
+    ] {
+        let shown = width_at(&mut evaluator, &mut session, id, frame);
+        assert_eq!(shown, width(read), "{frame}");
+        let holds = held(session.document(), session.files(), id, frame);
+        let expected = if frame == read as f64 {
+            vec![]
+        } else {
+            vec![(id, read)]
+        };
+        assert_eq!(holds, expected, "{frame}");
+    }
+    // A held frame is the end's image.
+    assert_eq!(
+        key_at(&mut session, id, 10.0),
+        key_at(&mut session, id, 4.0)
+    );
+
+    // Inside the range, a frame the scan did not find is that frame's error.
+    session.set_frame(3.0).unwrap();
+    let missed = missing(session.document(), session.files(), id, 3.0);
+    assert_eq!(missed, [(id, Missing::Frame(3))]);
+    let error = evaluate(&mut evaluator, &session, id).unwrap_err();
+    assert!(
+        matches!(&error, EvalError::Read { error: ReadError::Io(io), .. } if io.kind() == std::io::ErrorKind::NotFound),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("plate.0003.png"), "{error}");
+
+    // File frame 1 shows at frame 11 with an offset of 10.
+    session.set_value(id, "offset", Value::Float(10.0)).unwrap();
+    assert_eq!(width_at(&mut evaluator, &mut session, id, 11.0), width(1));
+    assert_eq!(width_at(&mut evaluator, &mut session, id, 0.0), width(-1));
+}
+
+#[test]
+fn first_and_last_trim_the_range_until_reset_to_follow_the_scan() {
+    let directory = directory("trimmed");
+    for frame in 1..=5 {
+        write_frame(&directory, frame);
+    }
+    let mut session = Session::new();
+    let mut evaluator = Evaluator::new();
+    let id = reader(&mut session, directory.join("plate.####.png"));
+    scan_unscanned(&mut session);
+
+    session.set_value(id, "first", Value::Float(2.0)).unwrap();
+    session.set_value(id, "last", Value::Float(4.0)).unwrap();
+    assert_eq!(width_at(&mut evaluator, &mut session, id, 1.0), width(2));
+    assert_eq!(width_at(&mut evaluator, &mut session, id, 5.0), width(4));
+
+    session.reset_value(id, "last").unwrap();
+    assert_eq!(width_at(&mut evaluator, &mut session, id, 5.0), width(5));
+
+    // Set before the frames found, First makes the frames between missing.
+    session.set_value(id, "first", Value::Float(0.0)).unwrap();
+    let missed = missing(session.document(), session.files(), id, -3.0);
+    assert_eq!(missed, [(id, Missing::Frame(0))]);
+}
+
+#[test]
+fn reload_files_rescans_and_reads_again_only_the_frames_that_changed() {
+    let directory = directory("reloaded");
+    for frame in [1, 2, 5] {
+        write_frame(&directory, frame);
+    }
+    let mut session = Session::new();
+    let mut evaluator = Evaluator::new();
+    let id = reader(&mut session, directory.join("plate.####.png"));
+    scan_unscanned(&mut session);
+    let before = [1.0, 2.0, 5.0].map(|frame| key_at(&mut session, id, frame));
+    assert_eq!(width_at(&mut evaluator, &mut session, id, 1.0), width(1));
+
+    write_frame_wide(&directory, 1, 40);
+    std::fs::remove_file(directory.join("plate.0002.png")).unwrap();
+    write_frame(&directory, 3);
+    // Unseen until reloaded: keys never look at the disk.
+    assert_eq!(key_at(&mut session, id, 1.0), before[0]);
+    assert_eq!(width_at(&mut evaluator, &mut session, id, 1.0), width(1));
+
+    let reload = session.reload(&[id]);
+    assert!(reload.stills.is_empty());
+    for sequence in reload.sequences {
+        let scan = Scan::of(&sequence).unwrap();
+        assert_eq!(session.record_scan(&sequence, scan), Some(3));
+    }
+
+    let after = [1.0, 2.0, 5.0].map(|frame| key_at(&mut session, id, frame));
+    assert_ne!(after[0], before[0]);
+    assert_ne!(after[1], before[1]);
+    assert_eq!(after[2], before[2]);
+    assert_eq!(width_at(&mut evaluator, &mut session, id, 1.0), 40);
+    assert_eq!(width_at(&mut evaluator, &mut session, id, 3.0), width(3));
+    let missed = missing(session.document(), session.files(), id, 2.0);
+    assert_eq!(missed, [(id, Missing::Frame(2))]);
 }

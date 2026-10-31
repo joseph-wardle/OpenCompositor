@@ -8,6 +8,7 @@ use imbl::OrdMap;
 use imbl::ordmap::DiffItem;
 use open_ng::Point;
 
+use crate::files::{Files, Reading, reading};
 use crate::parameter::{
     FloatParameter, Parameter, ParameterKind, Value, ValueError, describe, resolve, validate,
 };
@@ -49,7 +50,9 @@ impl Slot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
-    /// Reads the image file its File names. Without one it gives the empty image.
+    /// Reads the image file its File names, or for a sequence the frame at the time less its
+    /// Offset, holding the nearest end of its range, from First to Last, outside it. Without a
+    /// file it gives the empty image.
     Reader { version: ReaderVersion },
     /// Multiplies R, G and B by two to the power of its Stops and leaves A. On premultiplied
     /// pixels that equals unpremultiplying, scaling and premultiplying again.
@@ -234,11 +237,31 @@ impl ReaderVersion {
     pub const CURRENT: ReaderVersion = ReaderVersion::V1;
 }
 
-const READER_V1: &[Parameter] = &[Parameter {
-    name: "file",
-    label: "File",
-    kind: ParameterKind::File,
-}];
+const READER_V1: &[Parameter] = &[
+    Parameter {
+        name: "file",
+        label: "File",
+        kind: ParameterKind::File,
+    },
+    // Unset until the artist sets them, rather than filled in by the scan: a scan finishes on its
+    // own thread, and an edit arriving then would land outside undo's order.
+    Parameter {
+        name: "first",
+        label: "First",
+        kind: ParameterKind::Frame { default: None },
+    },
+    Parameter {
+        name: "last",
+        label: "Last",
+        kind: ParameterKind::Frame { default: None },
+    },
+    // Added to the file's frame, as Nuke's frame offset is: at 10, file frame 1 shows at 11.
+    Parameter {
+        name: "offset",
+        label: "Offset",
+        kind: ParameterKind::Frame { default: Some(0.0) },
+    },
+];
 
 /// The parameter and input descriptions an Exposure node was created with. A changed default is
 /// a new version, so a node keeps the defaults its values were authored against.
@@ -443,22 +466,27 @@ pub enum Missing {
     Input(&'static NodeInput),
     /// A file parameter with no file.
     File(&'static Parameter),
+    /// The frame of its sequence a Reader reads, inside its range, which the sequence's last scan
+    /// did not find. Unlike the others, it gives no image: reading it fails.
+    Frame(i64),
 }
 
 /// Everything missing on the node and upstream of it at a frame: the node's own first, its files
 /// before its inputs, each in declaration order, and each upstream node once, without recursion.
 /// Empty if the document has no such node.
 ///
-/// What is missing gives the empty image, so this, not the image, says what is incomplete. An
-/// input a node makes do without, such as a Merge's slots, is never missing.
-pub fn missing(document: &Document, node: NodeId, time: f64) -> Vec<(NodeId, Missing)> {
+/// What is missing gives the empty image, but for a missing frame, so this, not the image, says
+/// what is incomplete. An input a node makes do without, such as a Merge's slots, is never
+/// missing.
+pub fn missing(
+    document: &Document,
+    files: &Files,
+    node: NodeId,
+    time: f64,
+) -> Vec<(NodeId, Missing)> {
     let mut missing = Vec::new();
-    let mut visited = BTreeSet::new();
-    let mut pending = vec![node];
-    while let Some(id) = pending.pop() {
-        let Some(current) = document.node(id).filter(|_| visited.insert(id)) else {
-            continue;
-        };
+    for id in document.upstream(node) {
+        let current = document.node(id).expect("upstream nodes exist");
         let resolved = resolve(current, time);
         for parameter in current.kind.parameters() {
             if matches!(parameter.kind, ParameterKind::File)
@@ -467,14 +495,20 @@ pub fn missing(document: &Document, node: NodeId, time: f64) -> Vec<(NodeId, Mis
                 missing.push((id, Missing::File(parameter)));
             }
         }
+        if let NodeKind::Reader { .. } = current.kind
+            && let Some(Reading::Frame {
+                read,
+                found: Some(false),
+                ..
+            }) = reading(&resolved, files, time)
+        {
+            missing.push((id, Missing::Frame(read)));
+        }
         for input in current.kind.inputs() {
             if input.required && current.input(input.first_slot()).is_none() {
                 missing.push((id, Missing::Input(input)));
             }
         }
-        // Reversed, so that the first input's chain is visited first.
-        let sources: Vec<NodeId> = current.inputs().map(|(_, source)| source).collect();
-        pending.extend(sources.into_iter().rev());
     }
     missing
 }
@@ -696,6 +730,24 @@ impl Document {
             }
         }
         document
+    }
+
+    /// The node and every node upstream of it, each once, depth first with each node's inputs in
+    /// order, without recursion. Empty if the document has no such node.
+    pub(crate) fn upstream(&self, node: NodeId) -> Vec<NodeId> {
+        let mut upstream = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![node];
+        while let Some(id) = pending.pop() {
+            let Some(current) = self.node(id).filter(|_| visited.insert(id)) else {
+                continue;
+            };
+            upstream.push(id);
+            // Reversed, so that the first input's chain is visited first.
+            let sources: Vec<NodeId> = current.inputs().map(|(_, source)| source).collect();
+            pending.extend(sources.into_iter().rev());
+        }
+        upstream
     }
 
     /// Whether `node` feeds `from`, directly or through other nodes.

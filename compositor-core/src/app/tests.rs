@@ -26,11 +26,26 @@ const SHIFT: Modifiers = Modifiers {
 
 /// An app whose worker hands its results to the test, with a 400 × 300 graph pane at scale 2.
 fn app() -> (App, Receiver<Evaluated>) {
+    let (app, deliveries, _) = app_scanning();
+    (app, deliveries)
+}
+
+/// An app as [`app`] makes it, whose scans also come back to the test, as the events the shell
+/// would dispatch for them.
+/// A scan as the app's thread hands it over.
+type Scanned = (Pattern, io::Result<Scan>);
+
+fn app_scanning() -> (App, Receiver<Evaluated>, Receiver<Scanned>) {
     let (delivered, deliveries) = mpsc::channel();
-    let mut app = App::new(EvaluationDevice::Cpu, move |notice| {
-        if let Notice::Evaluated(evaluated) = notice {
+    let (scanned, scans) = mpsc::channel();
+    let mut app = App::new(EvaluationDevice::Cpu, move |notice| match notice {
+        Notice::Evaluated(evaluated) => {
             let _ = delivered.send(evaluated);
         }
+        Notice::Scanned { sequence, scan } => {
+            let _ = scanned.send((sequence, scan));
+        }
+        Notice::DeviceLost { .. } => {}
     });
     let size = PaneSize {
         width: 400,
@@ -45,7 +60,14 @@ fn app() -> (App, Receiver<Evaluated>) {
         requests.as_slice(),
         [Request::Redraw(Pane::Graph), Request::ShowViewerCaption(_)]
     ));
-    (app, deliveries)
+    (app, deliveries, scans)
+}
+
+fn next_scan(scans: &Receiver<Scanned>) -> Event {
+    let (sequence, scan) = scans
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scan finishes");
+    Event::Scanned { sequence, scan }
 }
 
 fn input(pane: Pane, input: Input) -> Event {
@@ -825,7 +847,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     assert_eq!(app.caption, "Slot 2 · Exposure · updating… · CPU");
     let key = |app: &App, id| {
         let session = app.session();
-        result_key(session.document(), session.reloads(), id, session.frame()).unwrap()
+        result_key(session.document(), session.files(), id, session.frame()).unwrap()
     };
     let requests = app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
@@ -1513,4 +1535,145 @@ fn an_image_finishing_after_a_move_to_a_frame_with_its_key_is_shown_as_that_fram
 
     app.dispatch(read(&first, 4, 4));
     assert_eq!(app.displayed().map(|shown| shown.frame), Some(30.0));
+}
+
+/// A directory of empty files for these frames of `plate.####.png`, each `bytes` long.
+fn plate(name: &str, frames: &[i64], bytes: usize) -> PathBuf {
+    let directory = crate::fixtures::directory(name);
+    for frame in frames {
+        std::fs::write(
+            directory.join(format!("plate.{frame:04}.png")),
+            vec![0; bytes],
+        )
+        .unwrap();
+    }
+    directory
+}
+
+fn files_of(app: &App, ids: &[NodeId]) -> Vec<PathBuf> {
+    (ids.iter())
+        .map(|&id| file(app, id).expect("a file").to_path_buf())
+        .collect()
+}
+
+#[test]
+fn a_frame_chosen_in_the_dialog_reads_its_sequence_once_a_scan_finds_other_frames() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let directory = plate("chosen", &[1, 2], 1);
+    std::fs::write(directory.join("shot_v002.png"), [0]).unwrap();
+    let chosen = vec![
+        directory.join("plate.0002.png"),
+        directory.join("shot_v002.png"),
+    ];
+
+    app.dispatch(Event::FilesChosen {
+        intent: FileIntent::CreateReaders(Anchor {
+            at: Point::default(),
+            current: None,
+        }),
+        paths: chosen,
+    });
+    assert_eq!(app.session().document().nodes().count(), 0);
+    let first = next_scan(&scans);
+    app.dispatch(first);
+    assert_eq!(app.session().document().nodes().count(), 0);
+    let requests = app.dispatch(next_scan(&scans));
+
+    assert!(requests.contains(&Request::Redraw(Pane::Graph)));
+    let created = app.session().document().selection().to_vec();
+    assert_eq!(
+        files_of(&app, &created),
+        [
+            directory.join("plate.####.png"),
+            directory.join("shot_v002.png")
+        ]
+    );
+    assert_eq!(app.session().undo_label(), Some("Create Reader"));
+    // The scan that decided is the sequence's first: nothing scans it again.
+    assert!(app.session().unscanned().is_empty() && app.scanning.is_empty());
+}
+
+#[test]
+fn a_typed_sequence_is_scanned_and_its_range_and_hold_are_shown() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let directory = plate("typed", &[1, 2], 1);
+    let id = create(&mut app, "a.exr");
+    let pattern = directory.join("plate.%04d.png");
+    app.edit(|session| {
+        session
+            .set_value(id, "file", Value::File(pattern.into()))
+            .unwrap()
+    });
+    app.dispatch(next_scan(&scans));
+    app.dispatch(slot_key(1, CTRL));
+
+    let (requests, _) = app.edit(|session| session.set_frame(5.0).unwrap());
+    assert!(
+        app.caption.ends_with("· updating…; holds frame 2 · CPU"),
+        "{}",
+        app.caption
+    );
+    let shown = |name| {
+        let panel = app.panel.as_ref().unwrap();
+        let row = panel
+            .rows
+            .iter()
+            .find(|row| row.parameter.name == name)
+            .unwrap();
+        (row.value.clone(), row.state)
+    };
+    assert_eq!(
+        shown("first"),
+        (Some(Value::Float(1.0)), ValueState::Absent)
+    );
+    assert_eq!(shown("last"), (Some(Value::Float(2.0)), ValueState::Absent));
+    assert!(
+        requests
+            .iter()
+            .all(|request| !matches!(request, Request::ShowError(_)))
+    );
+}
+
+#[test]
+fn reload_files_rescans_off_the_gui_thread_and_says_how_many_frames_changed() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let directory = plate("reload", &[1, 2], 1);
+    let id = create(&mut app, directory.join("plate.####.png").to_str().unwrap());
+    app.dispatch(next_scan(&scans));
+
+    std::fs::write(directory.join("plate.0001.png"), [0; 2]).unwrap();
+    app.dispatch(Event::ReloadFiles(id));
+    // Asked for again while the first rescan runs, whose listing may predate the change.
+    app.dispatch(Event::ReloadFiles(id));
+    let requests = app.dispatch(next_scan(&scans));
+    let status = format!(
+        "{}: 1 frame changed on disk",
+        directory.join("plate.####.png").display()
+    );
+    assert!(
+        requests.contains(&Request::ShowStatus(status)),
+        "{requests:?}"
+    );
+    let requests = app.dispatch(next_scan(&scans));
+    assert!(
+        !requests
+            .iter()
+            .any(|request| matches!(request, Request::ShowStatus(_)))
+    );
+    assert!(app.scanning.is_empty());
+
+    let gone = directory.join("gone/plate.####.png");
+    app.edit(|session| {
+        session
+            .set_value(id, "file", Value::File(gone.into()))
+            .unwrap()
+    });
+    let requests = app.dispatch(next_scan(&scans));
+    assert!(
+        matches!(requests.as_slice(), [Request::ShowError(error), ..] if error.starts_with("Cannot scan")),
+        "{requests:?}"
+    );
+    // Not scanned again until reloaded.
+    app.edit(|session| session.set_frame(7.0).unwrap());
+    assert!(app.scanning.is_empty());
 }

@@ -1406,8 +1406,8 @@ mod tests {
         let mut session = Session::new();
         let changes = session.create_readers(vec![path], open_ng::Point::default(), None);
         let node = *changes.nodes.first().expect("one Reader");
-        let key = result_key(session.document(), session.reloads(), node, session.frame())
-            .expect("a key");
+        let key =
+            result_key(session.document(), session.files(), node, session.frame()).expect("a key");
         let (delivered, deliveries) = mpsc::channel();
         let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
             delivered.send(evaluated).unwrap()

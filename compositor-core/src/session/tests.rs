@@ -556,7 +556,7 @@ fn a_reader_without_a_file_is_named_for_its_kind_and_reloads_nothing() {
     for id in [*created.nodes.first().unwrap(), empty] {
         assert_eq!(file(&session, id), None);
         assert_eq!(session.graph().node(id.into()).unwrap().title, "Reader");
-        assert!(!session.reload(&[id]));
+        assert!(session.reload(&[id]).is_empty());
     }
     assert_eq!(
         set_file(&mut session, empty, ""),
@@ -575,13 +575,16 @@ fn reloading_a_reader_reloads_every_reader_of_its_file() {
     let twin = create(&mut session, "a.exr", ORIGIN);
     let selected = create(&mut session, "a.exr", ORIGIN);
     let key = |session: &Session, id| {
-        result_key(session.document(), session.reloads(), id, session.frame())
+        result_key(session.document(), session.files(), id, session.frame())
     };
     let before = [selected, twin, other].map(|id| key(&session, id));
     session.record_failure(before[1].as_ref().unwrap());
     assert!(session.failures.nodes.contains(&twin));
 
-    assert!(session.reload(&[selected]));
+    assert_eq!(
+        session.reload(&[selected]).stills,
+        [Path::new("a.exr").into()]
+    );
 
     let after = [selected, twin, other].map(|id| key(&session, id));
     assert_ne!(after[0], before[0]);
@@ -591,7 +594,7 @@ fn reloading_a_reader_reloads_every_reader_of_its_file() {
     assert_presented(&session);
 
     let exposure = create_exposure(&mut session, ORIGIN);
-    assert!(!session.reload(&[exposure]));
+    assert!(session.reload(&[exposure]).is_empty());
 }
 
 #[test]
@@ -602,7 +605,7 @@ fn a_node_shows_a_failure_while_its_current_key_failed() {
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", reader).unwrap();
     let key = |session: &Session, id| {
-        result_key(session.document(), session.reloads(), id, session.frame()).unwrap()
+        result_key(session.document(), session.files(), id, session.frame()).unwrap()
     };
     let failing = |session: &Session| session.failures.nodes.iter().copied().collect::<Vec<_>>();
 
@@ -1412,7 +1415,7 @@ fn keys_hold_what_a_frame_resolves_to_not_the_frame() {
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", reader).unwrap();
     let key = |session: &Session, id| {
-        result_key(session.document(), session.reloads(), id, session.frame()).unwrap()
+        result_key(session.document(), session.files(), id, session.frame()).unwrap()
     };
     let at_first = key(&session, exposure);
     session.record_failure(&key(&session, reader));

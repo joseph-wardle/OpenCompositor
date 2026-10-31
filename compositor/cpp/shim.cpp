@@ -381,6 +381,11 @@ void ParameterPanel::rebuild(const PanelData &data) {
             grid->addWidget(field, index, 1);
             grid->addWidget(slider, index, 2);
             row_slider = slider;
+        } else if (data.kind == RowKind::Frame) {
+            field->setFixedWidth(field->fontMetrics().horizontalAdvance(QStringLiteral("-000.0000")) +
+                                 12);
+            field->setPlaceholderText(QStringLiteral("Unset"));
+            grid->addWidget(field, index, 1);
         } else {
             field->setPlaceholderText(QStringLiteral("No file"));
             auto *browse = new QPushButton(QStringLiteral("Browse…"));
@@ -389,9 +394,14 @@ void ParameterPanel::rebuild(const PanelData &data) {
             connect(browse, &QPushButton::clicked, this, [=, this] {
                 QTimer::singleShot(0, this, [=, this] { send(PanelGestureKind::Browse, name); });
             });
+            auto *reload = new QPushButton(QStringLiteral("Reload"));
+            reload->setToolTip(QStringLiteral("Read the files again, rescanning a sequence"));
+            connect(reload, &QPushButton::clicked, this,
+                    [=, this] { send(PanelGestureKind::Reload, name); });
             auto *box = new QHBoxLayout;
             box->addWidget(field, 1);
             box->addWidget(browse);
+            box->addWidget(reload);
             grid->addLayout(box, index, 1, 1, 2);
         }
         rows.push_back(Row{name, label, field, row_slider, QString(), false});

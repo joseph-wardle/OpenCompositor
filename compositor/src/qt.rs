@@ -174,6 +174,8 @@ pub mod ffi {
     #[derive(Debug)]
     enum RowKind {
         Float,
+        /// A whole frame number, in a field alone.
+        Frame,
         File,
     }
 
@@ -198,6 +200,8 @@ pub mod ffi {
         Typed,
         Reset,
         Browse,
+        /// Reload files, on a file's row.
+        Reload,
         Pin,
         Unpin,
     }

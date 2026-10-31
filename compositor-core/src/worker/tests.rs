@@ -18,7 +18,7 @@ fn key(path: impl Into<PathBuf>) -> ResultKey {
     let mut session = Session::new();
     let changes = session.create_readers(vec![path.into()], Point::default(), None);
     let id = *changes.nodes.first().unwrap();
-    result_key(session.document(), session.reloads(), id, session.frame()).unwrap()
+    result_key(session.document(), session.files(), id, session.frame()).unwrap()
 }
 
 /// A request for the node with the key, as the worker cares only about which node it is.

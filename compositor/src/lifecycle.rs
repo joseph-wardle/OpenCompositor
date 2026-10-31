@@ -169,10 +169,8 @@ fn step(index: usize) {
         10 => {
             let at = Point::default();
             let image = IMAGE.with(|cell| cell.borrow().clone());
-            crate::dispatch(Event::FilesChosen {
-                intent: FileIntent::CreateReaders(Anchor { at, current: None }),
-                paths: vec![image],
-            });
+            // Created as given: a file chosen in the dialog waits for a scan of its sequence.
+            crate::edit(|session| session.create_readers(vec![image], at, None));
             crate::dispatch(Event::KeyPressed {
                 key: Key::Slot(Slot::new(1).expect("1 is a slot")),
                 modifiers: Modifiers {

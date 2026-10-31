@@ -12,7 +12,8 @@ use crate::document::{
     Assignment, Changes, ConnectionError, Document, InputSlot, Node, NodeId, NodeKind,
     ReaderVersion, Slot, TimelineError, node_types,
 };
-use crate::evaluate::{Reloads, ResultKey, result_keys};
+use crate::evaluate::{ResultKey, result_keys};
+use crate::files::{Files, Pattern, Scan};
 use crate::parameter::{Value, ValueError, describe, resolve};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
@@ -100,7 +101,7 @@ struct Failures {
 }
 
 /// A document with its undo history, its OpenNG graph and the view of it, the current frame, the
-/// viewer, how many times each file has been reloaded, and which evaluations failed.
+/// viewer, what is known of its files on disk, and which evaluations failed.
 ///
 /// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
 /// before returning the [`Changes`] it made. An edit that changes nothing records no step.
@@ -126,9 +127,9 @@ pub struct Session {
     frame: f64,
     viewer: Viewer,
     /// Unsaved and not undoable.
-    reloads: Reloads,
+    files: Files,
     failures: Failures,
-    /// Counts changes to the document, the frame and the reloads, which every key is made from.
+    /// Counts changes to the document, the frame and the files, which every key is made from.
     version: u64,
 }
 
@@ -156,7 +157,7 @@ impl Session {
             }),
             frame: Document::default().timeline().first(),
             viewer: Viewer::new(),
-            reloads: Reloads::default(),
+            files: Files::default(),
             failures: Failures::default(),
             version: 0,
         }
@@ -182,7 +183,7 @@ impl Session {
         &mut self.viewer
     }
 
-    /// Changes whenever the document, the frame or the reloads do, so that a key built at one
+    /// Changes whenever the document, the frame or the files do, so that a key built at one
     /// version is current while the version is.
     pub fn version(&self) -> u64 {
         self.version
@@ -248,35 +249,89 @@ impl Session {
         self.failures
             .keys
             .retain(|failed| !inside.contains(&failed));
-        let keys = result_keys(&self.document, &self.reloads, self.frame);
+        let keys = result_keys(&self.document, &self.files, self.frame);
         if keys.values().any(|key| key == origin) {
             self.failures.keys.push(origin.clone());
         }
         self.present_failures()
     }
 
-    /// How many times each file has been reloaded.
-    pub fn reloads(&self) -> &Reloads {
-        &self.reloads
+    /// What is known of the files Readers read: the scans of their sequences and how many times
+    /// each file has been reloaded.
+    pub fn files(&self) -> &Files {
+        &self.files
     }
 
-    /// Makes every Reader of each given Reader's file at the current frame read it again the next
-    /// time it is viewed. Returns whether any of the nodes is a Reader with a file.
-    pub fn reload(&mut self, nodes: &[NodeId]) -> bool {
-        let file = |id| {
-            resolve(self.document.node(id)?, self.frame)
-                .file("file")
-                .cloned()
-        };
-        let paths: BTreeSet<Arc<Path>> = (nodes.iter()).filter_map(|&id| file(id)).collect();
-        for path in &paths {
-            self.reloads.reload(path.clone());
+    /// Makes every Reader of each given Reader's still read it again the next time it is viewed,
+    /// and returns the sequences the others read, each to be reloaded by recording a new scan of
+    /// it: what Reload files does.
+    ///
+    /// ```no_run
+    /// # fn reload(session: &mut opencompositor_core::Session, reader: opencompositor_core::NodeId) -> std::io::Result<()> {
+    /// use opencompositor_core::Scan;
+    /// for sequence in session.reload(&[reader]).sequences {
+    ///     let scan = Scan::of(&sequence)?;
+    ///     session.record_scan(&sequence, scan);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn reload(&mut self, nodes: &[NodeId]) -> Reload {
+        let mut reload = Reload::default();
+        let files: BTreeSet<Arc<Path>> =
+            (nodes.iter()).filter_map(|&id| self.file_of(id)).collect();
+        for file in files {
+            match Pattern::parse(&file) {
+                Some(sequence) => reload.sequences.push(sequence),
+                None => {
+                    self.files.reload(file.clone());
+                    reload.stills.push(file);
+                }
+            }
         }
-        if !paths.is_empty() {
+        if !reload.stills.is_empty() {
             self.version += 1;
+            self.present_failures();
         }
-        self.present_failures();
-        !paths.is_empty()
+        reload
+    }
+
+    /// The file a node reads, a sequence's pattern: `None` unless it is a Reader with a file.
+    fn file_of(&self, node: NodeId) -> Option<Arc<Path>> {
+        let reader = self.document.node(node)?;
+        if !matches!(reader.kind, NodeKind::Reader { .. }) {
+            return None;
+        }
+        resolve(reader, self.frame).file("file").cloned()
+    }
+
+    /// Records what a scan of a sequence found, which every Reader of it reads from now on:
+    /// its range, its missing frames, and a reload of each frame whose file differs from the last
+    /// scan's, changed, new or gone. The first scan reloads nothing. Returns how many frames it
+    /// reloaded, or `None` if it found what the last scan did.
+    pub fn record_scan(&mut self, sequence: &Pattern, scan: Scan) -> Option<usize> {
+        let reloaded = self.files.record(sequence, scan);
+        if reloaded.is_some() {
+            self.version += 1;
+            self.present_failures();
+        }
+        reloaded
+    }
+
+    /// The sequences the document's Readers read that have not been scanned, each once, in the
+    /// order of the nodes reading them. Until scanned, a sequence holds nothing and misses
+    /// nothing.
+    pub fn unscanned(&self) -> Vec<Pattern> {
+        let mut unscanned: Vec<Pattern> = Vec::new();
+        for (id, _) in self.document.nodes() {
+            if let Some(sequence) = self.file_of(id).as_ref().and_then(Pattern::parse)
+                && self.files.scan(sequence.path()).is_none()
+                && !unscanned.contains(&sequence)
+            {
+                unscanned.push(sequence);
+            }
+        }
+        unscanned
     }
 
     /// Centres the node a slot marks in the graph view. Returns whether the slot marks one.
@@ -789,10 +844,26 @@ impl Session {
         if self.failures.keys.is_empty() {
             return BTreeSet::new();
         }
-        (result_keys(&self.document, &self.reloads, self.frame).into_iter())
+        (result_keys(&self.document, &self.files, self.frame).into_iter())
             .filter(|(_, key)| self.failures.keys.contains(key))
             .map(|(id, _)| id)
             .collect()
+    }
+}
+
+/// What [`Session::reload`] found to read again.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Reload {
+    /// Files that are no sequence, reloaded at once.
+    pub stills: Vec<Arc<Path>>,
+    /// Sequences, each reloaded once a new scan of it is recorded.
+    pub sequences: Vec<Pattern>,
+}
+
+impl Reload {
+    /// Whether no node was a Reader with a file.
+    pub fn is_empty(&self) -> bool {
+        self.stills.is_empty() && self.sequences.is_empty()
     }
 }
 

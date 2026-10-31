@@ -1,8 +1,10 @@
 //! The interactive compositor: a session, the GPU that draws its panes, and the evaluator's
 //! worker, changed only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
 
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +12,7 @@ use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{EvalError, ResultKey, result_key};
+use crate::files::{Pattern, Scan, held};
 use crate::gpu::{
     Drawn, FrameCheck, FrameTiming, Gpu, NativeWindow, PaneSize, PixelRead, Probe, ViewerFrame,
 };
@@ -84,9 +87,18 @@ pub enum Event {
     /// keyboard to another pane or a dialog, or the window lost it to another application.
     FocusLost(Pane),
     /// The files chosen in the dialog a [`Request::ChooseFiles`] opened: none if it was cancelled.
+    /// A file that may be a frame of a sequence waits for a scan to say, and is then read as the
+    /// sequence if it has other frames.
     FilesChosen {
         intent: FileIntent,
         paths: Vec<PathBuf>,
+    },
+    /// The artist asked for the Reader's files to be read again, from its panel: Reload files.
+    ReloadFiles(NodeId),
+    /// A scan of a sequence finished on its own thread.
+    Scanned {
+        sequence: Pattern,
+        scan: io::Result<Scan>,
     },
     /// An evaluation finished on the evaluator's thread.
     Evaluated(Evaluated),
@@ -112,7 +124,14 @@ pub enum Event {
 )]
 pub enum Notice {
     Evaluated(Evaluated),
-    DeviceLost { generation: u64, at: Instant },
+    DeviceLost {
+        generation: u64,
+        at: Instant,
+    },
+    Scanned {
+        sequence: Pattern,
+        scan: io::Result<Scan>,
+    },
 }
 
 impl From<Notice> for Event {
@@ -120,6 +139,7 @@ impl From<Notice> for Event {
         match notice {
             Notice::Evaluated(evaluated) => Event::Evaluated(evaluated),
             Notice::DeviceLost { generation, at } => Event::DeviceLost { generation, at },
+            Notice::Scanned { sequence, scan } => Event::Scanned { sequence, scan },
         }
     }
 }
@@ -206,7 +226,7 @@ pub enum Command {
     /// Has the parameter panel show the current node, the last selected, again.
     UnpinPanel,
     /// Reads the selected Readers' files again, for every Reader of them, when they are next
-    /// viewed, at once if they are.
+    /// viewed, at once if they are: Reload files on each.
     Reload,
     Undo,
     Redo,
@@ -279,6 +299,14 @@ impl FileIntent {
     pub fn allows_several(self) -> bool {
         matches!(self, FileIntent::CreateReaders(_))
     }
+}
+
+/// Files chosen in a dialog, waiting for the scans that say which are frames of a sequence.
+#[derive(Debug)]
+struct Choice {
+    intent: FileIntent,
+    /// Each file chosen, with the sequence it may be a frame of until a scan decides.
+    files: Vec<(PathBuf, Option<Pattern>)>,
 }
 
 /// Where a new node goes, as it was when the artist asked for it, so that a menu or dialog taking
@@ -429,6 +457,17 @@ pub struct App {
     losses_during_evaluation: u32,
     /// Nothing is delivered once the app has dropped.
     worker: Worker,
+    /// Hands each scan's result to the GUI thread.
+    waker: Waker,
+    /// Sequences being scanned on threads of their own, by path, each with whether it is to be
+    /// scanned again when its scan returns, as Reload files asks while one runs.
+    scanning: HashMap<Arc<Path>, bool>,
+    /// Sequences whose scan failed, which are not scanned again until reloaded.
+    unscannable: BTreeSet<Arc<Path>>,
+    /// The session's version when the app last looked for sequences to scan.
+    scans_followed: Option<u64>,
+    /// Files chosen, in the order chosen, waiting for scans.
+    choices: Vec<Choice>,
     /// What the worker was last asked for.
     sent: Option<Wanted>,
     /// The session's version and the viewed node when the viewer last followed them.
@@ -481,13 +520,18 @@ impl App {
         let deliver = waker.clone();
         App {
             session: Session::new(),
-            gpu: Gpu::new(waker),
+            gpu: Gpu::new(waker.clone()),
             device,
             left_gpu: None,
             losses_during_evaluation: 0,
             worker: Worker::start(device, move |evaluated| {
                 deliver.wake(Notice::Evaluated(evaluated));
             }),
+            waker,
+            scanning: HashMap::new(),
+            unscannable: BTreeSet::new(),
+            scans_followed: None,
+            choices: Vec::new(),
             sent: None,
             followed: None,
             requests_sent: 0,
@@ -566,6 +610,8 @@ impl App {
                 Vec::new()
             }
             Event::FilesChosen { intent, paths } => self.files_chosen(intent, paths),
+            Event::ReloadFiles(node) => self.reload(&[node]),
+            Event::Scanned { sequence, scan } => self.scanned(sequence, scan),
             Event::Evaluated(evaluated) => self.evaluated(evaluated),
             Event::DeviceLost { generation, at } => self.device_lost(generation, at),
             Event::RetryDeviceCreation(attempt) => match self.drawing {
@@ -627,6 +673,7 @@ impl App {
     /// Follows whatever the event or edit changed: the viewer, then the panel and the labels the
     /// shell shows.
     fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
+        self.scan_unscanned();
         self.follow_viewer(&mut requests);
         self.follow_readout(&mut requests);
         let exposure = self.session.viewer().exposure();
@@ -667,11 +714,11 @@ impl App {
             return;
         }
         self.panel_followed = followed;
-        let frame = self.session.frame();
+        let (files, frame) = (self.session.files(), self.session.frame());
         let panel = match self.pinned {
-            Some(pinned) => Panel::of(document, pinned, true, frame),
+            Some(pinned) => Panel::of(document, files, pinned, true, frame),
             None => (document.selection().last())
-                .and_then(|&current| Panel::of(document, current, false, frame)),
+                .and_then(|&current| Panel::of(document, files, current, false, frame)),
         };
         if panel != self.panel {
             self.panel.clone_from(&panel);
@@ -987,11 +1034,7 @@ impl App {
             }
             Command::Reload => {
                 let selection = self.session.document().selection().to_vec();
-                if self.session.reload(&selection) {
-                    vec![Request::Redraw(Pane::Graph)]
-                } else {
-                    vec![Request::ShowStatus("Select Readers to reload".to_owned())]
-                }
+                self.reload(&selection)
             }
             Command::Undo => redraw_if(Pane::Graph, !self.session.undo().is_empty()),
             Command::Redo => redraw_if(Pane::Graph, !self.session.redo().is_empty()),
@@ -1077,7 +1120,148 @@ impl App {
         }
     }
 
+    /// Reload files on each Reader: stills at once, sequences once rescanned.
+    fn reload(&mut self, nodes: &[NodeId]) -> Vec<Request> {
+        let reload = self.session.reload(nodes);
+        if reload.is_empty() {
+            return vec![Request::ShowStatus("Select Readers to reload".to_owned())];
+        }
+        for sequence in reload.sequences {
+            self.unscannable.remove(sequence.path());
+            self.scan(sequence);
+        }
+        vec![Request::Redraw(Pane::Graph)]
+    }
+
+    /// Scans a sequence on a thread of its own, or again once the scan running returns, whose
+    /// listing may predate a change.
+    fn scan(&mut self, sequence: Pattern) {
+        if let Some(again) = self.scanning.get_mut(sequence.path()) {
+            *again = true;
+            return;
+        }
+        self.scanning.insert(sequence.path().clone(), false);
+        let waker = self.waker.clone();
+        std::thread::Builder::new()
+            .name("scan".to_owned())
+            .spawn(move || {
+                let scan = Scan::of(&sequence);
+                waker.wake(Notice::Scanned { sequence, scan });
+            })
+            .expect("the system starts a thread");
+    }
+
+    /// Scans each sequence the document reads that has none, such as one typed into a File, once.
+    fn scan_unscanned(&mut self) {
+        let version = Some(self.session.version());
+        if version == self.scans_followed {
+            return;
+        }
+        self.scans_followed = version;
+        for sequence in self.session.unscanned() {
+            if !self.scanning.contains_key(sequence.path())
+                && !self.unscannable.contains(sequence.path())
+            {
+                self.scan(sequence);
+            }
+        }
+    }
+
+    /// Records a finished scan, says how many frames it found changed or why it failed, and
+    /// decides the files chosen that waited for it.
+    fn scanned(&mut self, sequence: Pattern, scan: io::Result<Scan>) -> Vec<Request> {
+        let again = self.scanning.remove(sequence.path()).unwrap_or(false);
+        let mut requests = Vec::new();
+        match scan {
+            Ok(scan) => {
+                self.unscannable.remove(sequence.path());
+                if let Some(reloaded) = self.session.record_scan(&sequence, scan) {
+                    requests.push(Request::Redraw(Pane::Graph));
+                    if reloaded > 0 {
+                        requests.push(Request::ShowStatus(format!(
+                            "{}: {reloaded} {} changed on disk",
+                            sequence.path().display(),
+                            if reloaded == 1 { "frame" } else { "frames" }
+                        )));
+                    }
+                }
+            }
+            Err(error) => {
+                self.unscannable.insert(sequence.path().clone());
+                requests.push(Request::ShowError(format!(
+                    "Cannot scan {}: {error}",
+                    sequence.directory().display()
+                )));
+            }
+        }
+        requests.extend(self.decide_choices());
+        if again {
+            self.scan(sequence);
+        }
+        requests
+    }
+
     fn files_chosen(&mut self, intent: FileIntent, paths: Vec<PathBuf>) -> Vec<Request> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let files: Vec<(PathBuf, Option<Pattern>)> = (paths.into_iter())
+            .map(|path| {
+                let sequence = Pattern::candidate(&path);
+                (path, sequence)
+            })
+            .collect();
+        for sequence in files.iter().filter_map(|(_, sequence)| sequence.clone()) {
+            if self.session.files().scan(sequence.path()).is_none() {
+                self.scan(sequence);
+            }
+        }
+        self.choices.push(Choice { intent, files });
+        self.decide_choices()
+    }
+
+    /// Decides each file chosen whose sequence has been scanned, or failed to be: the sequence if
+    /// the scan found it with another frame, otherwise the file. Then applies the choices with
+    /// every file decided, in the order chosen, until one is still waiting.
+    fn decide_choices(&mut self) -> Vec<Request> {
+        let files = self.session.files();
+        for choice in &mut self.choices {
+            for (path, candidate) in &mut choice.files {
+                let Some(sequence) = candidate.as_ref() else {
+                    continue;
+                };
+                if self.scanning.contains_key(sequence.path()) {
+                    continue;
+                }
+                let scan = files.scan(sequence.path());
+                let is_sequence = scan.is_some_and(|scan| {
+                    sequence
+                        .frame_of(path)
+                        .is_some_and(|frame| scan.contains(frame) && scan.frames().nth(1).is_some())
+                });
+                if is_sequence {
+                    *path = sequence.path().to_path_buf();
+                }
+                *candidate = None;
+            }
+        }
+        let mut requests = Vec::new();
+        while let Some(choice) = self.choices.first() {
+            if choice
+                .files
+                .iter()
+                .any(|(_, candidate)| candidate.is_some())
+            {
+                break;
+            }
+            let choice = self.choices.remove(0);
+            let paths = choice.files.into_iter().map(|(path, _)| path).collect();
+            requests.extend(self.apply_choice(choice.intent, paths));
+        }
+        requests
+    }
+
+    fn apply_choice(&mut self, intent: FileIntent, paths: Vec<PathBuf>) -> Vec<Request> {
         let Some(first) = paths.first().cloned() else {
             return Vec::new();
         };
@@ -1177,7 +1361,7 @@ impl App {
     fn wanted(&self) -> Option<(NodeId, ResultKey)> {
         let node = self.session.viewed()?;
         let session = &self.session;
-        let key = result_key(session.document(), session.reloads(), node, session.frame())?;
+        let key = result_key(session.document(), session.files(), node, session.frame())?;
         Some((node, key))
     }
 
@@ -1335,16 +1519,26 @@ impl App {
             // The previous image stays until then.
             _ => details.push("updating…".to_owned()),
         }
-        for (id, what) in missing(document, viewed, self.session.frame()) {
+        let (files, frame) = (self.session.files(), self.session.frame());
+        let name = |id| document.node(id).expect("upstream nodes exist").name();
+        for (id, what) in missing(document, files, viewed, frame) {
             let (label, lack) = match what {
                 Missing::Input(input) => (input.label, "is not connected"),
                 Missing::File(parameter) => (parameter.label, "is not set"),
+                // Reading it fails, and the failure names the file.
+                Missing::Frame(_) => continue,
             };
             details.push(if id == viewed {
                 format!("{label} {lack}")
             } else {
-                let upstream = document.node(id).expect("inputs name existing nodes");
-                format!("{label} of {} {lack}", upstream.name())
+                format!("{label} of {} {lack}", name(id))
+            });
+        }
+        for (id, read) in held(document, files, viewed, frame) {
+            details.push(if id == viewed {
+                format!("holds frame {read}")
+            } else {
+                format!("{} holds frame {read}", name(id))
             });
         }
         if details.is_empty() {

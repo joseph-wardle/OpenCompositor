@@ -47,6 +47,16 @@ fn built_in_descriptions_are_consistent() {
         let names: HashSet<_> = parameters.iter().map(|parameter| parameter.name).collect();
         assert_eq!(names.len(), parameters.len(), "{kind:?}: names repeat");
         for parameter in parameters {
+            if let ParameterKind::Frame {
+                default: Some(default),
+            } = parameter.kind
+            {
+                assert!(
+                    default.fract() == 0.0 && default.abs() <= FRAME_LIMIT,
+                    "{}",
+                    parameter.name
+                );
+            }
             let ParameterKind::Float(float) = &parameter.kind else {
                 continue;
             };
@@ -162,4 +172,47 @@ fn negative_zero_is_stored_as_zero() {
     node.set_value("stops", Value::Float(-0.0)).unwrap();
     let stored = resolve(&node, 1.0).float("stops").unwrap();
     assert_eq!(stored.to_bits(), 0.0f64.to_bits());
+}
+
+#[test]
+fn a_frame_is_whole_and_unset_without_a_default() {
+    let mut node = reader();
+    let resolved = resolve(&node, 1.0);
+    assert_eq!(
+        (resolved.float("first"), resolved.float("offset")),
+        (None, Some(0.0))
+    );
+
+    let limits = -FRAME_LIMIT..=FRAME_LIMIT;
+    let refusals = [
+        (1.5, ValueError::NotWhole),
+        (f64::NAN, ValueError::NotFinite),
+        (FRAME_LIMIT + 1.0, ValueError::OutOfLimits(limits)),
+    ];
+    for (value, error) in refusals {
+        assert_eq!(
+            node.set_value("first", Value::Float(value)),
+            Err(error),
+            "{value}"
+        );
+    }
+    node.set_value("first", Value::Float(-1001.0)).unwrap();
+    node.set_value("offset", Value::Float(-0.0)).unwrap();
+    let resolved = resolve(&node, 1.0);
+    assert_eq!(resolved.float("first"), Some(-1001.0));
+    assert_eq!(
+        resolved.float("offset").unwrap().to_bits(),
+        0.0f64.to_bits()
+    );
+}
+
+#[test]
+fn a_printf_frame_number_in_a_file_is_stored_as_hashes() {
+    let mut node = reader();
+    node.set_value("file", Value::File(Path::new("plate.%04d.exr").into()))
+        .unwrap();
+    assert_eq!(
+        node.authored_value("file"),
+        Some(&Value::File(Path::new("plate.####.exr").into()))
+    );
 }

@@ -1,7 +1,7 @@
 //! Computing nodes' images on the CPU, without a window or a GPU: the keys that name them and the
 //! evaluator that computes and retains them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
@@ -15,6 +15,7 @@ use crate::document::{
     BlurVersion, Document, ExposureVersion, InputSlot, MergeVersion, Node, NodeId, NodeKind,
     ReaderVersion,
 };
+use crate::files::{Files, reading};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::{self, Level};
 use crate::parameter::resolve;
@@ -27,30 +28,10 @@ mod merge;
 pub(crate) use gpu::poll_device;
 pub use gpu::{DeviceLost, GpuEvaluation, GpuImage, Recorded};
 
-/// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
-/// undoable.
-///
-/// Counted per path, not per Reader: per-Reader counts let two Readers of one file reach equal
-/// keys after reloads made at different times, and one would be given the other's stale pixels.
-#[derive(Clone, Debug, Default)]
-pub struct Reloads {
-    counts: HashMap<Arc<Path>, u64>,
-}
-
-impl Reloads {
-    pub fn count(&self, path: &Path) -> u64 {
-        self.counts.get(path).copied().unwrap_or(0)
-    }
-
-    /// Makes every Reader of the path read its file again.
-    pub fn reload(&mut self, path: Arc<Path>) {
-        *self.counts.entry(path).or_default() += 1;
-    }
-}
-
 /// Everything that decides a node's image: each node on its upstream chain with its kind,
 /// version and resolved values, its inputs in declaration order, and for a Reader with a file
-/// that path's reload count. Within one evaluator, equal keys name the same image.
+/// the file it reads, a sequence's frame file, with its reload count. Within one evaluator, equal
+/// keys name the same image.
 ///
 /// Node IDs, positions and selection are outside it, so equal nodes have equal keys and moving
 /// a node changes nothing. Inputs are shared keys: cloning one is a reference count, and
@@ -103,7 +84,7 @@ impl ResultKey {
 enum Recipe {
     Reader {
         version: ReaderVersion,
-        /// `None` while the Reader has no file, and the reload count 0.
+        /// The file read, `None` while the Reader has no file, with the reload count 0.
         path: Option<Arc<Path>>,
         reload: u64,
     },
@@ -284,34 +265,34 @@ impl Recipe {
 /// has no such node.
 ///
 /// A key holds what the frame resolves to, not the frame, so a branch that is the same at two
-/// frames has equal keys at both and its image is computed once. Building one never reads the
-/// filesystem.
+/// frames has equal keys at both and its image is computed once: a still, or a sequence holding
+/// its last frame. Building one never reads the filesystem, only what scans found.
 ///
 /// Each upstream node is visited once, however many nodes take its image, and without recursion,
 /// however deep the chain.
 pub fn result_key(
     document: &Document,
-    reloads: &Reloads,
+    files: &Files,
     node: NodeId,
     time: f64,
 ) -> Option<ResultKey> {
     document.node(node)?;
-    keys(document, reloads, time, [node]).remove(&node)
+    keys(document, files, time, [node]).remove(&node)
 }
 
 /// The key of every node in the document at a frame, each upstream node visited once.
 pub(crate) fn result_keys(
     document: &Document,
-    reloads: &Reloads,
+    files: &Files,
     time: f64,
 ) -> BTreeMap<NodeId, ResultKey> {
-    keys(document, reloads, time, document.nodes().map(|(id, _)| id))
+    keys(document, files, time, document.nodes().map(|(id, _)| id))
 }
 
 /// The keys of existing nodes and of everything upstream of them.
 fn keys(
     document: &Document,
-    reloads: &Reloads,
+    files: &Files,
     time: f64,
     nodes: impl IntoIterator<Item = NodeId>,
 ) -> BTreeMap<NodeId, ResultKey> {
@@ -329,7 +310,7 @@ fn keys(
         }
         pending.pop();
         if !built.contains_key(&id) {
-            let key = ResultKey(Arc::new(recipe(current, reloads, time, &built)));
+            let key = ResultKey(Arc::new(recipe(current, files, time, &built)));
             built.insert(id, key);
         }
     }
@@ -337,12 +318,7 @@ fn keys(
 }
 
 /// A node's recipe at a frame, from the keys of its inputs at that frame.
-fn recipe(
-    node: &Node,
-    reloads: &Reloads,
-    time: f64,
-    built: &BTreeMap<NodeId, ResultKey>,
-) -> Recipe {
+fn recipe(node: &Node, files: &Files, time: f64, built: &BTreeMap<NodeId, ResultKey>) -> Recipe {
     let key_of = |source: NodeId| -> ResultKey {
         built
             .get(&source)
@@ -353,10 +329,10 @@ fn recipe(
     let resolved = resolve(node, time);
     match &node.kind {
         NodeKind::Reader { version } => {
-            let path = resolved.file("file").cloned();
+            let path = reading(&resolved, files, time).map(|reading| reading.file().clone());
             Recipe::Reader {
                 version: *version,
-                reload: path.as_deref().map_or(0, |path| reloads.count(path)),
+                reload: path.as_deref().map_or(0, |path| files.reloads(path)),
                 path,
             }
         }

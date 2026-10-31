@@ -1,6 +1,7 @@
 //! What the parameter panel shows: one node's parameters, their values, and which were set.
 
 use crate::document::{Document, NodeId};
+use crate::files::{Files, scanned_end};
 use crate::parameter::{Parameter, Value, resolve};
 
 /// One node's parameters as the panel shows them.
@@ -19,8 +20,9 @@ pub struct Panel {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub parameter: &'static Parameter,
-    /// What evaluation reads at the frame: the authored value or the default, or none for a file
-    /// not set.
+    /// What evaluation reads at the frame: the authored value or the default, or what the node
+    /// decides for an unset value without a default, such as a sequence's first frame found. None
+    /// for a file not set, or for what the node cannot decide yet.
     pub value: Option<Value>,
     pub state: ValueState,
 }
@@ -35,13 +37,20 @@ pub enum ValueState {
 
 impl Panel {
     /// The node's panel at a frame, or `None` if the document has no such node.
-    pub(crate) fn of(document: &Document, node: NodeId, pinned: bool, time: f64) -> Option<Panel> {
+    pub(crate) fn of(
+        document: &Document,
+        files: &Files,
+        node: NodeId,
+        pinned: bool,
+        time: f64,
+    ) -> Option<Panel> {
         let shown = document.node(node)?;
         let resolved = resolve(shown, time);
         let rows = (shown.kind.parameters().iter())
             .map(|parameter| Row {
                 parameter,
-                value: resolved.get(parameter.name).cloned(),
+                value: (resolved.get(parameter.name).cloned())
+                    .or_else(|| scanned_end(&resolved, files, parameter.name).map(Value::Float)),
                 state: match shown.authored_value(parameter.name) {
                     Some(_) => ValueState::Authored,
                     None => ValueState::Absent,

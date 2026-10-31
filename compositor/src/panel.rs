@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use cxx_qt_lib::QString;
 use opencompositor_core::{
-    Command, EditError, Event, FileIntent, FloatParameter, Panel, Parameter, ParameterKind,
-    Request, Row, Session, Value, ValueState,
+    Command, EditError, Event, FRAME_LIMIT, FileIntent, FloatParameter, Panel, Parameter,
+    ParameterKind, Request, Row, Session, Value, ValueState,
 };
 
 use crate::qt::ffi::{self, PanelGestureKind, RowKind};
@@ -59,6 +59,17 @@ fn row(row: &Row) -> ffi::PanelRow {
                 slider.ticks,
                 slider.tick(value),
             )
+        }
+        (ParameterKind::Frame { default }, value) => {
+            let text = match value {
+                Some(Value::Float(frame)) => number(*frame),
+                _ => String::new(),
+            };
+            let tooltip = match default {
+                Some(default) => format!("Default: {}", number(*default)),
+                None => "Unset, it follows what the node reads".to_owned(),
+            };
+            (RowKind::Frame, tooltip, QString::from(&text), 0, 0)
         }
         (ParameterKind::File, Some(Value::File(path))) => (
             RowKind::File,
@@ -152,7 +163,9 @@ pub fn gesture(gesture: ffi::PanelGesture) {
     };
     let tick_value = |tick| match &parameter.kind {
         ParameterKind::Float(float) => Value::Float(Slider::of(float).value(tick)),
-        ParameterKind::File => unreachable!("only a float row has a slider"),
+        ParameterKind::Frame { .. } | ParameterKind::File => {
+            unreachable!("only a float row has a slider")
+        }
     };
     let edited = match gesture.kind {
         PanelGestureKind::DragBegan => {
@@ -172,6 +185,7 @@ pub fn gesture(gesture: ffi::PanelGesture) {
         }
         PanelGestureKind::DragCancelled => Ok(crate::edit(Session::cancel_edit)),
         PanelGestureKind::Reset => crate::edit(|session| session.reset_value(node, parameter.name)),
+        PanelGestureKind::Reload => return crate::dispatch(Event::ReloadFiles(node)),
         PanelGestureKind::Browse => {
             crate::perform(Request::ChooseFiles(FileIntent::SetFile {
                 node,
@@ -180,7 +194,11 @@ pub fn gesture(gesture: ffi::PanelGesture) {
             return;
         }
         PanelGestureKind::Typed => match &parameter.kind {
-            ParameterKind::Float(_) => {
+            // An emptied field unsets the value, so that it follows what the node reads again.
+            ParameterKind::Frame { .. } if String::from(&gesture.text).trim().is_empty() => {
+                crate::edit(|session| session.reset_value(node, parameter.name))
+            }
+            ParameterKind::Float(_) | ParameterKind::Frame { .. } => {
                 // Text that is no number goes in as NaN, which the session refuses as from a
                 // script.
                 let value = String::from(&gesture.text)
@@ -225,6 +243,12 @@ fn refusal(parameter: &Parameter, error: &EditError) -> String {
             parameter.label,
             number(*float.limits.start()),
             number(*float.limits.end())
+        ),
+        (ParameterKind::Frame { .. }, EditError::InvalidValue { .. }) => format!(
+            "{} takes whole frames from {} to {}",
+            parameter.label,
+            number(-FRAME_LIMIT),
+            number(FRAME_LIMIT)
         ),
         (_, EditError::InvalidValue { error, .. }) => {
             format!("Cannot change {}: {error}", parameter.label)

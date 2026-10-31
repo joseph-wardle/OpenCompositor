@@ -425,7 +425,7 @@ fn receive(notice: Notice) {
             evaluated.timing,
             evaluated.data_window(),
         )),
-        Notice::DeviceLost { .. } => None,
+        Notice::DeviceLost { .. } | Notice::Scanned { .. } => None,
     };
     let started = Instant::now();
     dispatch(Event::from(notice));

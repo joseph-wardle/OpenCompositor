@@ -5,6 +5,7 @@
 mod app;
 mod document;
 mod evaluate;
+mod files;
 #[cfg(test)]
 mod fixtures;
 mod gpu;
@@ -35,16 +36,16 @@ pub use document::{
     Slot, Timeline, TimelineError, missing, node_types,
 };
 pub use evaluate::{
-    DeviceLost, EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, Reloads, ResultKey,
-    result_key,
+    DeviceLost, EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, ResultKey, result_key,
 };
+pub use files::{Files, Pattern, Scan, held};
 pub use gpu::{FrameCheck, FrameTiming, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
-    FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,
+    FRAME_LIMIT, FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,
 };
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
-pub use session::{EditError, Session};
+pub use session::{EditError, Reload, Session};
 pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};
 pub use worker::{Evaluated, EvaluationDevice, StagingTiming, Timing, ViewerError, ViewerImage};
