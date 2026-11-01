@@ -114,3 +114,27 @@ fn actual_size_shows_one_image_pixel_per_physical_pixel_about_the_display_centre
     viewer.fit();
     assert_eq!(viewer.placement(DISPLAY), fitted);
 }
+
+#[test]
+fn a_copy_is_halved_while_each_texel_still_covers_a_physical_pixel() {
+    let mut viewer = viewer();
+    // Fitted at 0.469 physical pixels per image pixel: once halved, a texel covers 0.94.
+    assert_eq!(viewer.zoom().halvings(DISPLAY), Some(1));
+    let wide = Window {
+        width: 8000,
+        ..DISPLAY
+    };
+    // At 0.1125: three halvings make 0.9, a fourth would make 1.8.
+    assert_eq!(viewer.zoom().halvings(wide), Some(3));
+    // At exactly half, a halved texel covers exactly one.
+    viewer.camera = Camera::Placed {
+        centre: [0.0, 0.0],
+        zoom: 0.5,
+    };
+    assert_eq!(viewer.zoom().halvings(wide), Some(1));
+    viewer.actual_size(DISPLAY);
+    assert_eq!(viewer.zoom().halvings(DISPLAY), Some(0));
+
+    let without_pane = Viewer::new();
+    assert_eq!(without_pane.zoom().halvings(DISPLAY), None);
+}

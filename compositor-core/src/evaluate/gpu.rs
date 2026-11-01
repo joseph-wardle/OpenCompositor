@@ -21,6 +21,7 @@ use super::{
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
 use crate::kernels::{Kernels, Planes, plane_bytes};
 use crate::read::read_image_until;
+use crate::viewer_cache::{GpuCopier, GpuCopy};
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
 /// 6 GB beside the viewer's textures and the GUI's surfaces.
@@ -40,6 +41,7 @@ pub struct GpuEvaluation {
     device: wgpu::Device,
     queue: wgpu::Queue,
     kernels: Kernels,
+    copier: GpuCopier,
     retained: Vec<GpuRetained>,
     /// Planes released while something else held them, as the viewer holds the result it
     /// shows: reused once it lets go, rather than each edit making new ones.
@@ -71,6 +73,7 @@ impl GpuEvaluation {
             device: device.clone(),
             queue: queue.clone(),
             kernels: Kernels::new(device),
+            copier: GpuCopier::new(device),
             retained: Vec::new(),
             lent: Vec::new(),
             cap: RETAINED_TEXTURE_BYTES_CAP,
@@ -530,6 +533,38 @@ impl GpuEvaluation {
         }
         self.retained.extend(to_retain);
         Ok(image)
+    }
+
+    /// Submits the copy of an image this generation made for the viewer cache, halved that many
+    /// times, into a buffer to map once the GPU is idle. `Ok(None)` for an empty data window.
+    /// Fails if the GPU cannot hold the copy.
+    pub(crate) fn copy_for_viewer(
+        &mut self,
+        image: &GpuImage,
+        halvings: u32,
+    ) -> Result<Option<GpuCopy>, String> {
+        let Some(planes) = &image.planes else {
+            return Ok(None);
+        };
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let planes = planes.each_ref().map(|plane| &*plane.0);
+        let recorded = self.copier.record(
+            &self.device,
+            &mut encoder,
+            planes,
+            image.info.data_window,
+            halvings,
+        )?;
+        if recorded.is_some() {
+            self.queue.submit([encoder.finish()]);
+            self.submitted += 1;
+            let (completed, number) = (Arc::clone(&self.completed), self.submitted);
+            // As `submit`'s: it may run on the GUI thread inside its submit.
+            self.queue.on_submitted_work_done(move || {
+                completed.fetch_max(number, Ordering::Release);
+            });
+        }
+        Ok(recorded)
     }
 
     /// The keys of the retained results, for planning a request before this is at hand.

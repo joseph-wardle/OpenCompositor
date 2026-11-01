@@ -17,6 +17,7 @@ mod presentation;
 mod read;
 mod session;
 mod viewer;
+mod viewer_cache;
 mod worker;
 
 /// What `benches/kernels.rs` measures. The benchmark is a crate of its own, so this is the one
@@ -48,4 +49,5 @@ pub use parameter::{
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Reload, Session};
 pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};
+pub use viewer_cache::{DEFAULT_BUDGET, ViewerCache, ViewerCopy};
 pub use worker::{Evaluated, EvaluationDevice, StagingTiming, Timing, ViewerError, ViewerImage};

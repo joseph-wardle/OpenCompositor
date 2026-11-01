@@ -21,6 +21,7 @@ use crate::panel::Panel;
 use crate::parameter::Value;
 use crate::session::Session;
 use crate::viewer::EXPOSURE_STEP;
+use crate::viewer_cache::ViewerCopy;
 use crate::worker::{Evaluated, EvaluationDevice, ViewerError, Wanted, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
@@ -102,6 +103,8 @@ pub enum Event {
     },
     /// An evaluation finished on the evaluator's thread.
     Evaluated(Evaluated),
+    /// The evaluator's thread made a copy of an image it evaluated, for the viewer cache.
+    Copied(ViewerCopy),
     /// The GPU device of the generation was lost, when wgpu reported it.
     DeviceLost {
         generation: u64,
@@ -124,6 +127,7 @@ pub enum Event {
 )]
 pub enum Notice {
     Evaluated(Evaluated),
+    Copied(ViewerCopy),
     DeviceLost {
         generation: u64,
         at: Instant,
@@ -138,6 +142,7 @@ impl From<Notice> for Event {
     fn from(notice: Notice) -> Event {
         match notice {
             Notice::Evaluated(evaluated) => Event::Evaluated(evaluated),
+            Notice::Copied(copy) => Event::Copied(copy),
             Notice::DeviceLost { generation, at } => Event::DeviceLost { generation, at },
             Notice::Scanned { sequence, scan } => Event::Scanned { sequence, scan },
         }
@@ -354,6 +359,9 @@ pub struct Displayed {
     pub requested: f64,
     /// Whether the frame failed, and shows no image.
     pub failed: bool,
+    /// How many times the viewer cache's copy shown was halved, or `None` if the image shown was
+    /// evaluated.
+    pub cached: Option<u32>,
 }
 
 /// What the viewer shows.
@@ -363,6 +371,11 @@ enum Shown {
     Image {
         wanted: Wanted,
         info: ImageInfo,
+    },
+    /// A copy from the viewer cache.
+    Copy {
+        wanted: Wanted,
+        copy: Arc<ViewerCopy>,
     },
     /// An empty frame, never an older image.
     Failed {
@@ -376,16 +389,20 @@ impl Shown {
     fn wanted(&self) -> Option<&Wanted> {
         match self {
             Shown::Nothing => None,
-            Shown::Image { wanted, .. } | Shown::Failed { wanted, .. } => Some(wanted),
+            Shown::Image { wanted, .. }
+            | Shown::Copy { wanted, .. }
+            | Shown::Failed { wanted, .. } => Some(wanted),
         }
     }
 
     /// The image the viewer frames: none for an empty display window, which has no size to fit.
     fn framed(&self) -> Option<&ImageInfo> {
-        match self {
-            Shown::Image { info, .. } if !info.display_window.is_empty() => Some(info),
-            Shown::Image { .. } | Shown::Nothing | Shown::Failed { .. } => None,
-        }
+        let info = match self {
+            Shown::Image { info, .. } => info,
+            Shown::Copy { copy, .. } => &copy.info,
+            Shown::Nothing | Shown::Failed { .. } => return None,
+        };
+        (!info.display_window.is_empty()).then_some(info)
     }
 
     fn display_window(&self) -> Option<Window> {
@@ -468,8 +485,10 @@ pub struct App {
     scans_followed: Option<u64>,
     /// Files chosen, in the order chosen, waiting for scans.
     choices: Vec<Choice>,
-    /// What the worker was last asked for.
+    /// What the viewer last wanted, which the worker was asked for unless it was paused.
     sent: Option<Wanted>,
+    /// Whether the worker was paused instead, while the viewer shows the cached copy of `sent`.
+    paused: bool,
     /// The session's version and the viewed node when the viewer last followed them.
     followed: Option<(u64, Option<NodeId>)>,
     /// How many requests the worker was sent, which numbers them.
@@ -524,15 +543,21 @@ impl App {
             device,
             left_gpu: None,
             losses_during_evaluation: 0,
-            worker: Worker::start(device, move |evaluated| {
-                deliver.wake(Notice::Evaluated(evaluated));
-            }),
+            worker: Worker::start(
+                device,
+                {
+                    let deliver = deliver.clone();
+                    move |evaluated| deliver.wake(Notice::Evaluated(evaluated))
+                },
+                move |copy| deliver.wake(Notice::Copied(copy)),
+            ),
             waker,
             scanning: HashMap::new(),
             unscannable: BTreeSet::new(),
             scans_followed: None,
             choices: Vec::new(),
             sent: None,
+            paused: false,
             followed: None,
             requests_sent: 0,
             drawing: Drawing::Ready { recovered: None },
@@ -613,6 +638,10 @@ impl App {
             Event::ReloadFiles(node) => self.reload(&[node]),
             Event::Scanned { sequence, scan } => self.scanned(sequence, scan),
             Event::Evaluated(evaluated) => self.evaluated(evaluated),
+            Event::Copied(copy) => {
+                self.session.viewer_cache_mut().insert(copy);
+                Vec::new()
+            }
             Event::DeviceLost { generation, at } => self.device_lost(generation, at),
             Event::RetryDeviceCreation(attempt) => match self.drawing {
                 Drawing::Unavailable { attempt: last, .. } if attempt == last => {
@@ -740,6 +769,10 @@ impl App {
             frame: wanted.frame,
             requested: self.session.frame(),
             failed: matches!(self.shown, Shown::Failed { .. }),
+            cached: match &self.shown {
+                Shown::Copy { copy, .. } => Some(copy.halvings()),
+                Shown::Nothing | Shown::Image { .. } | Shown::Failed { .. } => None,
+            },
         })
     }
 
@@ -785,9 +818,19 @@ impl App {
 
     /// Moves evaluation to the CPU, which evaluates the last request again, saying why.
     fn leave_gpu(&mut self, why: LeftGpu) {
-        self.device = EvaluationDevice::Cpu;
         self.left_gpu = Some(why);
-        self.worker.evaluate_on(EvaluationDevice::Cpu);
+        self.evaluate_on(EvaluationDevice::Cpu);
+    }
+
+    /// Evaluates on the device from the next request. The viewer cache's copies are dropped,
+    /// and a copy shown is evaluated anew, since results never mix devices.
+    fn evaluate_on(&mut self, device: EvaluationDevice) {
+        self.device = device;
+        self.session.viewer_cache_mut().clear();
+        self.worker.evaluate_on(device);
+        if self.paused {
+            self.resume();
+        }
     }
 
     /// Makes a device for every pane with a native window, which the worker then uses. On
@@ -797,6 +840,11 @@ impl App {
         match self.gpu.make_device() {
             Ok(new) => {
                 (self.worker).connect(new.device, new.queue, new.lost, new.generation);
+                // The paused worker shows nothing again, so the copy is shown anew.
+                if let Shown::Copy { copy, .. } = &self.shown {
+                    self.images_shown += 1;
+                    self.gpu.show_copy(copy, self.images_shown);
+                }
                 let mut requests = Vec::new();
                 if !new.pane_errors.is_empty() {
                     requests.push(Request::ShowError(new.pane_errors.join("; ")));
@@ -835,12 +883,29 @@ impl App {
 
     fn draw(&mut self, pane: Pane) -> Vec<Request> {
         let viewer = self.session.viewer();
-        let frame = self.shown.framed().map(|info| ViewerFrame {
-            placement: viewer.placement(info.display_window),
-            display_window: info.display_window,
-            data_window: info.data_window,
-            scale_factor: viewer.scale_factor(),
-            gain: viewer.gain(),
+        let frame = self.shown.framed().map(|info| {
+            let (data_window, pixels_per_texel) = match &self.shown {
+                Shown::Copy { copy, .. } => {
+                    let window = copy.window;
+                    let halvings = copy.halvings();
+                    let covered = Window {
+                        x: window.x << halvings,
+                        y: window.y << halvings,
+                        width: window.width << halvings,
+                        height: window.height << halvings,
+                    };
+                    (covered, 1 << halvings)
+                }
+                _ => (info.data_window, 1),
+            };
+            ViewerFrame {
+                placement: viewer.placement(info.display_window),
+                display_window: info.display_window,
+                data_window,
+                scale_factor: viewer.scale_factor(),
+                gain: viewer.gain(),
+                pixels_per_texel,
+            }
         });
         match self
             .gpu
@@ -849,7 +914,9 @@ impl App {
             Drawn::Presented => {
                 if pane == Pane::Viewer {
                     self.presented = match &self.shown {
-                        Shown::Image { wanted, .. } => Some(wanted.number),
+                        Shown::Image { wanted, .. } | Shown::Copy { wanted, .. } => {
+                            Some(wanted.number)
+                        }
                         Shown::Nothing | Shown::Failed { .. } => None,
                     };
                 }
@@ -1084,10 +1151,11 @@ impl App {
                 vec![Request::Redraw(Pane::Viewer)]
             }
             Command::EvaluateOn(device) => {
-                self.device = device;
                 self.left_gpu = None;
                 self.losses_during_evaluation = 0;
-                self.worker.evaluate_on(device);
+                if device != self.device {
+                    self.evaluate_on(device);
+                }
                 Vec::new()
             }
         }
@@ -1374,6 +1442,9 @@ impl App {
             self.followed = followed;
             self.send_wanted(requests);
         }
+        if self.paused && self.copy_falls_short() {
+            self.resume();
+        }
         let caption = self.caption();
         if caption != self.caption {
             self.caption.clone_from(&caption);
@@ -1396,24 +1467,80 @@ impl App {
         if wanted.as_ref().map(|(node, key)| (*node, key)) != sent {
             self.requests_sent += 1;
             let number = self.requests_sent;
-            let wanted = wanted.map(|(node, key)| Wanted {
+            let Some((node, key)) = wanted else {
+                self.worker.request(None);
+                self.sent = None;
+                self.paused = false;
+                return;
+            };
+            let mut wanted = Wanted {
                 node,
                 key,
                 frame,
                 number,
-            });
-            self.worker.request(wanted.clone());
-            self.sent = wanted;
+                copy: None,
+            };
+            let zoom = self.session.viewer().zoom();
+            // A hit is shown at once, and the worker stops rather than evaluate it.
+            match self.session.viewer_cache_mut().get(&wanted.key, zoom) {
+                Some(copy) => {
+                    self.worker.pause();
+                    self.paused = true;
+                    self.images_shown += 1;
+                    self.gpu.show_copy(&copy, self.images_shown);
+                    self.shown = Shown::Copy {
+                        wanted: wanted.clone(),
+                        copy,
+                    };
+                    requests.push(Request::Redraw(Pane::Viewer));
+                }
+                None => {
+                    wanted.copy = Some(zoom);
+                    self.worker.request(Some(wanted.clone()));
+                    self.paused = false;
+                }
+            }
+            self.sent = Some(wanted);
         } else if let Some(sent) = &mut self.sent {
             // Another frame with an equal key is not asked for: its image is the same, and what
             // is shown of the key is that frame's.
             sent.frame = frame;
-            if let Shown::Image { wanted, .. } | Shown::Failed { wanted, .. } = &mut self.shown
+            if let Shown::Image { wanted, .. }
+            | Shown::Copy { wanted, .. }
+            | Shown::Failed { wanted, .. } = &mut self.shown
                 && wanted.key == sent.key
             {
                 wanted.frame = frame;
             }
         }
+    }
+
+    /// Whether the cached copy shown falls short of the image: the readout points at one of its
+    /// pixels, whose working values only the image has, or the viewer draws it larger than its
+    /// texels, as after zooming in.
+    fn copy_falls_short(&self) -> bool {
+        let Shown::Copy { copy, .. } = &self.shown else {
+            return false;
+        };
+        let zoom = self.session.viewer().zoom();
+        let halvings = zoom.halvings(copy.info.display_window);
+        let coarse = halvings.is_none_or(|halvings| copy.halvings() > halvings);
+        coarse || matches!(self.pointed(), Some((_, Some(_))))
+    }
+
+    /// Asks the paused worker for what the viewer wants after all, under the same number, with a
+    /// copy for the viewer cache if it has none to serve the viewer's zoom.
+    fn resume(&mut self) {
+        self.paused = false;
+        let Some(sent) = &self.sent else {
+            return;
+        };
+        let zoom = self.session.viewer().zoom();
+        let cache = self.session.viewer_cache();
+        self.worker.request(Some(Wanted {
+            copy: (!cache.serves(&sent.key, zoom)).then_some(zoom),
+            ..sent.clone()
+        }));
     }
 
     /// Keeps the readout on the shown image's pixel under the pointer, or the one it left the
@@ -1515,9 +1642,22 @@ impl App {
                 }
                 details.extend(info.warnings.iter().map(ToString::to_string));
             }
+            Shown::Copy { copy, .. } if current => {
+                let window = copy.info.display_window;
+                if !window.is_empty() {
+                    details.push(format!("{} × {}", window.width, window.height));
+                }
+                details.extend(copy.info.warnings.iter().map(ToString::to_string));
+                details.push(match copy.halvings() {
+                    0 => "cached".to_owned(),
+                    halvings => format!("cached at 1/{}", 1u32 << halvings),
+                });
+            }
             Shown::Failed { error, .. } if current => details.push(error.clone()),
             // The previous image stays until then, and says which frame it is of.
-            Shown::Image { wanted, .. } if wanted.frame != self.session.frame() => {
+            Shown::Image { wanted, .. } | Shown::Copy { wanted, .. }
+                if wanted.frame != self.session.frame() =>
+            {
                 let frame = self.session.frame();
                 details.push(format!("frame {} shown, {frame} updating…", wanted.frame));
             }

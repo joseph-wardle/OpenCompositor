@@ -8,10 +8,13 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::document::NodeId;
+use crate::evaluate::GpuImage;
 use crate::evaluate::{
     DEEP_STACK, EvalError, Evaluator, GpuEvaluation, Pool, ResultKey, poll_device,
 };
 use crate::image::{ImageInfo, Plane, Window};
+use crate::viewer::Zoom;
+use crate::viewer_cache::ViewerCopy;
 
 /// The staging buffer's first size, a DCI 4K image of four planes, and its least.
 const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
@@ -56,6 +59,9 @@ pub(crate) struct Wanted {
     /// Not the key's: the worker evaluates the key, and the frame says what its image is of.
     pub(crate) frame: f64,
     pub(crate) number: u64,
+    /// How large the viewer draws images, for the copy of the result the viewer cache is given;
+    /// `None` for no copy.
+    pub(crate) copy: Option<Zoom>,
 }
 
 /// A finished evaluation of what the worker was asked for, which may have been superseded since.
@@ -222,6 +228,9 @@ impl std::error::Error for ViewerError {
 /// request replaces any request it has not started, so after a burst of requests it evaluates at
 /// most the one in progress and the last.
 ///
+/// Once it has delivered a result, unless a newer request is waiting, it makes the result's copy
+/// for the viewer cache if asked, on the device that evaluated it, and passes it on.
+///
 /// A newer request for another node, or for nothing, stops the evaluation in progress at its
 /// next stopping point: between nodes, between chunks of an operation long enough to ask or of an
 /// EXR file's decoding, before staging or submitting, and while waiting for the staging buffer;
@@ -253,9 +262,8 @@ struct Mailbox {
 /// holds them only in a GPU phase, which the worker's drop waits for.
 #[derive(Debug)]
 struct MailboxState {
-    /// A request the worker has not started: what the viewer wants, or `None` for nothing,
-    /// which releases everything retained.
-    request: Option<Option<Wanted>>,
+    /// A request the worker has not started.
+    request: Option<Asked>,
     /// The request the worker started last.
     started: Option<Wanted>,
     /// When the viewer last caught up: the worker's last delivery, or a request reaching it
@@ -272,6 +280,16 @@ struct MailboxState {
     /// Evaluation's last submission in a GPU session, for telling whether a device was lost
     /// while it had work on the GPU.
     last_submission: Option<Submission>,
+}
+
+/// What the worker is asked to do next.
+#[derive(Debug)]
+enum Asked {
+    Evaluate(Wanted),
+    /// Stop, keeping what is retained, as while the viewer shows a cached copy.
+    Pause,
+    /// Release everything retained, as when the viewer wants nothing.
+    Release,
 }
 
 #[derive(Debug)]
@@ -309,9 +327,13 @@ enum StagingSlot {
 }
 
 impl Worker {
-    /// Starts the worker, evaluating on `device`. It passes each result to `deliver` on its own
-    /// thread.
-    pub fn start(device: EvaluationDevice, deliver: impl Fn(Evaluated) + Send + 'static) -> Worker {
+    /// Starts the worker, evaluating on `device`. It passes each result to `deliver`, and each
+    /// copy for the viewer cache to `copied`, on its own thread.
+    pub fn start(
+        device: EvaluationDevice,
+        deliver: impl Fn(Evaluated) + Send + 'static,
+        copied: impl Fn(ViewerCopy) + Send + 'static,
+    ) -> Worker {
         let mailbox = Arc::new(Mailbox {
             state: Mutex::new(MailboxState {
                 request: None,
@@ -332,16 +354,18 @@ impl Worker {
             .spawn(move || {
                 let mut evaluator = Evaluator::new();
                 let mut sizing = StagingSizing::default();
-                while let Some((request, device)) = worker.next() {
-                    match (request, device) {
-                        (Some(wanted), EvaluationDevice::Cpu) => {
-                            evaluate(&worker, &mut evaluator, wanted, &deliver, &mut sizing);
+                let sinks = Sinks { deliver, copied };
+                while let Some((asked, device)) = worker.next() {
+                    match (asked, device) {
+                        (Asked::Evaluate(wanted), EvaluationDevice::Cpu) => {
+                            evaluate(&worker, &mut evaluator, wanted, &sinks, &mut sizing);
                         }
-                        (Some(wanted), EvaluationDevice::Gpu) => {
-                            evaluate_on_gpu(&worker, &mut evaluator, wanted, &deliver);
+                        (Asked::Evaluate(wanted), EvaluationDevice::Gpu) => {
+                            evaluate_on_gpu(&worker, &mut evaluator, wanted, &sinks);
                         }
-                        (None, EvaluationDevice::Cpu) => evaluator.release_all(),
-                        (None, EvaluationDevice::Gpu) => {
+                        (Asked::Pause, _) => {}
+                        (Asked::Release, EvaluationDevice::Cpu) => evaluator.release_all(),
+                        (Asked::Release, EvaluationDevice::Gpu) => {
                             evaluator.release_all();
                             release_on_gpu(&worker);
                         }
@@ -354,7 +378,18 @@ impl Worker {
 
     /// Asks for a node's image, or with `None` for nothing, releasing everything retained.
     pub(crate) fn request(&self, wanted: Option<Wanted>) {
-        self.mailbox.lock().request = Some(wanted);
+        let asked = match wanted {
+            Some(wanted) => Asked::Evaluate(wanted),
+            None => Asked::Release,
+        };
+        self.mailbox.lock().request = Some(asked);
+        self.mailbox.changed.notify_all();
+    }
+
+    /// Stops the request in progress as a request for another node would, keeping what it
+    /// retained, and waits for the next.
+    pub(crate) fn pause(&self) {
+        self.mailbox.lock().request = Some(Asked::Pause);
         self.mailbox.changed.notify_all();
     }
 
@@ -417,8 +452,10 @@ impl Worker {
             };
             (evaluation, staging)
         });
-        if state.request.is_none() && state.started.is_some() {
-            state.request = Some(state.started.clone());
+        if state.request.is_none()
+            && let Some(started) = &state.started
+        {
+            state.request = Some(Asked::Evaluate(started.clone()));
         }
         drop(state);
         self.mailbox.changed.notify_all();
@@ -428,8 +465,10 @@ impl Worker {
     fn replace_connection(&self, connection: Option<Connection>) {
         let mut state = self.mailbox.lock();
         let replaced = std::mem::replace(&mut state.connection, connection);
-        if state.request.is_none() && state.started.is_some() {
-            state.request = Some(state.started.clone());
+        if state.request.is_none()
+            && let Some(started) = &state.started
+        {
+            state.request = Some(Asked::Evaluate(started.clone()));
         }
         drop(state);
         self.mailbox.changed.notify_all();
@@ -482,18 +521,21 @@ impl Mailbox {
     }
 
     /// Waits for a request, and where to evaluate it, or `None` once the worker is stopping.
-    fn next(&self) -> Option<(Option<Wanted>, EvaluationDevice)> {
+    fn next(&self) -> Option<(Asked, EvaluationDevice)> {
         let mut idle = false;
         let next = self.wait_for(|state| {
-            let Some(request) = state.request.take() else {
+            let Some(asked) = state.request.take() else {
                 idle = true;
                 return Take::Wait;
             };
             if idle {
                 state.caught_up = Instant::now();
             }
-            state.started.clone_from(&request);
-            Take::Taken((request, state.device))
+            state.started = match &asked {
+                Asked::Evaluate(wanted) => Some(wanted.clone()),
+                Asked::Pause | Asked::Release => None,
+            };
+            Take::Taken((asked, state.device))
         });
         // For waits on the request being started, which only tests make.
         self.changed.notify_all();
@@ -549,6 +591,10 @@ impl Mailbox {
         self.lock().superseded()
     }
 
+    fn has_newer_request(&self) -> bool {
+        self.lock().request.is_some()
+    }
+
     /// Begins a GPU phase, in which the worker may hold GPU objects, unless the started request
     /// is superseded.
     fn start_gpu_phase(self: &Arc<Mailbox>) -> Option<GpuPhase<'_>> {
@@ -597,8 +643,8 @@ enum Take<T> {
 
 impl MailboxState {
     /// Whether the started request should stop: the worker is stopping, or a newer request is
-    /// waiting for another node, for nothing, or for another frame within the feedback interval
-    /// of the viewer catching up.
+    /// waiting for another node, for nothing, to pause, or for another frame within the feedback
+    /// interval of the viewer catching up.
     fn superseded(&self) -> bool {
         if self.stopping {
             return true;
@@ -607,7 +653,7 @@ impl MailboxState {
             return false;
         };
         match (newer, &self.started) {
-            (Some(newer), Some(started)) if newer.node == started.node => {
+            (Asked::Evaluate(newer), Some(started)) if newer.node == started.node => {
                 newer.frame != started.frame && self.caught_up.elapsed() < FEEDBACK_INTERVAL
             }
             _ => true,
@@ -697,13 +743,19 @@ impl Drop for GpuPhase<'_> {
     }
 }
 
+/// Where the worker passes what it made, on its own thread.
+struct Sinks<D, C> {
+    deliver: D,
+    copied: C,
+}
+
 /// Evaluates the wanted key on the worker's thread, then stages and delivers its image, unless it
-/// is superseded first.
+/// is superseded first, then makes its copy.
 fn evaluate(
     mailbox: &Arc<Mailbox>,
     evaluator: &mut Evaluator,
     wanted: Wanted,
-    deliver: &impl Fn(Evaluated),
+    sinks: &Sinks<impl Fn(Evaluated), impl Fn(ViewerCopy)>,
     sizing: &mut StagingSizing,
 ) {
     let started = Instant::now();
@@ -729,9 +781,14 @@ fn evaluate(
         return;
     };
     let mut staging = StagingTiming::default();
+    // What the copy is made from, once the result is delivered.
+    let mut to_copy = None;
     let result = match result {
         Ok(image) => {
             let (info, planes) = image.into_parts();
+            if let Some(zoom) = wanted.copy {
+                to_copy = Some((zoom, info.clone(), planes.clone()));
+            }
             let pool = evaluator.pool();
             match stage(&phase, &info, planes, pool, sizing, &mut staging) {
                 Ok(pixels) => Ok(ViewerImage { info, pixels }),
@@ -747,21 +804,33 @@ fn evaluate(
         staging,
         delivered: evaluated_at,
     };
-    deliver_unless_superseded(&phase, wanted, result, timing, deliver);
+    let key = wanted.key.clone();
+    let delivered = deliver_unless_superseded(&phase, wanted, result, timing, &sinks.deliver);
+    // The CPU's kernels run outside a GPU phase.
+    drop(phase);
+    if let Some((zoom, info, planes)) = to_copy
+        && delivered
+        && !mailbox.has_newer_request()
+        && let Some(halvings) = zoom.halvings(info.display_window)
+    {
+        let planes = planes.each_ref().map(|plane| &plane[..]);
+        let pool = evaluator.pool();
+        (sinks.copied)(ViewerCopy::of_planes(key, info, planes, halvings, pool));
+    }
 }
 
 /// Delivers a result, unless it is superseded or was finished for a replaced device, which drops
 /// it, even a failure, which may be that device's: connecting the new one asks for the request
-/// again. Its GPU objects, if any, go before the phase ends.
+/// again. Its GPU objects, if any, go before the phase ends. Returns whether it delivered it.
 fn deliver_unless_superseded(
     phase: &GpuPhase,
     wanted: Wanted,
     result: Result<ViewerImage, ViewerError>,
     mut timing: Timing,
     deliver: &impl Fn(Evaluated),
-) {
+) -> bool {
     if phase.mailbox.superseded() || phase.device_replaced() {
-        return;
+        return false;
     }
     timing.delivered = Instant::now();
     deliver(Evaluated {
@@ -770,17 +839,18 @@ fn deliver_unless_superseded(
         timing,
     });
     phase.mailbox.lock().caught_up = Instant::now();
+    true
 }
 
 /// Evaluates the wanted key in a GPU session: reads the files of the Readers it uploads on the
 /// worker's thread, then in a GPU phase records the request, submits it as one, delivers the
-/// result, and waits without blocking for the GPU to complete it, unless
-/// it is superseded first. Without a device it evaluates nothing: connecting one asks again.
+/// result, and waits without blocking for the GPU to complete it, unless it is superseded first,
+/// then makes its copy there. Without a device it evaluates nothing: connecting one asks again.
 fn evaluate_on_gpu(
     mailbox: &Arc<Mailbox>,
     evaluator: &mut Evaluator,
     wanted: Wanted,
-    deliver: &impl Fn(Evaluated),
+    sinks: &Sinks<impl Fn(Evaluated), impl Fn(ViewerCopy)>,
 ) {
     let started = Instant::now();
     let on_gpu = mailbox.retained_on_gpu();
@@ -813,7 +883,7 @@ fn evaluate_on_gpu(
     };
     if let Some(error) = failure {
         let result = Err(ViewerError::Eval(error));
-        deliver_unless_superseded(&phase, wanted, result, timing, deliver);
+        deliver_unless_superseded(&phase, wanted, result, timing, &sinks.deliver);
         return;
     }
     phase.with_evaluation(|evaluation, device| {
@@ -824,7 +894,19 @@ fn evaluate_on_gpu(
             return;
         };
         timing.evaluated = Instant::now();
-        deliver_unless_superseded(&phase, wanted, result, timing, deliver);
+        let to_copy = match (&result, wanted.copy) {
+            (Ok(image), Some(zoom)) => Some((zoom, image.clone(), wanted.key.clone())),
+            _ => None,
+        };
+        let result = result.map(|image| ViewerImage {
+            info: image.info().clone(),
+            pixels: image.textures().map(|planes| Pixels {
+                planes,
+                device_generation: device.generation,
+                staged: None,
+            }),
+        });
+        let delivered = deliver_unless_superseded(&phase, wanted, result, timing, &sinks.deliver);
         // The next request is recorded only once this one is complete, so that superseded work
         // on the GPU is at most one request, and so is its memory. A lost device's work never
         // completes; its lost callback has the app replace it.
@@ -836,7 +918,39 @@ fn evaluate_on_gpu(
         {
             submission.completed.get_or_insert_with(Instant::now);
         }
+        if let Some((zoom, image, key)) = to_copy
+            && delivered
+            && !mailbox.has_newer_request()
+            && let Some(copy) = copy_on_gpu(&phase, evaluation, device, &image, key, zoom)
+        {
+            (sinks.copied)(copy);
+        }
     });
+}
+
+/// Makes an image's copy for the viewer cache on the GPU that evaluated it and reads it back,
+/// waiting without blocking. `None` if the GPU cannot make it, or the phase is abandoned.
+fn copy_on_gpu(
+    phase: &GpuPhase,
+    evaluation: &mut GpuEvaluation,
+    device: &PhaseDevice,
+    image: &GpuImage,
+    key: ResultKey,
+    zoom: Zoom,
+) -> Option<ViewerCopy> {
+    let info = image.info().clone();
+    let halvings = zoom.halvings(info.display_window)?;
+    let Some(copy) = evaluation.copy_for_viewer(image, halvings).ok()? else {
+        return Some(ViewerCopy::empty(key, info, halvings));
+    };
+    while evaluation.idle() == Ok(false) && !phase.abandoned() {
+        phase.mailbox.pause(COMPLETION_POLL);
+    }
+    if evaluation.idle() != Ok(true) {
+        return None;
+    }
+    map(phase, &device.device, &copy.readback, wgpu::MapMode::Read).ok()?;
+    copy.read(key, info).ok()
 }
 
 /// Records the key's request on the device and submits it, unless `stop` returns true first,
@@ -848,7 +962,7 @@ fn record_and_submit(
     device: &PhaseDevice,
     key: &ResultKey,
     stop: impl Fn() -> bool,
-) -> Option<Result<ViewerImage, ViewerError>> {
+) -> Option<Result<GpuImage, ViewerError>> {
     let recorded = std::panic::catch_unwind(AssertUnwindSafe(|| {
         evaluator.record_on(evaluation, key, &stop)
     }));
@@ -874,18 +988,7 @@ fn record_and_submit(
         at: Instant::now(),
         completed: None,
     });
-    let image = match evaluation.submit(recorded) {
-        Ok(image) => image,
-        Err(error) => return Some(Err(ViewerError::Eval(error))),
-    };
-    Some(Ok(ViewerImage {
-        info: image.info().clone(),
-        pixels: image.textures().map(|planes| Pixels {
-            planes,
-            device_generation: device.generation,
-            staged: None,
-        }),
-    }))
+    Some(evaluation.submit(recorded).map_err(ViewerError::Eval))
 }
 
 /// Releases everything retained on the connected device, as when the viewer wants nothing.
@@ -957,7 +1060,7 @@ fn stage(
     let buffer = match staging.buffer.take() {
         Some(buffer) => match sizing.replacement(buffer.size(), size, limits.max_buffer_size) {
             None => {
-                map(phase, device, &buffer).map_err(|error| {
+                map(phase, device, &buffer, wgpu::MapMode::Write).map_err(|error| {
                     format!("the GPU could not map its staging buffer: {error}")
                 })?;
                 buffer
@@ -1127,11 +1230,15 @@ pub(crate) fn allocate<T>(
     }
 }
 
-/// Maps the buffer for writing once the GPU has finished copying out of it, unless the staging is
-/// abandoned first.
-fn map(phase: &GpuPhase, device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<(), String> {
+/// Maps the buffer once the GPU has finished with it, unless the phase is abandoned first.
+fn map(
+    phase: &GpuPhase,
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    mode: wgpu::MapMode,
+) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
-    buffer.map_async(wgpu::MapMode::Write, .., move |result| {
+    buffer.map_async(mode, .., move |result| {
         let _ = sender.send(result);
     });
     loop {

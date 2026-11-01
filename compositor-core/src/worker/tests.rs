@@ -28,6 +28,7 @@ fn on(node: u64, key: ResultKey) -> Wanted {
         key,
         frame: 1.0,
         number: 0,
+        copy: None,
     }
 }
 
@@ -43,9 +44,13 @@ fn write_png(path: &Path, width: u32, height: u32) {
 
 fn worker() -> (Worker, Receiver<Evaluated>) {
     let (delivered, deliveries) = mpsc::channel();
-    let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
-        delivered.send(evaluated).unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Cpu,
+        move |evaluated| {
+            delivered.send(evaluated).unwrap();
+        },
+        |_| {},
+    );
     (worker, deliveries)
 }
 
@@ -106,10 +111,14 @@ fn a_request_replaces_any_the_worker_has_not_started() {
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
     // Each delivery waits for the test, holding the worker as a long evaluation would.
-    let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
-        delivered.send(evaluated.wanted.key).unwrap();
-        released.lock().unwrap().recv().unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Cpu,
+        move |evaluated| {
+            delivered.send(evaluated.wanted.key).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        },
+        |_| {},
+    );
 
     worker.request(Some(on(1, missing("first"))));
     assert_eq!(deliveries.recv().unwrap(), missing("first"));
@@ -141,10 +150,14 @@ fn dropping_the_worker_waits_for_the_delivery_in_progress() {
     let (started, delivering) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
-    let worker = Worker::start(EvaluationDevice::Cpu, move |_| {
-        started.send(()).unwrap();
-        released.lock().unwrap().recv().unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Cpu,
+        move |_| {
+            started.send(()).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        },
+        |_| {},
+    );
     worker.request(Some(on(1, missing("missing"))));
     delivering.recv().unwrap();
 
@@ -160,28 +173,31 @@ fn dropping_the_worker_waits_for_the_delivery_in_progress() {
     drop_returned.recv_timeout(Duration::from_secs(10)).unwrap();
 }
 
+/// A named pipe in its own directory. Reading it waits for a writer, and then for what it
+/// writes, as a long decode would.
 #[cfg(unix)]
-#[test]
-fn dropping_the_worker_does_not_wait_for_an_evaluation() {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // Reading a named pipe waits for a writer, and then for what it writes, as a long decode
-    // would.
-    let pipe = directory("decode-in-progress").join("pipe.exr");
+fn pipe(name: &str) -> PathBuf {
+    let pipe = directory(name).join("pipe.exr");
     let made = std::process::Command::new("mkfifo").arg(&pipe).status();
     assert!(made.unwrap().success());
-    let (worker, deliveries) = worker();
-    worker.request(Some(on(1, key(&pipe))));
-    // Opening for writing without blocking fails until the worker has the pipe open for
-    // reading; once it succeeds, the worker waits on the read for as long as this end is open.
+    pipe
+}
+
+/// The pipe's writing end, once the worker has it open for reading. The worker then waits on
+/// the read for as long as this end is open.
+#[cfg(unix)]
+fn writer_once_read(pipe: &Path) -> File {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Opening for writing without blocking fails until a reader has the pipe open.
     let deadline = Instant::now() + Duration::from_secs(10);
-    let writer = loop {
+    loop {
         let opened = File::options()
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open(&pipe);
+            .open(pipe);
         match opened {
-            Ok(writer) => break writer,
+            Ok(writer) => return writer,
             Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
                 assert!(
                     Instant::now() < deadline,
@@ -191,7 +207,16 @@ fn dropping_the_worker_does_not_wait_for_an_evaluation() {
             }
             Err(error) => panic!("{error}"),
         }
-    };
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_the_worker_does_not_wait_for_an_evaluation() {
+    let pipe = pipe("decode-in-progress");
+    let (worker, deliveries) = worker();
+    worker.request(Some(on(1, key(&pipe))));
+    let writer = writer_once_read(&pipe);
 
     let drop_returned = drop_elsewhere(worker);
 
@@ -709,9 +734,13 @@ fn a_file_is_staged_bottom_row_first() {
 /// A GPU session's worker, connected to a device on the adapter the kernel tests use.
 fn gpu_worker() -> (Worker, Receiver<Evaluated>, wgpu::Device, wgpu::Queue) {
     let (delivered, deliveries) = mpsc::channel();
-    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
-        delivered.send(evaluated).unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        move |evaluated| {
+            delivered.send(evaluated).unwrap();
+        },
+        |_| {},
+    );
     let (device, queue) = crate::kernels::headless::device();
     worker.connect(device.clone(), queue.clone(), Arc::default(), 1);
     (worker, deliveries, device, queue)
@@ -771,9 +800,13 @@ fn a_gpu_session_evaluates_nothing_until_a_device_is_connected() {
     let path = directory("gpu-unconnected").join("image.png");
     write_png(&path, 3, 2);
     let (delivered, deliveries) = mpsc::channel();
-    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
-        delivered.send(evaluated).unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        move |evaluated| {
+            delivered.send(evaluated).unwrap();
+        },
+        |_| {},
+    );
 
     worker.request(Some(on(1, exposed(&path, 1.0))));
     assert!(
@@ -792,9 +825,13 @@ fn a_gpu_session_fails_a_request_on_a_lost_device_and_shows_it_on_the_next() {
     let path = directory("gpu-lost").join("image.png");
     write_png(&path, 3, 2);
     let (delivered, deliveries) = mpsc::channel();
-    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
-        delivered.send(evaluated).unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        move |evaluated| {
+            delivered.send(evaluated).unwrap();
+        },
+        |_| {},
+    );
     let (device, queue) = crate::kernels::headless::device();
     worker.connect(device, queue, Arc::new(AtomicBool::new(true)), 1);
     let requested = exposed(&path, 1.0);
@@ -867,10 +904,14 @@ fn dropping_a_gpu_session_worker_waits_for_its_gpu_phase() {
     let (started, delivering) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
-    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
-        started.send(evaluated).unwrap();
-        released.lock().unwrap().recv().unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        move |evaluated| {
+            started.send(evaluated).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        },
+        |_| {},
+    );
     let (device, queue) = crate::kernels::headless::device();
     worker.connect(device, queue, Arc::default(), 1);
     worker.request(Some(on(1, exposed(&path, 1.0))));
@@ -936,5 +977,82 @@ fn a_loss_counts_as_during_evaluation_only_until_the_gpu_completed_its_work() {
         // Without a submission on the device connected now, a loss is not during evaluation.
         connect(&worker, (device, queue), 2);
         assert!(!worker.disconnect(Instant::now()));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pause_stops_the_request_in_progress_and_the_next_request_is_evaluated() {
+    let pipe = pipe("paused");
+    let (worker, deliveries) = worker();
+    worker.request(Some(on(1, key(&pipe))));
+    let writer = writer_once_read(&pipe);
+
+    worker.pause();
+    // The read fails once the pipe closes, and the failure is not delivered.
+    drop(writer);
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        "delivered after the pause"
+    );
+    worker.request(Some(on(1, missing("next"))));
+    assert_eq!(receive(&deliveries).wanted.key, missing("next"));
+}
+
+/// A worker on the device that also hands its copies for the viewer cache to the test.
+fn copying_worker(device: EvaluationDevice) -> (Worker, Receiver<Evaluated>, Receiver<ViewerCopy>) {
+    let (delivered, deliveries) = mpsc::channel();
+    let (copied, copies) = mpsc::channel();
+    let worker = Worker::start(
+        device,
+        move |evaluated| delivered.send(evaluated).unwrap(),
+        move |copy| copied.send(copy).unwrap(),
+    );
+    (worker, deliveries, copies)
+}
+
+#[test]
+fn a_result_asked_for_with_a_copy_is_delivered_then_copied_on_its_device() {
+    let path = directory("copied").join("image.png");
+    write_png(&path, 8, 4);
+    // An 8-pixel-wide image fitted to a 4-pixel pane is drawn at 0.45 physical pixels a pixel.
+    let mut viewer = crate::viewer::Viewer::new();
+    viewer.resize(crate::gpu::PaneSize {
+        width: 4,
+        height: 4,
+        scale_factor: 1.0,
+    });
+    for device in [EvaluationDevice::Cpu, EvaluationDevice::Gpu] {
+        let (worker, deliveries, copies) = copying_worker(device);
+        let (gpu, queue) = crate::kernels::headless::device();
+        worker.connect(gpu, queue, Arc::default(), 1);
+        let key = exposed(&path, -1.0);
+
+        worker.request(Some(on(1, key.clone())));
+        receive(&deliveries);
+        assert!(
+            copies.recv_timeout(Duration::from_millis(200)).is_err(),
+            "copied unasked on the {device}"
+        );
+
+        worker.request(Some(Wanted {
+            copy: Some(viewer.zoom()),
+            ..on(1, key.clone())
+        }));
+        receive(&deliveries);
+        let copy = (copies.recv_timeout(Duration::from_secs(10))).expect("a copy");
+        assert!(copy.key == key);
+        assert_eq!(copy.halvings(), 1);
+        assert_eq!(
+            copy.window,
+            Window {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 2,
+            }
+        );
+        let texels: Vec<f32> = copy.texels.iter().map(|value| value.to_f32()).collect();
+        assert_eq!(texels, [0.5, 0.5, 0.5, 1.0].repeat(8), "on the {device}");
     }
 }

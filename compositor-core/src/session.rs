@@ -17,6 +17,7 @@ use crate::files::{Files, Pattern, Scan};
 use crate::parameter::{Value, ValueError, describe, resolve};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
+use crate::viewer_cache::ViewerCache;
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
 const READER_SPACING: f32 = 70.0;
@@ -126,6 +127,7 @@ pub struct Session {
     /// so undo never moves it.
     frame: f64,
     viewer: Viewer,
+    viewer_cache: ViewerCache,
     /// Unsaved and not undoable.
     files: Files,
     failures: Failures,
@@ -157,6 +159,7 @@ impl Session {
             }),
             frame: Document::default().timeline().first(),
             viewer: Viewer::new(),
+            viewer_cache: ViewerCache::default(),
             files: Files::default(),
             failures: Failures::default(),
             version: 0,
@@ -181,6 +184,22 @@ impl Session {
 
     pub(crate) fn viewer_mut(&mut self) -> &mut Viewer {
         &mut self.viewer
+    }
+
+    /// Copies of the images the viewer showed, which show their frames again without evaluating
+    /// them.
+    pub fn viewer_cache(&self) -> &ViewerCache {
+        &self.viewer_cache
+    }
+
+    pub(crate) fn viewer_cache_mut(&mut self) -> &mut ViewerCache {
+        &mut self.viewer_cache
+    }
+
+    /// Has the viewer cache hold at most `bytes` of copies, dropping those least recently
+    /// requested that no longer fit.
+    pub fn set_viewer_cache_budget(&mut self, bytes: u64) {
+        self.viewer_cache.set_budget(bytes);
     }
 
     /// Changes whenever the document, the frame or the files do, so that a key built at one

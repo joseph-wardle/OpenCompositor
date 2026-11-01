@@ -30,17 +30,37 @@ fn app() -> (App, Receiver<Evaluated>) {
     (app, deliveries)
 }
 
-/// An app as [`app`] makes it, whose scans also come back to the test, as the events the shell
-/// would dispatch for them.
 /// A scan as the app's thread hands it over.
 type Scanned = (Pattern, io::Result<Scan>);
 
+/// An app as [`app`] makes it, whose scans also come back to the test, as the events the shell
+/// would dispatch for them.
 fn app_scanning() -> (App, Receiver<Evaluated>, Receiver<Scanned>) {
+    let (app, deliveries, scans, _) = app_with_every_notice();
+    (app, deliveries, scans)
+}
+
+/// An app as [`app`] makes it, whose copies for the viewer cache also come back to the test.
+fn app_copying() -> (App, Receiver<Evaluated>, Receiver<ViewerCopy>) {
+    let (app, deliveries, _, copies) = app_with_every_notice();
+    (app, deliveries, copies)
+}
+
+fn app_with_every_notice() -> (
+    App,
+    Receiver<Evaluated>,
+    Receiver<Scanned>,
+    Receiver<ViewerCopy>,
+) {
     let (delivered, deliveries) = mpsc::channel();
     let (scanned, scans) = mpsc::channel();
+    let (copied, copies) = mpsc::channel();
     let mut app = App::new(EvaluationDevice::Cpu, move |notice| match notice {
         Notice::Evaluated(evaluated) => {
             let _ = delivered.send(evaluated);
+        }
+        Notice::Copied(copy) => {
+            let _ = copied.send(copy);
         }
         Notice::Scanned { sequence, scan } => {
             let _ = scanned.send((sequence, scan));
@@ -60,7 +80,7 @@ fn app_scanning() -> (App, Receiver<Evaluated>, Receiver<Scanned>) {
         requests.as_slice(),
         [Request::Redraw(Pane::Graph), Request::ShowViewerCaption(_)]
     ));
-    (app, deliveries, scans)
+    (app, deliveries, scans, copies)
 }
 
 fn next_scan(scans: &Receiver<Scanned>) -> Event {
@@ -1502,6 +1522,7 @@ fn displayed_names_the_frame_its_image_is_of() {
             frame,
             requested,
             failed: false,
+            cached: None,
         })
     };
     assert_eq!(app.displayed(), shown(1.0, 1.0));
@@ -1720,4 +1741,111 @@ fn a_scrub_shows_frames_in_the_order_asked_and_ends_on_the_last() {
 
     assert!(shown.is_sorted(), "{shown:?}");
     assert_eq!(app.caption, "Slot 1 · plate.####.png · 20 × 1 · CPU");
+}
+
+/// An app viewing a sequence of three white frames, 64 × 8, in a 16-pixel-square viewer pane,
+/// which draws them at 0.225 physical pixels a pixel: frames 1 and 2 shown and copied for the
+/// viewer cache, halved twice, then back on frame 1.
+fn back_on_a_cached_frame(name: &str) -> (App, Receiver<Evaluated>, Receiver<ViewerCopy>) {
+    let (mut app, deliveries, copies) = app_copying();
+    let directory = crate::fixtures::directory(name);
+    for frame in 1..=3 {
+        let path = directory.join(format!("plate.{frame:04}.png"));
+        crate::fixtures::write_png(&path, 64, 8, png::ColorType::Rgba, &[255; 64 * 8 * 4]);
+    }
+    app.dispatch(Event::Resized {
+        pane: Pane::Viewer,
+        size: PaneSize {
+            width: 16,
+            height: 16,
+            scale_factor: 1.0,
+        },
+    });
+    create(&mut app, directory.join("plate.####.png").to_str().unwrap());
+    app.dispatch(slot_key(1, CTRL));
+    for frame in [2.0, 1.0] {
+        app.dispatch(Event::Evaluated(receive(&deliveries)));
+        let copy = copies
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a copy");
+        assert_eq!(copy.halvings(), 2);
+        app.dispatch(Event::Copied(copy));
+        app.edit(|session| session.set_frame(frame).unwrap());
+    }
+    (app, deliveries, copies)
+}
+
+#[test]
+fn a_frame_shown_before_is_shown_again_from_the_viewer_cache_without_the_worker() {
+    let (app, deliveries, _) = back_on_a_cached_frame("cached-frame");
+
+    assert_eq!(app.session().viewer_cache().len(), 2);
+    let displayed = app.displayed().unwrap();
+    assert_eq!(
+        (displayed.frame, displayed.requested, displayed.cached),
+        (1.0, 1.0, Some(2))
+    );
+    assert_eq!(
+        app.caption,
+        "Slot 1 · plate.####.png · 64 × 8; cached at 1/4 · CPU"
+    );
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the worker evaluated a cached frame"
+    );
+}
+
+#[test]
+fn pointing_at_a_cached_copy_evaluates_its_frame_for_its_working_values() {
+    let (mut app, deliveries, copies) = back_on_a_cached_frame("cached-pointed");
+    let shown = app.displayed().unwrap();
+
+    let centre = PhysicalPoint { x: 8.0, y: 8.0 };
+    app.dispatch(input(Pane::Viewer, Input::PointerEntered));
+    app.dispatch(input(
+        Pane::Viewer,
+        Input::PointerMoved { position: centre },
+    ));
+    let evaluated = receive(&deliveries);
+    assert_eq!(evaluated.request(), app.latest_request());
+    app.dispatch(Event::Evaluated(evaluated));
+
+    let displayed = app.displayed().unwrap();
+    assert_eq!((displayed.frame, displayed.cached), (shown.frame, None));
+    assert!(
+        copies.recv_timeout(Duration::from_millis(200)).is_err(),
+        "copied again what the cache holds"
+    );
+}
+
+#[test]
+fn zooming_in_past_a_cached_copy_evaluates_its_frame_and_copies_it_finer() {
+    let (mut app, deliveries, copies) = back_on_a_cached_frame("cached-zoomed");
+
+    // Ten notches in, 1.2 times each, draws a pixel at 1.39 physical pixels.
+    let corner = PhysicalPoint { x: 0.0, y: 0.0 };
+    app.dispatch(input(
+        Pane::Viewer,
+        Input::Scrolled {
+            position: corner,
+            lines: 10.0,
+        },
+    ));
+    app.dispatch(Event::Evaluated(receive(&deliveries)));
+
+    assert_eq!(app.displayed().unwrap().cached, None);
+    let copy = copies
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a copy");
+    assert_eq!(copy.halvings(), 0);
+}
+
+#[test]
+fn choosing_another_device_drops_the_viewer_cache_and_evaluates_the_copy_shown() {
+    let (mut app, _deliveries, _copies) = back_on_a_cached_frame("cached-device");
+
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+
+    assert!(app.session().viewer_cache().is_empty());
+    assert!(!app.paused, "the worker was not asked for the frame");
 }
