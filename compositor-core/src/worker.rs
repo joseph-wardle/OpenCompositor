@@ -24,6 +24,11 @@ const IMAGES_BEFORE_SHRINKING: u32 = 3;
 /// GPU: a blocking wait would hold the device's lock against the GUI thread's present for as long.
 const COMPLETION_POLL: Duration = Duration::from_millis(1);
 
+/// How long the viewer may go without a new result before a newer request for another frame of
+/// the node no longer stops the one in progress: a scrub faster than evaluation still shows a
+/// result at least this often, give or take one evaluation.
+pub(crate) const FEEDBACK_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Where a session evaluates. Every request runs on one device, and results never mix devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvaluationDevice {
@@ -217,10 +222,15 @@ impl std::error::Error for ViewerError {
 /// request replaces any request it has not started, so after a burst of requests it evaluates at
 /// most the one in progress and the last.
 ///
-/// A newer request for the same node lets the evaluation in progress finish and be delivered, so
-/// that an edit faster than evaluation still shows its results as they finish. A newer request
-/// for another node, or for nothing, stops it between nodes, before staging or submitting and
-/// while waiting for the staging buffer, and skips its delivery after.
+/// A newer request for another node, or for nothing, stops the evaluation in progress at its
+/// next stopping point: between nodes, between chunks of an operation long enough to ask or of an
+/// EXR file's decoding, before staging or submitting, and while waiting for the staging buffer;
+/// and skips its delivery after. A read blocked on the file or work submitted to the GPU is not
+/// interrupted. So does a newer request for another frame of the same node, so that a scrub's
+/// final frame comes first, unless the viewer has gone the [`FEEDBACK_INTERVAL`] without a
+/// result. A newer request for the same frame, an edit, lets the evaluation in progress finish
+/// and be delivered: an edit's work is mostly done when the next arrives, and stopping it showed
+/// fewer edits, later.
 ///
 /// The worker never writes to a texture with `Queue::write_texture`, which copies under a
 /// queue-wide lock that the GUI thread's submit then waits for. In a CPU session it never
@@ -248,6 +258,10 @@ struct MailboxState {
     request: Option<Option<Wanted>>,
     /// The request the worker started last.
     started: Option<Wanted>,
+    /// When the viewer last caught up: the worker's last delivery, or a request reaching it
+    /// idle. Within the feedback interval of this, a newer request for another frame stops the
+    /// started one.
+    caught_up: Instant,
     stopping: bool,
     /// The device the worker evaluates or stages for, from `connect` until the worker drops.
     connection: Option<Connection>,
@@ -302,6 +316,7 @@ impl Worker {
             state: Mutex::new(MailboxState {
                 request: None,
                 started: None,
+                caught_up: Instant::now(),
                 stopping: false,
                 connection: None,
                 in_gpu_phase: false,
@@ -468,10 +483,15 @@ impl Mailbox {
 
     /// Waits for a request, and where to evaluate it, or `None` once the worker is stopping.
     fn next(&self) -> Option<(Option<Wanted>, EvaluationDevice)> {
+        let mut idle = false;
         let next = self.wait_for(|state| {
             let Some(request) = state.request.take() else {
+                idle = true;
                 return Take::Wait;
             };
+            if idle {
+                state.caught_up = Instant::now();
+            }
             state.started.clone_from(&request);
             Take::Taken((request, state.device))
         });
@@ -576,12 +596,22 @@ enum Take<T> {
 }
 
 impl MailboxState {
-    /// Whether a newer request for another node, or for nothing, is waiting, or the worker is
-    /// stopping. A newer request for the same node waits for the started one to be delivered.
+    /// Whether the started request should stop: the worker is stopping, or a newer request is
+    /// waiting for another node, for nothing, or for another frame within the feedback interval
+    /// of the viewer catching up.
     fn superseded(&self) -> bool {
-        let node = |wanted: &Option<Wanted>| wanted.as_ref().map(|wanted| wanted.node);
-        self.stopping
-            || (self.request.as_ref()).is_some_and(|newer| node(newer) != node(&self.started))
+        if self.stopping {
+            return true;
+        }
+        let Some(newer) = &self.request else {
+            return false;
+        };
+        match (newer, &self.started) {
+            (Some(newer), Some(started)) if newer.node == started.node => {
+                newer.frame != started.frame && self.caught_up.elapsed() < FEEDBACK_INTERVAL
+            }
+            _ => true,
+        }
     }
 }
 
@@ -739,6 +769,7 @@ fn deliver_unless_superseded(
         result,
         timing,
     });
+    phase.mailbox.lock().caught_up = Instant::now();
 }
 
 /// Evaluates the wanted key in a GPU session: reads the files of the Readers it uploads on the

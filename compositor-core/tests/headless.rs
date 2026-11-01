@@ -316,3 +316,42 @@ fn reload_files_rescans_and_reads_again_only_the_frames_that_changed() {
     let missed = missing(session.document(), session.files(), id, 2.0);
     assert_eq!(missed, [(id, Missing::Frame(2))]);
 }
+
+#[test]
+fn a_read_stopped_part_way_keeps_nothing_and_reads_whole_when_asked_again() {
+    use exr::prelude::{
+        Encoding, Image as ExrImage, Layer, LayerAttributes, SpecificChannels, WritableImage, f16,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let path = directory("stopped_read").join("lines.exr");
+    // A chunk per line.
+    let lines = Layer::new(
+        (8, 64),
+        LayerAttributes::default(),
+        Encoding::UNCOMPRESSED,
+        SpecificChannels::rgba(|_| (f16::ONE, f16::ONE, f16::ONE, f16::ONE)),
+    );
+    ExrImage::from_layer(lines).write().to_file(&path).unwrap();
+    let mut session = Session::new();
+    let mut evaluator = Evaluator::new();
+    let id = reader(&mut session, path);
+    let key = result_key(session.document(), session.files(), id, 1.0).unwrap();
+
+    // Asked once before the node, then before each chunk.
+    let asked = AtomicUsize::new(0);
+    let stopped = evaluator.evaluate(&key, || asked.fetch_add(1, Ordering::Relaxed) >= 4);
+    assert!(stopped.is_none());
+    assert!(asked.load(Ordering::Relaxed) < 64);
+
+    let asked = AtomicUsize::new(0);
+    let image = evaluator
+        .evaluate(&key, || {
+            asked.fetch_add(1, Ordering::Relaxed);
+            false
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(pixel(&image), [1.0; 4]);
+    assert!(asked.load(Ordering::Relaxed) > 64, "read again, not kept");
+}

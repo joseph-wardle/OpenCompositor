@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::atomic::AtomicUsize;
 
 use ::exr::image::Image as ExrImage;
 use ::exr::meta::attribute::{self, Text};
@@ -63,7 +64,7 @@ fn grey(attributes: ImageAttributes) -> Vec<u8> {
 }
 
 fn read_bytes(bytes: &[u8]) -> Result<Image, ReadError> {
-    read_from(Cursor::new(bytes))
+    read_from(Cursor::new(bytes), &|| false).map(|read| read.expect("not stopped"))
 }
 
 fn refusal(bytes: &[u8]) -> Refusal {
@@ -618,4 +619,32 @@ fn a_chunk_whose_decoder_panics_fails_the_read() {
         matches!(&read, Err(ReadError::Decode(reason)) if reason == "the decoder panicked"),
         "{read:?}"
     );
+}
+
+#[test]
+fn a_read_asks_whether_to_stop_before_each_chunk_and_can_stop_part_way() {
+    let size = (4, 64);
+    let mut lines = part(None, (0, 0), size, &rgb(0.18));
+    // A chunk per line.
+    lines.encoding = Encoding {
+        compression: Compression::Uncompressed,
+        blocks: Blocks::ScanLines,
+        line_order: LineOrder::Increasing,
+    };
+    let bytes = write(display(0, 0, size.0, size.1), vec![lines]);
+    let meta = MetaData::read_from_buffered(Cursor::new(&bytes), false).unwrap();
+    let chunks = meta.headers[0].chunk_count;
+    assert!(chunks > 8, "{chunks} chunks");
+    let asked = AtomicUsize::new(0);
+    let never = || {
+        asked.fetch_add(1, Ordering::Relaxed);
+        false
+    };
+    assert!(read_from(Cursor::new(&bytes), &never).unwrap().is_some());
+    // Once per chunk, and once more by each thread that finds none left.
+    assert!(asked.load(Ordering::Relaxed) > chunks);
+
+    let asked = AtomicUsize::new(0);
+    let part_way = || asked.fetch_add(1, Ordering::Relaxed) >= 8;
+    assert!(read_from(Cursor::new(&bytes), &part_way).unwrap().is_none());
 }

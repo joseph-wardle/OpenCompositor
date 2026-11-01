@@ -1516,7 +1516,11 @@ impl App {
                 details.extend(info.warnings.iter().map(ToString::to_string));
             }
             Shown::Failed { error, .. } if current => details.push(error.clone()),
-            // The previous image stays until then.
+            // The previous image stays until then, and says which frame it is of.
+            Shown::Image { wanted, .. } if wanted.frame != self.session.frame() => {
+                let frame = self.session.frame();
+                details.push(format!("frame {} shown, {frame} updating…", wanted.frame));
+            }
             _ => details.push("updating…".to_owned()),
         }
         let (files, frame) = (self.session.files(), self.session.frame());

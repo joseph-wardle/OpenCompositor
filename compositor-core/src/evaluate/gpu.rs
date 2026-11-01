@@ -20,7 +20,7 @@ use super::{
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
 use crate::kernels::{Kernels, Planes, plane_bytes};
-use crate::read::read_image;
+use crate::read::read_image_until;
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
 /// 6 GB beside the viewer's textures and the GUI's surfaces.
@@ -719,7 +719,7 @@ impl Evaluator {
         &mut self,
         key: &ResultKey,
         on_gpu: &[ResultKey],
-        stop: impl Fn() -> bool,
+        stop: impl Fn() -> bool + Sync,
     ) -> Option<Result<(), EvalError>> {
         let steps = self.plan(key, on_gpu);
         let uploaded = |index: usize| {
@@ -736,8 +736,10 @@ impl Evaluator {
             if stop() {
                 return None;
             }
-            if let Err(error) = self.read_and_retain(&step.key) {
-                return Some(Err(error));
+            match self.read_and_retain(&step.key, &stop) {
+                Ok(Some(_)) => {}
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
             }
         }
         Some(Ok(()))
@@ -821,7 +823,10 @@ impl Evaluator {
                 Recipe::Reader { .. } => {
                     let decoded = match &step.retained {
                         Some(image) => image.clone(),
-                        None => self.read_and_retain(&step.key)?,
+                        // Only what the CPU table could not retain is read here, in the GPU
+                        // phase, and not stopped: recording stops between nodes.
+                        None => (self.read_and_retain(&step.key, &|| false)?)
+                            .expect("a read that is never stopped finishes"),
                     };
                     gpu.upload(&mut encoder, &step.key, &decoded, &mut released)
                 }
@@ -924,18 +929,25 @@ impl Evaluator {
     }
 
     /// Reads a Reader's file and retains the decoded image in this evaluator's table, under its
-    /// cap, for the GPU table's uploads to come from.
-    fn read_and_retain(&mut self, key: &ResultKey) -> Result<Image, EvalError> {
+    /// cap, for the GPU table's uploads to come from. `Ok(None)` if `stop` returned true first.
+    fn read_and_retain(
+        &mut self,
+        key: &ResultKey,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<Image>, EvalError> {
         let Recipe::Reader { path, .. } = &*key.0 else {
             unreachable!("a Reader's key");
         };
         let Some(path) = path else {
-            return Ok(Image::empty());
+            return Ok(Some(Image::empty()));
         };
-        let image = read_image(path).map_err(|error| EvalError::Read {
+        let read = read_image_until(path, stop).map_err(|error| EvalError::Read {
             origin: key.clone(),
             error,
         })?;
+        let Some(image) = read else {
+            return Ok(None);
+        };
         let added = distinct_bytes(image.planes().iter());
         if self.retained_bytes() + added <= self.cap {
             self.retained.push(Retained {
@@ -943,7 +955,7 @@ impl Evaluator {
                 image: image.clone(),
             });
         }
-        Ok(image)
+        Ok(Some(image))
     }
 }
 

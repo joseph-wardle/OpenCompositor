@@ -48,7 +48,7 @@ fn tagged(configure: impl FnOnce(&mut Info<'static>), extra: &[([u8; 4], &[u8])]
 }
 
 fn read_bytes(bytes: &[u8]) -> Result<Image, ReadError> {
-    read_from(Cursor::new(bytes))
+    read_from(Cursor::new(bytes), &|| false).map(|read| read.expect("not stopped"))
 }
 
 fn warnings(bytes: &[u8]) -> Vec<Warning> {

@@ -417,31 +417,86 @@ fn a_newer_request_for_another_node_ends_the_wait_for_the_staging_buffer() {
     );
 }
 
-#[test]
-fn a_newer_request_for_the_same_node_lets_the_started_one_be_delivered() {
-    let directory = directory("same-node");
-    let [first, second, third] =
-        ["first.png", "second.png", "third.png"].map(|name| directory.join(name));
-    for path in [&first, &second, &third] {
+/// Asks for three images of one node, at the three frames: the first, delivered and held, which
+/// keeps the second waiting for the staging buffer; and the third while it waits, once the viewer
+/// last caught up at `caught_up`. Returns the images then delivered, by key, and the three keys.
+fn same_node(name: &str, frames: [f64; 3], caught_up: Instant) -> (Vec<ResultKey>, [ResultKey; 3]) {
+    let directory = directory(name);
+    let paths = ["first.png", "second.png", "third.png"].map(|name| directory.join(name));
+    for path in &paths {
         write_png(path, 3, 2);
     }
+    let keys = paths.map(key);
+    let at = |index: usize| Wanted {
+        frame: frames[index],
+        ..on(1, keys[index].clone())
+    };
+    let (worker, deliveries) = worker();
+    connect(&worker, noop_device(None), 1);
+    worker.request(Some(at(0)));
+    let held = staged(receive(&deliveries));
+
+    worker.request(Some(at(1)));
+    wait_until_finishing(&worker);
+    worker.mailbox.lock().caught_up = caught_up;
+    worker.request(Some(at(2)));
+    drop(held);
+
+    let mut delivered = Vec::new();
+    loop {
+        let evaluated = receive(&deliveries);
+        assert!(evaluated.result.unwrap().pixels.is_some());
+        let last = evaluated.wanted.key == keys[2];
+        delivered.push(evaluated.wanted.key);
+        if last {
+            break;
+        }
+    }
+    (delivered, keys)
+}
+
+/// Caught up for the whole test, however slowly it runs.
+fn caught_up_throughout() -> Instant {
+    Instant::now() + Duration::from_secs(600)
+}
+
+#[test]
+fn a_newer_request_for_another_frame_stops_the_started_one_while_the_viewer_is_fed() {
+    let frames = [1.0, 2.0, 3.0];
+    let (delivered, [.., third]) = same_node("scrub-fed", frames, caught_up_throughout());
+    assert_eq!(delivered, [third]);
+}
+
+#[test]
+fn a_newer_request_for_another_frame_lets_the_started_one_finish_once_the_viewer_waited() {
+    let waited = Instant::now().checked_sub(FEEDBACK_INTERVAL).unwrap();
+    let (delivered, [_, second, third]) = same_node("scrub-waited", [1.0, 2.0, 3.0], waited);
+    assert_eq!(delivered, [second, third]);
+}
+
+#[test]
+fn a_newer_request_for_the_same_frame_lets_the_started_one_finish() {
+    let frames = [1.0; 3];
+    let (delivered, [_, second, third]) = same_node("edit", frames, caught_up_throughout());
+    assert_eq!(delivered, [second, third]);
+}
+
+#[test]
+fn a_request_reaching_an_idle_worker_starts_the_feedback_interval_again() {
+    let [first, second] = two_images("idle-request");
     let (worker, deliveries) = worker();
     connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
     let held = staged(receive(&deliveries));
+    wait_until_done_after_evaluating(&worker);
 
-    // Waiting for the buffer the test holds when the edit goes on.
+    let asked = Instant::now();
     worker.request(Some(on(1, key(&second))));
+    // Waiting for the buffer the test holds, so not yet delivered.
     wait_until_finishing(&worker);
-    worker.request(Some(on(1, key(&third))));
+    assert!(worker.mailbox.lock().caught_up >= asked);
     drop(held);
-
-    let staged = |evaluated: Evaluated| {
-        assert!(evaluated.result.unwrap().pixels.is_some());
-        evaluated.wanted.key
-    };
-    assert_eq!(staged(receive(&deliveries)), key(&second));
-    assert_eq!(staged(receive(&deliveries)), key(&third));
+    receive(&deliveries);
 }
 
 /// Two white images in a directory of the test's own.

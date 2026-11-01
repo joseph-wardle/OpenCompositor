@@ -1521,8 +1521,13 @@ fn displayed_names_the_frame_its_image_is_of() {
     let second = sent(&app);
     assert_eq!(second.frame, 9.0);
     assert_eq!(app.displayed(), shown(5.0, 9.0));
+    assert_eq!(
+        app.caption,
+        "Slot 1 · Exposure · frame 5 shown, 9 updating… · CPU"
+    );
     app.dispatch(read(&second, 4, 4));
     assert_eq!(app.displayed(), shown(9.0, 9.0));
+    assert_eq!(app.caption, "Slot 1 · Exposure · 4 × 4 · CPU");
 }
 
 #[test]
@@ -1676,4 +1681,43 @@ fn reload_files_rescans_off_the_gui_thread_and_says_how_many_frames_changed() {
     // Not scanned again until reloaded.
     app.edit(|session| session.set_frame(7.0).unwrap());
     assert!(app.scanning.is_empty());
+}
+
+#[test]
+fn a_scrub_shows_frames_in_the_order_asked_and_ends_on_the_last() {
+    let (mut app, deliveries, scans) = app_scanning();
+    let directory = crate::fixtures::directory("scrub");
+    // Each frame as wide as its number and ten.
+    for frame in 1..=10_u32 {
+        let width = frame + 10;
+        let white = vec![255; width as usize * 4];
+        let path = directory.join(format!("plate.{frame:04}.png"));
+        crate::fixtures::write_png(&path, width, 1, png::ColorType::Rgba, &white);
+    }
+    create(&mut app, directory.join("plate.####.png").to_str().unwrap());
+    app.dispatch(next_scan(&scans));
+    app.dispatch(slot_key(1, CTRL));
+
+    for frame in 2..=10 {
+        app.edit(|session| session.set_frame(f64::from(frame)).unwrap());
+    }
+    let mut shown = Vec::new();
+    while app
+        .displayed()
+        .is_none_or(|displayed| displayed.frame != 10.0)
+    {
+        let evaluated = deliveries
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the last frame is delivered");
+        app.dispatch(Event::Evaluated(evaluated));
+        if let Some(displayed) = app.displayed()
+            && shown.last() != Some(&displayed.frame)
+        {
+            assert!(!displayed.failed);
+            shown.push(displayed.frame);
+        }
+    }
+
+    assert!(shown.is_sorted(), "{shown:?}");
+    assert_eq!(app.caption, "Slot 1 · plate.####.png · 20 × 1 · CPU");
 }

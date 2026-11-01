@@ -19,7 +19,7 @@ use crate::files::{Files, reading};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::{self, Level};
 use crate::parameter::resolve;
-use crate::read::{ReadError, read_image};
+use crate::read::{ReadError, read_image_until};
 
 pub(crate) mod blur;
 mod gpu;
@@ -445,7 +445,8 @@ impl Evaluator {
     /// The image a key names, its failure, or `None` if `stop` returned true before it was done.
     ///
     /// `stop` is asked before each node is computed, and by an operation long enough to matter
-    /// before each chunk of its work, from the pool's threads. Nodes completed before stopping
+    /// before each chunk of its work, from the pool's threads, as by a Reader before each chunk
+    /// of an EXR file, from the decoder's. Nodes completed before stopping
     /// stay retained until the next request.
     pub fn evaluate(
         &mut self,
@@ -657,7 +658,7 @@ impl Evaluator {
             Recipe::Reader { path: None, .. } => Ok(Some(Image::empty())),
             Recipe::Reader {
                 path: Some(path), ..
-            } => read_image(path).map(Some).map_err(|error| EvalError::Read {
+            } => read_image_until(path, stop).map_err(|error| EvalError::Read {
                 origin: key.clone(),
                 error,
             }),
