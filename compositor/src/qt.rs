@@ -1,6 +1,8 @@
 //! Every Qt declaration the shell uses: Qt's own headers where `cxx` can bind them, and
 //! `cpp/shim.h` one-liners where it cannot.
 
+pub use crate::timebar::frame_label;
+
 #[cxx_qt::bridge]
 pub mod ffi {
     unsafe extern "C++" {
@@ -209,17 +211,28 @@ pub mod ffi {
     /// The timebar as Rust sends it.
     #[derive(Debug)]
     struct TimebarData {
+        /// The range's first and last frame, the frame, and the timeline's rate, which the bar's
+        /// ticks follow.
         first: f64,
         last: f64,
         frame: f64,
+        rate: f64,
+        /// The frame, first and last as frame numbers, and as timecode.
         frame_text: QString,
+        frame_timecode: QString,
         first_text: QString,
+        first_timecode: QString,
         last_text: QString,
+        last_timecode: QString,
         rate_text: QString,
         /// 1 playing forwards, -1 backwards, 0 stopped.
         playing: i32,
         real_time: bool,
         looping: bool,
+        /// Whether the range is the viewed node's input range rather than the timeline's.
+        input: bool,
+        /// With `input`, whether the viewed node's range was found.
+        input_found: bool,
         /// How playback keeps up, or nothing.
         status: QString,
         /// Each whole frame's from the first: 1 cached, 2 missing, 4 held, or'd.
@@ -234,7 +247,7 @@ pub mod ffi {
         frame: f64,
         /// What was typed.
         text: QString,
-        /// Whether looping or real time was chosen.
+        /// Whether looping, real time or the input range was chosen.
         on: bool,
     }
 
@@ -250,13 +263,20 @@ pub mod ffi {
         Restore,
         FirstFrame,
         StepBackward,
+        /// Plays backwards, or stops if it does.
         PlayBackward,
-        Stop,
+        /// Plays forwards, or stops if it does.
         PlayForward,
         StepForward,
         LastFrame,
         Looping,
         RealTime,
+        InputRange,
+    }
+
+    extern "Rust" {
+        /// A frame as the bar labels it: its number, or its timecode at the rate.
+        fn frame_label(frame: f64, rate: f64, timecode: bool) -> String;
     }
 
     #[namespace = "shim"]
@@ -318,6 +338,7 @@ pub mod ffi {
             step: f64,
             exposure_set: fn(f64),
             timebar_gesture: fn(TimebarGesture),
+            rates: &QStringList,
         ) -> *mut ViewerStrip;
         unsafe fn show_timebar(strip: *mut ViewerStrip, data: &TimebarData);
         /// The strip's one-line caption.

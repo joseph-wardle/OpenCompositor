@@ -4,8 +4,6 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::document::Timeline;
-
 /// Which way playback steps through the timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -23,12 +21,31 @@ pub enum PlaybackMode {
     RealTime,
 }
 
+/// Which frames the timebar spans and playback plays through. The viewer's choice, not the
+/// document's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameRange {
+    /// The timeline's, which the document holds.
+    #[default]
+    Global,
+    /// The viewed node's sequences', as [`input_range`](crate::input_range) finds them, following
+    /// the viewer; the timeline's while it finds none.
+    Input,
+}
+
 /// The timebar under the viewer, as the shell shows it: the timeline, the frame, playback, and
 /// what is known of each frame of the viewed node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Timebar {
+    /// The range's first frame.
     pub first: f64,
+    /// The range's last frame.
     pub last: f64,
+    /// Where the range comes from.
+    pub range: FrameRange,
+    /// With [`FrameRange::Input`], whether the viewed node's range was found; if not, the range
+    /// is the timeline's.
+    pub input_found: bool,
     /// Frames per second.
     pub rate: f64,
     /// The session's frame.
@@ -64,6 +81,77 @@ pub struct FrameMark {
 /// walk, about 2 µs on the workstation, whenever the document or the files change.
 pub const MAX_MARKED_FRAMES: i64 = 2_000;
 
+/// The frames per second a timecode counts at a rate: the whole number nearest it, so that
+/// 23.976 counts as 24, without dropping frame numbers.
+fn timecode_base(rate: f64) -> i64 {
+    (rate.round() as i64).max(1)
+}
+
+/// A frame as non-drop timecode, `HH:MM:SS:FF`, counted from frame 0 at the rate's
+/// [nearest whole number](timecode_base), negative before it; a frame between whole frames as the
+/// one before it.
+pub fn timecode(frame: f64, rate: f64) -> String {
+    let base = timecode_base(rate);
+    let whole = frame.floor() as i64;
+    let sign = if whole < 0 { "-" } else { "" };
+    let count = whole.unsigned_abs();
+    let base = base as u64;
+    let (frames, seconds) = (count % base, count / base);
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    format!("{sign}{hours:02}:{minutes:02}:{seconds:02}:{frames:02}")
+}
+
+/// Why typed timecode is not a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimecodeError {
+    /// It has other than two to four parts, or a part is not a number.
+    Unreadable,
+    /// Minutes or seconds of 60 or more, or frames of the rate's whole number or more.
+    OutOfRange,
+}
+
+impl std::fmt::Display for TimecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimecodeError::Unreadable => write!(f, "not timecode, HH:MM:SS:FF"),
+            TimecodeError::OutOfRange => write!(f, "a part of the timecode is out of range"),
+        }
+    }
+}
+
+impl std::error::Error for TimecodeError {}
+
+/// The frame [`timecode`] writes as the text, which may leave out leading parts: `SS:FF`,
+/// `MM:SS:FF` or `HH:MM:SS:FF`, after an optional `-`.
+pub fn parse_timecode(text: &str, rate: f64) -> Result<f64, TimecodeError> {
+    let text = text.trim();
+    let (negative, text) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let parts: Vec<u64> = (text.split(':'))
+        .map(|part| part.trim().parse::<u64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| TimecodeError::Unreadable)?;
+    if !(2..=4).contains(&parts.len()) {
+        return Err(TimecodeError::Unreadable);
+    }
+    let base = timecode_base(rate) as u64;
+    // Hours, minutes, seconds, frames, the missing leading ones zero.
+    let mut fields = [0u64; 4];
+    fields[4 - parts.len()..].copy_from_slice(&parts);
+    let [hours, minutes, seconds, frames] = fields;
+    if minutes >= 60 || seconds >= 60 || frames >= base || hours > 1_000_000 {
+        return Err(TimecodeError::OutOfRange);
+    }
+    let count = ((hours * 60 + minutes) * 60 + seconds) * base + frames;
+    Ok(if negative {
+        -(count as f64)
+    } else {
+        count as f64
+    })
+}
+
 /// How long before the latest frame shown the achieved rate counts frames over.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
@@ -76,10 +164,11 @@ pub(crate) struct Frames {
 }
 
 impl Frames {
-    pub(crate) fn of(timeline: &Timeline) -> Frames {
+    /// The frames from `first` to `last`, which is not before it.
+    pub(crate) fn between(first: f64, last: f64) -> Frames {
         Frames {
-            first: timeline.first(),
-            count: (timeline.last() - timeline.first()).floor() as i64 + 1,
+            first,
+            count: (last - first).floor() as i64 + 1,
         }
     }
 

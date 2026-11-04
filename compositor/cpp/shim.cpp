@@ -131,39 +131,154 @@ constexpr uint8_t CACHED = 1;
 constexpr uint8_t MISSING = 2;
 constexpr uint8_t HELD = 4;
 
-// The timeline's whole frames side by side, each marked, with the frame shown as a line. A press
-// or a drag sends the frame under the pointer, once per frame it passes.
+namespace {
+// The timebar's buttons' pictures, drawn rather than taken from the icon theme, which differs
+// between desktops and lacks some.
+enum class Glyph {
+    FirstFrame,
+    StepBackward,
+    PlayBackward,
+    Stop,
+    PlayForward,
+    StepForward,
+    LastFrame,
+    Loop,
+    Once,
+    EveryFrame,
+    RealTime,
+};
+
+QIcon glyph_icon(Glyph glyph, const QColor &color) {
+    // Drawn on a 16 by 16 grid, at twice the pixels for high-density screens.
+    constexpr int SCALE = 2;
+    QPixmap pixmap(16 * SCALE, 16 * SCALE);
+    pixmap.fill(Qt::transparent);
+    pixmap.setDevicePixelRatio(SCALE);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(color);
+    auto triangle = [&](double left, double right, double top, double bottom) {
+        // Points towards `right`, which may be left of `left`.
+        const QPointF points[] = {{left, top}, {right, (top + bottom) / 2}, {left, bottom}};
+        painter.drawPolygon(points, 3);
+    };
+    auto bar = [&](double x) { painter.drawRect(QRectF(x, 3.5, 1.6, 9)); };
+    const QPen line(color, 1.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    switch (glyph) {
+    case Glyph::FirstFrame:
+        bar(3);
+        triangle(12, 5, 3.5, 12.5);
+        break;
+    case Glyph::StepBackward:
+        triangle(10, 4, 4.5, 11.5);
+        bar(11);
+        break;
+    case Glyph::PlayBackward:
+        triangle(12.5, 3.5, 3, 13);
+        break;
+    case Glyph::Stop:
+        painter.drawRect(QRectF(4, 4, 8, 8));
+        break;
+    case Glyph::PlayForward:
+        triangle(3.5, 12.5, 3, 13);
+        break;
+    case Glyph::StepForward:
+        bar(3.4);
+        triangle(6, 12, 4.5, 11.5);
+        break;
+    case Glyph::LastFrame:
+        triangle(4, 11, 3.5, 12.5);
+        bar(11.4);
+        break;
+    case Glyph::Loop: {
+        // Round, with an arrowhead where it closes.
+        painter.setPen(line);
+        painter.setBrush(Qt::NoBrush);
+        painter.drawArc(QRectF(2.5, 3.5, 11, 9), 30 * 16, 300 * 16);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(color);
+        const QPointF head[] = {{11.2, 2.4}, {14.6, 5.6}, {10.4, 6.8}};
+        painter.drawPolygon(head, 3);
+        break;
+    }
+    case Glyph::Once:
+        // Forwards to the end, and stops there.
+        painter.setPen(line);
+        painter.drawLine(QPointF(2.5, 8), QPointF(9, 8));
+        painter.setPen(Qt::NoPen);
+        triangle(8.5, 12, 5, 11);
+        bar(12.6);
+        break;
+    case Glyph::EveryFrame:
+        // A strip of film, its sprocket holes down each side: every frame of it.
+        painter.drawRect(QRectF(3, 1.5, 10, 13));
+        painter.setBrush(Qt::transparent);
+        painter.setCompositionMode(QPainter::CompositionMode_Clear);
+        for (double y : {3.0, 6.5, 10.0}) {
+            painter.drawRect(QRectF(4, y, 1.5, 2));
+            painter.drawRect(QRectF(10.5, y, 1.5, 2));
+        }
+        painter.drawRect(QRectF(6.5, 3, 3, 4));
+        painter.drawRect(QRectF(6.5, 9, 3, 4));
+        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        break;
+    case Glyph::RealTime:
+        // A clock: the rate kept.
+        painter.setPen(line);
+        painter.setBrush(Qt::NoBrush);
+        painter.drawEllipse(QRectF(2.5, 2.5, 11, 11));
+        painter.drawLine(QPointF(8, 8), QPointF(8, 4.8));
+        painter.drawLine(QPointF(8, 8), QPointF(10.6, 9.4));
+        break;
+    }
+    painter.end();
+    return QIcon(pixmap);
+}
+} // namespace
+
+// The range's whole frames side by side, ticked each frame and at each whole second of the rate,
+// labelled where there is room, marked, with the frame shown as a line. A press or a drag sends
+// the frame under the pointer, once per frame it passes.
 class FrameBar : public QWidget {
   public:
     explicit FrameBar(std::function<void(double)> scrubbed) : scrubbed(std::move(scrubbed)) {
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         setToolTip(QStringLiteral(
-            "Click or drag to go to a frame. Green: in the viewer cache. Red: a missing file. "
-            "Shaded: outside a sequence's frames, holding its nearest."));
+            "Click or drag to go to a frame. Green below: in the viewer cache. Red: a missing "
+            "file. Shaded: outside a sequence's frames, holding its nearest."));
     }
-    void show_frames(double first, double last, double frame, const rust::Vec<uint8_t> &marks) {
-        this->first = first;
-        this->last = last;
-        this->frame = frame;
-        this->marks.assign(marks.begin(), marks.end());
+    void show_frames(const TimebarData &data, bool timecode) {
+        first = data.first;
+        last = data.last;
+        frame = data.frame;
+        rate = data.rate;
+        this->timecode = timecode;
+        marks.assign(data.marks.begin(), data.marks.end());
         update();
     }
-    QSize sizeHint() const override { return {200, 18}; }
+    void show_timecode(bool timecode) {
+        this->timecode = timecode;
+        update();
+    }
+    QSize sizeHint() const override { return {200, fontMetrics().height() + 14}; }
 
   protected:
     void paintEvent(QPaintEvent *) override {
         QPainter painter(this);
-        const double w = width(), h = height(), frames = count();
+        const double w = width(), h = height(), frames = count(), cell = w / frames;
         painter.fillRect(rect(), palette().color(QPalette::Base));
-        auto x_of = [&](double offset) { return offset / frames * w; };
+        auto x_of = [&](double offset) { return offset * cell; };
         for (size_t index = 0; index < marks.size(); ++index) {
-            const double left = x_of(index), cell = std::max(x_of(index + 1) - left, 1.0);
-            if (marks[index] & HELD) painter.fillRect(QRectF(left, 0, cell, h), palette().mid());
+            const double left = x_of(index), right = std::max(x_of(index + 1), left + 1);
+            if (marks[index] & HELD)
+                painter.fillRect(QRectF(left, 0, right - left, h), palette().alternateBase());
             if (marks[index] & MISSING)
-                painter.fillRect(QRectF(left, 0, cell, h), QColor(200, 60, 60));
+                painter.fillRect(QRectF(left, 0, right - left, h), QColor(190, 60, 60, 150));
             if (marks[index] & CACHED)
-                painter.fillRect(QRectF(left, h - 4, cell, 4), QColor(80, 170, 90));
+                painter.fillRect(QRectF(left, h - 3, right - left, 3), QColor(80, 170, 90));
         }
+        paint_ticks(painter, cell);
         const double x = x_of(frame - first + 0.5);
         painter.setPen(QPen(palette().color(QPalette::Highlight), 2));
         painter.drawLine(QPointF(x, 0), QPointF(x, h));
@@ -179,6 +294,57 @@ class FrameBar : public QWidget {
 
   private:
     double count() const { return std::max(std::floor(last - first) + 1, 1.0); }
+    // Ticks hang from the top at each frame's middle: each frame's while they are 3 pixels
+    // apart, and longer every second's worth, or every so many seconds' where those crowd,
+    // labelled where the labels fit.
+    void paint_ticks(QPainter &painter, double cell) {
+        const int64_t second = std::max<int64_t>(std::llround(rate), 1);
+        const QFontMetrics metrics = fontMetrics();
+        const int64_t start = std::llround(std::ceil(first)), end = std::llround(std::floor(last));
+        const double label_width = std::max(metrics.horizontalAdvance(label(double(start))),
+                                            metrics.horizontalAdvance(label(double(end)))) +
+                                   8;
+        // Each step is so many seconds: 1, 2, 5, 10, 20, 50...
+        auto every = [&](double pixels) {
+            int64_t seconds = 1;
+            for (int64_t scale = 1; second * seconds * cell < pixels; scale *= 10) {
+                for (int64_t step : {1, 2, 5}) {
+                    seconds = step * scale;
+                    if (second * seconds * cell >= pixels) break;
+                }
+            }
+            return second * seconds;
+        };
+        const int64_t major = every(6), labelled = every(label_width);
+        QColor color = palette().color(QPalette::Text);
+        color.setAlphaF(0.45);
+        painter.setPen(QPen(color, 1));
+        auto x_at = [&](int64_t at) { return std::round((at - first + 0.5) * cell) + 0.5; };
+        if (cell >= 3) {
+            for (int64_t at = start; at <= end; ++at)
+                painter.drawLine(QPointF(x_at(at), 0), QPointF(x_at(at), 4));
+        }
+        // The first multiple of `of` from `start`, either side of zero.
+        auto first_multiple = [&](int64_t of) {
+            const int64_t past = ((start % of) + of) % of;
+            return past == 0 ? start : start + of - past;
+        };
+        for (int64_t at = first_multiple(major); at <= end; at += major)
+            painter.drawLine(QPointF(x_at(at), 0), QPointF(x_at(at), 9));
+        color.setAlphaF(0.75);
+        painter.setPen(color);
+        const double baseline = 9 + metrics.ascent();
+        for (int64_t at = first_multiple(labelled); at <= end; at += labelled) {
+            const QString text = label(double(at));
+            // Whole, or not at all.
+            if (x_at(at) + 3 + metrics.horizontalAdvance(text) > width()) break;
+            painter.drawText(QPointF(x_at(at) + 3, baseline), text);
+        }
+    }
+    QString label(double at) const {
+        const rust::String text = frame_label(at, rate, timecode);
+        return QString::fromUtf8(text.data(), text.size());
+    }
     void scrub(double x) {
         const double index = std::clamp(std::floor(x / width() * count()), 0.0, count() - 1);
         const double frame = first + index;
@@ -188,92 +354,128 @@ class FrameBar : public QWidget {
     }
 
     std::function<void(double)> scrubbed;
-    double first = 1, last = 1, frame = 1;
+    double first = 1, last = 1, frame = 1, rate = 24;
+    bool timecode = false;
     std::vector<uint8_t> marks;
     std::optional<double> sent;
 };
 
-Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, QWidget *parent)
+Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rates,
+                 QWidget *parent)
     : QWidget(parent), gestures(gestures) {
+    const QColor color = palette().color(QPalette::ButtonText);
+    play_backward_icon = glyph_icon(Glyph::PlayBackward, color);
+    play_forward_icon = glyph_icon(Glyph::PlayForward, color);
+    stop_icon = glyph_icon(Glyph::Stop, color);
+    loop_icon = glyph_icon(Glyph::Loop, color);
+    once_icon = glyph_icon(Glyph::Once, color);
+    every_frame_icon = glyph_icon(Glyph::EveryFrame, color);
+    real_time_icon = glyph_icon(Glyph::RealTime, color);
+
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(2);
-    auto *frames = new QHBoxLayout;
-    first = field(TimebarGestureKind::FirstTyped, QStringLiteral("The timeline's first frame"),
-                  QStringLiteral("-000000"));
     bar = new FrameBar([this](double frame) { send(TimebarGestureKind::Scrubbed, frame); });
-    last = field(TimebarGestureKind::LastTyped, QStringLiteral("The timeline's last frame"),
-                 QStringLiteral("-000000"));
-    frames->addWidget(first);
-    frames->addWidget(bar, 1);
-    frames->addWidget(last);
-    layout->addLayout(frames);
+    layout->addWidget(bar);
 
-    auto *transport = new QHBoxLayout;
-    const QStyle *style = this->style();
-    const QIcon play = style->standardIcon(QStyle::SP_MediaPlay);
-    const QPixmap forwards = play.pixmap(16);
-    const QIcon backwards(forwards.transformed(QTransform().scale(-1, 1)));
-    transport->addWidget(button(TimebarGestureKind::FirstFrame,
-                                style->standardIcon(QStyle::SP_MediaSkipBackward),
-                                QStringLiteral("The first frame")));
-    transport->addWidget(button(TimebarGestureKind::StepBackward,
-                                style->standardIcon(QStyle::SP_MediaSeekBackward),
-                                QStringLiteral("Back a frame (Left over the viewer)")));
-    play_backward = button(TimebarGestureKind::PlayBackward, backwards,
-                           QStringLiteral("Play backwards, or stop (J over the viewer)"));
-    transport->addWidget(play_backward);
-    transport->addWidget(button(TimebarGestureKind::Stop,
-                                style->standardIcon(QStyle::SP_MediaStop),
-                                QStringLiteral("Stop (K over the viewer)")));
-    play_forward = button(TimebarGestureKind::PlayForward, play,
-                          QStringLiteral("Play forwards, or stop (L over the viewer)"));
-    transport->addWidget(play_forward);
-    transport->addWidget(button(TimebarGestureKind::StepForward,
-                                style->standardIcon(QStyle::SP_MediaSeekForward),
-                                QStringLiteral("Forward a frame (Right over the viewer)")));
-    transport->addWidget(button(TimebarGestureKind::LastFrame,
-                                style->standardIcon(QStyle::SP_MediaSkipForward),
-                                QStringLiteral("The last frame")));
-    for (QToolButton *toggle : {play_backward, play_forward}) toggle->setCheckable(true);
-    frame = field(TimebarGestureKind::FrameTyped, QStringLiteral("The frame viewed"),
-                  QStringLiteral("-000000.0000"));
-    transport->addWidget(frame);
-    looping = new QToolButton;
-    looping->setText(QStringLiteral("Loop"));
-    looping->setCheckable(true);
-    looping->setFocusPolicy(Qt::NoFocus);
-    looping->setToolTip(QStringLiteral("Play round from the other end, rather than stopping"));
-    connect(looping, &QToolButton::toggled, this,
-            [this](bool on) { send(TimebarGestureKind::Looping, 0, QString(), on); });
-    transport->addWidget(looping);
-    mode = new QComboBox;
-    mode->addItems({QStringLiteral("Every frame"), QStringLiteral("Real time")});
-    mode->setFocusPolicy(Qt::NoFocus);
-    mode->setToolTip(QStringLiteral(
-        "Every frame: show each frame once ready, no faster than the rate. Real time: keep to "
-        "the rate, skipping frames not ready."));
-    connect(mode, &QComboBox::currentIndexChanged, this,
-            [this](int index) { send(TimebarGestureKind::RealTime, 0, QString(), index == 1); });
-    transport->addWidget(mode);
-    rate = field(TimebarGestureKind::RateTyped,
-                 QStringLiteral("The frames per second the timeline plays at"),
-                 QStringLiteral("000.000"));
-    transport->addWidget(rate);
-    transport->addWidget(new QLabel(QStringLiteral("fps")));
+    // The transport stays centred: the sides take equal shares of the room left.
+    auto *controls = new QGridLayout;
+    controls->setContentsMargins(0, 0, 0, 0);
+    controls->setColumnStretch(0, 1);
+    controls->setColumnStretch(2, 1);
+
+    auto *left = new QHBoxLayout;
+    rate = new QComboBox;
+    rate->setEditable(true);
+    rate->setInsertPolicy(QComboBox::NoInsert);
+    rate->addItems(rates);
+    rate->setFocusPolicy(Qt::ClickFocus);
+    rate->setToolTip(QStringLiteral("The frames per second the timeline plays at: type a rate, "
+                                    "or choose one"));
+    rate->setFixedWidth(rate->fontMetrics().horizontalAdvance(QStringLiteral("000.000")) + 36);
+    rate->lineEdit()->installEventFilter(this);
+    connect(rate, &QComboBox::activated, this,
+            [this](int index) { send(TimebarGestureKind::RateTyped, 0, rate->itemText(index)); });
+    connect(rate->lineEdit(), &QLineEdit::editingFinished, this, [this] {
+        if (rate->lineEdit()->isModified()) {
+            rate->lineEdit()->setModified(false);
+            send(TimebarGestureKind::RateTyped, 0, rate->currentText());
+        }
+        rate->clearFocus();
+    });
+    left->addWidget(rate);
+    left->addWidget(new QLabel(QStringLiteral("fps")));
+    timecode_button = new QToolButton;
+    timecode_button->setText(QStringLiteral("TC"));
+    timecode_button->setCheckable(true);
+    timecode_button->setAutoRaise(true);
+    timecode_button->setFocusPolicy(Qt::NoFocus);
+    timecode_button->setToolTip(
+        QStringLiteral("Frames as timecode, counted from frame 0 at the rate, rather than as "
+                       "numbers. Either can be typed."));
+    connect(timecode_button, &QToolButton::toggled, this, [this](bool on) {
+        timecode = on;
+        bar->show_timecode(on);
+        show_frames();
+    });
+    left->addWidget(timecode_button);
     status = new QLabel;
     status->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     status->setToolTip(QStringLiteral("Frames shown per second while playing, and in real time "
                                       "those skipped since it began"));
-    transport->addWidget(status, 1);
-    layout->addLayout(transport);
+    left->addWidget(status, 1);
+    controls->addLayout(left, 0, 0);
+
+    auto *transport = new QHBoxLayout;
+    transport->setSpacing(0);
+    transport->addWidget(button(TimebarGestureKind::FirstFrame,
+                                glyph_icon(Glyph::FirstFrame, color),
+                                QStringLiteral("The range's first frame")));
+    transport->addWidget(button(TimebarGestureKind::StepBackward,
+                                glyph_icon(Glyph::StepBackward, color),
+                                QStringLiteral("Back a frame (Left over the viewer)")));
+    play_backward = button(TimebarGestureKind::PlayBackward, play_backward_icon, QString());
+    transport->addWidget(play_backward);
+    frame = field(TimebarGestureKind::FrameTyped,
+                  QStringLiteral("The frame viewed: type a number or timecode"));
+    frame->setAlignment(Qt::AlignCenter);
+    transport->addSpacing(4);
+    transport->addWidget(frame);
+    transport->addSpacing(4);
+    play_forward = button(TimebarGestureKind::PlayForward, play_forward_icon, QString());
+    transport->addWidget(play_forward);
+    transport->addWidget(button(TimebarGestureKind::StepForward,
+                                glyph_icon(Glyph::StepForward, color),
+                                QStringLiteral("Forward a frame (Right over the viewer)")));
+    transport->addWidget(button(TimebarGestureKind::LastFrame,
+                                glyph_icon(Glyph::LastFrame, color),
+                                QStringLiteral("The range's last frame")));
+    controls->addLayout(transport, 0, 1);
+
+    auto *right = new QHBoxLayout;
+    right->addStretch(1);
+    looping = button(TimebarGestureKind::Looping, loop_icon, QString());
+    right->addWidget(looping);
+    mode = button(TimebarGestureKind::RealTime, every_frame_icon, QString());
+    right->addWidget(mode);
+    range = new QComboBox;
+    range->addItems({QStringLiteral("Global"), QStringLiteral("Input")});
+    range->setFocusPolicy(Qt::NoFocus);
+    connect(range, &QComboBox::currentIndexChanged, this, [this](int index) {
+        send(TimebarGestureKind::InputRange, 0, QString(), index == 1);
+    });
+    right->addWidget(range);
+    first = field(TimebarGestureKind::FirstTyped, QString());
+    right->addWidget(first);
+    last = field(TimebarGestureKind::LastTyped, QString());
+    right->addWidget(last);
+    controls->addLayout(right, 0, 2);
+    layout->addLayout(controls);
 }
 
-QLineEdit *Timebar::field(TimebarGestureKind kind, const QString &tooltip,
-                          const QString &widest) {
+QLineEdit *Timebar::field(TimebarGestureKind kind, const QString &tooltip) {
     auto *field = new QLineEdit;
     field->setToolTip(tooltip);
-    field->setFixedWidth(field->fontMetrics().horizontalAdvance(widest) + 12);
     // Typing takes the keyboard from the panes until Enter or a click elsewhere gives it back.
     field->setFocusPolicy(Qt::ClickFocus);
     field->installEventFilter(this);
@@ -294,32 +496,71 @@ QToolButton *Timebar::button(TimebarGestureKind kind, const QIcon &icon, const Q
     button->setAutoRaise(true);
     button->setFocusPolicy(Qt::NoFocus);
     connect(button, &QToolButton::clicked, this, [=, this] {
-        // Only Rust shows whether it plays.
-        if (button->isCheckable()) button->setChecked(!button->isChecked());
-        send(kind);
+        // The toggles send the other of what Rust last showed.
+        const bool on = kind == TimebarGestureKind::Looping     ? !looping_on
+                        : kind == TimebarGestureKind::RealTime ? !real_time
+                                                               : false;
+        send(kind, 0, QString(), on);
     });
     return button;
 }
 
+void Timebar::show_frames() {
+    QLineEdit *const fields[] = {frame, first, last};
+    const QFontMetrics metrics = frame->fontMetrics();
+    const QString widest = timecode ? QStringLiteral("-00:00:00:00") : QStringLiteral("-000000");
+    for (int index = 0; index < 3; ++index) {
+        QLineEdit *field = fields[index];
+        field->setFixedWidth(metrics.horizontalAdvance(widest) + 12);
+        // What the artist is typing stays.
+        if (!field->hasFocus()) field->setText(texts[index][timecode ? 1 : 0]);
+    }
+}
+
 void Timebar::show_timebar(const TimebarData &data) {
     refreshing = true;
-    bar->show_frames(data.first, data.last, data.frame, data.marks);
-    const std::pair<QLineEdit *, const QString *> fields[] = {
-        {frame, &data.frame_text},
-        {first, &data.first_text},
-        {last, &data.last_text},
-        {rate, &data.rate_text}};
-    for (auto [field, text] : fields) {
-        // What the artist is typing stays.
-        if (!field->hasFocus()) field->setText(*text);
-    }
-    play_backward->setChecked(data.playing < 0);
-    play_forward->setChecked(data.playing > 0);
-    {
-        const QSignalBlocker blockers[] = {QSignalBlocker(looping), QSignalBlocker(mode)};
-        looping->setChecked(data.looping);
-        mode->setCurrentIndex(data.real_time ? 1 : 0);
-    }
+    bar->show_frames(data, timecode);
+    const QString shown[3][2] = {{data.frame_text, data.frame_timecode},
+                                 {data.first_text, data.first_timecode},
+                                 {data.last_text, data.last_timecode}};
+    for (int index = 0; index < 3; ++index)
+        for (int form = 0; form < 2; ++form) texts[index][form] = shown[index][form];
+    show_frames();
+    if (!rate->hasFocus()) rate->setEditText(data.rate_text);
+
+    play_backward->setIcon(data.playing < 0 ? stop_icon : play_backward_icon);
+    play_backward->setToolTip(data.playing < 0 ? QStringLiteral("Stop (K or J over the viewer)")
+                                               : QStringLiteral("Play backwards (J over the viewer)"));
+    play_forward->setIcon(data.playing > 0 ? stop_icon : play_forward_icon);
+    play_forward->setToolTip(data.playing > 0 ? QStringLiteral("Stop (K or L over the viewer)")
+                                              : QStringLiteral("Play forwards (L over the viewer)"));
+
+    looping_on = data.looping;
+    looping->setIcon(data.looping ? loop_icon : once_icon);
+    looping->setToolTip(data.looping
+                            ? QStringLiteral("Loop: playing round from the other end at the "
+                                             "range's end. Click to stop there instead.")
+                            : QStringLiteral("Once: stopping at the range's end. Click to loop."));
+    real_time = data.real_time;
+    mode->setIcon(data.real_time ? real_time_icon : every_frame_icon);
+    mode->setToolTip(
+        data.real_time
+            ? QStringLiteral("Real time: keeping to the rate, skipping frames not ready. Click to "
+                             "show every frame.")
+            : QStringLiteral("Every frame: showing each frame once ready, no faster than the "
+                             "rate. Click to keep real time."));
+
+    range->setCurrentIndex(data.input ? 1 : 0);
+    range->setToolTip(
+        !data.input         ? QStringLiteral("Global: the timeline's frames, set beside")
+        : data.input_found ? QStringLiteral("Input: the viewed node's sequences' frames")
+                           : QStringLiteral("Input: the viewed node reads no sequence, so the "
+                                            "timeline's frames"));
+    for (QLineEdit *field : {first, last}) field->setEnabled(!data.input);
+    first->setToolTip(data.input ? QStringLiteral("The range's first frame")
+                                 : QStringLiteral("The timeline's first frame"));
+    last->setToolTip(data.input ? QStringLiteral("The range's last frame")
+                                : QStringLiteral("The timeline's last frame"));
     status->setText(data.status);
     refreshing = false;
 }
@@ -330,6 +571,7 @@ bool Timebar::eventFilter(QObject *watched, QEvent *event) {
         if (auto *field = qobject_cast<QLineEdit *>(watched)) {
             field->setModified(false);
             field->clearFocus();
+            rate->clearFocus();
             send(TimebarGestureKind::Restore);
             return true;
         }
@@ -343,12 +585,13 @@ void Timebar::send(TimebarGestureKind kind, double frame, const QString &text, b
 }
 
 ViewerStrip::ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set,
-                         rust::Fn<void(TimebarGesture)> timebar_gestures, QWidget *parent)
+                         rust::Fn<void(TimebarGesture)> timebar_gestures,
+                         const QStringList &rates, QWidget *parent)
     : QWidget(parent) {
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(6, 2, 6, 2);
     layout->setSpacing(2);
-    timebar = new Timebar(timebar_gestures, this);
+    timebar = new Timebar(timebar_gestures, rates, this);
     layout->addWidget(timebar);
     caption = new QLabel;
     // Clipped rather than widening the dock, as is the readout.
@@ -378,13 +621,14 @@ ViewerStrip::ViewerStrip(double limit, double step, rust::Fn<void(double)> expos
 
 ViewerStrip *container_with_strip(Pane *pane, QDockWidget *dock, double limit, double step,
                                   rust::Fn<void(double)> exposure_set,
-                                  rust::Fn<void(TimebarGesture)> timebar_gestures) {
+                                  rust::Fn<void(TimebarGesture)> timebar_gestures,
+                                  const QStringList &rates) {
     auto *widget = new QWidget(dock);
     auto *layout = new QVBoxLayout(widget);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     layout->addWidget(QWidget::createWindowContainer(pane, widget), 1);
-    auto *strip = new ViewerStrip(limit, step, exposure_set, timebar_gestures, widget);
+    auto *strip = new ViewerStrip(limit, step, exposure_set, timebar_gestures, rates, widget);
     layout->addWidget(strip);
     dock->setWidget(widget);
     return strip;

@@ -293,6 +293,7 @@ fn main() {
             f64::from(EXPOSURE_STEP),
             exposure_set,
             timebar::gesture,
+            &timebar::rates(),
         );
         (strip, ffi::strip_caption(strip))
     };

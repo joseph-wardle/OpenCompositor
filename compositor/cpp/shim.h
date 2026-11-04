@@ -89,12 +89,13 @@ class ParameterPanel : public QWidget {
 
 class FrameBar;
 
-// The timeline under the viewer: its frames as a bar to scrub, marked as Rust sends them, the
-// transport, the frame, the range and rate, playback's mode and looping, and how playback keeps
-// up. Each gesture is sent back; nothing is sent while Rust shows the timebar.
+// The timeline under the viewer: its frames as a bar to scrub, ticked and marked as Rust sends
+// them; under it the rate and how playback keeps up, the transport round the frame, and playback's
+// looping and mode and the range. Frames read as numbers or as timecode. Each gesture is sent back;
+// nothing is sent while Rust shows the timebar.
 class Timebar : public QWidget {
   public:
-    Timebar(rust::Fn<void(TimebarGesture)> gestures, QWidget *parent);
+    Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rates, QWidget *parent);
     void show_timebar(const TimebarData &data);
 
   protected:
@@ -102,23 +103,35 @@ class Timebar : public QWidget {
 
   private:
     // A field that sends what is typed into it as the gesture, if the artist changed it.
-    QLineEdit *field(TimebarGestureKind kind, const QString &tooltip, const QString &widest);
+    QLineEdit *field(TimebarGestureKind kind, const QString &tooltip);
     QToolButton *button(TimebarGestureKind kind, const QIcon &icon, const QString &tooltip);
+    // Shows the frame, first and last as numbers or timecode, sizing their fields to fit.
+    void show_frames();
     void send(TimebarGestureKind kind, double frame = 0, const QString &text = QString(),
               bool on = false);
 
     rust::Fn<void(TimebarGesture)> gestures;
     bool refreshing = false;
+    bool timecode = false;
+    // As last shown, which the buttons send the other of.
+    bool looping_on = false;
+    bool real_time = false;
+    // The frame, first and last as last shown: as numbers, then as timecode.
+    QString texts[3][2];
     FrameBar *bar;
-    QLineEdit *frame;
-    QLineEdit *first;
-    QLineEdit *last;
-    QLineEdit *rate;
+    QComboBox *rate;
+    QLabel *status;
+    QToolButton *timecode_button;
     QToolButton *play_backward;
     QToolButton *play_forward;
+    QLineEdit *frame;
     QToolButton *looping;
-    QComboBox *mode;
-    QLabel *status;
+    QToolButton *mode;
+    QComboBox *range;
+    QLineEdit *first;
+    QLineEdit *last;
+    QIcon play_backward_icon, play_forward_icon, stop_icon;
+    QIcon loop_icon, once_icon, every_frame_icon, real_time_icon;
 };
 
 // Under the viewer: its timebar and caption, then the readout and the viewer's exposure, which
@@ -126,7 +139,8 @@ class Timebar : public QWidget {
 class ViewerStrip : public QWidget {
   public:
     ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set,
-                rust::Fn<void(TimebarGesture)> timebar_gestures, QWidget *parent);
+                rust::Fn<void(TimebarGesture)> timebar_gestures, const QStringList &rates,
+                QWidget *parent);
     Timebar *timebar;
     QLabel *caption;
     QLabel *readout;
@@ -175,7 +189,8 @@ QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, in
 QWidget *container(Pane *pane, QDockWidget *dock);
 ViewerStrip *container_with_strip(Pane *pane, QDockWidget *dock, double limit, double step,
                                   rust::Fn<void(double)> exposure_set,
-                                  rust::Fn<void(TimebarGesture)> timebar_gestures);
+                                  rust::Fn<void(TimebarGesture)> timebar_gestures,
+                                  const QStringList &rates);
 void show_timebar(ViewerStrip *strip, const TimebarData &data);
 QLabel *strip_caption(ViewerStrip *strip);
 void set_readout(ViewerStrip *strip, const QString &text);

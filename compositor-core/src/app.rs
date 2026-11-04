@@ -12,7 +12,7 @@ use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{EvalError, ResultKey, result_key};
-use crate::files::{Pattern, Scan, held};
+use crate::files::{Pattern, Scan, held, input_range};
 use crate::gpu::{
     Drawn, FrameCheck, FrameTiming, Gpu, NativeWindow, PaneSize, PixelRead, Probe, ViewerFrame,
 };
@@ -20,7 +20,7 @@ use crate::image::{ImageInfo, Window};
 use crate::panel::Panel;
 use crate::parameter::Value;
 use crate::playback::{
-    Clock, Direction, FrameMark, Frames, MAX_MARKED_FRAMES, PlaybackMode, Timebar,
+    Clock, Direction, FrameMark, FrameRange, Frames, MAX_MARKED_FRAMES, PlaybackMode, Timebar,
 };
 use crate::session::Session;
 use crate::viewer::{EXPOSURE_STEP, Zoom};
@@ -132,8 +132,10 @@ pub enum Event {
     FrameRateSet(f64),
     /// The artist chose the mode playback plays in, from now on and at once if playing.
     PlaybackModeSet(PlaybackMode),
-    /// The artist chose whether playback wraps round at the timeline's end.
+    /// The artist chose whether playback wraps round at the range's end.
     LoopingSet(bool),
+    /// The artist chose which frames the timebar spans and playback plays through.
+    FrameRangeChosen(FrameRange),
 }
 
 /// What another thread, or wgpu inside a call, tells the GUI thread through the waker
@@ -581,8 +583,10 @@ pub struct App {
     clock: Option<Clock>,
     /// The mode playback plays in.
     playback_mode: PlaybackMode,
-    /// Whether playback wraps round at the timeline's end.
+    /// Whether playback wraps round at the range's end.
     looping: bool,
+    /// Which frames the timebar spans and playback plays through.
+    frame_range: FrameRange,
     /// Whether a [`Request::Advance`] is waiting to be dispatched.
     advance_requested: bool,
     /// The keys of the frames the worker was last asked to prepare.
@@ -660,6 +664,7 @@ impl App {
             clock: None,
             playback_mode: PlaybackMode::default(),
             looping: true,
+            frame_range: FrameRange::default(),
             advance_requested: false,
             ahead_sent: Vec::new(),
             marks: Marks::default(),
@@ -825,6 +830,10 @@ impl App {
             }
             Event::LoopingSet(looping) => {
                 self.looping = looping;
+                Vec::new()
+            }
+            Event::FrameRangeChosen(range) => {
+                self.frame_range = range;
                 Vec::new()
             }
         };
@@ -1342,7 +1351,7 @@ impl App {
             Command::Step(direction) => {
                 self.clock = None;
                 let frame = self.session.frame();
-                let frames = Frames::of(&self.session.document().timeline());
+                let frames = self.frames();
                 let stepped = match frames.index(frame) {
                     Some(index) => match frames.step(index, 1, direction, self.looping) {
                         Ok(index) | Err(index) => frames.frame(index),
@@ -1356,10 +1365,10 @@ impl App {
             }
             Command::FirstFrame | Command::LastFrame => {
                 self.clock = None;
-                let timeline = self.session.document().timeline();
+                let (first, last, _) = self.range();
                 self.go_to(match command {
-                    Command::FirstFrame => timeline.first(),
-                    _ => timeline.last(),
+                    Command::FirstFrame => first,
+                    _ => last,
                 })
             }
         }
@@ -1395,15 +1404,15 @@ impl App {
     /// is shown.
     fn advance_clock(&mut self, now: Instant) -> Vec<Request> {
         self.advance_requested = false;
+        let frames = self.frames();
         let Some(clock) = &mut self.clock else {
             return Vec::new();
         };
-        let timeline = self.session.document().timeline();
         let tick = clock.advance(
             now,
             self.session.frame(),
-            Frames::of(&timeline),
-            timeline.rate(),
+            frames,
+            self.session.document().timeline().rate(),
             self.looping,
         );
         if tick.stopped {
@@ -1478,11 +1487,33 @@ impl App {
     }
 
     /// What the marks are built from as the session stands: its content version, the viewed node
-    /// and the timeline's frames.
+    /// and the range's frames.
     fn marks_for(&self) -> (u64, Option<NodeId>, Frames) {
         let session = &self.session;
-        let frames = Frames::of(&session.document().timeline());
-        (session.content_version(), session.viewed(), frames)
+        (session.content_version(), session.viewed(), self.frames())
+    }
+
+    /// The first and last frame of the range chosen, and with [`FrameRange::Input`] whether the
+    /// viewed node's was found, without which it is the timeline's.
+    fn range(&self) -> (f64, f64, bool) {
+        let session = &self.session;
+        let timeline = session.document().timeline();
+        let input = match (self.frame_range, session.viewed()) {
+            (FrameRange::Input, Some(node)) => {
+                input_range(session.document(), session.files(), node, session.frame())
+            }
+            _ => None,
+        };
+        match input {
+            Some((first, last)) => (first, last, true),
+            None => (timeline.first(), timeline.last(), false),
+        }
+    }
+
+    /// The frames of the range chosen, which playback steps through.
+    fn frames(&self) -> Frames {
+        let (first, last, _) = self.range();
+        Frames::between(first, last)
     }
 
     /// Asks the worker to prepare the frames playback shows next that the viewer cache cannot
@@ -1502,7 +1533,7 @@ impl App {
             return Vec::new();
         };
         let session = &self.session;
-        let frames = Frames::of(&session.document().timeline());
+        let frames = self.frames();
         let Some(current) = frames.index(session.frame()) else {
             return Vec::new();
         };
@@ -1540,12 +1571,14 @@ impl App {
 
     /// Shows the timebar again when anything it shows changed.
     fn follow_timebar(&mut self, requests: &mut Vec<Request>) {
-        let timeline = self.session.document().timeline();
+        let (first, last, input_found) = self.range();
         let clock = self.clock.as_ref();
         let timebar = Timebar {
-            first: timeline.first(),
-            last: timeline.last(),
-            rate: timeline.rate(),
+            first,
+            last,
+            range: self.frame_range,
+            input_found,
+            rate: self.session.document().timeline().rate(),
             frame: self.session.frame(),
             playing: clock.map(Clock::direction),
             mode: self.playback_mode,

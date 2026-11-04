@@ -1,9 +1,8 @@
 use super::*;
 
-/// Frames 1001 to 1005 at 24 frames a second.
-fn timeline() -> Timeline {
-    let timeline = Timeline::default().with_range(1001.0, 1005.0).unwrap();
-    timeline.with_rate(24.0).unwrap()
+/// Frames 1001 to 1005.
+fn frames() -> Frames {
+    Frames::between(1001.0, 1005.0)
 }
 
 fn period() -> Duration {
@@ -12,7 +11,7 @@ fn period() -> Duration {
 
 #[test]
 fn playback_steps_through_whole_frames_and_wraps_round_or_stops_at_the_end() {
-    let frames = Frames::of(&Timeline::default().with_range(-2.0, 1.5).unwrap());
+    let frames = Frames::between(-2.0, 1.5);
     assert_eq!(frames.count(), 4);
     assert_eq!(frames.frame(3), 1.0);
     assert_eq!(frames.index(-1.0), Some(1));
@@ -30,8 +29,7 @@ fn playback_steps_through_whole_frames_and_wraps_round_or_stops_at_the_end() {
 
 #[test]
 fn every_frame_playback_waits_for_each_frame_and_never_outruns_the_rate() {
-    let (timeline, period) = (timeline(), period());
-    let frames = Frames::of(&timeline);
+    let (frames, period) = (frames(), period());
     let mut clock = Clock::new(Direction::Forward, PlaybackMode::EveryFrame);
     let start = Instant::now();
     let first = clock.advance(start, 1004.0, frames, 24.0, true);
@@ -63,8 +61,7 @@ fn every_frame_playback_waits_for_each_frame_and_never_outruns_the_rate() {
 
 #[test]
 fn real_time_playback_keeps_to_the_rate_and_counts_the_frames_it_drops() {
-    let (timeline, period) = (timeline(), period());
-    let frames = Frames::of(&timeline);
+    let (frames, period) = (frames(), period());
     let mut clock = Clock::new(Direction::Backward, PlaybackMode::RealTime);
     let start = Instant::now();
     // Outside the timeline, it starts from the end it plays from.
@@ -100,7 +97,7 @@ fn the_achieved_rate_counts_the_frames_shown_over_the_last_second() {
     // Shown once per frame, however often it is told.
     clock.frame_shown(start + Duration::from_millis(10));
     assert_eq!(clock.achieved_rate(), None);
-    let frames = Frames::of(&timeline());
+    let frames = frames();
     for shown in 1..=48 {
         let now = start + period() * shown;
         clock.advance(now, 1001.0, frames, 24.0, true);
@@ -108,4 +105,31 @@ fn the_achieved_rate_counts_the_frames_shown_over_the_last_second() {
     }
     let rate = clock.achieved_rate().unwrap();
     assert!((rate - 24.0).abs() < 0.01, "{rate}");
+}
+
+#[test]
+fn timecode_counts_whole_seconds_at_the_nearest_whole_rate_and_reads_back() {
+    assert_eq!(timecode(0.0, 24.0), "00:00:00:00");
+    assert_eq!(timecode(1001.0, 24.0), "00:00:41:17");
+    assert_eq!(timecode(86_400.5, 24.0), "01:00:00:00");
+    assert_eq!(timecode(30.0, 30_000.0 / 1001.0), "00:00:01:00");
+    assert_eq!(timecode(-25.0, 25.0), "-00:00:01:00");
+    for (frame, rate) in [
+        (1001.0, 24.0),
+        (-25.0, 25.0),
+        (123_456.0, 24_000.0 / 1001.0),
+    ] {
+        assert_eq!(parse_timecode(&timecode(frame, rate), rate), Ok(frame));
+    }
+    assert_eq!(parse_timecode("1:12", 24.0), Ok(36.0));
+    assert_eq!(
+        parse_timecode("00:00:00:24", 24.0),
+        Err(TimecodeError::OutOfRange)
+    );
+    assert_eq!(
+        parse_timecode("00:60:00", 24.0),
+        Err(TimecodeError::OutOfRange)
+    );
+    assert_eq!(parse_timecode("1001", 24.0), Err(TimecodeError::Unreadable));
+    assert_eq!(parse_timecode("a:b", 24.0), Err(TimecodeError::Unreadable));
 }

@@ -40,14 +40,17 @@ pub use document::{
 pub use evaluate::{
     DeviceLost, EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, ResultKey, result_key,
 };
-pub use files::{Files, Pattern, Scan, held};
+pub use files::{Files, Pattern, Scan, held, input_range};
 pub use gpu::{FrameCheck, FrameTiming, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FRAME_LIMIT, FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,
 };
-pub use playback::{Direction, FrameMark, MAX_MARKED_FRAMES, PlaybackMode, Timebar};
+pub use playback::{
+    Direction, FrameMark, FrameRange, MAX_MARKED_FRAMES, PlaybackMode, Timebar, TimecodeError,
+    parse_timecode, timecode,
+};
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Reload, Session};
 pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};

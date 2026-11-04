@@ -2087,3 +2087,59 @@ fn a_drag_leaves_the_timebar_marks_until_it_finishes() {
     app.edit(Session::finish_edit);
     assert_eq!(marks_version(&app), Some(app.session().content_version()));
 }
+
+#[test]
+fn the_input_range_spans_the_viewed_sequence_moved_by_its_offset_and_playback_keeps_to_it() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let directory = crate::fixtures::directory("input-range");
+    for frame in [1, 2, 4] {
+        let path = directory.join(format!("plate.{frame:04}.png"));
+        crate::fixtures::write_png(&path, 4, 4, png::ColorType::Rgba, &[255; 4 * 4 * 4]);
+    }
+    app.dispatch(Event::FrameRangeSet {
+        first: 0.0,
+        last: 9.0,
+    });
+    let reader = create(&mut app, directory.join("plate.####.png").to_str().unwrap());
+    app.dispatch(next_scan(&scans));
+    app.dispatch(slot_key(1, CTRL));
+    let span = |app: &App| {
+        let timebar = app.timebar().unwrap();
+        (timebar.first, timebar.last, timebar.input_found)
+    };
+    assert_eq!(span(&app), (0.0, 9.0, false));
+
+    app.dispatch(Event::FrameRangeChosen(FrameRange::Input));
+    assert_eq!(span(&app), (1.0, 4.0, true));
+    assert_eq!(app.timebar().unwrap().marks.len(), 4);
+    app.dispatch(Event::Command(Command::LastFrame));
+    assert_eq!(app.session().frame(), 4.0);
+    app.dispatch(Event::Command(Command::Step(Direction::Forward)));
+    assert_eq!(
+        app.session().frame(),
+        1.0,
+        "stepping wraps round the input range"
+    );
+
+    app.edit(|session| {
+        session.begin_edit(reader, "Offset").unwrap();
+        session.edit_value("offset", Value::Float(10.0)).unwrap();
+        session.finish_edit();
+    });
+    assert_eq!(span(&app), (11.0, 14.0, true));
+    assert_eq!(
+        app.session().document().timeline().last(),
+        9.0,
+        "the document's range is left alone"
+    );
+
+    let still = directory.join("still.png");
+    crate::fixtures::write_png(&still, 4, 4, png::ColorType::Rgba, &[255; 4 * 4 * 4]);
+    create(&mut app, still.to_str().unwrap());
+    app.dispatch(slot_key(2, CTRL));
+    assert_eq!(
+        span(&app),
+        (0.0, 9.0, false),
+        "a still has no range of its own"
+    );
+}

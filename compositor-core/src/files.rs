@@ -300,6 +300,42 @@ pub(crate) fn scanned_end(resolved: &Resolved, files: &Files, parameter: &str) -
     }
 }
 
+/// The frames the node's sequences span on the timeline: from the earliest first frame to the
+/// latest last frame of the sequences its upstream Readers read, each moved by its Offset, at
+/// the time their parameters are resolved at. `None` if none reads a sequence with both ends
+/// known, as for a still.
+pub fn input_range(
+    document: &Document,
+    files: &Files,
+    node: NodeId,
+    time: f64,
+) -> Option<(f64, f64)> {
+    let mut span: Option<(f64, f64)> = None;
+    for id in document.upstream(node) {
+        let reader = document.node(id).expect("upstream nodes exist");
+        if !matches!(reader.kind, NodeKind::Reader { .. }) {
+            continue;
+        }
+        let resolved = resolve(reader, time);
+        let Some(path) = resolved.file("file") else {
+            continue;
+        };
+        if Pattern::parse(path).is_none() {
+            continue;
+        }
+        let (Some(first), Some(last)) = range(&resolved, files.scan(path)) else {
+            continue;
+        };
+        let offset = resolved.float("offset").expect("a Reader has an Offset");
+        let (first, last) = (first as f64 + offset, last as f64 + offset);
+        span = Some(match span {
+            Some((earliest, latest)) => (earliest.min(first), latest.max(last)),
+            None => (first, last),
+        });
+    }
+    span
+}
+
 /// The Readers on the node's upstream, itself included, that hold the nearest end of their
 /// sequence at a frame, each with the frame it reads, in the order [`missing`](crate::missing)
 /// visits them. Empty if the document has no such node.
