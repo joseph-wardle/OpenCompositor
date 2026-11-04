@@ -362,55 +362,77 @@ class FrameBar : public QWidget {
         else if (index + 1 > offset + span) show_view(index, span);
     }
     // Ticks hang from the top at each frame's middle: each frame's while they are 3 pixels
-    // apart, and longer every second's worth, or every so many seconds' where those crowd,
-    // labelled where the labels fit.
+    // apart, longer at steps that keep 8 pixels apart, and longest and labelled at steps that
+    // leave labels room. Steps below a second divide it, so they meet each second's; above, they
+    // are 1, 2 or 5 seconds times a power of ten. The range's ends are always long and labelled.
     void paint_ticks(QPainter &painter) {
         const double cell = this->cell();
         const int64_t second = std::max<int64_t>(std::llround(rate), 1);
+        std::vector<int64_t> steps;
+        for (int64_t step : {1, 2, 4, 5, 6, 8, 10, 12, 15})
+            if (step < second && second % step == 0) steps.push_back(step);
+        for (int64_t scale = 1; scale <= 1'000'000; scale *= 10)
+            for (int64_t step : {1, 2, 5}) steps.push_back(second * step * scale);
+        auto step_for = [&](double pixels) {
+            for (int64_t step : steps)
+                if (step * cell >= pixels) return step;
+            return steps.back();
+        };
         const QFontMetrics metrics = fontMetrics();
         const auto [from, to] = visible();
-        const int64_t first_whole = std::llround(std::ceil(first));
-        const int64_t start = first_whole + from;
-        const int64_t end = std::min<int64_t>(first_whole + to, std::llround(std::floor(last)));
+        const int64_t range_first = std::llround(std::ceil(first));
+        const int64_t range_last = std::llround(std::floor(last));
+        const int64_t start = range_first + from;
+        const int64_t end = std::min<int64_t>(range_first + to, range_last);
         const double label_width = std::max(metrics.horizontalAdvance(label(double(start))),
-                                            metrics.horizontalAdvance(label(double(end)))) +
-                                   8;
-        // Each step is so many seconds: 1, 2, 5, 10, 20, 50...
-        auto every = [&](double pixels) {
-            int64_t seconds = 1;
-            for (int64_t scale = 1; second * seconds * cell < pixels; scale *= 10) {
-                for (int64_t step : {1, 2, 5}) {
-                    seconds = step * scale;
-                    if (second * seconds * cell >= pixels) break;
-                }
-            }
-            return second * seconds;
-        };
-        const int64_t major = every(6), labelled = every(label_width);
+                                            metrics.horizontalAdvance(label(double(end))));
+        const int64_t medium = step_for(8);
+        const int64_t labelled = step_for(std::max(2 * label_width, 100.0));
+
         QColor color = palette().color(QPalette::Text);
         color.setAlphaF(0.45);
         painter.setPen(QPen(color, 1));
         auto x_at = [&](int64_t at) { return std::round(x_of(at - first + 0.5)) + 0.5; };
-        if (cell >= 3) {
-            for (int64_t at = start; at <= end; ++at)
-                painter.drawLine(QPointF(x_at(at), 0), QPointF(x_at(at), 4));
-        }
+        auto tick = [&](int64_t at, double length) {
+            painter.drawLine(QPointF(x_at(at), 0), QPointF(x_at(at), length));
+        };
         // The first multiple of `of` from `start`, either side of zero.
         auto first_multiple = [&](int64_t of) {
             const int64_t past = ((start % of) + of) % of;
             return past == 0 ? start : start + of - past;
         };
-        for (int64_t at = first_multiple(major); at <= end; at += major)
-            painter.drawLine(QPointF(x_at(at), 0), QPointF(x_at(at), 9));
+        if (cell >= 3)
+            for (int64_t at = start; at <= end; ++at) tick(at, 4);
+        for (int64_t at = first_multiple(medium); at <= end; at += medium) tick(at, 7);
+        for (int64_t at = first_multiple(labelled); at <= end; at += labelled) tick(at, 10);
+        for (int64_t at : {range_first, range_last})
+            if (at >= start && at <= end) tick(at, 10);
+
+        // Centred under their ticks; the ends' kept inside the bar, the others dropped where
+        // they would be cut off or meet an end's.
         color.setAlphaF(0.75);
         painter.setPen(color);
-        const double baseline = 9 + metrics.ascent();
+        const double baseline = 10 + metrics.ascent();
+        auto place = [&](int64_t at) {
+            const double text_width = metrics.horizontalAdvance(label(double(at)));
+            return QRectF(x_at(at) - text_width / 2, 10, text_width, metrics.height());
+        };
+        std::vector<QRectF> ends;
+        for (int64_t at : {range_first, range_last}) {
+            if (at < start || at > end || (at == range_last && range_last == range_first)) continue;
+            QRectF rect = place(at);
+            rect.moveLeft(std::clamp(rect.left(), 2.0, std::max(2.0, width() - 2 - rect.width())));
+            painter.drawText(QPointF(rect.left(), baseline), label(double(at)));
+            ends.push_back(rect.adjusted(-8, 0, 8, 0));
+        }
         for (int64_t at = first_multiple(labelled); at <= end; at += labelled) {
-            const QString text = label(double(at));
-            // Whole, or not at all.
-            if (x_at(at) < 0) continue;
-            if (x_at(at) + 3 + metrics.horizontalAdvance(text) > width()) break;
-            painter.drawText(QPointF(x_at(at) + 3, baseline), text);
+            if (at == range_first || at == range_last) continue;
+            const QRectF rect = place(at);
+            if (rect.left() < 0 || rect.right() > width()) continue;
+            if (std::any_of(ends.begin(), ends.end(),
+                            [&](const QRectF &taken) { return taken.intersects(rect); }))
+                continue;
+            painter.drawText(QPointF(rect.left(), baseline), label(double(at)));
         }
     }
     QString label(double at) const {
