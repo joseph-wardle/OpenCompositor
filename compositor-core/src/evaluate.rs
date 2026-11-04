@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -37,13 +38,27 @@ pub use gpu::{DeviceLost, GpuEvaluation, GpuImage, Recorded};
 /// a node changes nothing. Inputs are shared keys: cloning one is a reference count, and
 /// comparing stops at the first input two keys share. Comparing visits each pair of inputs once,
 /// without recursion; dropping a key recurses once per node of its chain.
+///
+/// Each key carries a fingerprint of its whole chain, equal for equal keys, so that telling
+/// unequal keys apart is one comparison: the viewer cache and the timeline compare every frame's
+/// key with every copy held. Equal fingerprints are then confirmed by walking both chains.
 #[derive(Clone, Debug)]
-pub struct ResultKey(Arc<Recipe>);
+pub struct ResultKey(Arc<Recipe>, u64);
+
+impl ResultKey {
+    fn new(recipe: Recipe) -> ResultKey {
+        let fingerprint = recipe.fingerprint();
+        ResultKey(Arc::new(recipe), fingerprint)
+    }
+}
 
 impl PartialEq for ResultKey {
     fn eq(&self, other: &ResultKey) -> bool {
         if Arc::ptr_eq(&self.0, &other.0) {
             return true;
+        }
+        if self.1 != other.1 {
+            return false;
         }
         // Keys from separate builds share no inputs. Where a graph branches and rejoins, walking
         // both chains would compare a shared input once per path to it, exponentially many.
@@ -173,6 +188,39 @@ impl Recipe {
                 source: source.as_ref().and_then(|_| inputs.next()),
             },
         }
+    }
+
+    /// A hash of what [`same_but_inputs`](Recipe::same_but_inputs) compares and of the inputs'
+    /// fingerprints, in order, so that equal keys have equal fingerprints.
+    fn fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        match self {
+            Recipe::Reader {
+                version,
+                path,
+                reload,
+            } => (0u8, version, path, reload).hash(&mut hasher),
+            Recipe::Exposure {
+                version,
+                stops,
+                source,
+            } => (1u8, version, stops, source.is_some()).hash(&mut hasher),
+            Recipe::Merge {
+                version,
+                mix,
+                background,
+                layers,
+            } => (2u8, version, mix, background.is_some(), layers.len()).hash(&mut hasher),
+            Recipe::Blur {
+                version,
+                size,
+                source,
+            } => (3u8, version, size, source.is_some()).hash(&mut hasher),
+        }
+        for input in self.inputs() {
+            input.1.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     /// Whether two recipes are equal, where equal inputs are known to be the same key: one step,
@@ -310,7 +358,7 @@ fn keys(
         }
         pending.pop();
         if !built.contains_key(&id) {
-            let key = ResultKey(Arc::new(recipe(current, files, time, &built)));
+            let key = ResultKey::new(recipe(current, files, time, &built));
             built.insert(id, key);
         }
     }
@@ -548,7 +596,7 @@ impl Evaluator {
                 (Some(retained), _) => retained.key.clone(),
                 (None, Some(key)) => key.clone(),
                 (None, None) if unchanged => current.clone(),
-                (None, None) => ResultKey(Arc::new(recipe)),
+                (None, None) => ResultKey::new(recipe),
             };
             steps.push(Step {
                 key,

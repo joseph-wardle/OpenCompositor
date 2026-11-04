@@ -206,6 +206,59 @@ pub mod ffi {
         Unpin,
     }
 
+    /// The timebar as Rust sends it.
+    #[derive(Debug)]
+    struct TimebarData {
+        first: f64,
+        last: f64,
+        frame: f64,
+        frame_text: QString,
+        first_text: QString,
+        last_text: QString,
+        rate_text: QString,
+        /// 1 playing forwards, -1 backwards, 0 stopped.
+        playing: i32,
+        real_time: bool,
+        looping: bool,
+        /// How playback keeps up, or nothing.
+        status: QString,
+        /// Each whole frame's from the first: 1 cached, 2 missing, 4 held, or'd.
+        marks: Vec<u8>,
+    }
+
+    /// What the artist did to the timebar.
+    #[derive(Debug)]
+    struct TimebarGesture {
+        kind: TimebarGestureKind,
+        /// The frame scrubbed to.
+        frame: f64,
+        /// What was typed.
+        text: QString,
+        /// Whether looping or real time was chosen.
+        on: bool,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum TimebarGestureKind {
+        Scrubbed,
+        FrameTyped,
+        FirstTyped,
+        LastTyped,
+        RateTyped,
+        /// Escape in a field: show the timebar as it was.
+        Restore,
+        FirstFrame,
+        StepBackward,
+        PlayBackward,
+        Stop,
+        PlayForward,
+        StepForward,
+        LastFrame,
+        Looping,
+        RealTime,
+    }
+
     #[namespace = "shim"]
     unsafe extern "C++" {
         include!("shim.h");
@@ -255,15 +308,18 @@ pub mod ffi {
         /// Puts the pane in the dock, which owns it from then on.
         unsafe fn container(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QWidget;
         /// Puts the pane in the dock above the viewer's strip, which the dock owns too: its
-        /// caption, readout and exposure control, from `-limit` to `limit` stops by `step`. The
-        /// control sends each value the artist sets to `exposure_set`.
+        /// timebar, which sends each gesture to `timebar_gesture`, caption, readout and exposure
+        /// control, from `-limit` to `limit` stops by `step`. The control sends each value the
+        /// artist sets to `exposure_set`.
         unsafe fn container_with_strip(
             pane: *mut Pane,
             dock: *mut QDockWidget,
             limit: f64,
             step: f64,
             exposure_set: fn(f64),
+            timebar_gesture: fn(TimebarGesture),
         ) -> *mut ViewerStrip;
+        unsafe fn show_timebar(strip: *mut ViewerStrip, data: &TimebarData);
         /// The strip's one-line caption.
         unsafe fn strip_caption(strip: *mut ViewerStrip) -> *mut QLabel;
         unsafe fn set_readout(strip: *mut ViewerStrip, text: &QString);

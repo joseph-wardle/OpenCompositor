@@ -159,8 +159,8 @@ pub(crate) fn copy_window(data: Window, halvings: u32) -> Window {
 /// Copies of images the viewer showed, by result key and halvings, within a budget of bytes.
 /// The session owns it, the worker fills it, and the app shows from it without the worker.
 ///
-/// When full, it drops the copies least recently requested. Keys are compared one by one: a key
-/// has no hash, and a cache within its budget holds hundreds of copies at most.
+/// When full, it drops the copies least recently requested. Keys are compared one by one, each by
+/// its fingerprint first: a cache within its budget holds hundreds of copies at most.
 #[derive(Debug)]
 pub struct ViewerCache {
     budget: u64,
@@ -168,6 +168,8 @@ pub struct ViewerCache {
     entries: Vec<Entry>,
     /// Counts insertions and hits, which order the entries by when they were last requested.
     requests: u64,
+    /// Counts changes to which copies are held.
+    changes: u64,
 }
 
 #[derive(Debug)]
@@ -183,6 +185,7 @@ impl Default for ViewerCache {
             bytes: 0,
             entries: Vec::new(),
             requests: 0,
+            changes: 0,
         }
     }
 }
@@ -205,6 +208,12 @@ impl ViewerCache {
         self.entries.is_empty()
     }
 
+    /// Changes whenever a copy is added or dropped, so that what was learned of the copies held is
+    /// current while this is.
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
     /// Whether it holds a copy of the key, at any reduction.
     pub fn contains(&self, key: &ResultKey) -> bool {
         self.entries.iter().any(|entry| entry.copy.key == *key)
@@ -219,6 +228,7 @@ impl ViewerCache {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
+        self.changes += 1;
     }
 
     /// The copy of the key that the viewer at this zoom draws no larger than its texels: the
@@ -252,6 +262,7 @@ impl ViewerCache {
         }
         self.make_room(bytes);
         self.requests += 1;
+        self.changes += 1;
         self.bytes += bytes;
         self.entries.push(Entry {
             copy: Arc::new(copy),
@@ -275,6 +286,7 @@ impl ViewerCache {
     fn remove(&mut self, index: usize) {
         let entry = self.entries.swap_remove(index);
         self.bytes -= entry.copy.bytes();
+        self.changes += 1;
     }
 }
 

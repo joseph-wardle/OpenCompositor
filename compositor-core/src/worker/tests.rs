@@ -1056,3 +1056,93 @@ fn a_result_asked_for_with_a_copy_is_delivered_then_copied_on_its_device() {
         assert_eq!(texels, [0.5, 0.5, 0.5, 1.0].repeat(8), "on the {device}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn look_ahead_yields_to_a_request_and_prepares_its_frame_again_after() {
+    let pipe = pipe("look-ahead-yields");
+    let (worker, deliveries) = worker();
+    let ahead = key(&pipe);
+    worker.look_ahead(vec![on(1, ahead.clone())]);
+    let writer = writer_once_read(&pipe);
+
+    worker.request(Some(on(1, missing("request"))));
+    drop(writer);
+    assert_eq!(receive(&deliveries).wanted.key, missing("request"));
+
+    // Stopped, it was not prepared, so the worker reads it again.
+    drop(writer_once_read(&pipe));
+    wait_until(&worker, "prepared the frame", |state| {
+        state.prepared.contains(&ahead)
+    });
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        "delivered a frame it prepared"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_request_for_the_frame_being_prepared_lets_it_finish_then_is_evaluated() {
+    let pipe = pipe("look-ahead-same-frame");
+    let (worker, deliveries) = worker();
+    let ahead = key(&pipe);
+    worker.look_ahead(vec![on(1, ahead.clone())]);
+    let writer = writer_once_read(&pipe);
+
+    worker.request(Some(on(1, ahead.clone())));
+    drop(writer);
+    wait_until(&worker, "prepared the frame", |state| {
+        state.prepared.contains(&ahead)
+    });
+    drop(writer_once_read(&pipe));
+    assert!(receive(&deliveries).wanted.key == ahead);
+}
+
+#[test]
+fn look_ahead_copies_each_frame_once_and_delivers_none() {
+    let directory = directory("look-ahead-copies");
+    let mut viewer = crate::viewer::Viewer::new();
+    viewer.resize(crate::gpu::PaneSize {
+        width: 4,
+        height: 4,
+        scale_factor: 1.0,
+    });
+    for device in [EvaluationDevice::Cpu, EvaluationDevice::Gpu] {
+        let (worker, deliveries, copies) = copying_worker(device);
+        let (gpu, queue) = crate::kernels::headless::device();
+        worker.connect(gpu, queue, Arc::default(), 1);
+        let keys: Vec<ResultKey> = (1..=3)
+            .map(|frame| {
+                let path = directory.join(format!("{device}.{frame}.png"));
+                write_png(&path, 8, 4);
+                exposed(&path, f64::from(frame))
+            })
+            .collect();
+        let ahead = |keys: &[ResultKey]| {
+            (keys.iter())
+                .map(|key| Wanted {
+                    copy: Some(viewer.zoom()),
+                    ..on(1, key.clone())
+                })
+                .collect()
+        };
+
+        worker.look_ahead(ahead(&keys));
+        for key in &keys {
+            let copy = (copies.recv_timeout(Duration::from_secs(10))).expect("a copy");
+            assert!(copy.key == *key, "prepared out of order on the {device}");
+            assert_eq!(copy.halvings(), 1);
+        }
+        // The same frames again, as the app asks after each copy, are not prepared again.
+        worker.look_ahead(ahead(&keys[1..]));
+        assert!(
+            copies.recv_timeout(Duration::from_millis(200)).is_err(),
+            "prepared a frame twice on the {device}"
+        );
+        assert!(
+            deliveries.try_recv().is_err(),
+            "delivered a prepared frame on the {device}"
+        );
+    }
+}

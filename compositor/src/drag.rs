@@ -61,8 +61,8 @@ const BLUR_SIZES: [f64; 2] = [3.0, 30.0];
 /// The GUI's frame budget in a GPU session: from acquiring a frame to submitting it, p99 and
 /// at most, but for one frame per drag: the driver alone occasionally takes milliseconds to
 /// submit.
-const FRAME_GUI_P99: Duration = Duration::from_millis(1);
-const FRAME_GUI_MAX: Duration = Duration::from_millis(4);
+pub const FRAME_GUI_P99: Duration = Duration::from_millis(1);
+pub const FRAME_GUI_MAX: Duration = Duration::from_millis(4);
 
 /// A chain the check drags a slider on, from its Reader to the node whose panel has the slider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -856,7 +856,7 @@ fn report(mut failures: Vec<String>) {
 }
 
 /// The value at the quantile of sorted durations, or zero of none.
-fn percentile(sorted: &[Duration], quantile: f64) -> Duration {
+pub fn percentile(sorted: &[Duration], quantile: f64) -> Duration {
     match sorted.len() {
         0 => Duration::ZERO,
         len => sorted[((len - 1) as f64 * quantile).round() as usize],
@@ -864,7 +864,7 @@ fn percentile(sorted: &[Duration], quantile: f64) -> Duration {
 }
 
 /// The process's resident set from /proc, as Linux reports it.
-fn resident_memory() -> String {
+pub fn resident_memory() -> String {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     status
         .lines()

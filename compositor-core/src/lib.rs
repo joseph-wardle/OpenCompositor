@@ -13,6 +13,7 @@ mod image;
 mod kernels;
 mod panel;
 mod parameter;
+mod playback;
 mod presentation;
 mod read;
 mod session;
@@ -46,6 +47,7 @@ pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FRAME_LIMIT, FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,
 };
+pub use playback::{Direction, FrameMark, MAX_MARKED_FRAMES, PlaybackMode, Timebar};
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Reload, Session};
 pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};

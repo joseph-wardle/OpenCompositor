@@ -28,6 +28,10 @@ struct PanelData;
 struct PanelRow;
 struct PanelGesture;
 enum class PanelGestureKind : uint8_t;
+struct TimebarData;
+struct TimebarGesture;
+enum class TimebarGestureKind : uint8_t;
+class QComboBox;
 class QDoubleSpinBox;
 class QLineEdit;
 class QListWidget;
@@ -83,11 +87,47 @@ class ParameterPanel : public QWidget {
     std::vector<Row> rows;
 };
 
-// Under the viewer: its caption, then the readout and the viewer's exposure, which sends each value
-// the artist sets in stops. Nothing is sent when Rust shows a value.
+class FrameBar;
+
+// The timeline under the viewer: its frames as a bar to scrub, marked as Rust sends them, the
+// transport, the frame, the range and rate, playback's mode and looping, and how playback keeps
+// up. Each gesture is sent back; nothing is sent while Rust shows the timebar.
+class Timebar : public QWidget {
+  public:
+    Timebar(rust::Fn<void(TimebarGesture)> gestures, QWidget *parent);
+    void show_timebar(const TimebarData &data);
+
+  protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
+  private:
+    // A field that sends what is typed into it as the gesture, if the artist changed it.
+    QLineEdit *field(TimebarGestureKind kind, const QString &tooltip, const QString &widest);
+    QToolButton *button(TimebarGestureKind kind, const QIcon &icon, const QString &tooltip);
+    void send(TimebarGestureKind kind, double frame = 0, const QString &text = QString(),
+              bool on = false);
+
+    rust::Fn<void(TimebarGesture)> gestures;
+    bool refreshing = false;
+    FrameBar *bar;
+    QLineEdit *frame;
+    QLineEdit *first;
+    QLineEdit *last;
+    QLineEdit *rate;
+    QToolButton *play_backward;
+    QToolButton *play_forward;
+    QToolButton *looping;
+    QComboBox *mode;
+    QLabel *status;
+};
+
+// Under the viewer: its timebar and caption, then the readout and the viewer's exposure, which
+// sends each value the artist sets in stops. Nothing is sent when Rust shows a value.
 class ViewerStrip : public QWidget {
   public:
-    ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set, QWidget *parent);
+    ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set,
+                rust::Fn<void(TimebarGesture)> timebar_gestures, QWidget *parent);
+    Timebar *timebar;
     QLabel *caption;
     QLabel *readout;
     QDoubleSpinBox *exposure;
@@ -134,7 +174,9 @@ void set_action(QAction *action, const QString &text, bool enabled);
 QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area);
 QWidget *container(Pane *pane, QDockWidget *dock);
 ViewerStrip *container_with_strip(Pane *pane, QDockWidget *dock, double limit, double step,
-                                  rust::Fn<void(double)> exposure_set);
+                                  rust::Fn<void(double)> exposure_set,
+                                  rust::Fn<void(TimebarGesture)> timebar_gestures);
+void show_timebar(ViewerStrip *strip, const TimebarData &data);
 QLabel *strip_caption(ViewerStrip *strip);
 void set_readout(ViewerStrip *strip, const QString &text);
 void show_viewer_exposure(ViewerStrip *strip, double stops);

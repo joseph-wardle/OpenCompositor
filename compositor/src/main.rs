@@ -8,7 +8,9 @@ mod lifecycle;
 mod pace;
 mod pane;
 mod panel;
+mod playback_check;
 mod qt;
+mod timebar;
 
 use std::cell::{OnceCell, RefCell};
 use std::ffi::OsString;
@@ -20,8 +22,8 @@ use std::time::Instant;
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
 use opencompositor_core::{
-    App, Command, EXPOSURE_STEP, EvaluationDevice, Event, FileIntent, FrameCheck, FrameTiming,
-    MAX_EXPOSURE, Notice, Pane, Request, Session, Slot,
+    App, Command, Direction, EXPOSURE_STEP, EvaluationDevice, Event, FileIntent, FrameCheck,
+    FrameTiming, MAX_EXPOSURE, Notice, Pane, Request, Session, Slot,
 };
 
 use crate::qt::ffi;
@@ -64,13 +66,40 @@ pub struct Widgets {
 enum Check {
     Lifecycle(PathBuf),
     Drag(PathBuf, drag::Chain),
+    Playback {
+        pattern: PathBuf,
+        chain: playback_check::Chain,
+        budget: Option<u64>,
+    },
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--cpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur]]"
+        "usage: opencompositor [--cpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur] | --playback-check IMAGE_PATTERN [exposure | blur] [BUDGET_MIB]]"
     );
     std::process::exit(2)
+}
+
+/// The playback check's chain and viewer cache budget, from the arguments after its pattern.
+fn playback_check(pattern: &OsString, rest: &[OsString]) -> Check {
+    let mut chain = playback_check::Chain::Exposure;
+    let mut budget = None;
+    for argument in rest {
+        let argument = argument.to_str().unwrap_or_else(|| usage());
+        match (
+            playback_check::Chain::from_name(argument),
+            argument.parse::<u64>(),
+        ) {
+            (Some(named), _) => chain = named,
+            (None, Ok(mebibytes)) => budget = Some(mebibytes << 20),
+            (None, Err(_)) => usage(),
+        }
+    }
+    Check::Playback {
+        pattern: pattern.into(),
+        chain,
+        budget,
+    }
 }
 
 fn main() {
@@ -90,6 +119,9 @@ fn main() {
                 Some(chain) => Some(Check::Drag(image.into(), chain)),
                 None => usage(),
             }
+        }
+        [flag, pattern, rest @ ..] if flag == "--playback-check" && rest.len() <= 2 => {
+            Some(playback_check(pattern, rest))
         }
         _ => usage(),
     };
@@ -113,7 +145,7 @@ fn main() {
     });
     match check {
         Some(Check::Lifecycle(_)) => app.check_frames(),
-        Some(Check::Drag(..)) => app.time_frames(),
+        Some(Check::Drag(..) | Check::Playback { .. }) => app.time_frames(),
         None => {}
     }
     APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -196,6 +228,20 @@ fn main() {
     );
     // SAFETY: the viewer menu is live.
     unsafe { ffi::add_separator(viewer_menu) };
+    let playback = [
+        ("&Play Forwards\tL", Command::Play(Direction::Forward)),
+        ("Play &Backwards\tJ", Command::Play(Direction::Backward)),
+        ("&Stop\tK", Command::Stop),
+        ("Step F&orwards\tRight", Command::Step(Direction::Forward)),
+        ("Step Back&wards\tLeft", Command::Step(Direction::Backward)),
+        ("F&irst Frame", Command::FirstFrame),
+        ("&Last Frame", Command::LastFrame),
+    ];
+    for (text, command) in playback {
+        add(viewer_menu, text, "", command);
+    }
+    // SAFETY: the viewer menu is live.
+    unsafe { ffi::add_separator(viewer_menu) };
     add(
         viewer_menu,
         "Evaluate on the &GPU",
@@ -246,6 +292,7 @@ fn main() {
             f64::from(MAX_EXPOSURE),
             f64::from(EXPOSURE_STEP),
             exposure_set,
+            timebar::gesture,
         );
         (strip, ffi::strip_caption(strip))
     };
@@ -274,6 +321,11 @@ fn main() {
     match check {
         Some(Check::Lifecycle(image)) => lifecycle::start(image),
         Some(Check::Drag(image, chain)) => drag::start(image, chain),
+        Some(Check::Playback {
+            pattern,
+            chain,
+            budget,
+        }) => playback_check::start(pattern, chain, budget),
         None => {}
     }
     let status = ffi::exec();
@@ -300,6 +352,7 @@ pub fn dispatch(event: Event) {
     };
     if let Some(pane) = drawn {
         drag::frame_drawn(pane);
+        playback_check::frame_drawn(pane);
     }
     for request in requests {
         perform(request);
@@ -412,7 +465,22 @@ pub fn perform(request: Request) {
             let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
             ffi::single_shot(milliseconds, collect_pixel_read, 0);
         }
+        Request::Advance { after } => {
+            // Qt's timers count whole milliseconds, so the advance is at the nearest; the clock
+            // keeps time from when it started, not from each tick.
+            let milliseconds = (after.as_micros() + 500) / 1000;
+            let milliseconds = i32::try_from(milliseconds).unwrap_or(i32::MAX);
+            ffi::single_shot(milliseconds, advance, 0);
+        }
+        Request::ShowTimebar(shown) => timebar::show(&shown),
     }
+}
+
+/// One whose timer fires after the app has dropped dispatches to nothing.
+fn advance(_: usize) {
+    let started = Instant::now();
+    dispatch(Event::Advance(started));
+    playback_check::advanced(started.elapsed());
 }
 
 /// Dispatches a notice from another thread. Retiring a lost device blocks the GUI thread, so

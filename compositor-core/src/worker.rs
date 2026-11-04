@@ -241,6 +241,11 @@ impl std::error::Error for ViewerError {
 /// and be delivered: an edit's work is mostly done when the next arrives, and stopping it showed
 /// fewer edits, later.
 ///
+/// With no request waiting, it prepares the frames the app expects to want next, in order: it
+/// evaluates each and makes its copy for the viewer cache, delivering nothing. Look-ahead yields
+/// to every request but one for the frame it is preparing, whose copy the viewer then shows,
+/// and to a pause, which only stops requests. It prepares each key once, until a device change.
+///
 /// The worker never writes to a texture with `Queue::write_texture`, which copies under a
 /// queue-wide lock that the GUI thread's submit then waits for. In a CPU session it never
 /// submits; in a GPU session it submits each request once, and submits the next only once the GPU
@@ -266,6 +271,12 @@ struct MailboxState {
     request: Option<Asked>,
     /// The request the worker started last.
     started: Option<Wanted>,
+    /// What to prepare with no request waiting, in order: the frames the app expects next.
+    ahead: Vec<Wanted>,
+    /// The keys of `ahead` already prepared, or that failed.
+    prepared: Vec<ResultKey>,
+    /// The key the worker is preparing, if it is.
+    preparing: Option<ResultKey>,
     /// When the viewer last caught up: the worker's last delivery, or a request reaching it
     /// idle. Within the feedback interval of this, a newer request for another frame stops the
     /// started one.
@@ -286,6 +297,9 @@ struct MailboxState {
 #[derive(Debug)]
 enum Asked {
     Evaluate(Wanted),
+    /// Make a copy for the viewer cache, delivering nothing: look-ahead, which the worker takes
+    /// itself from what the app expects next.
+    Prepare(Wanted),
     /// Stop, keeping what is retained, as while the viewer shows a cached copy.
     Pause,
     /// Release everything retained, as when the viewer wants nothing.
@@ -338,6 +352,9 @@ impl Worker {
             state: Mutex::new(MailboxState {
                 request: None,
                 started: None,
+                ahead: Vec::new(),
+                prepared: Vec::new(),
+                preparing: None,
                 caught_up: Instant::now(),
                 stopping: false,
                 connection: None,
@@ -362,6 +379,12 @@ impl Worker {
                         }
                         (Asked::Evaluate(wanted), EvaluationDevice::Gpu) => {
                             evaluate_on_gpu(&worker, &mut evaluator, wanted, &sinks);
+                        }
+                        (Asked::Prepare(wanted), EvaluationDevice::Cpu) => {
+                            prepare(&worker, &mut evaluator, wanted, &sinks);
+                        }
+                        (Asked::Prepare(wanted), EvaluationDevice::Gpu) => {
+                            prepare_on_gpu(&worker, &mut evaluator, wanted, &sinks);
                         }
                         (Asked::Pause, _) => {}
                         (Asked::Release, EvaluationDevice::Cpu) => evaluator.release_all(),
@@ -390,6 +413,19 @@ impl Worker {
     /// retained, and waits for the next.
     pub(crate) fn pause(&self) {
         self.mailbox.lock().request = Some(Asked::Pause);
+        self.mailbox.changed.notify_all();
+    }
+
+    /// Has the worker prepare these frames' copies for the viewer cache, in order, whenever no
+    /// request waits: the frames playback shows next, each with the zoom to copy it at. Nothing
+    /// stops preparing.
+    pub(crate) fn look_ahead(&self, ahead: Vec<Wanted>) {
+        let mut state = self.mailbox.lock();
+        state
+            .prepared
+            .retain(|key| ahead.iter().any(|wanted| wanted.key == *key));
+        state.ahead = ahead;
+        drop(state);
         self.mailbox.changed.notify_all();
     }
 
@@ -442,6 +478,8 @@ impl Worker {
             return;
         }
         state.device = device;
+        // The app drops the copies made on the device left.
+        state.prepared.clear();
         let left = state.connection.as_mut().map(|connection| {
             let evaluation = connection.evaluation.take();
             let staging = match connection.staging {
@@ -465,6 +503,8 @@ impl Worker {
     fn replace_connection(&self, connection: Option<Connection>) {
         let mut state = self.mailbox.lock();
         let replaced = std::mem::replace(&mut state.connection, connection);
+        // A GPU session prepares nothing without a device.
+        state.prepared.clear();
         if state.request.is_none()
             && let Some(started) = &state.started
         {
@@ -520,20 +560,33 @@ impl Mailbox {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Waits for a request, and where to evaluate it, or `None` once the worker is stopping.
+    /// Waits for a request, or with none for a frame to prepare, and where to evaluate it, or
+    /// `None` once the worker is stopping.
     fn next(&self) -> Option<(Asked, EvaluationDevice)> {
-        let mut idle = false;
+        // Preparing counts as idle: a request stops it.
+        let mut idle = self.lock().preparing.take().is_some();
         let next = self.wait_for(|state| {
             let Some(asked) = state.request.take() else {
-                idle = true;
-                return Take::Wait;
+                let unprepared = (state.ahead.iter())
+                    .find(|wanted| !state.prepared.contains(&wanted.key))
+                    .cloned();
+                return match unprepared {
+                    Some(wanted) => {
+                        state.preparing = Some(wanted.key.clone());
+                        Take::Taken((Asked::Prepare(wanted), state.device))
+                    }
+                    None => {
+                        idle = true;
+                        Take::Wait
+                    }
+                };
             };
             if idle {
                 state.caught_up = Instant::now();
             }
             state.started = match &asked {
                 Asked::Evaluate(wanted) => Some(wanted.clone()),
-                Asked::Pause | Asked::Release => None,
+                Asked::Prepare(_) | Asked::Pause | Asked::Release => None,
             };
             Take::Taken((asked, state.device))
         });
@@ -595,6 +648,12 @@ impl Mailbox {
         self.lock().request.is_some()
     }
 
+    /// Records that the key being prepared is done, copied or failed, so that it is not prepared
+    /// again.
+    fn prepared(&self, key: ResultKey) {
+        self.lock().prepared.push(key);
+    }
+
     /// Begins a GPU phase, in which the worker may hold GPU objects, unless the started request
     /// is superseded.
     fn start_gpu_phase(self: &Arc<Mailbox>) -> Option<GpuPhase<'_>> {
@@ -644,7 +703,8 @@ enum Take<T> {
 impl MailboxState {
     /// Whether the started request should stop: the worker is stopping, or a newer request is
     /// waiting for another node, for nothing, to pause, or for another frame within the feedback
-    /// interval of the viewer catching up.
+    /// interval of the viewer catching up. A frame being prepared stops for any request but one
+    /// for its key or a pause.
     fn superseded(&self) -> bool {
         if self.stopping {
             return true;
@@ -652,6 +712,13 @@ impl MailboxState {
         let Some(newer) = &self.request else {
             return false;
         };
+        if let Some(preparing) = &self.preparing {
+            return match newer {
+                Asked::Evaluate(newer) => newer.key != *preparing,
+                Asked::Pause => false,
+                Asked::Prepare(_) | Asked::Release => true,
+            };
+        }
         match (newer, &self.started) {
             (Asked::Evaluate(newer), Some(started)) if newer.node == started.node => {
                 newer.frame != started.frame && self.caught_up.elapsed() < FEEDBACK_INTERVAL
@@ -907,17 +974,7 @@ fn evaluate_on_gpu(
             }),
         });
         let delivered = deliver_unless_superseded(&phase, wanted, result, timing, &sinks.deliver);
-        // The next request is recorded only once this one is complete, so that superseded work
-        // on the GPU is at most one request, and so is its memory. A lost device's work never
-        // completes; its lost callback has the app replace it.
-        while evaluation.idle() == Ok(false) && !phase.abandoned() {
-            mailbox.pause(COMPLETION_POLL);
-        }
-        if evaluation.idle() == Ok(true)
-            && let Some(submission) = &mut mailbox.lock().last_submission
-        {
-            submission.completed.get_or_insert_with(Instant::now);
-        }
+        wait_for_completion(&phase, evaluation);
         if let Some((zoom, image, key)) = to_copy
             && delivered
             && !mailbox.has_newer_request()
@@ -926,6 +983,103 @@ fn evaluate_on_gpu(
             (sinks.copied)(copy);
         }
     });
+}
+
+/// Waits without blocking for the GPU to complete evaluation's work, or for the phase to be
+/// abandoned. The next request is recorded only once this one is complete, so that superseded
+/// work on the GPU is at most one request, and so is its memory. A lost device's work never
+/// completes; its lost callback has the app replace it.
+fn wait_for_completion(phase: &GpuPhase, evaluation: &GpuEvaluation) {
+    while evaluation.idle() == Ok(false) && !phase.abandoned() {
+        phase.mailbox.pause(COMPLETION_POLL);
+    }
+    if evaluation.idle() == Ok(true)
+        && let Some(submission) = &mut phase.mailbox.lock().last_submission
+    {
+        submission.completed.get_or_insert_with(Instant::now);
+    }
+}
+
+/// Evaluates a frame to prepare on the worker's thread and makes its copy for the viewer cache,
+/// delivering nothing, unless a request stops the evaluation first. The copy is passed on even
+/// if one has since, since it is still the frame's.
+fn prepare(
+    mailbox: &Arc<Mailbox>,
+    evaluator: &mut Evaluator,
+    wanted: Wanted,
+    sinks: &Sinks<impl Fn(Evaluated), impl Fn(ViewerCopy)>,
+) {
+    let key = wanted.key;
+    let evaluated = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        evaluator.evaluate(&key, || mailbox.superseded())
+    }));
+    match evaluated {
+        Ok(None) => return,
+        Ok(Some(Ok(image))) => {
+            let (info, planes) = image.into_parts();
+            if let Some(halvings) = wanted
+                .copy
+                .and_then(|zoom| zoom.halvings(info.display_window))
+            {
+                let planes = planes.each_ref().map(|plane| &plane[..]);
+                let pool = evaluator.pool();
+                let copy = ViewerCopy::of_planes(key.clone(), info, planes, halvings, pool);
+                (sinks.copied)(copy);
+            }
+        }
+        // A read the request cut short fails too, and is tried again.
+        Ok(Some(Err(_))) if mailbox.superseded() => return,
+        // The app learns of the failure when the frame is requested.
+        Ok(Some(Err(_))) => {}
+        // As for a request: the evaluator's own panic, after which it starts again.
+        Err(_) => *evaluator = Evaluator::new(),
+    }
+    mailbox.prepared(key);
+}
+
+/// Prepares a frame in a GPU session as [`evaluate_on_gpu`] evaluates a request, but makes only
+/// its copy for the viewer cache, delivering nothing. Without a device it prepares nothing, and
+/// connecting one prepares every frame again.
+fn prepare_on_gpu(
+    mailbox: &Arc<Mailbox>,
+    evaluator: &mut Evaluator,
+    wanted: Wanted,
+    sinks: &Sinks<impl Fn(Evaluated), impl Fn(ViewerCopy)>,
+) {
+    let key = wanted.key;
+    let on_gpu = mailbox.retained_on_gpu();
+    let read = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        evaluator.read_for_gpu(&key, &on_gpu, || mailbox.superseded())
+    }));
+    drop(on_gpu);
+    match read {
+        Ok(None) => return,
+        Ok(Some(Ok(()))) => {}
+        Ok(Some(Err(_))) if mailbox.superseded() => return,
+        Ok(Some(Err(_))) => return mailbox.prepared(key),
+        Err(_) => {
+            *evaluator = Evaluator::new();
+            return mailbox.prepared(key);
+        }
+    }
+    let Some(phase) = mailbox.start_gpu_phase() else {
+        return;
+    };
+    let finished = phase.with_evaluation(|evaluation, device| {
+        let stop = || mailbox.superseded() || phase.abandoned();
+        let result = record_and_submit(mailbox, evaluator, evaluation, device, &key, stop)?;
+        wait_for_completion(&phase, evaluation);
+        if let (Ok(image), Some(zoom)) = (result, wanted.copy)
+            && let Some(copy) = copy_on_gpu(&phase, evaluation, device, &image, key.clone(), zoom)
+        {
+            (sinks.copied)(copy);
+        }
+        Some(())
+    });
+    // Stopped by a request, it is prepared again later.
+    if finished != Some(None) {
+        mailbox.prepared(key);
+    }
 }
 
 /// Makes an image's copy for the viewer cache on the GPU that evaluated it and reads it back,

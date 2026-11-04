@@ -133,6 +133,8 @@ pub struct Session {
     failures: Failures,
     /// Counts changes to the document, the frame and the files, which every key is made from.
     version: u64,
+    /// Counts the changes of `version` that were to the frame alone.
+    frames_set: u64,
 }
 
 impl Default for Session {
@@ -163,6 +165,7 @@ impl Session {
             files: Files::default(),
             failures: Failures::default(),
             version: 0,
+            frames_set: 0,
         }
     }
 
@@ -208,6 +211,12 @@ impl Session {
         self.version
     }
 
+    /// Changes whenever the document or the files do, but not the frame: what is known of every
+    /// frame at once, such as which are missing, is current while this is.
+    pub fn content_version(&self) -> u64 {
+        self.version - self.frames_set
+    }
+
     /// The node the viewer's slot marks.
     pub fn viewed(&self) -> Option<NodeId> {
         self.document.mark(self.viewer.slot())
@@ -229,6 +238,7 @@ impl Session {
         if frame != self.frame {
             self.frame = frame;
             self.version += 1;
+            self.frames_set += 1;
             self.present_failures();
         }
         Ok(())

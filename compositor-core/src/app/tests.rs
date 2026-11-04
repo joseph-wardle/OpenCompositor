@@ -78,7 +78,11 @@ fn app_with_every_notice() -> (
     });
     assert!(matches!(
         requests.as_slice(),
-        [Request::Redraw(Pane::Graph), Request::ShowViewerCaption(_)]
+        [
+            Request::ShowTimebar(_),
+            Request::Redraw(Pane::Graph),
+            Request::ShowViewerCaption(_)
+        ]
     ));
     (app, deliveries, scans, copies)
 }
@@ -1848,4 +1852,238 @@ fn choosing_another_device_drops_the_viewer_cache_and_evaluates_the_copy_shown()
 
     assert!(app.session().viewer_cache().is_empty());
     assert!(!app.paused, "the worker was not asked for the frame");
+}
+
+/// Dispatches results and copies as they arrive until `done` holds of the app, failing after a
+/// generous while.
+fn settle(
+    app: &mut App,
+    deliveries: &Receiver<Evaluated>,
+    copies: &Receiver<ViewerCopy>,
+    done: impl Fn(&App) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !done(app) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the app never settled"
+        );
+        if let Ok(evaluated) = deliveries.recv_timeout(Duration::from_millis(5)) {
+            app.dispatch(Event::Evaluated(evaluated));
+        }
+        while let Ok(copy) = copies.try_recv() {
+            app.dispatch(Event::Copied(copy));
+        }
+    }
+}
+
+/// Whether the app shows the session's frame, evaluated or from the viewer cache.
+fn shows_frame(app: &App) -> bool {
+    (app.displayed()).is_some_and(|shown| shown.frame == shown.requested && !shown.failed)
+}
+
+fn advance_asked(requests: &[Request]) -> Option<Duration> {
+    requests.iter().find_map(|request| match request {
+        Request::Advance { after } => Some(*after),
+        _ => None,
+    })
+}
+
+/// An app viewing a sequence of three frames, 64 × 8, timed 1 to 3 at 24 frames a second, in a
+/// 16-pixel-square viewer pane, showing frame 1.
+fn viewing_three_frames(name: &str) -> (App, Receiver<Evaluated>, Receiver<ViewerCopy>) {
+    let (mut app, deliveries, copies) = app_copying();
+    let directory = crate::fixtures::directory(name);
+    for frame in 1..=3u8 {
+        let path = directory.join(format!("plate.{frame:04}.png"));
+        let pixels = [frame * 60; 64 * 8 * 4];
+        crate::fixtures::write_png(&path, 64, 8, png::ColorType::Rgba, &pixels);
+    }
+    app.dispatch(Event::Resized {
+        pane: Pane::Viewer,
+        size: PaneSize {
+            width: 16,
+            height: 16,
+            scale_factor: 1.0,
+        },
+    });
+    app.dispatch(Event::FrameRangeSet {
+        first: 1.0,
+        last: 3.0,
+    });
+    create(&mut app, directory.join("plate.####.png").to_str().unwrap());
+    app.dispatch(slot_key(1, CTRL));
+    settle(&mut app, &deliveries, &copies, shows_frame);
+    (app, deliveries, copies)
+}
+
+#[test]
+fn every_frame_playback_steps_once_each_frame_is_shown_and_wraps_round() {
+    let (mut app, deliveries, copies) = viewing_three_frames("every-frame");
+    let period = Duration::from_secs_f64(1.0 / 24.0);
+
+    let requests = app.play(Direction::Forward, PlaybackMode::EveryFrame);
+    assert_eq!(advance_asked(&requests), Some(Duration::ZERO));
+    let start = std::time::Instant::now();
+    let requests = app.advance(start);
+    assert_eq!(
+        app.session().frame(),
+        1.0,
+        "it starts on the frame it is at"
+    );
+    assert!(advance_asked(&requests).is_some_and(|after| after <= period));
+
+    let mut shown = vec![1.0];
+    let mut now = start;
+    for _ in 0..3 {
+        now += period;
+        app.advance(now);
+        let frame = app.session().frame();
+        assert_eq!(frame, *shown.last().unwrap() % 3.0 + 1.0);
+        // However late, it waits for a frame not yet shown, unless look-ahead has cached it.
+        if !shows_frame(&app) {
+            app.advance(now + period * 5);
+            assert_eq!(
+                app.session().frame(),
+                frame,
+                "stepped from a frame not shown"
+            );
+        }
+        settle(&mut app, &deliveries, &copies, shows_frame);
+        shown.push(frame);
+        now += period * 5;
+    }
+    assert_eq!(shown, [1.0, 2.0, 3.0, 1.0]);
+    assert_eq!(app.timebar().unwrap().drops, 0);
+    assert_eq!(
+        app.playing(),
+        Some((Direction::Forward, PlaybackMode::EveryFrame))
+    );
+}
+
+#[test]
+fn playing_prepares_the_frames_ahead_for_the_viewer_cache_without_showing_them() {
+    let (mut app, deliveries, copies) = viewing_three_frames("look-ahead");
+    app.play(Direction::Forward, PlaybackMode::EveryFrame);
+
+    settle(&mut app, &deliveries, &copies, |app| {
+        app.session().viewer_cache().len() == 3
+    });
+    let marks = &app.timebar().unwrap().marks;
+    assert!(marks.iter().all(|mark| mark.cached), "{marks:?}");
+    assert_eq!(app.displayed().unwrap().frame, 1.0);
+
+    // Every frame is then shown from the cache, the worker paused.
+    let start = std::time::Instant::now();
+    app.advance(start);
+    app.advance(start + Duration::from_millis(50));
+    assert_eq!(app.session().frame(), 2.0);
+    assert_eq!(app.displayed().unwrap().cached, Some(2));
+    assert!(app.paused);
+}
+
+#[test]
+fn real_time_playback_keeps_time_counting_drops_and_stops_at_the_end_unless_looping() {
+    let (mut app, _deliveries) = app();
+    app.dispatch(Event::FrameRangeSet {
+        first: 1.0,
+        last: 5.0,
+    });
+    // Frames that never arrive.
+    create(&mut app, "/nonexistent/plate.####.exr");
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(Event::LoopingSet(false));
+    let period = Duration::from_secs_f64(1.0 / 24.0);
+
+    app.play(Direction::Forward, PlaybackMode::RealTime);
+    let start = std::time::Instant::now();
+    app.advance(start);
+    let requests = app.advance(start + period * 3);
+    assert_eq!(app.session().frame(), 4.0);
+    assert_eq!(app.timebar().unwrap().drops, 3);
+    assert!(advance_asked(&requests).is_some());
+
+    app.advance(start + period * 9);
+    assert_eq!(app.session().frame(), 5.0);
+    assert_eq!(app.playing(), None);
+}
+
+#[test]
+fn stepping_and_going_to_a_frame_stop_playback() {
+    let (mut app, _deliveries) = app();
+    app.dispatch(Event::FrameRangeSet {
+        first: 1.0,
+        last: 3.0,
+    });
+    app.dispatch(Event::Command(Command::Play(Direction::Forward)));
+    app.dispatch(Event::Command(Command::Step(Direction::Backward)));
+    assert_eq!(app.playing(), None);
+    assert_eq!(app.session().frame(), 3.0, "looping, it steps round");
+
+    app.dispatch(Event::Command(Command::Play(Direction::Backward)));
+    // The same way again stops.
+    app.dispatch(Event::Command(Command::Play(Direction::Backward)));
+    assert_eq!(app.playing(), None);
+
+    app.dispatch(Event::Command(Command::Play(Direction::Forward)));
+    app.dispatch(Event::FrameSet(2.5));
+    assert_eq!(app.playing(), None);
+    app.dispatch(Event::Command(Command::Step(Direction::Forward)));
+    assert_eq!(app.session().frame(), 3.0);
+    app.dispatch(Event::Command(Command::FirstFrame));
+    assert_eq!(app.session().frame(), 1.0);
+    let requests = app.dispatch(Event::FrameSet(f64::NAN));
+    assert!(matches!(requests.as_slice(), [Request::ShowStatus(_)]));
+}
+
+#[test]
+fn the_timebar_marks_the_frames_a_sequence_lacks_and_those_it_holds() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let directory = crate::fixtures::directory("timebar-marks");
+    for frame in [1, 2, 4] {
+        let path = directory.join(format!("plate.{frame:04}.png"));
+        crate::fixtures::write_png(&path, 4, 4, png::ColorType::Rgba, &[255; 4 * 4 * 4]);
+    }
+    app.dispatch(Event::FrameRangeSet {
+        first: 0.0,
+        last: 5.0,
+    });
+    create(&mut app, directory.join("plate.####.png").to_str().unwrap());
+    app.dispatch(next_scan(&scans));
+    let requests = app.dispatch(slot_key(1, CTRL));
+
+    let timebar = (requests.iter())
+        .find_map(|request| match request {
+            Request::ShowTimebar(timebar) => Some(timebar),
+            _ => None,
+        })
+        .expect("the timebar shows the viewed node's frames");
+    let marked = |what: fn(&FrameMark) -> bool| -> Vec<usize> {
+        (timebar.marks.iter().enumerate())
+            .filter(|(_, mark)| what(mark))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    assert_eq!(timebar.marks.len(), 6);
+    assert_eq!(marked(|mark| mark.missing), [3]);
+    assert_eq!(marked(|mark| mark.held), [0, 5]);
+}
+
+#[test]
+fn a_drag_leaves_the_timebar_marks_until_it_finishes() {
+    let (mut app, _deliveries) = app();
+    let reader = create(&mut app, "/nonexistent/plate.####.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let marks_version = |app: &App| app.marks.built_for.map(|(version, ..)| version);
+    let before = marks_version(&app);
+
+    app.edit(|session| {
+        session.begin_edit(reader, "File").unwrap();
+        let file = Value::File(Path::new("/nonexistent/other.####.exr").into());
+        session.edit_value("file", file).unwrap();
+    });
+    assert_eq!(marks_version(&app), before);
+
+    app.edit(Session::finish_edit);
+    assert_eq!(marks_version(&app), Some(app.session().content_version()));
 }

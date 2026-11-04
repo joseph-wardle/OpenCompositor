@@ -19,8 +19,11 @@ use crate::gpu::{
 use crate::image::{ImageInfo, Window};
 use crate::panel::Panel;
 use crate::parameter::Value;
+use crate::playback::{
+    Clock, Direction, FrameMark, Frames, MAX_MARKED_FRAMES, PlaybackMode, Timebar,
+};
 use crate::session::Session;
-use crate::viewer::EXPOSURE_STEP;
+use crate::viewer::{EXPOSURE_STEP, Zoom};
 use crate::viewer_cache::ViewerCopy;
 use crate::worker::{Evaluated, EvaluationDevice, ViewerError, Wanted, Worker};
 
@@ -116,6 +119,21 @@ pub enum Event {
     CollectPixelRead,
     /// The artist set the viewer's exposure, in stops, in the viewer's own control.
     ViewerExposureSet(f32),
+    /// The time to advance playback, after [`Request::Advance`], with the time it is.
+    Advance(Instant),
+    /// The artist went to a frame, typing it or scrubbing the timebar. It stops playback.
+    FrameSet(f64),
+    /// The artist set the timeline's first and last frames, as one step.
+    FrameRangeSet {
+        first: f64,
+        last: f64,
+    },
+    /// The artist set the rate the timeline plays at, in frames per second, as one step.
+    FrameRateSet(f64),
+    /// The artist chose the mode playback plays in, from now on and at once if playing.
+    PlaybackModeSet(PlaybackMode),
+    /// The artist chose whether playback wraps round at the timeline's end.
+    LoopingSet(bool),
 }
 
 /// What another thread, or wgpu inside a call, tells the GUI thread through the waker
@@ -217,6 +235,11 @@ pub enum Request {
     RetryDeviceCreation { attempt: u64, after: Duration },
     /// Dispatch [`Event::CollectPixelRead`] after the delay.
     CollectPixelRead { after: Duration },
+    /// Dispatch [`Event::Advance`] after the delay, with the time it is then. The app asks for one
+    /// at a time.
+    Advance { after: Duration },
+    /// Show the timebar under the viewer as given. It starts empty.
+    ShowTimebar(Timebar),
 }
 
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
@@ -253,6 +276,16 @@ pub enum Command {
     ResetExposure,
     /// Evaluates on the device from now on, also after the app moved evaluation off the GPU.
     EvaluateOn(EvaluationDevice),
+    /// Plays the timeline that way in the mode chosen, or stops if it plays that way already.
+    Play(Direction),
+    /// Stops playback, staying on the frame.
+    Stop,
+    /// Stops playback and goes one frame that way, round to the other end when looping.
+    Step(Direction),
+    /// Stops playback and goes to the timeline's first frame.
+    FirstFrame,
+    /// Stops playback and goes to the timeline's last frame.
+    LastFrame,
 }
 
 /// The keys the window uses. The pane under the pointer receives all but the slot keys.
@@ -268,6 +301,13 @@ pub enum Key {
     Delete,
     /// Opens the node creation menu while the pointer is over the graph.
     Tab,
+    /// Over the viewer, the arrows step a frame, and J, K and L play backwards, stop and play
+    /// forwards.
+    Left,
+    Right,
+    J,
+    K,
+    L,
     /// A key of the digit row, by its position rather than the character it types, so that
     /// layouts that type digits with Shift, as AZERTY does, use the same keys. Alone it views
     /// the slot, with Ctrl it marks the selected node there, with Shift it frames that node.
@@ -282,7 +322,15 @@ impl Key {
             Key::G => open_ng::Key::G,
             Key::H => open_ng::Key::H,
             Key::Y => open_ng::Key::Y,
-            Key::E | Key::Delete | Key::Tab | Key::Slot(_) => return None,
+            Key::E
+            | Key::Delete
+            | Key::Tab
+            | Key::Left
+            | Key::Right
+            | Key::J
+            | Key::K
+            | Key::L
+            | Key::Slot(_) => return None,
         })
     }
 }
@@ -529,6 +577,36 @@ pub struct App {
     panel_followed: Option<(u64, Option<NodeId>)>,
     /// The parameter panel as last requested.
     panel: Option<Panel>,
+    /// Playback in progress.
+    clock: Option<Clock>,
+    /// The mode playback plays in.
+    playback_mode: PlaybackMode,
+    /// Whether playback wraps round at the timeline's end.
+    looping: bool,
+    /// Whether a [`Request::Advance`] is waiting to be dispatched.
+    advance_requested: bool,
+    /// The keys of the frames the worker was last asked to prepare.
+    ahead_sent: Vec<ResultKey>,
+    /// What is known of each frame of the viewed node.
+    marks: Marks,
+    /// The timebar as last requested.
+    timebar: Option<Timebar>,
+}
+
+/// How many frames ahead of playback's the worker prepares, at most: a provisional depth, which
+/// bounds the work done for frames a stop then makes unneeded.
+const LOOK_AHEAD: i64 = 24;
+
+/// The viewed node's key at each frame of the timeline, and what the timebar shows of each.
+#[derive(Debug, Default)]
+struct Marks {
+    /// What the keys were built from: the session's content version, the viewed node and the
+    /// timeline's frames.
+    built_for: Option<(u64, Option<NodeId>, Frames)>,
+    keys: Vec<Option<ResultKey>>,
+    marks: Vec<FrameMark>,
+    /// What the marks' `cached` was learned from: the viewer cache's changes, and the zoom.
+    cached_for: Option<(u64, Zoom)>,
 }
 
 impl App {
@@ -579,6 +657,13 @@ impl App {
             pinned: None,
             panel_followed: None,
             panel: None,
+            clock: None,
+            playback_mode: PlaybackMode::default(),
+            looping: true,
+            advance_requested: false,
+            ahead_sent: Vec::new(),
+            marks: Marks::default(),
+            timebar: None,
         }
     }
 
@@ -598,6 +683,41 @@ impl App {
     /// for the drag check.
     pub fn latest_request(&self) -> u64 {
         self.requests_sent
+    }
+
+    /// Plays the timeline from the session's frame, that way, in the mode, from the first
+    /// [`advance`](App::advance) on. A frame outside the timeline plays from the end it plays
+    /// from.
+    pub fn play(&mut self, direction: Direction, mode: PlaybackMode) -> Vec<Request> {
+        self.playback_mode = mode;
+        let requests = self.start_playing(direction);
+        self.after_change(requests)
+    }
+
+    /// Stops playback, staying on the frame.
+    pub fn stop(&mut self) -> Vec<Request> {
+        self.dispatch(Event::Command(Command::Stop))
+    }
+
+    /// Moves playback's clock to `now`, as the shell does when [`Request::Advance`] asks.
+    pub fn advance(&mut self, now: Instant) -> Vec<Request> {
+        self.dispatch(Event::Advance(now))
+    }
+
+    /// Goes to a frame, stopping playback, as the artist does in the timebar.
+    pub fn set_frame(&mut self, frame: f64) -> Vec<Request> {
+        self.dispatch(Event::FrameSet(frame))
+    }
+
+    /// Which way and how playback plays, if it does.
+    pub fn playing(&self) -> Option<(Direction, PlaybackMode)> {
+        let clock = self.clock.as_ref()?;
+        Some((clock.direction(), clock.mode()))
+    }
+
+    /// The timebar as last shown.
+    pub fn timebar(&self) -> Option<&Timebar> {
+        self.timebar.as_ref()
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
@@ -640,7 +760,12 @@ impl App {
             Event::Evaluated(evaluated) => self.evaluated(evaluated),
             Event::Copied(copy) => {
                 self.session.viewer_cache_mut().insert(copy);
-                Vec::new()
+                // Look-ahead may have prepared the frame the viewer waits for.
+                let mut requests = Vec::new();
+                if !self.paused && !self.shows_sent() {
+                    self.show_cached(&mut requests);
+                }
+                requests
             }
             Event::DeviceLost { generation, at } => self.device_lost(generation, at),
             Event::RetryDeviceCreation(attempt) => match self.drawing {
@@ -668,6 +793,39 @@ impl App {
                 // The control shows what the artist typed, which echoing could rewrite.
                 self.exposure_shown = self.session.viewer().exposure();
                 vec![Request::Redraw(Pane::Viewer)]
+            }
+            Event::Advance(now) => self.advance_clock(now),
+            Event::FrameSet(frame) => {
+                self.clock = None;
+                self.go_to(frame)
+            }
+            Event::FrameRangeSet { first, last } => {
+                match self.session.set_frame_range(first, last) {
+                    Ok(_) => Vec::new(),
+                    Err(error) => vec![Request::ShowStatus(format!(
+                        "Cannot set the frame range: {error}"
+                    ))],
+                }
+            }
+            Event::FrameRateSet(rate) => match self.session.set_frame_rate(rate) {
+                Ok(_) => Vec::new(),
+                Err(error) => vec![Request::ShowStatus(format!(
+                    "Cannot set the frame rate: {error}"
+                ))],
+            },
+            Event::PlaybackModeSet(mode) => {
+                self.playback_mode = mode;
+                match &self.clock {
+                    Some(clock) if clock.mode() != mode => {
+                        let direction = clock.direction();
+                        self.start_playing(direction)
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            Event::LoopingSet(looping) => {
+                self.looping = looping;
+                Vec::new()
             }
         };
         self.after_change(requests)
@@ -703,7 +861,11 @@ impl App {
     /// shell shows.
     fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
         self.scan_unscanned();
+        self.follow_marks();
         self.follow_viewer(&mut requests);
+        self.follow_playback(&mut requests);
+        self.follow_look_ahead();
+        self.follow_timebar(&mut requests);
         self.follow_readout(&mut requests);
         let exposure = self.session.viewer().exposure();
         if exposure != self.exposure_shown {
@@ -1055,6 +1217,11 @@ impl App {
             Key::E if modifiers.ctrl => self.command(Command::ResetExposure),
             Key::E if modifiers.shift => self.command(Command::ExposureDown),
             Key::E => self.command(Command::ExposureUp),
+            Key::Left => self.command(Command::Step(Direction::Backward)),
+            Key::Right => self.command(Command::Step(Direction::Forward)),
+            Key::J => self.command(Command::Play(Direction::Backward)),
+            Key::K => self.command(Command::Stop),
+            Key::L => self.command(Command::Play(Direction::Forward)),
             _ => Vec::new(),
         }
     }
@@ -1158,6 +1325,239 @@ impl App {
                 }
                 Vec::new()
             }
+            Command::Play(direction) => {
+                if self
+                    .playing()
+                    .is_some_and(|(playing, _)| playing == direction)
+                {
+                    self.clock = None;
+                    return Vec::new();
+                }
+                self.start_playing(direction)
+            }
+            Command::Stop => {
+                self.clock = None;
+                Vec::new()
+            }
+            Command::Step(direction) => {
+                self.clock = None;
+                let frame = self.session.frame();
+                let frames = Frames::of(&self.session.document().timeline());
+                let stepped = match frames.index(frame) {
+                    Some(index) => match frames.step(index, 1, direction, self.looping) {
+                        Ok(index) | Err(index) => frames.frame(index),
+                    },
+                    None => match direction {
+                        Direction::Forward => frame.floor() + 1.0,
+                        Direction::Backward => frame.ceil() - 1.0,
+                    },
+                };
+                self.go_to(stepped)
+            }
+            Command::FirstFrame | Command::LastFrame => {
+                self.clock = None;
+                let timeline = self.session.document().timeline();
+                self.go_to(match command {
+                    Command::FirstFrame => timeline.first(),
+                    _ => timeline.last(),
+                })
+            }
+        }
+    }
+
+    /// Goes to a frame, or says why not.
+    fn go_to(&mut self, frame: f64) -> Vec<Request> {
+        match self.session.set_frame(frame) {
+            Ok(()) => Vec::new(),
+            Err(error) => vec![Request::ShowStatus(format!(
+                "Cannot go to the frame: {error}"
+            ))],
+        }
+    }
+
+    /// Starts playing that way in the mode chosen, from the next advance, asked for at once.
+    fn start_playing(&mut self, direction: Direction) -> Vec<Request> {
+        self.clock = Some(Clock::new(direction, self.playback_mode));
+        self.request_advance(Duration::ZERO).into_iter().collect()
+    }
+
+    /// Asks for an advance after the delay, unless one is waiting already.
+    fn request_advance(&mut self, after: Duration) -> Option<Request> {
+        if self.advance_requested {
+            return None;
+        }
+        self.advance_requested = true;
+        Some(Request::Advance { after })
+    }
+
+    /// Moves playback's clock to `now`, and the session to its frame. Asks for the next advance
+    /// when the clock knows when; in every-frame mode, following the viewer asks once the frame
+    /// is shown.
+    fn advance_clock(&mut self, now: Instant) -> Vec<Request> {
+        self.advance_requested = false;
+        let Some(clock) = &mut self.clock else {
+            return Vec::new();
+        };
+        let timeline = self.session.document().timeline();
+        let tick = clock.advance(
+            now,
+            self.session.frame(),
+            Frames::of(&timeline),
+            timeline.rate(),
+            self.looping,
+        );
+        if tick.stopped {
+            self.clock = None;
+        }
+        let mut requests = match tick.frame {
+            Some(frame) => self.go_to(frame),
+            None => Vec::new(),
+        };
+        if let Some(next) = tick.next {
+            let after = next.saturating_duration_since(Instant::now());
+            requests.extend(self.request_advance(after));
+        }
+        requests
+    }
+
+    /// Tells the clock when its frame is shown, and in every-frame mode asks for the advance
+    /// that steps once it is due.
+    fn follow_playback(&mut self, requests: &mut Vec<Request>) {
+        let shown = self.shows_sent()
+            && (self.shown.wanted()).is_some_and(|shown| shown.frame == self.session.frame());
+        let Some(clock) = &mut self.clock else {
+            return;
+        };
+        if shown {
+            clock.frame_shown(Instant::now());
+        }
+        if clock.mode() == PlaybackMode::EveryFrame && clock.is_shown() {
+            requests.extend(self.request_advance(Duration::ZERO));
+        }
+    }
+
+    /// Rebuilds the viewed node's key at every frame of the timeline, and what the timebar marks
+    /// of each, when the document, the files, the viewed node or the timeline changed, but not
+    /// during an edit in progress, which would rebuild them for every value a drag passes; and
+    /// which the viewer cache serves when it or the zoom changed.
+    fn follow_marks(&mut self) {
+        let session = &self.session;
+        let (version, viewed, frames) = self.marks_for();
+        let built_for = Some((version, viewed, frames));
+        let marks = &mut self.marks;
+        if marks.built_for != built_for && session.editing().is_none() {
+            marks.built_for = built_for;
+            marks.keys.clear();
+            marks.marks.clear();
+            marks.cached_for = None;
+            if let Some(node) = viewed
+                && frames.count() <= MAX_MARKED_FRAMES
+            {
+                let (document, files) = (session.document(), session.files());
+                for index in 0..frames.count() {
+                    let frame = frames.frame(index);
+                    marks.keys.push(result_key(document, files, node, frame));
+                    let lacks = missing(document, files, node, frame);
+                    marks.marks.push(FrameMark {
+                        cached: false,
+                        missing: (lacks.iter()).any(|(_, what)| matches!(what, Missing::Frame(_))),
+                        held: !held(document, files, node, frame).is_empty(),
+                    });
+                }
+            }
+        }
+        let cache = session.viewer_cache();
+        let zoom = session.viewer().zoom();
+        let cached_for = Some((cache.changes(), zoom));
+        if marks.cached_for != cached_for {
+            marks.cached_for = cached_for;
+            for (mark, key) in marks.marks.iter_mut().zip(&marks.keys) {
+                mark.cached = key.as_ref().is_some_and(|key| cache.serves(key, zoom));
+            }
+        }
+    }
+
+    /// What the marks are built from as the session stands: its content version, the viewed node
+    /// and the timeline's frames.
+    fn marks_for(&self) -> (u64, Option<NodeId>, Frames) {
+        let session = &self.session;
+        let frames = Frames::of(&session.document().timeline());
+        (session.content_version(), session.viewed(), frames)
+    }
+
+    /// Asks the worker to prepare the frames playback shows next that the viewer cache cannot
+    /// serve, while playing; and for nothing otherwise.
+    fn follow_look_ahead(&mut self) {
+        let ahead = self.look_ahead();
+        if (ahead.iter().map(|wanted| &wanted.key)).ne(self.ahead_sent.iter()) {
+            self.ahead_sent = ahead.iter().map(|wanted| wanted.key.clone()).collect();
+            self.worker.look_ahead(ahead);
+        }
+    }
+
+    /// The frames after the session's that playback shows next, in order, up to the look-ahead
+    /// depth, with neither a copy to serve them nor a request for them.
+    fn look_ahead(&self) -> Vec<Wanted> {
+        let (Some(clock), Some(node)) = (&self.clock, self.session.viewed()) else {
+            return Vec::new();
+        };
+        let session = &self.session;
+        let frames = Frames::of(&session.document().timeline());
+        let Some(current) = frames.index(session.frame()) else {
+            return Vec::new();
+        };
+        let (cache, zoom) = (session.viewer_cache(), session.viewer().zoom());
+        // The marks' keys, unless an edit in progress has left them behind.
+        let marked = (self.marks.built_for == Some(self.marks_for())).then_some(&self.marks.keys);
+        let mut ahead: Vec<Wanted> = Vec::new();
+        for steps in 1..=LOOK_AHEAD.min(frames.count() - 1) {
+            let Ok(index) = frames.step(current, steps, clock.direction(), self.looping) else {
+                break;
+            };
+            let frame = frames.frame(index);
+            let key = match marked.and_then(|keys| keys.get(index as usize)) {
+                Some(key) => key.clone(),
+                None => result_key(session.document(), session.files(), node, frame),
+            };
+            let Some(key) = key else {
+                continue;
+            };
+            let requested = (self.sent.as_ref()).is_some_and(|sent| sent.key == key);
+            if requested || cache.serves(&key, zoom) || ahead.iter().any(|wanted| wanted.key == key)
+            {
+                continue;
+            }
+            ahead.push(Wanted {
+                node,
+                key,
+                frame,
+                number: self.requests_sent,
+                copy: Some(zoom),
+            });
+        }
+        ahead
+    }
+
+    /// Shows the timebar again when anything it shows changed.
+    fn follow_timebar(&mut self, requests: &mut Vec<Request>) {
+        let timeline = self.session.document().timeline();
+        let clock = self.clock.as_ref();
+        let timebar = Timebar {
+            first: timeline.first(),
+            last: timeline.last(),
+            rate: timeline.rate(),
+            frame: self.session.frame(),
+            playing: clock.map(Clock::direction),
+            mode: self.playback_mode,
+            looping: self.looping,
+            achieved: (clock.and_then(Clock::achieved_rate))
+                .map(|rate| (rate * 10.0).round() / 10.0),
+            drops: clock.map_or(0, Clock::drops),
+            marks: self.marks.marks.clone(),
+        };
+        if self.timebar.as_ref() != Some(&timebar) {
+            self.timebar = Some(timebar.clone());
+            requests.insert(0, Request::ShowTimebar(timebar));
         }
     }
 
@@ -1480,27 +1880,14 @@ impl App {
                 number,
                 copy: None,
             };
-            let zoom = self.session.viewer().zoom();
             // A hit is shown at once, and the worker stops rather than evaluate it.
-            match self.session.viewer_cache_mut().get(&wanted.key, zoom) {
-                Some(copy) => {
-                    self.worker.pause();
-                    self.paused = true;
-                    self.images_shown += 1;
-                    self.gpu.show_copy(&copy, self.images_shown);
-                    self.shown = Shown::Copy {
-                        wanted: wanted.clone(),
-                        copy,
-                    };
-                    requests.push(Request::Redraw(Pane::Viewer));
-                }
-                None => {
-                    wanted.copy = Some(zoom);
-                    self.worker.request(Some(wanted.clone()));
-                    self.paused = false;
-                }
+            self.sent = Some(wanted.clone());
+            if !self.show_cached(requests) {
+                wanted.copy = Some(self.session.viewer().zoom());
+                self.worker.request(Some(wanted.clone()));
+                self.paused = false;
+                self.sent = Some(wanted);
             }
-            self.sent = Some(wanted);
         } else if let Some(sent) = &mut self.sent {
             // Another frame with an equal key is not asked for: its image is the same, and what
             // is shown of the key is that frame's.
@@ -1512,6 +1899,36 @@ impl App {
             {
                 wanted.frame = frame;
             }
+        }
+    }
+
+    /// Shows the viewer cache's copy of what was sent, if it holds one the viewer can show at its
+    /// zoom, and pauses the worker rather than have it evaluate the image. Returns whether it did.
+    fn show_cached(&mut self, requests: &mut Vec<Request>) -> bool {
+        let Some(sent) = &self.sent else {
+            return false;
+        };
+        let zoom = self.session.viewer().zoom();
+        let Some(copy) = self.session.viewer_cache_mut().get(&sent.key, zoom) else {
+            return false;
+        };
+        self.worker.pause();
+        self.paused = true;
+        self.images_shown += 1;
+        self.gpu.show_copy(&copy, self.images_shown);
+        self.shown = Shown::Copy {
+            wanted: sent.clone(),
+            copy,
+        };
+        requests.push(Request::Redraw(Pane::Viewer));
+        true
+    }
+
+    /// Whether the viewer shows the result of what was last sent, an image, a copy or a failure.
+    fn shows_sent(&self) -> bool {
+        match (&self.sent, self.shown.wanted()) {
+            (Some(sent), Some(shown)) => shown.key == sent.key,
+            _ => false,
         }
     }
 
@@ -1629,10 +2046,7 @@ impl App {
             };
         };
         let node = document.node(viewed).expect("marks name existing nodes");
-        let current = match (&self.sent, self.shown.wanted()) {
-            (Some(sent), Some(shown)) => shown.key == sent.key,
-            _ => false,
-        };
+        let current = self.shows_sent();
         let mut details = Vec::new();
         match &self.shown {
             Shown::Image { info, .. } if current => {

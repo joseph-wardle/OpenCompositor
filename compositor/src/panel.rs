@@ -93,7 +93,7 @@ fn row(row: &Row) -> ffi::PanelRow {
 }
 
 /// A number as the panel shows it: up to four decimals, without trailing zeros.
-fn number(value: f64) -> String {
+pub fn number(value: f64) -> String {
     let text = format!("{value:.4}");
     let text = text.trim_end_matches('0').trim_end_matches('.');
     match text {
