@@ -66,40 +66,14 @@ pub struct Widgets {
 enum Check {
     Lifecycle(PathBuf),
     Drag(PathBuf, drag::Chain),
-    Playback {
-        pattern: PathBuf,
-        chain: playback_check::Chain,
-        budget: Option<u64>,
-    },
+    Playback(playback_check::Run),
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--cpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur] | --playback-check IMAGE_PATTERN [exposure | blur] [BUDGET_MIB]]"
+        "usage: opencompositor [--cpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur] | --playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]]"
     );
     std::process::exit(2)
-}
-
-/// The playback check's chain and viewer cache budget, from the arguments after its pattern.
-fn playback_check(pattern: &OsString, rest: &[OsString]) -> Check {
-    let mut chain = playback_check::Chain::Exposure;
-    let mut budget = None;
-    for argument in rest {
-        let argument = argument.to_str().unwrap_or_else(|| usage());
-        match (
-            playback_check::Chain::from_name(argument),
-            argument.parse::<u64>(),
-        ) {
-            (Some(named), _) => chain = named,
-            (None, Ok(mebibytes)) => budget = Some(mebibytes << 20),
-            (None, Err(_)) => usage(),
-        }
-    }
-    Check::Playback {
-        pattern: pattern.into(),
-        chain,
-        budget,
-    }
 }
 
 fn main() {
@@ -120,8 +94,11 @@ fn main() {
                 None => usage(),
             }
         }
-        [flag, pattern, rest @ ..] if flag == "--playback-check" && rest.len() <= 2 => {
-            Some(playback_check(pattern, rest))
+        [flag, pattern, rest @ ..] if flag == "--playback-check" => {
+            match playback_check::Run::parse(pattern, rest) {
+                Some(run) => Some(Check::Playback(run)),
+                None => usage(),
+            }
         }
         _ => usage(),
     };
@@ -322,11 +299,7 @@ fn main() {
     match check {
         Some(Check::Lifecycle(image)) => lifecycle::start(image),
         Some(Check::Drag(image, chain)) => drag::start(image, chain),
-        Some(Check::Playback {
-            pattern,
-            chain,
-            budget,
-        }) => playback_check::start(pattern, chain, budget),
+        Some(Check::Playback(run)) => playback_check::start(run),
         None => {}
     }
     let status = ffi::exec();

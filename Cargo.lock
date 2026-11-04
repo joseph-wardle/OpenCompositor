@@ -1623,6 +1623,7 @@ dependencies = [
  "cxx-qt",
  "cxx-qt-build",
  "cxx-qt-lib",
+ "libc",
  "open-ng",
  "opencompositor-core",
  "qt-build-utils",

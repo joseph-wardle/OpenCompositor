@@ -30,7 +30,7 @@ const COMPLETION_POLL: Duration = Duration::from_millis(1);
 /// How long the viewer may go without a new result before a newer request for another frame of
 /// the node no longer stops the one in progress: a scrub faster than evaluation still shows a
 /// result at least this often, give or take one evaluation.
-pub(crate) const FEEDBACK_INTERVAL: Duration = Duration::from_millis(100);
+pub const FEEDBACK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Where a session evaluates. Every request runs on one device, and results never mix devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

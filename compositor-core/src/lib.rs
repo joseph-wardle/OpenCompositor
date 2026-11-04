@@ -41,7 +41,7 @@ pub use evaluate::{
     DeviceLost, EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, ResultKey, result_key,
 };
 pub use files::{Files, Pattern, Scan, held, input_range};
-pub use gpu::{FrameCheck, FrameTiming, NativeWindow, PaneSize};
+pub use gpu::{FrameCheck, FrameTiming, GpuMemory, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
@@ -55,4 +55,6 @@ pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Reload, Session};
 pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};
 pub use viewer_cache::{DEFAULT_BUDGET, ViewerCache, ViewerCopy};
-pub use worker::{Evaluated, EvaluationDevice, StagingTiming, Timing, ViewerError, ViewerImage};
+pub use worker::{
+    Evaluated, EvaluationDevice, FEEDBACK_INTERVAL, StagingTiming, Timing, ViewerError, ViewerImage,
+};

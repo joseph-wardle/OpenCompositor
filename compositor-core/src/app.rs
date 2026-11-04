@@ -14,7 +14,8 @@ use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{EvalError, ResultKey, result_key};
 use crate::files::{Pattern, Scan, held, input_range};
 use crate::gpu::{
-    Drawn, FrameCheck, FrameTiming, Gpu, NativeWindow, PaneSize, PixelRead, Probe, ViewerFrame,
+    Drawn, FrameCheck, FrameTiming, Gpu, GpuMemory, NativeWindow, PaneSize, PixelRead, Probe,
+    ViewerFrame,
 };
 use crate::image::{ImageInfo, Window};
 use crate::panel::Panel;
@@ -2191,6 +2192,11 @@ impl App {
     /// up to a limit, after which drawing continues.
     pub fn gpu_errors(&self) -> u64 {
         self.gpu.errors()
+    }
+
+    /// What the GPU's allocator holds, for the playback check.
+    pub fn gpu_memory(&self) -> Option<GpuMemory> {
+        self.gpu.memory()
     }
 
     /// Destroys the GPU device for the lifecycle check. Its loss then arrives as a driver's

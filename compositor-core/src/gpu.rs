@@ -62,6 +62,16 @@ impl PaneSize {
     }
 }
 
+/// What wgpu's allocator holds on the panes' device, which evaluation shares, in bytes. Neither
+/// counts the swapchains' images nor the driver's own memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuMemory {
+    /// In use by buffers and textures.
+    pub allocated: u64,
+    /// In the blocks the allocator holds, used or not.
+    pub reserved: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct Gpu {
     // Fields drop in order: the device and the surfaces it holds go first.
@@ -242,6 +252,15 @@ impl Gpu {
     }
 
     /// Runs the callbacks of the device's completed work, without waiting for any.
+    /// `None` without a device, or on a backend whose allocator does not report.
+    pub(crate) fn memory(&self) -> Option<GpuMemory> {
+        let report = self.device.as_ref()?.device.generate_allocator_report()?;
+        Some(GpuMemory {
+            allocated: report.total_allocated_bytes,
+            reserved: report.total_reserved_bytes,
+        })
+    }
+
     pub(crate) fn poll(&self) {
         if let Some(device) = &self.device {
             // A loss runs the lost callback, which notices it.
