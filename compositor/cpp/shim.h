@@ -89,9 +89,9 @@ class ParameterPanel : public QWidget {
 
 class FrameBar;
 
-// The timeline under the viewer: its frames as a bar to scrub, ticked and marked as Rust sends
-// them; under it the rate and how playback keeps up, the transport round the frame, and playback's
-// looping and mode and the range. Frames read as numbers or as timecode. Each gesture is sent back;
+// The timeline under the viewer: its frames as a bar to scrub and zoom, ticked and marked as Rust
+// sends them, between the range's first and last; under it the rate and how playback keeps up,
+// the transport round the frame, and playback's looping and mode and the range. Frames read as numbers or as timecode. Each gesture is sent back;
 // nothing is sent while Rust shows the timebar.
 class Timebar : public QWidget {
   public:
@@ -131,7 +131,7 @@ class Timebar : public QWidget {
     QLineEdit *first;
     QLineEdit *last;
     QIcon play_backward_icon, play_forward_icon, stop_icon;
-    QIcon loop_icon, once_icon, every_frame_icon, real_time_icon;
+    QIcon loop_icon, once_icon;
 };
 
 // Under the viewer: its timebar and caption, then the readout and the viewer's exposure, which

@@ -10,6 +10,7 @@
 #include <QtGui/QKeyEvent>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainter>
+#include <QtGui/QPainterPath>
 #include <QtGui/QTransform>
 #include <QtGui/QPlatformSurfaceEvent>
 #include <QtGui/QScreen>
@@ -144,7 +145,6 @@ enum class Glyph {
     LastFrame,
     Loop,
     Once,
-    EveryFrame,
     RealTime,
 };
 
@@ -192,14 +192,25 @@ QIcon glyph_icon(Glyph glyph, const QColor &color) {
         bar(11.4);
         break;
     case Glyph::Loop: {
-        // Round, with an arrowhead where it closes.
+        // Flat-bottomed: along the top to the right, round and back along the bottom.
         painter.setPen(line);
         painter.setBrush(Qt::NoBrush);
-        painter.drawArc(QRectF(2.5, 3.5, 11, 9), 30 * 16, 300 * 16);
+        QPainterPath top;
+        top.moveTo(3, 9.5);
+        top.lineTo(3, 7);
+        top.quadTo(3, 5, 5, 5);
+        top.lineTo(10.5, 5);
+        QPainterPath bottom;
+        bottom.moveTo(13, 6.5);
+        bottom.lineTo(13, 9);
+        bottom.quadTo(13, 11, 11, 11);
+        bottom.lineTo(5.5, 11);
+        painter.drawPath(top);
+        painter.drawPath(bottom);
         painter.setPen(Qt::NoPen);
         painter.setBrush(color);
-        const QPointF head[] = {{11.2, 2.4}, {14.6, 5.6}, {10.4, 6.8}};
-        painter.drawPolygon(head, 3);
+        triangle(10, 14, 2.4, 7.6);
+        triangle(6, 2, 8.4, 13.6);
         break;
     }
     case Glyph::Once:
@@ -210,26 +221,14 @@ QIcon glyph_icon(Glyph glyph, const QColor &color) {
         triangle(8.5, 12, 5, 11);
         bar(12.6);
         break;
-    case Glyph::EveryFrame:
-        // A strip of film, its sprocket holes down each side: every frame of it.
-        painter.drawRect(QRectF(3, 1.5, 10, 13));
-        painter.setBrush(Qt::transparent);
-        painter.setCompositionMode(QPainter::CompositionMode_Clear);
-        for (double y : {3.0, 6.5, 10.0}) {
-            painter.drawRect(QRectF(4, y, 1.5, 2));
-            painter.drawRect(QRectF(10.5, y, 1.5, 2));
-        }
-        painter.drawRect(QRectF(6.5, 3, 3, 4));
-        painter.drawRect(QRectF(6.5, 9, 3, 4));
-        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        break;
     case Glyph::RealTime:
-        // A clock: the rate kept.
-        painter.setPen(line);
+        // A clock, as Houdini's: the rate kept.
+        painter.setPen(QPen(color, 1.4));
         painter.setBrush(Qt::NoBrush);
-        painter.drawEllipse(QRectF(2.5, 2.5, 11, 11));
-        painter.drawLine(QPointF(8, 8), QPointF(8, 4.8));
-        painter.drawLine(QPointF(8, 8), QPointF(10.6, 9.4));
+        painter.drawEllipse(QPointF(8, 8), 6.2, 6.2);
+        painter.setPen(line);
+        painter.drawLine(QPointF(8, 8), QPointF(8, 3.8));
+        painter.drawLine(QPointF(8, 8), QPointF(11, 8));
         break;
     }
     painter.end();
@@ -239,19 +238,28 @@ QIcon glyph_icon(Glyph glyph, const QColor &color) {
 
 // The range's whole frames side by side, ticked each frame and at each whole second of the rate,
 // labelled where there is room, marked, with the frame shown as a line. A press or a drag sends
-// the frame under the pointer, once per frame it passes.
+// the frame under the pointer, once per frame it passes. The wheel zooms round the pointer and a
+// middle drag or a sideways wheel scrolls; the view is the bar's own, kept within the range, and
+// pages on to keep a frame that moves out of it in sight.
 class FrameBar : public QWidget {
   public:
     explicit FrameBar(std::function<void(double)> scrubbed) : scrubbed(std::move(scrubbed)) {
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         setToolTip(QStringLiteral(
-            "Click or drag to go to a frame. Green below: in the viewer cache. Red: a missing "
-            "file. Shaded: outside a sequence's frames, holding its nearest."));
+            "Click or drag to go to a frame. The wheel zooms; a middle drag or Shift with the "
+            "wheel scrolls. Green below: in the viewer cache. Red: a missing file. Shaded: "
+            "outside a sequence's frames, holding its nearest."));
     }
     void show_frames(const TimebarData &data, bool timecode) {
-        first = data.first;
-        last = data.last;
-        frame = data.frame;
+        if (data.first != first || data.last != last) {
+            first = data.first;
+            last = data.last;
+            fit();
+        }
+        if (data.frame != frame) {
+            frame = data.frame;
+            follow();
+        }
         rate = data.rate;
         this->timecode = timecode;
         marks.assign(data.marks.begin(), data.marks.end());
@@ -266,41 +274,104 @@ class FrameBar : public QWidget {
   protected:
     void paintEvent(QPaintEvent *) override {
         QPainter painter(this);
-        const double w = width(), h = height(), frames = count(), cell = w / frames;
+        const double h = height();
         painter.fillRect(rect(), palette().color(QPalette::Base));
-        auto x_of = [&](double offset) { return offset * cell; };
-        for (size_t index = 0; index < marks.size(); ++index) {
+        const auto [from, to] = visible();
+        for (int64_t index = from; index <= to && index < int64_t(marks.size()); ++index) {
             const double left = x_of(index), right = std::max(x_of(index + 1), left + 1);
-            if (marks[index] & HELD)
+            const uint8_t mark = marks[size_t(index)];
+            if (mark & HELD)
                 painter.fillRect(QRectF(left, 0, right - left, h), palette().alternateBase());
-            if (marks[index] & MISSING)
+            if (mark & MISSING)
                 painter.fillRect(QRectF(left, 0, right - left, h), QColor(190, 60, 60, 150));
-            if (marks[index] & CACHED)
+            if (mark & CACHED)
                 painter.fillRect(QRectF(left, h - 3, right - left, 3), QColor(80, 170, 90));
         }
-        paint_ticks(painter, cell);
+        paint_ticks(painter);
+        if (span < count()) {
+            // Zoomed: where the view lies in the range, along the top.
+            QColor color = palette().color(QPalette::Highlight);
+            color.setAlphaF(0.6);
+            painter.fillRect(QRectF(offset / count() * width(), 0, span / count() * width(), 2),
+                             color);
+        }
         const double x = x_of(frame - first + 0.5);
         painter.setPen(QPen(palette().color(QPalette::Highlight), 2));
         painter.drawLine(QPointF(x, 0), QPointF(x, h));
     }
     void mousePressEvent(QMouseEvent *event) override {
-        if (event->button() != Qt::LeftButton) return;
-        sent.reset();
-        scrub(event->position().x());
+        if (event->button() == Qt::LeftButton) {
+            sent.reset();
+            scrub(event->position().x());
+        } else if (event->button() == Qt::MiddleButton) {
+            dragged_from = {event->position().x(), offset};
+        }
     }
     void mouseMoveEvent(QMouseEvent *event) override {
-        if (event->buttons() & Qt::LeftButton) scrub(event->position().x());
+        if (event->buttons() & Qt::LeftButton) {
+            scrub(event->position().x());
+        } else if ((event->buttons() & Qt::MiddleButton) && dragged_from) {
+            const auto [x, from] = *dragged_from;
+            show_view(from - (event->position().x() - x) / cell(), span);
+        }
     }
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::MiddleButton) dragged_from.reset();
+    }
+    void wheelEvent(QWheelEvent *event) override {
+        const QPoint delta = event->angleDelta();
+        const bool sideways = delta.x() != 0 || (event->modifiers() & Qt::ShiftModifier);
+        const double notches = (sideways ? (delta.x() ? delta.x() : delta.y()) : delta.y()) / 120.0;
+        if (sideways) {
+            show_view(offset - notches * span / 8, span);
+        } else {
+            // Round the pointer: the frame under it stays under it.
+            const double at = event->position().x() / width();
+            const double zoomed = std::clamp(span * std::pow(0.8, notches), min_span(), count());
+            show_view(offset + at * (span - zoomed), zoomed);
+        }
+        event->accept();
+    }
+    void resizeEvent(QResizeEvent *) override { show_view(offset, span); }
 
   private:
     double count() const { return std::max(std::floor(last - first) + 1, 1.0); }
+    // Zoomed in no further than a few frames across.
+    double min_span() const { return std::min(count(), 5.0); }
+    double cell() const { return width() / span; }
+    // Where the left of the frame so many from the first lies.
+    double x_of(double index) const { return (index - offset) * cell(); }
+    // The frames, from the first, the view shows any of.
+    std::pair<int64_t, int64_t> visible() const {
+        return {int64_t(std::floor(offset)), int64_t(std::ceil(offset + span)) - 1};
+    }
+    void fit() {
+        offset = 0;
+        span = count();
+    }
+    void show_view(double new_offset, double new_span) {
+        span = std::clamp(new_span, min_span(), count());
+        offset = std::clamp(new_offset, 0.0, count() - span);
+        update();
+    }
+    // A frame that leaves the view turns it a page: to start the view going forwards, to end it
+    // going backwards.
+    void follow() {
+        const double index = std::floor(frame - first);
+        if (index < offset) show_view(index + 1 - span, span);
+        else if (index + 1 > offset + span) show_view(index, span);
+    }
     // Ticks hang from the top at each frame's middle: each frame's while they are 3 pixels
     // apart, and longer every second's worth, or every so many seconds' where those crowd,
     // labelled where the labels fit.
-    void paint_ticks(QPainter &painter, double cell) {
+    void paint_ticks(QPainter &painter) {
+        const double cell = this->cell();
         const int64_t second = std::max<int64_t>(std::llround(rate), 1);
         const QFontMetrics metrics = fontMetrics();
-        const int64_t start = std::llround(std::ceil(first)), end = std::llround(std::floor(last));
+        const auto [from, to] = visible();
+        const int64_t first_whole = std::llround(std::ceil(first));
+        const int64_t start = first_whole + from;
+        const int64_t end = std::min<int64_t>(first_whole + to, std::llround(std::floor(last)));
         const double label_width = std::max(metrics.horizontalAdvance(label(double(start))),
                                             metrics.horizontalAdvance(label(double(end)))) +
                                    8;
@@ -319,7 +390,7 @@ class FrameBar : public QWidget {
         QColor color = palette().color(QPalette::Text);
         color.setAlphaF(0.45);
         painter.setPen(QPen(color, 1));
-        auto x_at = [&](int64_t at) { return std::round((at - first + 0.5) * cell) + 0.5; };
+        auto x_at = [&](int64_t at) { return std::round(x_of(at - first + 0.5)) + 0.5; };
         if (cell >= 3) {
             for (int64_t at = start; at <= end; ++at)
                 painter.drawLine(QPointF(x_at(at), 0), QPointF(x_at(at), 4));
@@ -337,6 +408,7 @@ class FrameBar : public QWidget {
         for (int64_t at = first_multiple(labelled); at <= end; at += labelled) {
             const QString text = label(double(at));
             // Whole, or not at all.
+            if (x_at(at) < 0) continue;
             if (x_at(at) + 3 + metrics.horizontalAdvance(text) > width()) break;
             painter.drawText(QPointF(x_at(at) + 3, baseline), text);
         }
@@ -346,7 +418,7 @@ class FrameBar : public QWidget {
         return QString::fromUtf8(text.data(), text.size());
     }
     void scrub(double x) {
-        const double index = std::clamp(std::floor(x / width() * count()), 0.0, count() - 1);
+        const double index = std::clamp(std::floor(offset + x / cell()), 0.0, count() - 1);
         const double frame = first + index;
         if (sent == frame) return;
         sent = frame;
@@ -355,9 +427,13 @@ class FrameBar : public QWidget {
 
     std::function<void(double)> scrubbed;
     double first = 1, last = 1, frame = 1, rate = 24;
+    // The view: the frames from the first at its left edge, and across it.
+    double offset = 0, span = 1;
     bool timecode = false;
     std::vector<uint8_t> marks;
     std::optional<double> sent;
+    // Where a middle drag began, and the view's offset then.
+    std::optional<std::pair<double, double>> dragged_from;
 };
 
 Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rates,
@@ -369,14 +445,20 @@ Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rat
     stop_icon = glyph_icon(Glyph::Stop, color);
     loop_icon = glyph_icon(Glyph::Loop, color);
     once_icon = glyph_icon(Glyph::Once, color);
-    every_frame_icon = glyph_icon(Glyph::EveryFrame, color);
-    real_time_icon = glyph_icon(Glyph::RealTime, color);
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(2);
+    // The range's ends either side of the bar.
+    auto *ends = new QHBoxLayout;
+    ends->setSpacing(4);
+    first = field(TimebarGestureKind::FirstTyped, QString());
+    ends->addWidget(first);
     bar = new FrameBar([this](double frame) { send(TimebarGestureKind::Scrubbed, frame); });
-    layout->addWidget(bar);
+    ends->addWidget(bar, 1);
+    last = field(TimebarGestureKind::LastTyped, QString());
+    ends->addWidget(last);
+    layout->addLayout(ends);
 
     // The transport stays centred: the sides take equal shares of the room left.
     auto *controls = new QGridLayout;
@@ -392,7 +474,8 @@ Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rat
     rate->setFocusPolicy(Qt::ClickFocus);
     rate->setToolTip(QStringLiteral("The frames per second the timeline plays at: type a rate, "
                                     "or choose one"));
-    rate->setFixedWidth(rate->fontMetrics().horizontalAdvance(QStringLiteral("000.000")) + 36);
+    rate->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    rate->setMinimumContentsLength(5);
     rate->lineEdit()->installEventFilter(this);
     connect(rate, &QComboBox::activated, this,
             [this](int index) { send(TimebarGestureKind::RateTyped, 0, rate->itemText(index)); });
@@ -456,7 +539,9 @@ Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rat
     right->addStretch(1);
     looping = button(TimebarGestureKind::Looping, loop_icon, QString());
     right->addWidget(looping);
-    mode = button(TimebarGestureKind::RealTime, every_frame_icon, QString());
+    // Lit when on, as Houdini's.
+    mode = button(TimebarGestureKind::RealTime, glyph_icon(Glyph::RealTime, color), QString());
+    mode->setCheckable(true);
     right->addWidget(mode);
     range = new QComboBox;
     range->addItems({QStringLiteral("Global"), QStringLiteral("Input")});
@@ -465,10 +550,6 @@ Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rat
         send(TimebarGestureKind::InputRange, 0, QString(), index == 1);
     });
     right->addWidget(range);
-    first = field(TimebarGestureKind::FirstTyped, QString());
-    right->addWidget(first);
-    last = field(TimebarGestureKind::LastTyped, QString());
-    right->addWidget(last);
     controls->addLayout(right, 0, 2);
     layout->addLayout(controls);
 }
@@ -542,17 +623,17 @@ void Timebar::show_timebar(const TimebarData &data) {
                                              "range's end. Click to stop there instead.")
                             : QStringLiteral("Once: stopping at the range's end. Click to loop."));
     real_time = data.real_time;
-    mode->setIcon(data.real_time ? real_time_icon : every_frame_icon);
+    mode->setChecked(data.real_time);
     mode->setToolTip(
         data.real_time
             ? QStringLiteral("Real time: keeping to the rate, skipping frames not ready. Click to "
-                             "show every frame.")
-            : QStringLiteral("Every frame: showing each frame once ready, no faster than the "
-                             "rate. Click to keep real time."));
+                             "show every frame instead.")
+            : QStringLiteral("Real time is off: showing every frame once ready, no faster than "
+                             "the rate. Click to keep to the rate, skipping frames not ready."));
 
     range->setCurrentIndex(data.input ? 1 : 0);
     range->setToolTip(
-        !data.input         ? QStringLiteral("Global: the timeline's frames, set beside")
+        !data.input         ? QStringLiteral("Global: the timeline's frames, set at the bar's ends")
         : data.input_found ? QStringLiteral("Input: the viewed node's sequences' frames")
                            : QStringLiteral("Input: the viewed node reads no sequence, so the "
                                             "timeline's frames"));
