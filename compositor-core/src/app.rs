@@ -1923,7 +1923,7 @@ impl App {
             // A hit is shown at once, and the worker stops rather than evaluate it.
             self.sent = Some(wanted.clone());
             if !self.show_cached(requests) {
-                wanted.copy = Some(self.session.viewer().zoom());
+                wanted.copy = self.copy_wanted();
                 self.worker.request(Some(wanted.clone()));
                 self.paused = false;
                 self.sent = Some(wanted);
@@ -1986,18 +1986,27 @@ impl App {
     }
 
     /// Asks the paused worker for what the viewer wants after all, under the same number, with a
-    /// copy for the viewer cache if it has none to serve the viewer's zoom.
+    /// copy for the viewer cache if it has none to serve the viewer's zoom and no edit is in
+    /// progress.
     fn resume(&mut self) {
         self.paused = false;
         let Some(sent) = &self.sent else {
             return;
         };
         let zoom = self.session.viewer().zoom();
-        let cache = self.session.viewer_cache();
-        self.worker.request(Some(Wanted {
-            copy: (!cache.serves(&sent.key, zoom)).then_some(zoom),
+        let served = self.session.viewer_cache().serves(&sent.key, zoom);
+        let wanted = Wanted {
+            copy: self.copy_wanted().filter(|_| !served),
             ..sent.clone()
-        }));
+        };
+        self.worker.request(Some(wanted));
+    }
+
+    /// The zoom to copy the viewed result at for the viewer cache, unless an edit is in
+    /// progress: each value a drag passes is stale by the next, and copying it cost the GPU
+    /// session's GUI frames their budget.
+    fn copy_wanted(&self) -> Option<Zoom> {
+        (self.session.editing().is_none()).then(|| self.session.viewer().zoom())
     }
 
     /// Keeps the readout on the shown image's pixel under the pointer, or the one it left the

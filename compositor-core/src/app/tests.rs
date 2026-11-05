@@ -1056,6 +1056,31 @@ fn the_viewer_follows_value_edits_and_their_undo() {
     assert_eq!(sent(&app).key, edited);
 }
 
+/// Each value a drag passes is stale by the next, so the viewer cache gets a copy only once the
+/// edit is over.
+#[test]
+fn a_request_during_an_edit_asks_for_no_copy() {
+    let (mut app, _deliveries) = app();
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    let exposure = create_exposure(&mut app);
+    app.session.connect(exposure, "source", reader).unwrap();
+    app.dispatch(slot_key(1, CTRL));
+    assert!(sent(&app).copy.is_some());
+
+    app.edit(|session| {
+        session.begin_edit(exposure, "Stops").unwrap();
+        session.edit_value("stops", Value::Float(1.0)).unwrap();
+    });
+    assert_eq!(sent(&app).copy, None);
+
+    app.edit(|session| {
+        session.edit_value("stops", Value::Float(2.0)).unwrap();
+        session.finish_edit();
+    });
+    app.dispatch(Event::Command(Command::Undo));
+    assert!(sent(&app).copy.is_some());
+}
+
 #[test]
 fn an_edit_names_itself_as_what_undo_would_undo() {
     let (mut app, _deliveries) = app();
