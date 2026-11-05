@@ -506,6 +506,25 @@ fn a_newer_request_for_the_same_frame_lets_the_started_one_finish() {
     assert_eq!(delivered, [second, third]);
 }
 
+/// Decoder threads that saw the stop have already left, so the read cannot carry on as though it
+/// never had, which once read whole frames on a thread or two, only to drop them.
+#[test]
+fn a_started_request_found_superseded_stays_so_after_the_feedback_interval() {
+    let [first, second] = two_images("stop-stays");
+    let (worker, _deliveries) = worker();
+    let mut state = worker.mailbox.lock();
+    state.started = Some(on(1, key(&first)));
+    state.request = Some(Asked::Evaluate(Wanted {
+        frame: 2.0,
+        ..on(1, key(&second))
+    }));
+    state.caught_up = Instant::now();
+    assert!(state.superseded());
+
+    state.caught_up = Instant::now().checked_sub(FEEDBACK_INTERVAL).unwrap();
+    assert!(state.superseded());
+}
+
 #[test]
 fn a_request_reaching_an_idle_worker_starts_the_feedback_interval_again() {
     let [first, second] = two_images("idle-request");
@@ -1055,6 +1074,39 @@ fn a_result_asked_for_with_a_copy_is_delivered_then_copied_on_its_device() {
         let texels: Vec<f32> = copy.texels.iter().map(|value| value.to_f32()).collect();
         assert_eq!(texels, [0.5, 0.5, 0.5, 1.0].repeat(8), "on the {device}");
     }
+}
+
+#[test]
+fn a_gpu_session_copies_a_frame_although_a_newer_request_came_while_the_gpu_made_it() {
+    let path = directory("copied-superseded").join("image.png");
+    write_png(&path, 8, 4);
+    let mailbox: Arc<std::sync::OnceLock<Arc<Mailbox>>> = Arc::default();
+    let (copied, copies) = mpsc::channel();
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        {
+            let mailbox = Arc::clone(&mailbox);
+            // As playback asks for the next frame once this one is shown, before the GPU is done.
+            move |_| mailbox.get().unwrap().lock().request = Some(Asked::Release)
+        },
+        move |copy| copied.send(copy).unwrap(),
+    );
+    mailbox.set(Arc::clone(&worker.mailbox)).unwrap();
+    let (gpu, queue) = crate::kernels::headless::device();
+    worker.connect(gpu, queue, Arc::default(), 1);
+    let mut viewer = crate::viewer::Viewer::new();
+    viewer.resize(crate::gpu::PaneSize {
+        width: 4,
+        height: 4,
+        scale_factor: 1.0,
+    });
+    let key = exposed(&path, -1.0);
+    worker.request(Some(Wanted {
+        copy: Some(viewer.zoom()),
+        ..on(1, key.clone())
+    }));
+    let copy = (copies.recv_timeout(Duration::from_secs(10))).expect("a copy");
+    assert!(copy.key == key);
 }
 
 #[cfg(unix)]

@@ -1528,12 +1528,18 @@ impl App {
     }
 
     /// The frames after the session's that playback shows next, in order, up to the look-ahead
-    /// depth, with neither a copy to serve them nor a request for them.
+    /// depth, with neither a copy to serve them nor a request for them. None while the viewer
+    /// cache is full: the copy of a frame ahead would drop the least recently requested, which is
+    /// the next frame not yet played, and preparing that would drop the one after, each frame
+    /// prepared again on the device as playback reaches it.
     fn look_ahead(&self) -> Vec<Wanted> {
         let (Some(clock), Some(node)) = (&self.clock, self.session.viewed()) else {
             return Vec::new();
         };
         let session = &self.session;
+        if !session.viewer_cache().has_room() {
+            return Vec::new();
+        }
         let frames = self.frames();
         let Some(current) = frames.index(session.frame()) else {
             return Vec::new();

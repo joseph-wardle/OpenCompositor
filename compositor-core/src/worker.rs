@@ -14,7 +14,7 @@ use crate::evaluate::{
 };
 use crate::image::{ImageInfo, Plane, Window};
 use crate::viewer::Zoom;
-use crate::viewer_cache::ViewerCopy;
+use crate::viewer_cache::{GpuCopy, ViewerCopy};
 
 /// The staging buffer's first size, a DCI 4K image of four planes, and its least.
 const FIRST_STAGING_SIZE: (u32, u32) = (4096, 2160);
@@ -76,6 +76,11 @@ impl Evaluated {
     /// The number of the request this answers.
     pub fn request(&self) -> u64 {
         self.wanted.number
+    }
+
+    /// The frame of the request this answers.
+    pub fn frame(&self) -> f64 {
+        self.wanted.frame
     }
 
     /// The image's data window, or `None` for a failure.
@@ -281,6 +286,10 @@ struct MailboxState {
     /// idle. Within the feedback interval of this, a newer request for another frame stops the
     /// started one.
     caught_up: Instant,
+    /// Whether the started request, or the key being prepared, was found superseded. It stays so
+    /// although the feedback interval may pass meanwhile: work stopped in part has been dropped,
+    /// as by decoder threads that stopped while others went on.
+    stopped: bool,
     stopping: bool,
     /// The device the worker evaluates or stages for, from `connect` until the worker drops.
     connection: Option<Connection>,
@@ -356,6 +365,7 @@ impl Worker {
                 prepared: Vec::new(),
                 preparing: None,
                 caught_up: Instant::now(),
+                stopped: false,
                 stopping: false,
                 connection: None,
                 in_gpu_phase: false,
@@ -566,6 +576,7 @@ impl Mailbox {
         // Preparing counts as idle: a request stops it.
         let mut idle = self.lock().preparing.take().is_some();
         let next = self.wait_for(|state| {
+            state.stopped = false;
             let Some(asked) = state.request.take() else {
                 let unprepared = (state.ahead.iter())
                     .find(|wanted| !state.prepared.contains(&wanted.key))
@@ -704,11 +715,13 @@ impl MailboxState {
     /// Whether the started request should stop: the worker is stopping, or a newer request is
     /// waiting for another node, for nothing, to pause, or for another frame within the feedback
     /// interval of the viewer catching up. A frame being prepared stops for any request but one
-    /// for its key or a pause.
-    fn superseded(&self) -> bool {
-        if self.stopping {
-            return true;
-        }
+    /// for its key or a pause. Once true, it stays true until the next request starts.
+    fn superseded(&mut self) -> bool {
+        self.stopped = self.stopped || self.stopping || self.newer_supersedes();
+        self.stopped
+    }
+
+    fn newer_supersedes(&self) -> bool {
         let Some(newer) = &self.request else {
             return false;
         };
@@ -955,15 +968,25 @@ fn evaluate_on_gpu(
     }
     phase.with_evaluation(|evaluation, device| {
         let stop = || mailbox.superseded() || phase.abandoned();
-        let Some(result) =
-            record_and_submit(mailbox, evaluator, evaluation, device, &wanted.key, stop)
-        else {
+        let copy = wanted.copy;
+        let Some(result) = record_and_submit(
+            mailbox,
+            evaluator,
+            evaluation,
+            device,
+            &wanted.key,
+            copy,
+            stop,
+        ) else {
             return;
         };
         timing.evaluated = Instant::now();
-        let to_copy = match (&result, wanted.copy) {
-            (Ok(image), Some(zoom)) => Some((zoom, image.clone(), wanted.key.clone())),
-            _ => None,
+        let (result, to_copy) = match result {
+            Ok((image, copy)) => {
+                let to_copy = copy.map(|copy| (copy, image.info().clone(), wanted.key.clone()));
+                (Ok(image), to_copy)
+            }
+            Err(error) => (Err(error), None),
         };
         let result = result.map(|image| ViewerImage {
             info: image.info().clone(),
@@ -973,12 +996,12 @@ fn evaluate_on_gpu(
                 staged: None,
             }),
         });
-        let delivered = deliver_unless_superseded(&phase, wanted, result, timing, &sinks.deliver);
+        deliver_unless_superseded(&phase, wanted, result, timing, &sinks.deliver);
         wait_for_completion(&phase, evaluation);
-        if let Some((zoom, image, key)) = to_copy
-            && delivered
-            && !mailbox.has_newer_request()
-            && let Some(copy) = copy_on_gpu(&phase, evaluation, device, &image, key, zoom)
+        // Kept although a newer request waits: the GPU has made it, and reading it back is
+        // little beside evaluating the frame again for the cache.
+        if let Some((copy, info, key)) = to_copy
+            && let Some(copy) = read_copy(&phase, evaluation, device, copy, key, info)
         {
             (sinks.copied)(copy);
         }
@@ -1067,10 +1090,25 @@ fn prepare_on_gpu(
     };
     let finished = phase.with_evaluation(|evaluation, device| {
         let stop = || mailbox.superseded() || phase.abandoned();
-        let result = record_and_submit(mailbox, evaluator, evaluation, device, &key, stop)?;
+        let result = record_and_submit(
+            mailbox,
+            evaluator,
+            evaluation,
+            device,
+            &key,
+            wanted.copy,
+            stop,
+        )?;
         wait_for_completion(&phase, evaluation);
-        if let (Ok(image), Some(zoom)) = (result, wanted.copy)
-            && let Some(copy) = copy_on_gpu(&phase, evaluation, device, &image, key.clone(), zoom)
+        if let Ok((image, Some(copy))) = result
+            && let Some(copy) = read_copy(
+                &phase,
+                evaluation,
+                device,
+                copy,
+                key.clone(),
+                image.info().clone(),
+            )
         {
             (sinks.copied)(copy);
         }
@@ -1082,24 +1120,26 @@ fn prepare_on_gpu(
     }
 }
 
-/// Makes an image's copy for the viewer cache on the GPU that evaluated it and reads it back,
-/// waiting without blocking. `None` if the GPU cannot make it, or the phase is abandoned.
-fn copy_on_gpu(
+/// An image's copy for the viewer cache, submitted with its request.
+struct SubmittedCopy {
+    halvings: u32,
+    /// None for an empty data window, whose copy has no texels.
+    copy: Option<GpuCopy>,
+}
+
+/// Reads back a copy for the viewer cache once the GPU has completed its request. `None` if the
+/// GPU did not complete it.
+fn read_copy(
     phase: &GpuPhase,
-    evaluation: &mut GpuEvaluation,
+    evaluation: &GpuEvaluation,
     device: &PhaseDevice,
-    image: &GpuImage,
+    submitted: SubmittedCopy,
     key: ResultKey,
-    zoom: Zoom,
+    info: ImageInfo,
 ) -> Option<ViewerCopy> {
-    let info = image.info().clone();
-    let halvings = zoom.halvings(info.display_window)?;
-    let Some(copy) = evaluation.copy_for_viewer(image, halvings).ok()? else {
-        return Some(ViewerCopy::empty(key, info, halvings));
+    let Some(copy) = submitted.copy else {
+        return Some(ViewerCopy::empty(key, info, submitted.halvings));
     };
-    while evaluation.idle() == Ok(false) && !phase.abandoned() {
-        phase.mailbox.pause(COMPLETION_POLL);
-    }
     if evaluation.idle() != Ok(true) {
         return None;
     }
@@ -1108,19 +1148,21 @@ fn copy_on_gpu(
 }
 
 /// Records the key's request on the device and submits it, unless `stop` returns true first,
-/// which records or submits nothing more.
+/// which records or submits nothing more. With a zoom, the submission also makes the image's
+/// copy for the viewer cache at it, if the GPU can.
 fn record_and_submit(
     mailbox: &Mailbox,
     evaluator: &mut Evaluator,
     evaluation: &mut GpuEvaluation,
     device: &PhaseDevice,
     key: &ResultKey,
+    copy: Option<Zoom>,
     stop: impl Fn() -> bool,
-) -> Option<Result<GpuImage, ViewerError>> {
+) -> Option<Result<(GpuImage, Option<SubmittedCopy>), ViewerError>> {
     let recorded = std::panic::catch_unwind(AssertUnwindSafe(|| {
         evaluator.record_on(evaluation, key, &stop)
     }));
-    let recorded = match recorded {
+    let mut recorded = match recorded {
         Ok(None) => return None,
         Ok(Some(Ok(recorded))) => recorded,
         Ok(Some(Err(error))) => return Some(Err(ViewerError::Eval(error))),
@@ -1142,7 +1184,15 @@ fn record_and_submit(
         at: Instant::now(),
         completed: None,
     });
-    Some(evaluation.submit(recorded).map_err(ViewerError::Eval))
+    let halvings = copy.and_then(|zoom| zoom.halvings(recorded.image().info().display_window));
+    let copy = halvings.and_then(|halvings| {
+        let copy = evaluation
+            .record_copy_for_viewer(&mut recorded, halvings)
+            .ok()?;
+        Some(SubmittedCopy { halvings, copy })
+    });
+    let image = evaluation.submit(recorded).map_err(ViewerError::Eval);
+    Some(image.map(|image| (image, copy)))
 }
 
 /// Releases everything retained on the connected device, as when the viewer wants nothing.

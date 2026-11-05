@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use open_ng::Point;
 use opencompositor_kernels::BoxPass;
@@ -431,6 +432,53 @@ fn stopping_keeps_what_was_completed() {
 
     write_png(&path, 0);
     assert_ne!(red(&run(&mut evaluator, &exposed).unwrap()), 0.0);
+}
+
+/// A Merge's two files are read at once, for the CPU and for the GPU alike: each file's decoder
+/// asks `stop` before its one chunk, and waits there for the other file's to ask too.
+#[test]
+fn a_request_reads_its_files_together() {
+    let directory = directory("together");
+    let paths = ["background.exr", "layer.exr"].map(|name| directory.join(name));
+    for path in &paths {
+        let channels = ["R", "G", "B", "A"].map(|name| (name, vec![1.0; 2]));
+        fixtures::write_exr(path, ((0, 0), (2, 1)), (0, 0), (2, 1), channels.into());
+    }
+    let document = graph(
+        [reader(&paths[0]), reader(&paths[1]), merge(None)],
+        &[(3, "background".into(), 1), (3, ("layer", 1).into(), 2)],
+    );
+    let merged = key(&document, 3);
+    let requester = std::thread::current().id();
+    for on_gpu in [false, true] {
+        let asking = Mutex::new(Vec::new());
+        let asked = std::sync::Condvar::new();
+        let alone = AtomicUsize::new(0);
+        let stop = || {
+            let thread = std::thread::current().id();
+            if thread == requester {
+                return false;
+            }
+            let mut threads = asking.lock().unwrap();
+            if !threads.contains(&thread) {
+                threads.push(thread);
+                asked.notify_all();
+            }
+            let wait = Duration::from_secs(10);
+            let (_threads, waited) =
+                (asked.wait_timeout_while(threads, wait, |threads| threads.len() < 2)).unwrap();
+            if waited.timed_out() {
+                alone.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        };
+        let mut evaluator = Evaluator::new();
+        match on_gpu {
+            false => drop(evaluator.evaluate(&merged, stop).unwrap().unwrap()),
+            true => evaluator.read_for_gpu(&merged, &[], stop).unwrap().unwrap(),
+        }
+        assert_eq!(alone.load(Ordering::Relaxed), 0, "on the GPU: {on_gpu}");
+    }
 }
 
 #[test]

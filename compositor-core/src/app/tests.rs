@@ -1983,6 +1983,25 @@ fn playing_prepares_the_frames_ahead_for_the_viewer_cache_without_showing_them()
 }
 
 #[test]
+fn playing_prepares_nothing_ahead_while_the_viewer_cache_is_full() {
+    let (mut app, deliveries, copies) = viewing_three_frames("look-ahead-full");
+    settle(&mut app, &deliveries, &copies, |app| {
+        app.session().viewer_cache().len() == 1
+    });
+    let bytes = app.session().viewer_cache().bytes();
+    app.session.set_viewer_cache_budget(bytes);
+    app.play(Direction::Forward, PlaybackMode::EveryFrame);
+    assert!(
+        app.look_ahead().is_empty(),
+        "looked ahead over a full cache"
+    );
+
+    app.session.set_viewer_cache_budget(bytes * 3);
+    let ahead: Vec<f64> = app.look_ahead().iter().map(|wanted| wanted.frame).collect();
+    assert_eq!(ahead, [2.0, 3.0]);
+}
+
+#[test]
 fn real_time_playback_keeps_time_counting_drops_and_stops_at_the_end_unless_looping() {
     let (mut app, _deliveries) = app();
     app.dispatch(Event::FrameRangeSet {

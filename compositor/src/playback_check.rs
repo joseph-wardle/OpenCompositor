@@ -14,12 +14,17 @@
 //! 3. A scrub over cached frames, a frame each refresh of the viewer's screen: each frame
 //!    presented p95 within two refreshes of being asked for.
 //! 4. The viewed node edited, so that no frame is cached, then jumps to frames one at a time,
-//!    whose median time to presentation is the uncached frame time; then a scrub over uncached
-//!    frames: each frame presented p95 within that time and a refresh of being asked for.
+//!    whose p95 time to presentation is the uncached frame time; then scrubs over uncached frames,
+//!    each after another edit: their frames presented p95 within that time, a refresh, and the
+//!    p95 wait of those frames for the frame in progress to stop, of being asked for. The decoder
+//!    stops only between the chunks it decodes, which is the cost of stopping at all. A scrub
+//!    faster than evaluation presents a frame about each feedback interval, so there are several,
+//!    for enough frames that their p95 is not just the slowest.
 //!
-//! After each scrub the final frame must be presented within the feedback interval and the
-//! uncached frame time of the scrub's last request. The viewer cache must stay within its
-//! budget, 4 GiB unless BUDGET_MIB sets another. Each stage reports the process's resident memory
+//! A scrub's last frame is judged on its own, since it may wait for the frame in progress, which
+//! the worker stops only within the feedback interval of starting it: it must be presented
+//! within the uncached frame time and the longer of it and the interval of being asked for. The
+//! viewer cache must stay within its budget, 4 GiB unless BUDGET_MIB sets another. Each stage reports the process's resident memory
 //! and what wgpu's allocator holds.
 //!
 //! With `cold`, the sequences' files are dropped from this machine's page cache before each
@@ -37,8 +42,8 @@ use std::time::{Duration, Instant};
 
 use open_ng::Point;
 use opencompositor_core::{
-    Changes, Command, Direction, EvaluationDevice, Event, FEEDBACK_INTERVAL, FrameTiming, NodeId,
-    Pane, Pattern, PlaybackMode, Slot, Value,
+    App, Changes, Command, Direction, EvaluationDevice, Event, FEEDBACK_INTERVAL, FrameTiming,
+    NodeId, Pane, Pattern, PlaybackMode, Slot, Value,
 };
 
 use crate::drag::{FRAME_GUI_MAX, FRAME_GUI_P99, percentile, resident_memory};
@@ -51,9 +56,11 @@ const LONGEST_WAIT: Duration = Duration::from_secs(600);
 /// The most frames played, as many as the workloads' sequences have.
 const MOST_FRAMES: f64 = 150.0;
 
-/// The most frames each scrub passes over, and the jumps that time an uncached frame.
+/// The most frames each scrub passes over, the jumps that time an uncached frame, and the scrubs
+/// over uncached frames.
 const SCRUB_FRAMES: f64 = 48.0;
-const JUMPS: usize = 5;
+const JUMPS: usize = 20;
+const UNCACHED_SCRUBS: usize = 10;
 
 /// A chain the check plays, from its Reader to the node viewed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +72,8 @@ pub enum Chain {
 }
 
 impl Chain {
-    /// The viewed node's parameter, its value, and the value an edit sets to uncache every frame.
+    /// The viewed node's parameter, its value, and the value the first edit sets to uncache every
+    /// frame; each later edit adds a tenth of the difference again.
     fn parameter(&self) -> (&'static str, f64, f64) {
         match self {
             Chain::Exposure => ("stops", 1.0, 1.5),
@@ -130,7 +138,7 @@ enum Stage {
     Edited,
     /// Jumps to uncached frames, one at a time.
     Jumps,
-    /// A scrub over uncached frames.
+    /// A scrub over uncached frames, one of several.
     UncachedScrub,
 }
 
@@ -138,9 +146,24 @@ enum Stage {
 #[derive(Default)]
 struct Scrub {
     asked: Vec<(f64, Instant)>,
+    /// When the worker took each frame it delivered.
+    started: Vec<(f64, Instant)>,
     /// Each frame presented, from being asked for.
     latencies: Vec<Duration>,
+    /// Each frame presented, from being asked for to the worker taking it: the wait for the
+    /// frame in progress to stop, which the decoder does only between the chunks it decodes.
+    waits: Vec<Duration>,
     last: Option<Duration>,
+}
+
+impl Scrub {
+    /// How often it asked for a frame, which a GUI thread held up does less than each refresh.
+    fn pace(&self) -> Duration {
+        let (Some((_, first)), Some((_, last))) = (self.asked.first(), self.asked.last()) else {
+            return Duration::ZERO;
+        };
+        (*last - *first) / (self.asked.len().max(2) - 1) as u32
+    }
 }
 
 struct Check {
@@ -167,7 +190,9 @@ struct Check {
     /// The scrub in progress, and each once finished.
     scrub: Scrub,
     cached_scrub: Option<Scrub>,
-    uncached_scrub: Option<Scrub>,
+    uncached_scrubs: Vec<Scrub>,
+    /// The edits made to uncache every frame.
+    edits: u32,
     /// The jump in progress, and how long each before it took.
     jump: Option<(f64, Instant)>,
     jumps: Vec<Duration>,
@@ -203,7 +228,8 @@ pub fn start(run: Run) {
             advances: Vec::new(),
             scrub: Scrub::default(),
             cached_scrub: None,
-            uncached_scrub: None,
+            uncached_scrubs: Vec::new(),
+            edits: 0,
             jump: None,
             jumps: Vec::new(),
             lines: Vec::new(),
@@ -225,6 +251,18 @@ pub fn advanced(took: Duration) {
             && check.began.is_some()
         {
             check.advances.push(took);
+        }
+    });
+}
+
+/// Records when the worker took a frame it delivered during a scrub.
+pub fn delivered(frame: f64, started: Instant) {
+    if !running() {
+        return;
+    }
+    with(|check| {
+        if matches!(check.stage, Stage::CachedScrub | Stage::UncachedScrub) {
+            check.scrub.started.push((frame, started));
         }
     });
 }
@@ -322,7 +360,10 @@ fn wait(_: usize) {
     });
     let done = match stage {
         Stage::Setup => set_range(),
-        Stage::EveryFrame | Stage::RealTime => crate::read_app(|app| app.playing().is_none()),
+        // The last frame's copy lands after it is shown, and would otherwise drop a frame from
+        // the cache once real time has been kept to those it holds.
+        Stage::EveryFrame => crate::read_app(|app| app.playing().is_none() && shown_is_cached(app)),
+        Stage::RealTime => crate::read_app(|app| app.playing().is_none()),
         Stage::Rewind => shows(with(|check| check.first)),
         Stage::CachedScrub | Stage::UncachedScrub => scrubbed(),
         Stage::Edited => crate::read_app(|app| app.presented_request())
@@ -354,17 +395,26 @@ fn wait(_: usize) {
             }
             Stage::Edited => {
                 evict_if_cold();
-                with(|check| check.stage = Stage::Jumps);
-                jump();
+                if with(|check| check.jumps.is_empty()) {
+                    with(|check| check.stage = Stage::Jumps);
+                    jump();
+                } else {
+                    return scrub(Stage::UncachedScrub);
+                }
             }
             Stage::Jumps if with(|check| check.jumps.len()) < JUMPS => jump(),
             Stage::Jumps => {
                 finish_jumps();
-                return scrub(Stage::UncachedScrub);
+                edit_viewed();
             }
             Stage::UncachedScrub => {
                 finish_scrub();
-                return report();
+                if with(|check| check.uncached_scrubs.len()) < UNCACHED_SCRUBS {
+                    edit_viewed();
+                } else {
+                    finish_uncached_scrubs();
+                    return report();
+                }
             }
         }
     }
@@ -417,6 +467,15 @@ fn set_range() -> bool {
         check.whole = (first, last);
     });
     true
+}
+
+/// Whether the viewer cache holds the frame shown, as the timebar marks it.
+fn shown_is_cached(app: &App) -> bool {
+    let (Some(shown), Some(timebar)) = (app.displayed(), app.timebar()) else {
+        return false;
+    };
+    let index = (shown.frame - timebar.first) as usize;
+    (timebar.marks.get(index)).is_some_and(|mark| mark.cached)
 }
 
 /// Whether the viewer shows the frame asked for, evaluated or cached.
@@ -632,58 +691,113 @@ fn scrubbed() -> bool {
     })
 }
 
-/// Measures the scrub just finished: each frame presented from being asked for, and the last.
+/// Measures the scrub just finished: each frame presented during it from being asked for, and
+/// the last, which its own gate judges, since it may wait for a frame the worker lets finish.
 fn finish_scrub() {
     let memory = memory();
     with(|check| {
         let asked: HashMap<i64, Instant> = (check.scrub.asked.iter())
             .map(|(frame, at)| (*frame as i64, *at))
             .collect();
+        let (last_frame, last_asked) = *check.scrub.asked.last().expect("the scrub asked");
         // The first presentation is what was on screen when the scrub began.
-        let mut latencies: Vec<Duration> = (check.presented.iter().skip(1))
+        let during = || (check.presented.iter().skip(1)).filter(|(frame, _)| *frame != last_frame);
+        let mut latencies: Vec<Duration> = during()
             .filter_map(|(frame, at)| Some(*at - *asked.get(&(*frame as i64))?))
             .collect();
-        let (last_frame, last_asked) = *check.scrub.asked.last().expect("the scrub asked");
+        let mut waits: Vec<Duration> = during()
+            .filter_map(|(frame, _)| {
+                let (_, started) = check.scrub.started.iter().find(|(f, _)| f == frame)?;
+                Some(started.saturating_duration_since(*asked.get(&(*frame as i64))?))
+            })
+            .collect();
+        waits.sort();
+        check.scrub.waits = waits;
         check.scrub.last = (check.presented.iter().rev())
             .find(|(frame, _)| *frame == last_frame)
             .map(|(_, at)| *at - last_asked);
         latencies.sort();
-        let name = match check.stage {
-            Stage::CachedScrub => "scrub over cached frames",
-            _ => "scrub over uncached frames",
-        };
-        // A GUI thread held up asks less often than each refresh, which eases the worker's load.
-        let first_asked = check.scrub.asked[0].1;
-        let pace = (last_asked - first_asked) / (asked.len().max(2) - 1) as u32;
-        check.lines.push(format!(
-            "{name}: {} of {} frames asked for presented, one asked every {pace:.1?}; each from \
-             being asked for p50 {:.1?}, p95 {:.1?}, max {:.1?}; the last {:.1?}; {memory}",
-            latencies.len(),
-            asked.len(),
-            percentile(&latencies, 0.5),
-            percentile(&latencies, 0.95),
-            latencies.last().copied().unwrap_or_default(),
-            check.scrub.last.unwrap_or_default(),
-        ));
         check.scrub.latencies = latencies;
-        let finished = Some(std::mem::take(&mut check.scrub));
-        match check.stage {
-            Stage::CachedScrub => check.cached_scrub = finished,
-            _ => check.uncached_scrub = finished,
+        let finished = std::mem::take(&mut check.scrub);
+        if check.stage == Stage::CachedScrub {
+            let line = scrub_line("scrub over cached frames", &[&finished], &memory);
+            check.lines.push(line);
+            check.cached_scrub = Some(finished);
+        } else {
+            check.uncached_scrubs.push(finished);
         }
     });
 }
 
+fn finish_uncached_scrubs() {
+    let memory = memory();
+    with(|check| {
+        let scrubs: Vec<&Scrub> = check.uncached_scrubs.iter().collect();
+        let line = scrub_line("scrubs over uncached frames", &scrubs, &memory);
+        check.lines.push(line);
+    });
+}
+
+/// Describes scrubs together: each frame presented from being asked for, the slowest last.
+fn scrub_line(name: &str, scrubs: &[&Scrub], memory: &str) -> String {
+    let mut latencies: Vec<Duration> = (scrubs.iter())
+        .flat_map(|scrub| scrub.latencies.iter().copied())
+        .collect();
+    latencies.sort();
+    let asked: usize = scrubs.iter().map(|scrub| scrub.asked.len()).sum();
+    let pace = scrubs
+        .iter()
+        .map(|scrub| scrub.pace())
+        .max()
+        .unwrap_or_default();
+    let last = scrubs.iter().filter_map(|scrub| scrub.last).max();
+    let waits = stop_waits(scrubs);
+    let waits = match waits.is_empty() {
+        true => String::new(),
+        false => format!(
+            "; waiting for the frame in progress to stop p50 {:.1?}, p95 {:.1?}",
+            percentile(&waits, 0.5),
+            percentile(&waits, 0.95),
+        ),
+    };
+    let lasts = match scrubs.len() {
+        1 => "the last".to_string(),
+        n => format!("of {n} scrubs, the slowest last"),
+    };
+    format!(
+        "{name}: {} of {asked} frames asked for presented before the last, one asked every \
+         {pace:.1?} at most; each from being asked for p50 {:.1?}, p95 {:.1?}, max {:.1?}{waits}; \
+         {lasts} {:.1?}; {memory}",
+        latencies.len(),
+        percentile(&latencies, 0.5),
+        percentile(&latencies, 0.95),
+        latencies.last().copied().unwrap_or_default(),
+        last.unwrap_or_default(),
+    )
+}
+
+/// The waits of the scrubs' frames for the frame in progress to stop, sorted.
+fn stop_waits(scrubs: &[&Scrub]) -> Vec<Duration> {
+    let mut waits: Vec<Duration> = (scrubs.iter())
+        .flat_map(|scrub| scrub.waits.iter().copied())
+        .collect();
+    waits.sort();
+    waits
+}
+
 /// Edits the viewed node so that no frame is cached, over the whole range again, at its last
-/// frame, which neither the jumps nor the uncached scrub reach unless the range is short, then
+/// frame, which neither the jumps nor the uncached scrubs reach unless the range is short, then
 /// waits for it.
 fn edit_viewed() {
-    let (viewed, (parameter, _, edited), (first, last)) = with(|check| {
+    let (viewed, parameter, edited, (first, last)) = with(|check| {
         check.stage = Stage::Edited;
         check.began = None;
         (check.first, check.last) = check.whole;
         let viewed = check.viewed.expect("setup made it");
-        (viewed, check.run.chain.parameter(), check.whole)
+        let (parameter, value, edited) = check.run.chain.parameter();
+        let edited = edited + f64::from(check.edits) * (edited - value) / 10.0;
+        check.edits += 1;
+        (viewed, parameter, edited, check.whole)
     });
     crate::dispatch(Event::FrameRangeSet { first, last });
     crate::dispatch(Event::FrameSet(last));
@@ -735,8 +849,9 @@ fn finish_jumps() {
         let mut jumps = check.jumps.clone();
         jumps.sort();
         check.lines.push(format!(
-            "an uncached frame, jumped to: p50 {:.1?}, max {:.1?}, of {}",
+            "an uncached frame, jumped to: p50 {:.1?}, p95 {:.1?}, max {:.1?}, of {}",
             percentile(&jumps, 0.5),
+            percentile(&jumps, 0.95),
             jumps.last().copied().unwrap_or_default(),
             jumps.len()
         ));
@@ -747,39 +862,57 @@ fn finish_jumps() {
 fn judge_scrubs(check: &mut Check) {
     let mut jumps = check.jumps.clone();
     jumps.sort();
-    let uncached = percentile(&jumps, 0.5);
-    let final_gate = FEEDBACK_INTERVAL + uncached;
+    let uncached = percentile(&jumps, 0.95);
+    let final_gate = uncached + FEEDBACK_INTERVAL.max(uncached);
+    let mut uncached_latencies: Vec<Duration> = (check.uncached_scrubs.iter())
+        .flat_map(|scrub| scrub.latencies.iter().copied())
+        .collect();
+    uncached_latencies.sort();
+    let uncached_scrubs: Vec<&Scrub> = check.uncached_scrubs.iter().collect();
+    let stop = percentile(&stop_waits(&uncached_scrubs), 0.95);
+    let cached = check.cached_scrub.as_ref();
     let scrubs = [
         (
-            "cached",
-            check.cached_scrub.as_ref(),
+            "cached scrub",
+            cached.map(|scrub| scrub.latencies.clone()),
+            cached
+                .map(|scrub| scrub.last)
+                .into_iter()
+                .collect::<Vec<_>>(),
             check.refresh * 2,
             "two refreshes",
         ),
         (
-            "uncached",
-            check.uncached_scrub.as_ref(),
-            uncached + check.refresh,
-            "the uncached frame time and a refresh",
+            "uncached scrubs",
+            (!check.uncached_scrubs.is_empty()).then_some(uncached_latencies),
+            check
+                .uncached_scrubs
+                .iter()
+                .map(|scrub| scrub.last)
+                .collect(),
+            uncached + check.refresh + stop,
+            "the uncached frame time, a refresh and the wait for the frame in progress to stop",
         ),
     ];
-    for (name, scrub, gate, gate_name) in scrubs {
-        let Some(scrub) = scrub else {
+    for (name, latencies, lasts, gate, gate_name) in scrubs {
+        let Some(latencies) = latencies else {
             continue;
         };
-        let p95 = percentile(&scrub.latencies, 0.95);
+        let p95 = percentile(&latencies, 0.95);
         if p95 > gate {
             check.failures.push(format!(
-                "the {name} scrub presented frames p95 {p95:.1?} from being asked for, over \
+                "the {name} presented frames p95 {p95:.1?} from being asked for, over \
                  {gate_name}, {gate:.1?}"
             ));
         }
-        match scrub.last {
-            Some(last) if last <= final_gate => {}
-            last => check.failures.push(format!(
-                "the {name} scrub's last frame took {last:.1?}, over the feedback interval and \
-                 the uncached frame time, {final_gate:.1?}"
-            )),
+        for last in lasts {
+            match last {
+                Some(last) if last <= final_gate => {}
+                last => check.failures.push(format!(
+                    "a last frame of the {name} took {last:.1?}, over the frame in progress and \
+                     the uncached frame time, {final_gate:.1?}"
+                )),
+            }
         }
     }
 }

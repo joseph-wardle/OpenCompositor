@@ -214,6 +214,12 @@ impl ViewerCache {
         self.changes
     }
 
+    /// Whether a copy as large as the largest held fits without dropping any.
+    pub(crate) fn has_room(&self) -> bool {
+        let largest = (self.entries.iter().map(|entry| entry.copy.bytes())).max();
+        self.bytes + largest.unwrap_or(0) <= self.budget
+    }
+
     /// Whether it holds a copy of the key, at any reduction.
     pub fn contains(&self, key: &ResultKey) -> bool {
         self.entries.iter().any(|entry| entry.copy.key == *key)

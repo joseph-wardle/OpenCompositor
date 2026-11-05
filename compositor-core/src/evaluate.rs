@@ -492,10 +492,11 @@ impl Evaluator {
 
     /// The image a key names, its failure, or `None` if `stop` returned true before it was done.
     ///
-    /// `stop` is asked before each node is computed, and by an operation long enough to matter
-    /// before each chunk of its work, from the pool's threads, as by a Reader before each chunk
-    /// of an EXR file, from the decoder's. Nodes completed before stopping
-    /// stay retained until the next request.
+    /// The request's files are read first, together, as [`read_files`] reads them. `stop` is
+    /// asked before each node is computed, and by an operation long enough to matter before each
+    /// chunk of its work, from the pool's threads, as by a Reader before each chunk of an EXR
+    /// file, from the decoder's. Nodes completed before stopping stay retained until the next
+    /// request.
     pub fn evaluate(
         &mut self,
         key: &ResultKey,
@@ -510,6 +511,18 @@ impl Evaluator {
         let (needed, mut uses) = needs(&steps, |index| steps[index].retained.is_some());
         let mut images: Vec<Option<Image>> = steps.iter().map(|_| None).collect();
         let mut kept: Vec<bool> = steps.iter().map(|step| step.retained.is_some()).collect();
+        let readers: Vec<usize> = (0..steps.len())
+            .filter(|&index| needed[index] && steps[index].retained.is_none())
+            .filter(|&index| matches!(*steps[index].key.0, Recipe::Reader { .. }))
+            .collect();
+        if !readers.is_empty() && stop() {
+            return None;
+        }
+        let mut files: Vec<Option<Result<Option<Image>, EvalError>>> =
+            steps.iter().map(|_| None).collect();
+        for (&index, read) in readers.iter().zip(read_files(&steps, &readers, &stop)) {
+            files[index] = Some(read);
+        }
         for (index, step) in steps.iter().enumerate() {
             if !needed[index] {
                 continue;
@@ -518,13 +531,19 @@ impl Evaluator {
                 images[index] = Some(image.clone());
                 continue;
             }
-            if stop() {
+            // A file already read is kept, as a completed node is.
+            let read = files[index].take();
+            if read.is_none() && stop() {
                 return None;
             }
             let inputs: Vec<&Image> = (step.inputs.iter())
                 .map(|&input| images[input].as_ref().expect("inputs come first"))
                 .collect();
-            let image = match self.compute(&step.key, &inputs, &mut released, &stop) {
+            let computed = match read {
+                Some(read) => read,
+                None => self.compute(&step.key, &inputs, &mut released, &stop),
+            };
+            let image = match computed {
                 Ok(Some(image)) => image,
                 Ok(None) => return None,
                 Err(error) => return Some(Err(error)),
@@ -675,6 +694,54 @@ fn needs(steps: &[Step], held: impl Fn(usize) -> bool) -> (Vec<bool>, Vec<usize>
     (needed, uses)
 }
 
+/// The images of the Readers at `readers` in `steps`, in that order, each read on a thread of its
+/// own when there are several: one file's chunks are read in turn, so reading files together
+/// overlaps their storage's latency, which on NFS is most of a cold read.
+fn read_files(
+    steps: &[Step],
+    readers: &[usize],
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Vec<Result<Option<Image>, EvalError>> {
+    let read = |index: usize| read_file(&steps[index].key, stop);
+    match readers {
+        [] => Vec::new(),
+        [only] => vec![read(*only)],
+        _ => std::thread::scope(|scope| {
+            let threads: Vec<_> = (readers.iter())
+                .map(|&index| scope.spawn(move || read(index)))
+                .collect();
+            (threads.into_iter())
+                .map(|thread| thread.join().expect("a read's panic fails its Reader"))
+                .collect()
+        }),
+    }
+}
+
+/// A Reader's image, read from its file, or `None` if `stop` returned true first. A panic while
+/// reading fails the Reader.
+fn read_file(
+    key: &ResultKey,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Image>, EvalError> {
+    let Recipe::Reader { path, .. } = &*key.0 else {
+        unreachable!("a Reader's key");
+    };
+    let Some(path) = path else {
+        return Ok(Some(Image::empty()));
+    };
+    let read = || {
+        read_image_until(path, stop).map_err(|error| EvalError::Read {
+            origin: key.clone(),
+            error,
+        })
+    };
+    std::panic::catch_unwind(AssertUnwindSafe(read)).unwrap_or_else(|_| {
+        Err(EvalError::Panicked {
+            origin: key.clone(),
+        })
+    })
+}
+
 /// The bytes of the planes' storage, each counted once however often it appears.
 fn distinct_bytes<'a>(planes: impl Iterator<Item = &'a Plane>) -> u64 {
     let mut counted = BTreeSet::new();
@@ -703,13 +770,7 @@ impl Evaluator {
             None => &empty,
         };
         let operation = || match &*key.0 {
-            Recipe::Reader { path: None, .. } => Ok(Some(Image::empty())),
-            Recipe::Reader {
-                path: Some(path), ..
-            } => read_image_until(path, stop).map_err(|error| EvalError::Read {
-                origin: key.clone(),
-                error,
-            }),
+            Recipe::Reader { .. } => read_file(key, stop),
             Recipe::Exposure { stops, source, .. } => Ok(Some(exposure(
                 &self.pool,
                 image_of(source),

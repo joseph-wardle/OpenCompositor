@@ -17,10 +17,10 @@ use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, LineReduce, Merge}
 use super::merge::{is_the_base, merged_warnings, merged_window};
 use super::{
     EvalError, Evaluator, Recipe, ResultKey, Retained, check_node_bytes, distinct_bytes, needs,
+    read_file, read_files,
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
 use crate::kernels::{Kernels, Planes, plane_bytes};
-use crate::read::read_image_until;
 use crate::viewer_cache::{GpuCopier, GpuCopy};
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
@@ -535,36 +535,21 @@ impl GpuEvaluation {
         Ok(image)
     }
 
-    /// Submits the copy of an image this generation made for the viewer cache, halved that many
-    /// times, into a buffer to map once the GPU is idle. `Ok(None)` for an empty data window.
+    /// Records into a recorded request the copy of its image for the viewer cache, halved that
+    /// many times, into a buffer to map once the GPU has completed the submission: the copy
+    /// costs the GPU its dispatch and no wait of its own. `Ok(None)` for an empty data window.
     /// Fails if the GPU cannot hold the copy.
-    pub(crate) fn copy_for_viewer(
-        &mut self,
-        image: &GpuImage,
+    pub(crate) fn record_copy_for_viewer(
+        &self,
+        recorded: &mut Recorded,
         halvings: u32,
     ) -> Result<Option<GpuCopy>, String> {
-        let Some(planes) = &image.planes else {
+        let Some(planes) = &recorded.image.planes else {
             return Ok(None);
         };
-        let mut encoder = self.device.create_command_encoder(&Default::default());
         let planes = planes.each_ref().map(|plane| &*plane.0);
-        let recorded = self.copier.record(
-            &self.device,
-            &mut encoder,
-            planes,
-            image.info.data_window,
-            halvings,
-        )?;
-        if recorded.is_some() {
-            self.queue.submit([encoder.finish()]);
-            self.submitted += 1;
-            let (completed, number) = (Arc::clone(&self.completed), self.submitted);
-            // As `submit`'s: it may run on the GUI thread inside its submit.
-            self.queue.on_submitted_work_done(move || {
-                completed.fetch_max(number, Ordering::Release);
-            });
-        }
-        Ok(recorded)
+        let data = recorded.image.info.data_window;
+        (self.copier).record(&self.device, &mut recorded.encoder, planes, data, halvings)
     }
 
     /// The keys of the retained results, for planning a request before this is at hand.
@@ -746,8 +731,9 @@ impl Evaluator {
     }
 
     /// Reads the files of the Readers a request on a GPU retaining `on_gpu` would upload, unless
-    /// this evaluator retains them already, so that recording it decodes nothing. `None` if
-    /// `stop` returned true first. Fails as the first file that cannot be read.
+    /// this evaluator retains them already, so that recording it decodes nothing. They are read
+    /// together, as [`read_files`] reads them. `None` if `stop` returned true first. Fails as the
+    /// first file that cannot be read.
     ///
     /// Like a request, it releases every retained result the key does not contain.
     pub fn read_for_gpu(
@@ -763,16 +749,16 @@ impl Evaluator {
         };
         let (needed, _) = needs(&steps, uploaded);
         drop(self.release_except(&steps));
-        for (index, step) in steps.iter().enumerate() {
-            let unread = step.retained.is_none() && !uploaded(index);
-            if !needed[index] || !unread || !matches!(*step.key.0, Recipe::Reader { .. }) {
-                continue;
-            }
-            if stop() {
-                return None;
-            }
-            match self.read_and_retain(&step.key, &stop) {
-                Ok(Some(_)) => {}
+        let readers: Vec<usize> = (0..steps.len())
+            .filter(|&index| needed[index] && steps[index].retained.is_none() && !uploaded(index))
+            .filter(|&index| matches!(*steps[index].key.0, Recipe::Reader { .. }))
+            .collect();
+        if !readers.is_empty() && stop() {
+            return None;
+        }
+        for (&index, read) in readers.iter().zip(read_files(&steps, &readers, &stop)) {
+            match read {
+                Ok(Some(image)) => self.retain_read(&steps[index].key, &image),
                 Ok(None) => return None,
                 Err(error) => return Some(Err(error)),
             }
@@ -970,19 +956,15 @@ impl Evaluator {
         key: &ResultKey,
         stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<Image>, EvalError> {
-        let Recipe::Reader { path, .. } = &*key.0 else {
-            unreachable!("a Reader's key");
-        };
-        let Some(path) = path else {
-            return Ok(Some(Image::empty()));
-        };
-        let read = read_image_until(path, stop).map_err(|error| EvalError::Read {
-            origin: key.clone(),
-            error,
-        })?;
-        let Some(image) = read else {
+        let Some(image) = read_file(key, stop)? else {
             return Ok(None);
         };
+        self.retain_read(key, &image);
+        Ok(Some(image))
+    }
+
+    /// Retains a Reader's image read for the GPU table, under this evaluator's cap.
+    fn retain_read(&mut self, key: &ResultKey, image: &Image) {
         let added = distinct_bytes(image.planes().iter());
         if self.retained_bytes() + added <= self.cap {
             self.retained.push(Retained {
@@ -990,7 +972,6 @@ impl Evaluator {
                 image: image.clone(),
             });
         }
-        Ok(Some(image))
     }
 }
 

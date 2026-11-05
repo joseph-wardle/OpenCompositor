@@ -462,11 +462,14 @@ fn advance(_: usize) {
 fn receive(notice: Notice) {
     let lost = matches!(notice, Notice::DeviceLost { .. });
     let evaluated = match &notice {
-        Notice::Evaluated(evaluated) => Some((
-            evaluated.request(),
-            evaluated.timing,
-            evaluated.data_window(),
-        )),
+        Notice::Evaluated(evaluated) => {
+            playback_check::delivered(evaluated.frame(), evaluated.timing.started);
+            Some((
+                evaluated.request(),
+                evaluated.timing,
+                evaluated.data_window(),
+            ))
+        }
         Notice::DeviceLost { .. } | Notice::Scanned { .. } | Notice::Copied(_) => None,
     };
     let started = Instant::now();
