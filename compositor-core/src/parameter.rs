@@ -197,7 +197,7 @@ impl Resolved {
 ///
 /// Values are resolved at a frame, so that animated values can be sampled there; until a
 /// parameter can be animated, every value is the same at every frame.
-pub fn resolve(node: &Node, _time: f64) -> Resolved {
+pub fn resolve(node: &Node, _frame: f64) -> Resolved {
     let values = node
         .kind
         .parameters()

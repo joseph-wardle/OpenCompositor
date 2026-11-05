@@ -322,26 +322,26 @@ pub fn result_key(
     document: &Document,
     files: &Files,
     node: NodeId,
-    time: f64,
+    frame: f64,
 ) -> Option<ResultKey> {
     document.node(node)?;
-    keys(document, files, time, [node]).remove(&node)
+    keys(document, files, frame, [node]).remove(&node)
 }
 
 /// The key of every node in the document at a frame, each upstream node visited once.
 pub(crate) fn result_keys(
     document: &Document,
     files: &Files,
-    time: f64,
+    frame: f64,
 ) -> BTreeMap<NodeId, ResultKey> {
-    keys(document, files, time, document.nodes().map(|(id, _)| id))
+    keys(document, files, frame, document.nodes().map(|(id, _)| id))
 }
 
 /// The keys of existing nodes and of everything upstream of them.
 fn keys(
     document: &Document,
     files: &Files,
-    time: f64,
+    frame: f64,
     nodes: impl IntoIterator<Item = NodeId>,
 ) -> BTreeMap<NodeId, ResultKey> {
     let mut built: BTreeMap<NodeId, ResultKey> = BTreeMap::new();
@@ -358,7 +358,7 @@ fn keys(
         }
         pending.pop();
         if !built.contains_key(&id) {
-            let key = ResultKey::new(recipe(current, files, time, &built));
+            let key = ResultKey::new(recipe(current, files, frame, &built));
             built.insert(id, key);
         }
     }
@@ -366,7 +366,7 @@ fn keys(
 }
 
 /// A node's recipe at a frame, from the keys of its inputs at that frame.
-fn recipe(node: &Node, files: &Files, time: f64, built: &BTreeMap<NodeId, ResultKey>) -> Recipe {
+fn recipe(node: &Node, files: &Files, frame: f64, built: &BTreeMap<NodeId, ResultKey>) -> Recipe {
     let key_of = |source: NodeId| -> ResultKey {
         built
             .get(&source)
@@ -374,10 +374,10 @@ fn recipe(node: &Node, files: &Files, time: f64, built: &BTreeMap<NodeId, Result
             .clone()
     };
     let input = |input: InputSlot<'_>| node.input(input).map(key_of);
-    let resolved = resolve(node, time);
+    let resolved = resolve(node, frame);
     match &node.kind {
         NodeKind::Reader { version } => {
-            let path = reading(&resolved, files, time).map(|reading| reading.file().clone());
+            let path = reading(&resolved, files, frame).map(|reading| reading.file().clone());
             Recipe::Reader {
                 version: *version,
                 reload: path.as_deref().map_or(0, |path| files.reloads(path)),
@@ -444,7 +444,7 @@ const NODE_BYTES_CAP: u64 = 1 << 30;
 /// Operations run on the evaluator's own threads, a chunk of rows at a time, and a request's
 /// outputs take the planes of the results it releases before making new ones.
 ///
-/// A key is one frame's, so the evaluator never sees time. The whole data window is computed and
+/// A key is one frame's, so the evaluator never sees the frame. The whole data window is computed and
 /// every channel produced.
 #[derive(Debug)]
 pub struct Evaluator {

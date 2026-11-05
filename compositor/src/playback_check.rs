@@ -366,8 +366,8 @@ fn wait(_: usize) {
         Stage::RealTime => crate::read_app(|app| app.playing().is_none()),
         Stage::Rewind => shows(with(|check| check.first)),
         Stage::CachedScrub | Stage::UncachedScrub => scrubbed(),
-        Stage::Edited => crate::read_app(|app| app.presented_request())
-            .is_some_and(|shown| shown >= crate::latest_request()),
+        Stage::Edited => crate::read_app(|app| app.presented_job())
+            .is_some_and(|shown| shown >= crate::latest_job()),
         Stage::Jumps => jumped(),
     };
     if done {
@@ -481,7 +481,8 @@ fn shown_is_cached(app: &App) -> bool {
 /// Whether the viewer shows the frame asked for, evaluated or cached.
 fn shows(frame: f64) -> bool {
     crate::read_app(|app| {
-        (app.displayed()).is_some_and(|shown| shown.frame == frame && shown.requested == frame)
+        app.session().frame() == frame
+            && (app.displayed()).is_some_and(|shown| shown.frame == frame)
     })
 }
 

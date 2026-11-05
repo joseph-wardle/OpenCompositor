@@ -230,14 +230,14 @@ impl Files {
 
 /// The file a Reader reads at a frame.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Reading {
+pub enum Reading {
     /// A file that is no sequence, the same at every frame.
     Still(Arc<Path>),
     Frame {
         file: Arc<Path>,
-        /// The frame the time maps to, the time less the offset.
-        wanted: i64,
-        /// The frame read: the one wanted, or the nearest end of the range outside it.
+        /// The sequence's frame at the frame less the Reader's Offset.
+        mapped: i64,
+        /// The frame read: the one mapped to, or the nearest end of the range outside it.
         read: i64,
         /// Whether the sequence's last scan found the file read; `None` before a scan.
         found: Option<bool>,
@@ -245,37 +245,76 @@ pub(crate) enum Reading {
 }
 
 impl Reading {
-    pub(crate) fn file(&self) -> &Arc<Path> {
+    pub fn file(&self) -> &Arc<Path> {
         match self {
             Reading::Still(file) | Reading::Frame { file, .. } => file,
         }
     }
+
+    /// The frame read in place of the one mapped to, which is outside the sequence's range.
+    pub fn held(&self) -> Option<i64> {
+        match *self {
+            Reading::Frame { mapped, read, .. } if mapped != read => Some(read),
+            Reading::Frame { .. } | Reading::Still(_) => None,
+        }
+    }
+
+    /// The frame read, if the sequence's last scan did not find it: reading it fails.
+    pub fn missing(&self) -> Option<i64> {
+        match *self {
+            Reading::Frame {
+                read,
+                found: Some(false),
+                ..
+            } => Some(read),
+            Reading::Frame { .. } | Reading::Still(_) => None,
+        }
+    }
 }
 
-/// What a Reader with a file reads at a frame: a sequence's frame at the time less its offset,
+/// What a Reader with a file reads at a frame: a sequence's frame at the frame less its offset,
 /// held at the nearest end of its range outside it. The range is First and Last, each as set or
 /// else as the last scan found, and without either nothing is held.
-pub(crate) fn reading(resolved: &Resolved, files: &Files, time: f64) -> Option<Reading> {
+pub(crate) fn reading(resolved: &Resolved, files: &Files, frame: f64) -> Option<Reading> {
     let path = resolved.file("file")?;
     let Some(pattern) = Pattern::parse(path) else {
         return Some(Reading::Still(path.clone()));
     };
     let offset = resolved.float("offset").expect("a Reader has an Offset");
-    // Saturating, for a time beyond any frame a file can name.
-    let wanted = (time - offset).floor() as i64;
+    // Saturating, for a frame beyond any a file can name.
+    let mapped = (frame - offset).floor() as i64;
     let scan = files.scan(path);
     let (first, last) = range(resolved, scan);
     let read = match (first, last) {
-        (Some(first), _) if wanted < first => first,
-        (_, Some(last)) if wanted > last => last,
-        _ => wanted,
+        (Some(first), _) if mapped < first => first,
+        (_, Some(last)) if mapped > last => last,
+        _ => mapped,
     };
     Some(Reading::Frame {
         file: pattern.frame_path(read).into(),
-        wanted,
+        mapped,
         read,
         found: scan.map(|scan| scan.contains(read)),
     })
+}
+
+/// What each Reader with a file on the node's upstream, itself included, reads at a frame, in the
+/// order [`missing`](crate::missing) visits them. Empty if the document has no such node.
+pub fn readings(
+    document: &Document,
+    files: &Files,
+    node: NodeId,
+    frame: f64,
+) -> Vec<(NodeId, Reading)> {
+    (document.upstream(node).into_iter())
+        .filter_map(|id| {
+            let reader = document.node(id).expect("upstream nodes exist");
+            if !matches!(reader.kind, NodeKind::Reader { .. }) {
+                return None;
+            }
+            Some((id, reading(&resolve(reader, frame), files, frame)?))
+        })
+        .collect()
 }
 
 /// A sequence's First and Last, each as set or else as its last scan found.
@@ -302,13 +341,13 @@ pub(crate) fn scanned_end(resolved: &Resolved, files: &Files, parameter: &str) -
 
 /// The frames the node's sequences span on the timeline: from the earliest first frame to the
 /// latest last frame of the sequences its upstream Readers read, each moved by its Offset, at
-/// the time their parameters are resolved at. `None` if none reads a sequence with both ends
+/// the frame their parameters are resolved at. `None` if none reads a sequence with both ends
 /// known, as for a still.
 pub fn input_range(
     document: &Document,
     files: &Files,
     node: NodeId,
-    time: f64,
+    frame: f64,
 ) -> Option<(f64, f64)> {
     let mut span: Option<(f64, f64)> = None;
     for id in document.upstream(node) {
@@ -316,7 +355,7 @@ pub fn input_range(
         if !matches!(reader.kind, NodeKind::Reader { .. }) {
             continue;
         }
-        let resolved = resolve(reader, time);
+        let resolved = resolve(reader, frame);
         let Some(path) = resolved.file("file") else {
             continue;
         };
@@ -334,24 +373,6 @@ pub fn input_range(
         });
     }
     span
-}
-
-/// The Readers on the node's upstream, itself included, that hold the nearest end of their
-/// sequence at a frame, each with the frame it reads, in the order [`missing`](crate::missing)
-/// visits them. Empty if the document has no such node.
-pub fn held(document: &Document, files: &Files, node: NodeId, time: f64) -> Vec<(NodeId, i64)> {
-    (document.upstream(node).into_iter())
-        .filter_map(|id| {
-            let reader = document.node(id).expect("upstream nodes exist");
-            if !matches!(reader.kind, NodeKind::Reader { .. }) {
-                return None;
-            }
-            match reading(&resolve(reader, time), files, time)? {
-                Reading::Frame { wanted, read, .. } if wanted != read => Some((id, read)),
-                Reading::Frame { .. } | Reading::Still(_) => None,
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

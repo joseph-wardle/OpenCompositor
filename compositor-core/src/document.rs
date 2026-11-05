@@ -8,7 +8,6 @@ use imbl::OrdMap;
 use imbl::ordmap::DiffItem;
 use open_ng::Point;
 
-use crate::files::{Files, Reading, reading};
 use crate::parameter::{
     FloatParameter, Parameter, ParameterKind, Value, ValueError, describe, resolve, validate,
 };
@@ -50,7 +49,7 @@ impl Slot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
-    /// Reads the image file its File names, or for a sequence the frame at the time less its
+    /// Reads the image file its File names, or for a sequence the file numbered the frame less its
     /// Offset, holding the nearest end of its range, from First to Last, outside it. Without a
     /// file it gives the empty image.
     Reader { version: ReaderVersion },
@@ -466,43 +465,26 @@ pub enum Missing {
     Input(&'static NodeInput),
     /// A file parameter with no file.
     File(&'static Parameter),
-    /// The frame of its sequence a Reader reads, inside its range, which the sequence's last scan
-    /// did not find. Unlike the others, it gives no image: reading it fails.
-    Frame(i64),
 }
 
 /// Everything missing on the node and upstream of it at a frame: the node's own first, its files
 /// before its inputs, each in declaration order, and each upstream node once, without recursion.
 /// Empty if the document has no such node.
 ///
-/// What is missing gives the empty image, but for a missing frame, so this, not the image, says
-/// what is incomplete. An input a node makes do without, such as a Merge's slots, is never
-/// missing.
-pub fn missing(
-    document: &Document,
-    files: &Files,
-    node: NodeId,
-    time: f64,
-) -> Vec<(NodeId, Missing)> {
+/// What is missing gives the empty image, so this, not the image, says what is incomplete. An
+/// input a node makes do without, such as a Merge's slots, is never missing. A sequence's missing
+/// frame is no such gap: reading it fails, as [`Reading::missing`](crate::Reading::missing) says.
+pub fn missing(document: &Document, node: NodeId, frame: f64) -> Vec<(NodeId, Missing)> {
     let mut missing = Vec::new();
     for id in document.upstream(node) {
         let current = document.node(id).expect("upstream nodes exist");
-        let resolved = resolve(current, time);
+        let resolved = resolve(current, frame);
         for parameter in current.kind.parameters() {
             if matches!(parameter.kind, ParameterKind::File)
                 && resolved.get(parameter.name).is_none()
             {
                 missing.push((id, Missing::File(parameter)));
             }
-        }
-        if let NodeKind::Reader { .. } = current.kind
-            && let Some(Reading::Frame {
-                read,
-                found: Some(false),
-                ..
-            }) = reading(&resolved, files, time)
-        {
-            missing.push((id, Missing::Frame(read)));
         }
         for input in current.kind.inputs() {
             if input.required && current.input(input.first_slot()).is_none() {

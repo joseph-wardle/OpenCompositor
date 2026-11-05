@@ -22,8 +22,8 @@ fn key(path: impl Into<PathBuf>) -> ResultKey {
 }
 
 /// A request for the node with the key, as the worker cares only about which node it is.
-fn on(node: u64, key: ResultKey) -> Wanted {
-    Wanted {
+fn on(node: u64, key: ResultKey) -> Job {
+    Job {
         node: NodeId(node),
         key,
         frame: 1.0,
@@ -114,7 +114,7 @@ fn a_request_replaces_any_the_worker_has_not_started() {
     let worker = Worker::start(
         EvaluationDevice::Cpu,
         move |evaluated| {
-            delivered.send(evaluated.wanted.key).unwrap();
+            delivered.send(evaluated.job.key).unwrap();
             released.lock().unwrap().recv().unwrap();
         },
         |_| {},
@@ -235,7 +235,7 @@ fn a_failure_is_delivered_with_its_key() {
     worker.request(Some(on(1, missing("missing"))));
     let evaluated = receive(&deliveries);
 
-    assert_eq!(evaluated.wanted.key, missing("missing"));
+    assert_eq!(evaluated.job.key, missing("missing"));
     assert!(matches!(
         evaluated.result,
         Err(ViewerError::Eval(EvalError::Read {
@@ -271,7 +271,7 @@ fn connecting_a_gpu_delivers_the_last_key_again_with_its_pixels() {
     connect(&worker, noop_device(None), 1);
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, key(&path));
+    assert_eq!(evaluated.job.key, key(&path));
     assert!(evaluated.result.unwrap().pixels.is_some());
 }
 
@@ -432,7 +432,7 @@ fn a_newer_request_for_another_node_ends_the_wait_for_the_staging_buffer() {
     worker.request(Some(on(2, missing("missing"))));
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, missing("missing"));
+    assert_eq!(evaluated.job.key, missing("missing"));
     assert!(evaluated.result.is_err());
     drop(held);
     wait_until_done_after_evaluating(&worker);
@@ -452,7 +452,7 @@ fn same_node(name: &str, frames: [f64; 3], caught_up: Instant) -> (Vec<ResultKey
         write_png(path, 3, 2);
     }
     let keys = paths.map(key);
-    let at = |index: usize| Wanted {
+    let at = |index: usize| Job {
         frame: frames[index],
         ..on(1, keys[index].clone())
     };
@@ -471,8 +471,8 @@ fn same_node(name: &str, frames: [f64; 3], caught_up: Instant) -> (Vec<ResultKey
     loop {
         let evaluated = receive(&deliveries);
         assert!(evaluated.result.unwrap().pixels.is_some());
-        let last = evaluated.wanted.key == keys[2];
-        delivered.push(evaluated.wanted.key);
+        let last = evaluated.job.key == keys[2];
+        delivered.push(evaluated.job.key);
         if last {
             break;
         }
@@ -514,7 +514,7 @@ fn a_started_request_found_superseded_stays_so_after_the_feedback_interval() {
     let (worker, _deliveries) = worker();
     let mut state = worker.mailbox.lock();
     state.started = Some(on(1, key(&first)));
-    state.request = Some(Asked::Evaluate(Wanted {
+    state.request = Some(Asked::Evaluate(Job {
         frame: 2.0,
         ..on(1, key(&second))
     }));
@@ -621,7 +621,7 @@ fn an_image_finishing_for_a_replaced_device_is_staged_again_for_the_new_one() {
     connect(&worker, noop_device(None), 2);
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, key(&second));
+    assert_eq!(evaluated.job.key, key(&second));
     assert!(evaluated.result.unwrap().pixels.is_some());
     drop(held);
 }
@@ -644,7 +644,7 @@ fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
 
     connect(&worker, noop_device(None), 2);
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, key(&second));
+    assert_eq!(evaluated.job.key, key(&second));
     assert!(evaluated.result.unwrap().pixels.is_some());
 }
 
@@ -662,7 +662,7 @@ fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels(
     worker.disconnect(Instant::now());
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, key(&second));
+    assert_eq!(evaluated.job.key, key(&second));
     assert!(evaluated.result.unwrap().pixels.is_none());
     drop(held);
     wait_until_done_after_evaluating(&worker);
@@ -869,7 +869,7 @@ fn a_gpu_session_fails_a_request_on_a_lost_device_and_shows_it_on_the_next() {
     let (device, queue) = crate::kernels::headless::device();
     worker.connect(device, queue, Arc::default(), 2);
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, requested);
+    assert_eq!(evaluated.job.key, requested);
     let (_, generation) = evaluated_planes(evaluated);
     assert_eq!(generation, 2);
 }
@@ -888,7 +888,7 @@ fn a_replaced_device_drops_its_state_and_the_new_one_shows_the_request_again() {
     worker.connect(device, queue, Arc::default(), 2);
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, requested);
+    assert_eq!(evaluated.job.key, requested);
     let (second, generation) = evaluated_planes(evaluated);
     assert_eq!(generation, 2);
     assert!(!Arc::ptr_eq(&first[0], &second[0]));
@@ -966,7 +966,7 @@ fn moving_a_gpu_session_to_the_cpu_drops_its_gpu_state_and_stages_the_request_ag
     worker.evaluate_on(EvaluationDevice::Cpu);
 
     let again = receive(&deliveries);
-    assert_eq!(again.wanted.key, exposed(&path, 1.0));
+    assert_eq!(again.job.key, exposed(&path, 1.0));
     staged(again);
     assert!(retained_on_gpu(&worker).is_empty());
     worker.evaluate_on(EvaluationDevice::Gpu);
@@ -1015,7 +1015,7 @@ fn a_pause_stops_the_request_in_progress_and_the_next_request_is_evaluated() {
         "delivered after the pause"
     );
     worker.request(Some(on(1, missing("next"))));
-    assert_eq!(receive(&deliveries).wanted.key, missing("next"));
+    assert_eq!(receive(&deliveries).job.key, missing("next"));
 }
 
 /// A worker on the device that also hands its copies for the viewer cache to the test.
@@ -1054,7 +1054,7 @@ fn a_result_asked_for_with_a_copy_is_delivered_then_copied_on_its_device() {
             "copied unasked on the {device}"
         );
 
-        worker.request(Some(Wanted {
+        worker.request(Some(Job {
             copy: Some(viewer.zoom()),
             ..on(1, key.clone())
         }));
@@ -1101,7 +1101,7 @@ fn a_gpu_session_copies_a_frame_although_a_newer_request_came_while_the_gpu_made
         scale_factor: 1.0,
     });
     let key = exposed(&path, -1.0);
-    worker.request(Some(Wanted {
+    worker.request(Some(Job {
         copy: Some(viewer.zoom()),
         ..on(1, key.clone())
     }));
@@ -1120,7 +1120,7 @@ fn look_ahead_yields_to_a_request_and_prepares_its_frame_again_after() {
 
     worker.request(Some(on(1, missing("request"))));
     drop(writer);
-    assert_eq!(receive(&deliveries).wanted.key, missing("request"));
+    assert_eq!(receive(&deliveries).job.key, missing("request"));
 
     // Stopped, it was not prepared, so the worker reads it again.
     drop(writer_once_read(&pipe));
@@ -1148,7 +1148,7 @@ fn a_request_for_the_frame_being_prepared_lets_it_finish_then_is_evaluated() {
         state.prepared.contains(&ahead)
     });
     drop(writer_once_read(&pipe));
-    assert!(receive(&deliveries).wanted.key == ahead);
+    assert!(receive(&deliveries).job.key == ahead);
 }
 
 #[test]
@@ -1173,7 +1173,7 @@ fn look_ahead_copies_each_frame_once_and_delivers_none() {
             .collect();
         let ahead = |keys: &[ResultKey]| {
             (keys.iter())
-                .map(|key| Wanted {
+                .map(|key| Job {
                     copy: Some(viewer.zoom()),
                     ..on(1, key.clone())
                 })

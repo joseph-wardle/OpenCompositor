@@ -12,7 +12,7 @@ use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{EvalError, ResultKey, result_key};
-use crate::files::{Pattern, Scan, held, input_range};
+use crate::files::{Pattern, Scan, input_range, readings};
 use crate::gpu::{
     Drawn, FrameCheck, FrameTiming, Gpu, GpuMemory, NativeWindow, PaneSize, PixelRead, Probe,
     ViewerFrame,
@@ -21,12 +21,12 @@ use crate::image::{ImageInfo, Window};
 use crate::panel::Panel;
 use crate::parameter::Value;
 use crate::playback::{
-    Clock, Direction, FrameMark, FrameRange, Frames, MAX_MARKED_FRAMES, PlaybackMode, Timebar,
+    Clock, Direction, FrameMark, Frames, MAX_MARKED_FRAMES, PlaybackMode, RangeSource, Timebar,
 };
 use crate::session::Session;
 use crate::viewer::{EXPOSURE_STEP, Zoom};
 use crate::viewer_cache::ViewerCopy;
-use crate::worker::{Evaluated, EvaluationDevice, ViewerError, Wanted, Worker};
+use crate::worker::{Evaluated, EvaluationDevice, Job, ViewerError, Worker};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,7 +136,7 @@ pub enum Event {
     /// The artist chose whether playback wraps round at the range's end.
     LoopingSet(bool),
     /// The artist chose which frames the timebar spans and playback plays through.
-    FrameRangeChosen(FrameRange),
+    RangeSourceChosen(RangeSource),
 }
 
 /// What another thread, or wgpu inside a call, tells the GUI thread through the waker
@@ -404,15 +404,13 @@ pub enum Input {
 pub struct Displayed {
     /// The node the image is of, which the viewer may no longer mark.
     pub node: NodeId,
-    /// The frame the image is of.
+    /// The frame the image is of, which may not be the session's while that one is evaluated.
     pub frame: f64,
-    /// The session's frame, which the viewer is following.
-    pub requested: f64,
     /// Whether the frame failed, and shows no image.
     pub failed: bool,
     /// How many times the viewer cache's copy shown was halved, or `None` if the image shown was
     /// evaluated.
-    pub cached: Option<u32>,
+    pub copy_halvings: Option<u32>,
 }
 
 /// What the viewer shows.
@@ -420,29 +418,29 @@ pub struct Displayed {
 enum Shown {
     Nothing,
     Image {
-        wanted: Wanted,
+        job: Job,
         info: ImageInfo,
     },
     /// A copy from the viewer cache.
     Copy {
-        wanted: Wanted,
+        job: Job,
         copy: Arc<ViewerCopy>,
     },
     /// An empty frame, never an older image.
     Failed {
-        wanted: Wanted,
+        job: Job,
         error: String,
     },
 }
 
 impl Shown {
-    /// The request whose result is shown.
-    fn wanted(&self) -> Option<&Wanted> {
+    /// The job whose result is shown.
+    fn job(&self) -> Option<&Job> {
         match self {
             Shown::Nothing => None,
-            Shown::Image { wanted, .. }
-            | Shown::Copy { wanted, .. }
-            | Shown::Failed { wanted, .. } => Some(wanted),
+            Shown::Image { job, .. } | Shown::Copy { job, .. } | Shown::Failed { job, .. } => {
+                Some(job)
+            }
         }
     }
 
@@ -537,13 +535,13 @@ pub struct App {
     /// Files chosen, in the order chosen, waiting for scans.
     choices: Vec<Choice>,
     /// What the viewer last wanted, which the worker was asked for unless it was paused.
-    sent: Option<Wanted>,
+    sent: Option<Job>,
     /// Whether the worker was paused instead, while the viewer shows the cached copy of `sent`.
     paused: bool,
     /// The session's version and the viewed node when the viewer last followed them.
     followed: Option<(u64, Option<NodeId>)>,
-    /// How many requests the worker was sent, which numbers them.
-    requests_sent: u64,
+    /// How many jobs the worker was given, which numbers them.
+    jobs_sent: u64,
     drawing: Drawing,
     /// How many attempts to make a device were requested, which numbers them.
     attempts_requested: u64,
@@ -552,7 +550,7 @@ pub struct App {
     /// The pointer's last position over the graph pane.
     graph_pointer: Option<PhysicalPoint>,
     shown: Shown,
-    /// The request whose image the viewer's last presented frame showed.
+    /// The job whose image the viewer's last presented frame showed.
     presented: Option<u64>,
     /// Images given to the GPU to show, which numbers them for their pixel reads.
     images_shown: u64,
@@ -587,7 +585,7 @@ pub struct App {
     /// Whether playback wraps round at the range's end.
     looping: bool,
     /// Which frames the timebar spans and playback plays through.
-    frame_range: FrameRange,
+    range_source: RangeSource,
     /// Whether a [`Request::Advance`] is waiting to be dispatched.
     advance_requested: bool,
     /// The keys of the frames the worker was last asked to prepare.
@@ -642,7 +640,7 @@ impl App {
             sent: None,
             paused: false,
             followed: None,
-            requests_sent: 0,
+            jobs_sent: 0,
             drawing: Drawing::Ready { recovered: None },
             attempts_requested: 0,
             hovered: None,
@@ -665,7 +663,7 @@ impl App {
             clock: None,
             playback_mode: PlaybackMode::default(),
             looping: true,
-            frame_range: FrameRange::default(),
+            range_source: RangeSource::default(),
             advance_requested: false,
             ahead_sent: Vec::new(),
             marks: Marks::default(),
@@ -685,10 +683,10 @@ impl App {
         (requests, edited)
     }
 
-    /// The number of the latest request to the worker, whose result shows the session as it is,
+    /// The number of the latest job given the worker, whose result shows the session as it is,
     /// for the drag check.
-    pub fn latest_request(&self) -> u64 {
-        self.requests_sent
+    pub fn latest_job(&self) -> u64 {
+        self.jobs_sent
     }
 
     /// Plays the timeline from the session's frame, that way, in the mode, from the first
@@ -833,8 +831,8 @@ impl App {
                 self.looping = looping;
                 Vec::new()
             }
-            Event::FrameRangeChosen(range) => {
-                self.frame_range = range;
+            Event::RangeSourceChosen(source) => {
+                self.range_source = source;
                 Vec::new()
             }
         };
@@ -932,16 +930,14 @@ impl App {
         self.panel.as_ref()
     }
 
-    /// What the viewer shows, if anything: the frame of the image, which may not be the frame
-    /// asked for while the asked-for one is evaluated.
+    /// What the viewer shows, if anything.
     pub fn displayed(&self) -> Option<Displayed> {
-        let wanted = self.shown.wanted()?;
+        let job = self.shown.job()?;
         Some(Displayed {
-            node: wanted.node,
-            frame: wanted.frame,
-            requested: self.session.frame(),
+            node: job.node,
+            frame: job.frame,
             failed: matches!(self.shown, Shown::Failed { .. }),
-            cached: match &self.shown {
+            copy_halvings: match &self.shown {
                 Shown::Copy { copy, .. } => Some(copy.halvings()),
                 Shown::Nothing | Shown::Image { .. } | Shown::Failed { .. } => None,
             },
@@ -1086,9 +1082,7 @@ impl App {
             Drawn::Presented => {
                 if pane == Pane::Viewer {
                     self.presented = match &self.shown {
-                        Shown::Image { wanted, .. } | Shown::Copy { wanted, .. } => {
-                            Some(wanted.number)
-                        }
+                        Shown::Image { job, .. } | Shown::Copy { job, .. } => Some(job.number),
                         Shown::Nothing | Shown::Failed { .. } => None,
                     };
                 }
@@ -1434,7 +1428,7 @@ impl App {
     /// that steps once it is due.
     fn follow_playback(&mut self, requests: &mut Vec<Request>) {
         let shown = self.shows_sent()
-            && (self.shown.wanted()).is_some_and(|shown| shown.frame == self.session.frame());
+            && (self.shown.job()).is_some_and(|shown| shown.frame == self.session.frame());
         let Some(clock) = &mut self.clock else {
             return;
         };
@@ -1467,11 +1461,11 @@ impl App {
                 for index in 0..frames.count() {
                     let frame = frames.frame(index);
                     marks.keys.push(result_key(document, files, node, frame));
-                    let lacks = missing(document, files, node, frame);
+                    let readings = readings(document, files, node, frame);
                     marks.marks.push(FrameMark {
                         cached: false,
-                        missing: (lacks.iter()).any(|(_, what)| matches!(what, Missing::Frame(_))),
-                        held: !held(document, files, node, frame).is_empty(),
+                        missing: (readings.iter()).any(|(_, read)| read.missing().is_some()),
+                        held: (readings.iter()).any(|(_, read)| read.held().is_some()),
                     });
                 }
             }
@@ -1494,13 +1488,13 @@ impl App {
         (session.content_version(), session.viewed(), self.frames())
     }
 
-    /// The first and last frame of the range chosen, and with [`FrameRange::Input`] whether the
+    /// The first and last frame of the range chosen, and with [`RangeSource::Input`] whether the
     /// viewed node's was found, without which it is the timeline's.
     fn range(&self) -> (f64, f64, bool) {
         let session = &self.session;
         let timeline = session.document().timeline();
-        let input = match (self.frame_range, session.viewed()) {
-            (FrameRange::Input, Some(node)) => {
+        let input = match (self.range_source, session.viewed()) {
+            (RangeSource::Input, Some(node)) => {
                 input_range(session.document(), session.files(), node, session.frame())
             }
             _ => None,
@@ -1521,8 +1515,8 @@ impl App {
     /// serve, while playing; and for nothing otherwise.
     fn follow_look_ahead(&mut self) {
         let ahead = self.look_ahead();
-        if (ahead.iter().map(|wanted| &wanted.key)).ne(self.ahead_sent.iter()) {
-            self.ahead_sent = ahead.iter().map(|wanted| wanted.key.clone()).collect();
+        if (ahead.iter().map(|job| &job.key)).ne(self.ahead_sent.iter()) {
+            self.ahead_sent = ahead.iter().map(|job| job.key.clone()).collect();
             self.worker.look_ahead(ahead);
         }
     }
@@ -1532,7 +1526,7 @@ impl App {
     /// cache is full: the copy of a frame ahead would drop the least recently requested, which is
     /// the next frame not yet played, and preparing that would drop the one after, each frame
     /// prepared again on the device as playback reaches it.
-    fn look_ahead(&self) -> Vec<Wanted> {
+    fn look_ahead(&self) -> Vec<Job> {
         let (Some(clock), Some(node)) = (&self.clock, self.session.viewed()) else {
             return Vec::new();
         };
@@ -1547,7 +1541,7 @@ impl App {
         let (cache, zoom) = (session.viewer_cache(), session.viewer().zoom());
         // The marks' keys, unless an edit in progress has left them behind.
         let marked = (self.marks.built_for == Some(self.marks_for())).then_some(&self.marks.keys);
-        let mut ahead: Vec<Wanted> = Vec::new();
+        let mut ahead: Vec<Job> = Vec::new();
         for steps in 1..=LOOK_AHEAD.min(frames.count() - 1) {
             let Ok(index) = frames.step(current, steps, clock.direction(), self.looping) else {
                 break;
@@ -1561,15 +1555,14 @@ impl App {
                 continue;
             };
             let requested = (self.sent.as_ref()).is_some_and(|sent| sent.key == key);
-            if requested || cache.serves(&key, zoom) || ahead.iter().any(|wanted| wanted.key == key)
-            {
+            if requested || cache.serves(&key, zoom) || ahead.iter().any(|job| job.key == key) {
                 continue;
             }
-            ahead.push(Wanted {
+            ahead.push(Job {
                 node,
                 key,
                 frame,
-                number: self.requests_sent,
+                number: self.jobs_sent,
                 copy: Some(zoom),
             });
         }
@@ -1583,7 +1576,7 @@ impl App {
         let timebar = Timebar {
             first,
             last,
-            range: self.frame_range,
+            source: self.range_source,
             input_found,
             rate: self.session.document().timeline().rate(),
             frame: self.session.frame(),
@@ -1797,7 +1790,7 @@ impl App {
     /// buffer to the worker.
     fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
         let Evaluated {
-            mut wanted, result, ..
+            mut job, result, ..
         } = evaluated;
         // Not the node's failure, nor shown: the CPU evaluates the request again, and the last
         // frame stays until it does. One evaluated on the GPU before a move to the CPU may
@@ -1817,20 +1810,20 @@ impl App {
             self.gpu.count_error(error);
         }
         // Not only later: connecting the GPU delivers the request shown again, with its pixels.
-        let not_older = (self.shown.wanted()).is_none_or(|shown| wanted.number >= shown.number);
-        if self.session.viewed() != Some(wanted.node) || !not_older {
+        let not_older = (self.shown.job()).is_none_or(|shown| job.number >= shown.number);
+        if self.session.viewed() != Some(job.node) || !not_older {
             return Vec::new();
         }
         // What was sent is current: the viewer follows every change before this runs.
-        let current = (self.sent.as_ref()).is_some_and(|sent| sent.key == wanted.key);
+        let current = (self.sent.as_ref()).is_some_and(|sent| sent.key == job.key);
         // A current image is the current frame's, whichever frame asked for it.
         if let Some(sent) = self.sent.as_ref().filter(|_| current) {
-            wanted.frame = sent.frame;
+            job.frame = sent.frame;
         }
         let graph_changed = match &result {
             Err(ViewerError::Eval(error)) => self.session.record_failure(error.origin()),
             // What the GPU cannot hold is the viewer's limitation, not the node's failure.
-            Ok(_) | Err(ViewerError::CannotShow(_)) => self.session.record_success(&wanted.key),
+            Ok(_) | Err(ViewerError::CannotShow(_)) => self.session.record_success(&job.key),
         };
         if result.is_err() && !current {
             return redraw_if(Pane::Graph, graph_changed);
@@ -1846,14 +1839,14 @@ impl App {
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
-                    wanted,
+                    job,
                     info: image.info,
                 }
             }
             Err(error) => {
                 self.gpu.clear_image();
                 Shown::Failed {
-                    wanted,
+                    job,
                     error: error.to_string(),
                 }
             }
@@ -1866,7 +1859,7 @@ impl App {
     }
 
     /// The node the viewer's slot marks, and its key at the current frame.
-    fn wanted(&self) -> Option<(NodeId, ResultKey)> {
+    fn viewed_key(&self) -> Option<(NodeId, ResultKey)> {
         let node = self.session.viewed()?;
         let session = &self.session;
         let key = result_key(session.document(), session.files(), node, session.frame())?;
@@ -1880,7 +1873,7 @@ impl App {
         let followed = Some((self.session.version(), self.session.viewed()));
         if followed != self.followed {
             self.followed = followed;
-            self.send_wanted(requests);
+            self.send_job(requests);
         }
         if self.paused && self.copy_falls_short() {
             self.resume();
@@ -1892,9 +1885,9 @@ impl App {
         }
     }
 
-    fn send_wanted(&mut self, requests: &mut Vec<Request>) {
-        let wanted = self.wanted();
-        if wanted.is_none() && !matches!(self.shown, Shown::Nothing) {
+    fn send_job(&mut self, requests: &mut Vec<Request>) {
+        let viewed = self.viewed_key();
+        if viewed.is_none() && !matches!(self.shown, Shown::Nothing) {
             self.shown = Shown::Nothing;
             self.gpu.clear_image();
             requests.push(Request::Redraw(Pane::Viewer));
@@ -1904,16 +1897,16 @@ impl App {
         // Nothing is sent too, which releases everything.
         let frame = self.session.frame();
         let sent = (self.sent.as_ref()).map(|sent| (sent.node, &sent.key));
-        if wanted.as_ref().map(|(node, key)| (*node, key)) != sent {
-            self.requests_sent += 1;
-            let number = self.requests_sent;
-            let Some((node, key)) = wanted else {
+        if viewed.as_ref().map(|(node, key)| (*node, key)) != sent {
+            self.jobs_sent += 1;
+            let number = self.jobs_sent;
+            let Some((node, key)) = viewed else {
                 self.worker.request(None);
                 self.sent = None;
                 self.paused = false;
                 return;
             };
-            let mut wanted = Wanted {
+            let mut job = Job {
                 node,
                 key,
                 frame,
@@ -1921,23 +1914,22 @@ impl App {
                 copy: None,
             };
             // A hit is shown at once, and the worker stops rather than evaluate it.
-            self.sent = Some(wanted.clone());
+            self.sent = Some(job.clone());
             if !self.show_cached(requests) {
-                wanted.copy = self.copy_wanted();
-                self.worker.request(Some(wanted.clone()));
+                job.copy = self.copy_wanted();
+                self.worker.request(Some(job.clone()));
                 self.paused = false;
-                self.sent = Some(wanted);
+                self.sent = Some(job);
             }
         } else if let Some(sent) = &mut self.sent {
             // Another frame with an equal key is not asked for: its image is the same, and what
             // is shown of the key is that frame's.
             sent.frame = frame;
-            if let Shown::Image { wanted, .. }
-            | Shown::Copy { wanted, .. }
-            | Shown::Failed { wanted, .. } = &mut self.shown
-                && wanted.key == sent.key
+            if let Shown::Image { job, .. } | Shown::Copy { job, .. } | Shown::Failed { job, .. } =
+                &mut self.shown
+                && job.key == sent.key
             {
-                wanted.frame = frame;
+                job.frame = frame;
             }
         }
     }
@@ -1957,7 +1949,7 @@ impl App {
         self.images_shown += 1;
         self.gpu.show_copy(&copy, self.images_shown);
         self.shown = Shown::Copy {
-            wanted: sent.clone(),
+            job: sent.clone(),
             copy,
         };
         requests.push(Request::Redraw(Pane::Viewer));
@@ -1966,7 +1958,7 @@ impl App {
 
     /// Whether the viewer shows the result of what was last sent, an image, a copy or a failure.
     fn shows_sent(&self) -> bool {
-        match (&self.sent, self.shown.wanted()) {
+        match (&self.sent, self.shown.job()) {
             (Some(sent), Some(shown)) => shown.key == sent.key,
             _ => false,
         }
@@ -1995,11 +1987,11 @@ impl App {
         };
         let zoom = self.session.viewer().zoom();
         let served = self.session.viewer_cache().serves(&sent.key, zoom);
-        let wanted = Wanted {
+        let job = Job {
             copy: self.copy_wanted().filter(|_| !served),
             ..sent.clone()
         };
-        self.worker.request(Some(wanted));
+        self.worker.request(Some(job));
     }
 
     /// The zoom to copy the viewed result at for the viewer cache, unless an edit is in
@@ -2079,7 +2071,7 @@ impl App {
     }
 
     /// Names the viewed node from the document as it stands, then says what is shown of it, what
-    /// upstream of it is not connected, and the device evaluating it. Called once the wanted key
+    /// upstream of it is not connected, and the device evaluating it. Called once the viewed key
     /// has been sent.
     fn caption(&self) -> String {
         let slot = self.session.viewer().slot().digit();
@@ -2118,22 +2110,20 @@ impl App {
             }
             Shown::Failed { error, .. } if current => details.push(error.clone()),
             // The previous image stays until then, and says which frame it is of.
-            Shown::Image { wanted, .. } | Shown::Copy { wanted, .. }
-                if wanted.frame != self.session.frame() =>
+            Shown::Image { job, .. } | Shown::Copy { job, .. }
+                if job.frame != self.session.frame() =>
             {
                 let frame = self.session.frame();
-                details.push(format!("frame {} shown, {frame} updating…", wanted.frame));
+                details.push(format!("frame {} shown, {frame} updating…", job.frame));
             }
             _ => details.push("updating…".to_owned()),
         }
         let (files, frame) = (self.session.files(), self.session.frame());
         let name = |id| document.node(id).expect("upstream nodes exist").name();
-        for (id, what) in missing(document, files, viewed, frame) {
+        for (id, what) in missing(document, viewed, frame) {
             let (label, lack) = match what {
                 Missing::Input(input) => (input.label, "is not connected"),
                 Missing::File(parameter) => (parameter.label, "is not set"),
-                // Reading it fails, and the failure names the file.
-                Missing::Frame(_) => continue,
             };
             details.push(if id == viewed {
                 format!("{label} {lack}")
@@ -2141,7 +2131,10 @@ impl App {
                 format!("{label} of {} {lack}", name(id))
             });
         }
-        for (id, read) in held(document, files, viewed, frame) {
+        for (id, reading) in readings(document, files, viewed, frame) {
+            let Some(read) = reading.held() else {
+                continue;
+            };
             details.push(if id == viewed {
                 format!("holds frame {read}")
             } else {
@@ -2220,9 +2213,9 @@ impl App {
         self.gpu.destroy_device();
     }
 
-    /// The number of the request whose image the viewer's last presented frame showed, for the
-    /// drag check.
-    pub fn presented_request(&self) -> Option<u64> {
+    /// The number of the job whose image the viewer's last presented frame showed, for the drag
+    /// check.
+    pub fn presented_job(&self) -> Option<u64> {
         self.presented
     }
 }

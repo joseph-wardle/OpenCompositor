@@ -8,9 +8,21 @@ use std::path::{Path, PathBuf};
 
 use open_ng::Point;
 use opencompositor_core::{
-    Channel, EvalError, Evaluator, Image, Missing, NodeId, ReadError, Scan, Session, Value, held,
-    missing, result_key,
+    Channel, EvalError, Evaluator, Image, NodeId, ReadError, Reading, Scan, Session, Value,
+    readings, result_key,
 };
+
+/// The frames the node's Readers read at a frame that `which` picks out, as held or missing.
+fn frames_read(
+    session: &Session,
+    node: NodeId,
+    frame: f64,
+    which: impl Fn(&Reading) -> Option<i64>,
+) -> Vec<(NodeId, i64)> {
+    (readings(session.document(), session.files(), node, frame).into_iter())
+        .filter_map(|(id, reading)| Some((id, which(&reading)?)))
+        .collect()
+}
 
 /// A directory of this test's own, emptied first.
 fn directory(name: &str) -> PathBuf {
@@ -197,7 +209,7 @@ fn key_at(session: &mut Session, id: NodeId, frame: f64) -> opencompositor_core:
 }
 
 #[test]
-fn a_sequence_reads_the_frame_its_offset_maps_the_time_to_and_holds_its_ends() {
+fn a_sequence_reads_the_frame_its_offset_maps_to_and_holds_its_ends() {
     let directory = directory("sequence");
     for frame in [-1, 0, 1, 2, 4] {
         write_frame(&directory, frame);
@@ -224,7 +236,7 @@ fn a_sequence_reads_the_frame_its_offset_maps_the_time_to_and_holds_its_ends() {
     ] {
         let shown = width_at(&mut evaluator, &mut session, id, frame);
         assert_eq!(shown, width(read), "{frame}");
-        let holds = held(session.document(), session.files(), id, frame);
+        let holds = frames_read(&session, id, frame, |reading| reading.held());
         let expected = if frame == read as f64 {
             vec![]
         } else {
@@ -240,8 +252,8 @@ fn a_sequence_reads_the_frame_its_offset_maps_the_time_to_and_holds_its_ends() {
 
     // Inside the range, a frame the scan did not find is that frame's error.
     session.set_frame(3.0).unwrap();
-    let missed = missing(session.document(), session.files(), id, 3.0);
-    assert_eq!(missed, [(id, Missing::Frame(3))]);
+    let missed = frames_read(&session, id, 3.0, |reading| reading.missing());
+    assert_eq!(missed, [(id, 3)]);
     let error = evaluate(&mut evaluator, &session, id).unwrap_err();
     assert!(
         matches!(&error, EvalError::Read { error: ReadError::Io(io), .. } if io.kind() == std::io::ErrorKind::NotFound),
@@ -276,8 +288,8 @@ fn first_and_last_trim_the_range_until_reset_to_follow_the_scan() {
 
     // Set before the frames found, First makes the frames between missing.
     session.set_value(id, "first", Value::Float(0.0)).unwrap();
-    let missed = missing(session.document(), session.files(), id, -3.0);
-    assert_eq!(missed, [(id, Missing::Frame(0))]);
+    let missed = frames_read(&session, id, -3.0, |reading| reading.missing());
+    assert_eq!(missed, [(id, 0)]);
 }
 
 #[test]
@@ -313,8 +325,8 @@ fn reload_files_rescans_and_reads_again_only_the_frames_that_changed() {
     assert_eq!(after[2], before[2]);
     assert_eq!(width_at(&mut evaluator, &mut session, id, 1.0), 40);
     assert_eq!(width_at(&mut evaluator, &mut session, id, 3.0), width(3));
-    let missed = missing(session.document(), session.files(), id, 2.0);
-    assert_eq!(missed, [(id, Missing::Frame(2))]);
+    let missed = frames_read(&session, id, 2.0, |reading| reading.missing());
+    assert_eq!(missed, [(id, 2)]);
 }
 
 #[test]

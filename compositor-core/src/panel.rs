@@ -42,10 +42,10 @@ impl Panel {
         files: &Files,
         node: NodeId,
         pinned: bool,
-        time: f64,
+        frame: f64,
     ) -> Option<Panel> {
         let shown = document.node(node)?;
-        let resolved = resolve(shown, time);
+        let resolved = resolve(shown, frame);
         let rows = (shown.kind.parameters().iter())
             .map(|parameter| Row {
                 parameter,

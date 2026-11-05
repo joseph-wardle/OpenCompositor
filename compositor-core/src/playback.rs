@@ -21,13 +21,13 @@ pub enum PlaybackMode {
     RealTime,
 }
 
-/// Which frames the timebar spans and playback plays through. The viewer's choice, not the
-/// document's.
+/// Where the frames the timebar spans and playback plays through come from. The viewer's choice,
+/// not the document's; the shell calls the timeline's Global, as Nuke does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum FrameRange {
+pub enum RangeSource {
     /// The timeline's, which the document holds.
     #[default]
-    Global,
+    Timeline,
     /// The viewed node's sequences', as [`input_range`](crate::input_range) finds them, following
     /// the viewer; the timeline's while it finds none.
     Input,
@@ -42,8 +42,8 @@ pub struct Timebar {
     /// The range's last frame.
     pub last: f64,
     /// Where the range comes from.
-    pub range: FrameRange,
-    /// With [`FrameRange::Input`], whether the viewed node's range was found; if not, the range
+    pub source: RangeSource,
+    /// With [`RangeSource::Input`], whether the viewed node's range was found; if not, the range
     /// is the timeline's.
     pub input_found: bool,
     /// Frames per second.

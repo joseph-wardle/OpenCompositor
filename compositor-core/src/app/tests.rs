@@ -123,12 +123,12 @@ fn slot_key(digit: u8, modifiers: Modifiers) -> Event {
 }
 
 /// What the worker was last asked for.
-fn sent(app: &App) -> Wanted {
+fn sent(app: &App) -> Job {
     app.sent.clone().expect("a key was sent")
 }
 
 /// A finished evaluation of a `width` × `height` image whose pixels the GPU never received.
-fn read(wanted: &Wanted, width: u32, height: u32) -> Event {
+fn read(job: &Job, width: u32, height: u32) -> Event {
     let window = Window {
         x: 0,
         y: 0,
@@ -137,7 +137,7 @@ fn read(wanted: &Wanted, width: u32, height: u32) -> Event {
     };
     Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: wanted.clone(),
+        job: job.clone(),
         result: Ok(ViewerImage {
             info: ImageInfo {
                 display_window: window,
@@ -438,7 +438,7 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     );
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, sent(&app).key);
+    assert_eq!(evaluated.job.key, sent(&app).key);
     app.dispatch(Event::Evaluated(evaluated));
 
     // Failed: the error under the viewer, and the node coloured unlike others.
@@ -532,14 +532,14 @@ fn a_superseded_failure_leaves_the_viewer_and_the_node_as_they_are() {
     app.dispatch(Event::Command(Command::Reload));
     let superseded = sent(&app);
     app.dispatch(Event::Command(Command::Reload));
-    let failed = |wanted: Wanted| {
+    let failed = |job: Job| {
         Event::Evaluated(Evaluated {
             timing: Timing::now(),
             result: Err(ViewerError::Eval(EvalError::Read {
-                origin: wanted.key.clone(),
+                origin: job.key.clone(),
                 error: ReadError::UnknownFormat,
             })),
-            wanted,
+            job,
         })
     };
 
@@ -734,7 +734,7 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     assert_ne!(reload.key, before.key);
     app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: reload.clone(),
+        job: reload.clone(),
         result: Err(ViewerError::Eval(EvalError::Read {
             origin: reload.key,
             error: ReadError::UnknownFormat,
@@ -875,7 +875,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     };
     let requests = app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: sent(&app),
+        job: sent(&app),
         result: Err(ViewerError::Eval(EvalError::Read {
             origin: key(&app, reader),
             error: ReadError::UnknownFormat,
@@ -1030,7 +1030,7 @@ fn a_viewer_draw_without_a_surface_presents_nothing() {
     assert!(matches!(app.shown, Shown::Image { .. }));
 
     assert_eq!(app.dispatch(Event::Draw(Pane::Viewer)), []);
-    assert_eq!(app.presented_request(), None);
+    assert_eq!(app.presented_job(), None);
 }
 
 #[test]
@@ -1220,14 +1220,14 @@ fn out_of_gpu_memory_moves_evaluation_to_the_cpu_until_the_artist_chooses_the_gp
     app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let wanted = sent(&app);
-    app.dispatch(read(&wanted, 4, 4));
+    let job = sent(&app);
+    app.dispatch(read(&job, 4, 4));
 
     app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: wanted.clone(),
+        job: job.clone(),
         result: Err(ViewerError::Eval(EvalError::OutOfGpuMemory {
-            origin: wanted.key.clone(),
+            origin: job.key.clone(),
         })),
     }));
 
@@ -1237,7 +1237,7 @@ fn out_of_gpu_memory_moves_evaluation_to_the_cpu_until_the_artist_chooses_the_gp
         app.caption,
         "Slot 1 · a.exr · 4 × 4 · CPU (the GPU ran out of memory)"
     );
-    assert_eq!(receive(&deliveries).wanted.number, wanted.number);
+    assert_eq!(receive(&deliveries).job.number, job.number);
     app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
     assert_eq!(app.evaluation_device(), EvaluationDevice::Gpu);
     assert_eq!(app.caption, "Slot 1 · a.exr · 4 × 4 · GPU");
@@ -1249,15 +1249,15 @@ fn a_request_failed_by_a_lost_device_leaves_the_frame_and_fails_no_node() {
     app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let wanted = sent(&app);
-    app.dispatch(read(&wanted, 4, 4));
+    let job = sent(&app);
+    app.dispatch(read(&job, 4, 4));
     let caption = app.caption.clone();
 
     let requests = app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: wanted.clone(),
+        job: job.clone(),
         result: Err(ViewerError::Eval(EvalError::GpuLost {
-            origin: wanted.key.clone(),
+            origin: job.key.clone(),
         })),
     }));
 
@@ -1273,13 +1273,13 @@ fn a_request_wgpu_rejects_fails_its_node_and_counts_a_gpu_error() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let wanted = sent(&app);
+    let job = sent(&app);
 
     let requests = app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: wanted.clone(),
+        job: job.clone(),
         result: Err(ViewerError::Eval(EvalError::GpuValidation {
-            origin: wanted.key.clone(),
+            origin: job.key.clone(),
             message: "rejected".to_owned(),
         })),
     }));
@@ -1343,8 +1343,8 @@ fn viewing_a_cropped_image() -> (App, Receiver<Evaluated>) {
     (app, deliveries)
 }
 
-fn cropped(wanted: &Wanted) -> Event {
-    let Event::Evaluated(mut evaluated) = read(wanted, 4000, 2000) else {
+fn cropped(job: &Job) -> Event {
+    let Event::Evaluated(mut evaluated) = read(job, 4000, 2000) else {
         unreachable!("an evaluation");
     };
     if let Ok(image) = &mut evaluated.result {
@@ -1545,21 +1545,20 @@ fn displayed_names_the_frame_its_image_is_of() {
     assert_eq!(app.displayed(), None);
     let first = sent(&app);
     app.dispatch(read(&first, 4, 4));
-    let shown = |frame, requested| {
+    let shown = |frame| {
         Some(Displayed {
             node: exposure,
             frame,
-            requested,
             failed: false,
-            cached: None,
+            copy_halvings: None,
         })
     };
-    assert_eq!(app.displayed(), shown(1.0, 1.0));
+    assert_eq!(app.displayed(), shown(1.0));
 
     // Another frame whose key is the same is not asked for: what is shown is its image.
     app.edit(|session| session.set_frame(5.0).unwrap());
     assert_eq!(sent(&app).number, first.number);
-    assert_eq!(app.displayed(), shown(5.0, 5.0));
+    assert_eq!(app.displayed(), shown(5.0));
 
     // An edit at another frame shows the frame asked for before, until its image arrives.
     app.edit(|session| {
@@ -1570,13 +1569,13 @@ fn displayed_names_the_frame_its_image_is_of() {
     });
     let second = sent(&app);
     assert_eq!(second.frame, 9.0);
-    assert_eq!(app.displayed(), shown(5.0, 9.0));
+    assert_eq!(app.displayed(), shown(5.0));
     assert_eq!(
         app.caption,
         "Slot 1 · Exposure · frame 5 shown, 9 updating… · CPU"
     );
     app.dispatch(read(&second, 4, 4));
-    assert_eq!(app.displayed(), shown(9.0, 9.0));
+    assert_eq!(app.displayed(), shown(9.0));
     assert_eq!(app.caption, "Slot 1 · Exposure · 4 × 4 · CPU");
 }
 
@@ -1810,10 +1809,8 @@ fn a_frame_shown_before_is_shown_again_from_the_viewer_cache_without_the_worker(
 
     assert_eq!(app.session().viewer_cache().len(), 2);
     let displayed = app.displayed().unwrap();
-    assert_eq!(
-        (displayed.frame, displayed.requested, displayed.cached),
-        (1.0, 1.0, Some(2))
-    );
+    assert_eq!((displayed.frame, displayed.copy_halvings), (1.0, Some(2)));
+    assert_eq!(app.session().frame(), 1.0);
     assert_eq!(
         app.caption,
         "Slot 1 · plate.####.png · 64 × 8; cached at 1/4 · CPU"
@@ -1836,11 +1833,14 @@ fn pointing_at_a_cached_copy_evaluates_its_frame_for_its_working_values() {
         Input::PointerMoved { position: centre },
     ));
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.request(), app.latest_request());
+    assert_eq!(evaluated.job(), app.latest_job());
     app.dispatch(Event::Evaluated(evaluated));
 
     let displayed = app.displayed().unwrap();
-    assert_eq!((displayed.frame, displayed.cached), (shown.frame, None));
+    assert_eq!(
+        (displayed.frame, displayed.copy_halvings),
+        (shown.frame, None)
+    );
     assert!(
         copies.recv_timeout(Duration::from_millis(200)).is_err(),
         "copied again what the cache holds"
@@ -1862,7 +1862,7 @@ fn zooming_in_past_a_cached_copy_evaluates_its_frame_and_copies_it_finer() {
     ));
     app.dispatch(Event::Evaluated(receive(&deliveries)));
 
-    assert_eq!(app.displayed().unwrap().cached, None);
+    assert_eq!(app.displayed().unwrap().copy_halvings, None);
     let copy = copies
         .recv_timeout(Duration::from_secs(10))
         .expect("a copy");
@@ -1904,7 +1904,7 @@ fn settle(
 
 /// Whether the app shows the session's frame, evaluated or from the viewer cache.
 fn shows_frame(app: &App) -> bool {
-    (app.displayed()).is_some_and(|shown| shown.frame == shown.requested && !shown.failed)
+    (app.displayed()).is_some_and(|shown| shown.frame == app.session().frame() && !shown.failed)
 }
 
 fn advance_asked(requests: &[Request]) -> Option<Duration> {
@@ -2003,7 +2003,7 @@ fn playing_prepares_the_frames_ahead_for_the_viewer_cache_without_showing_them()
     app.advance(start);
     app.advance(start + Duration::from_millis(50));
     assert_eq!(app.session().frame(), 2.0);
-    assert_eq!(app.displayed().unwrap().cached, Some(2));
+    assert_eq!(app.displayed().unwrap().copy_halvings, Some(2));
     assert!(app.paused);
 }
 
@@ -2022,7 +2022,7 @@ fn playing_prepares_nothing_ahead_while_the_viewer_cache_is_full() {
     );
 
     app.session.set_viewer_cache_budget(bytes * 3);
-    let ahead: Vec<f64> = app.look_ahead().iter().map(|wanted| wanted.frame).collect();
+    let ahead: Vec<f64> = app.look_ahead().iter().map(|job| job.frame).collect();
     assert_eq!(ahead, [2.0, 3.0]);
 }
 
@@ -2153,7 +2153,7 @@ fn the_input_range_spans_the_viewed_sequence_moved_by_its_offset_and_playback_ke
     };
     assert_eq!(span(&app), (0.0, 9.0, false));
 
-    app.dispatch(Event::FrameRangeChosen(FrameRange::Input));
+    app.dispatch(Event::RangeSourceChosen(RangeSource::Input));
     assert_eq!(span(&app), (1.0, 4.0, true));
     assert_eq!(app.timebar().unwrap().marks.len(), 4);
     app.dispatch(Event::Command(Command::LastFrame));

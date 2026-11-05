@@ -1494,7 +1494,7 @@ mod tests {
         use crate::evaluate::result_key;
         use crate::fixtures;
         use crate::session::Session;
-        use crate::worker::{EvaluationDevice, Wanted, Worker};
+        use crate::worker::{EvaluationDevice, Job, Worker};
 
         let mut gpu = Gpu::with_noop_device(Waker::channel().0);
         let device = gpu.device.as_ref().expect("a device").device.clone();
@@ -1520,7 +1520,7 @@ mod tests {
 
         // Staged for the generation before the GPU's own, as after a loss.
         worker.connect(device.clone(), queue.clone(), Arc::default(), 0);
-        worker.request(Some(Wanted {
+        worker.request(Some(Job {
             node,
             key,
             frame: 1.0,

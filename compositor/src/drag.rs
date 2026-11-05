@@ -275,7 +275,7 @@ pub fn frame_drawn(pane: Pane) {
     let Some(frame) = crate::frame_timing(pane) else {
         return;
     };
-    let shown = crate::presented_request();
+    let shown = crate::presented_job();
     CHECK.with(|cell| {
         let mut check = cell.borrow_mut();
         let Some(check) = check.as_mut() else {
@@ -348,7 +348,7 @@ fn setup(_: usize) {
             .expect("the node exists");
         vec![reader, node]
     });
-    let marked = crate::latest_request();
+    let marked = crate::latest_job();
     with(|check| {
         check.nodes = nodes;
         check.marked = marked;
@@ -364,7 +364,7 @@ fn created(changes: Changes) -> NodeId {
 
 fn wait_for_image(tries: usize) {
     let marked = with(|check| check.marked);
-    if crate::presented_request().is_some_and(|shown| shown >= marked) {
+    if crate::presented_job().is_some_and(|shown| shown >= marked) {
         let (chain, node, shown) = with(|check| {
             if check.chain == Chain::Blur {
                 check.blur_sizes_shown += 1;
@@ -377,7 +377,7 @@ fn wait_for_image(tries: usize) {
                     .set_value(node, "size", Value::Float(BLUR_SIZES[shown]))
                     .expect("a Blur has a Size")
             });
-            with(|check| check.marked = crate::latest_request());
+            with(|check| check.marked = crate::latest_job());
             ffi::single_shot(poll_in(1), wait_for_image, 1);
             return;
         }
@@ -448,12 +448,12 @@ fn input_blocked() -> Option<String> {
 /// Sends the slider a mouse event, timing it, and records the edit if it asked for a new result.
 fn send(kind: i32, pixel: i32) {
     let slider = with(|check| check.slider);
-    let request = crate::latest_request();
+    let request = crate::latest_job();
     let at = Instant::now();
     // SAFETY: as in `begin`.
     unsafe { ffi::drag_slider(slider, kind, pixel) };
     let took = at.elapsed();
-    let latest = crate::latest_request();
+    let latest = crate::latest_job();
     with(|check| {
         check.dispatches.push(took);
         if latest != request {

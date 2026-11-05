@@ -464,11 +464,7 @@ fn receive(notice: Notice) {
     let evaluated = match &notice {
         Notice::Evaluated(evaluated) => {
             playback_check::delivered(evaluated.frame(), evaluated.timing.started);
-            Some((
-                evaluated.request(),
-                evaluated.timing,
-                evaluated.data_window(),
-            ))
+            Some((evaluated.job(), evaluated.timing, evaluated.data_window()))
         }
         Notice::DeviceLost { .. } | Notice::Scanned { .. } | Notice::Copied(_) => None,
     };
@@ -528,9 +524,9 @@ pub fn gpu_errors() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))
 }
 
-/// The number of the latest request to the worker, in the drag check.
-pub fn latest_request() -> u64 {
-    APP.with(|cell| cell.borrow().as_ref().map_or(0, App::latest_request))
+/// The number of the latest job given the worker, in the drag check.
+pub fn latest_job() -> u64 {
+    APP.with(|cell| cell.borrow().as_ref().map_or(0, App::latest_job))
 }
 
 /// The pane's last frame, in the drag check.
@@ -552,9 +548,9 @@ pub fn evaluation_device() -> EvaluationDevice {
     APP.with(|cell| (cell.borrow().as_ref()).map_or(EvaluationDevice::Cpu, App::evaluation_device))
 }
 
-/// The number of the request whose image the viewer last presented, in the drag check.
-pub fn presented_request() -> Option<u64> {
-    APP.with(|cell| cell.borrow().as_ref()?.presented_request())
+/// The number of the job whose image the viewer last presented, in the drag check.
+pub fn presented_job() -> Option<u64> {
+    APP.with(|cell| cell.borrow().as_ref()?.presented_job())
 }
 
 pub fn widgets() -> Widgets {

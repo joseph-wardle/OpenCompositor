@@ -3,7 +3,7 @@
 
 use cxx_qt_lib::{QList, QString, QStringList};
 use opencompositor_core::{
-    Command, Direction, Event, FrameRange, PlaybackMode, Timebar, parse_timecode, timecode,
+    Command, Direction, Event, PlaybackMode, RangeSource, Timebar, parse_timecode, timecode,
 };
 
 use crate::panel::number;
@@ -83,7 +83,7 @@ pub fn show(timebar: &Timebar) {
         },
         real_time: timebar.mode == PlaybackMode::RealTime,
         looping: timebar.looping,
-        input: timebar.range == FrameRange::Input,
+        input: timebar.source == RangeSource::Input,
         input_found: timebar.input_found,
         status: QString::from(&status),
         marks,
@@ -141,10 +141,10 @@ pub fn gesture(gesture: ffi::TimebarGesture) {
         } else {
             PlaybackMode::EveryFrame
         })),
-        TimebarGestureKind::InputRange => Ok(Event::FrameRangeChosen(if gesture.on {
-            FrameRange::Input
+        TimebarGestureKind::InputRange => Ok(Event::RangeSourceChosen(if gesture.on {
+            RangeSource::Input
         } else {
-            FrameRange::Global
+            RangeSource::Timeline
         })),
         _ => return,
     };
