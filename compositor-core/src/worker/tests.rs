@@ -514,7 +514,7 @@ fn a_started_request_found_superseded_stays_so_after_the_feedback_interval() {
     let (worker, _deliveries) = worker();
     let mut state = worker.mailbox.lock();
     state.started = Some(on(1, key(&first)));
-    state.request = Some(Asked::Evaluate(Job {
+    state.request = Some(Ask::Show(Job {
         frame: 2.0,
         ..on(1, key(&second))
     }));
@@ -1087,7 +1087,7 @@ fn a_gpu_session_copies_a_frame_although_a_newer_request_came_while_the_gpu_made
         {
             let mailbox = Arc::clone(&mailbox);
             // As playback asks for the next frame once this one is shown, before the GPU is done.
-            move |_| mailbox.get().unwrap().lock().request = Some(Asked::Release)
+            move |_| mailbox.get().unwrap().lock().request = Some(Ask::Release)
         },
         move |copy| copied.send(copy).unwrap(),
     );
