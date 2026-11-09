@@ -519,6 +519,15 @@ pub fn destroy_device() {
     });
 }
 
+/// Has the viewer cache hold at most `bytes` of copies, in the playback check.
+pub fn set_viewer_cache_budget(bytes: u64) {
+    APP.with(|cell| {
+        if let Some(app) = cell.borrow_mut().as_mut() {
+            app.set_viewer_cache_budget(bytes);
+        }
+    });
+}
+
 /// How many GPU errors this session went uncaptured.
 pub fn gpu_errors() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))

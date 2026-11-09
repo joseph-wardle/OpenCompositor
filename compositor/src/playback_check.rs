@@ -311,10 +311,10 @@ fn setup(_: usize) {
             check.run.budget,
         )
     });
+    if let Some(budget) = budget {
+        crate::set_viewer_cache_budget(budget);
+    }
     let viewed = crate::edit(|session| {
-        if let Some(budget) = budget {
-            session.set_viewer_cache_budget(budget);
-        }
         let reader = created(session.create_readers(vec![pattern], Point::default(), None));
         let (parameter, value, _) = chain.parameter();
         let viewed = match &chain {
@@ -514,7 +514,7 @@ fn play(stage: Stage) {
 /// Describes the playback just finished, and fails real time for what it missed.
 fn finish_playing() {
     let (cached, budget, bytes) = crate::read_app(|app| {
-        let cache = app.session().viewer_cache();
+        let cache = app.viewer_cache();
         let cached = (app.timebar()).map_or(0, |timebar| {
             timebar.marks.iter().filter(|mark| mark.cached).count()
         });
