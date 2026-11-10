@@ -1617,12 +1617,13 @@ dependencies = [
 
 [[package]]
 name = "opencompositor"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cxx",
  "cxx-qt",
  "cxx-qt-build",
  "cxx-qt-lib",
+ "libc",
  "open-ng",
  "opencompositor-core",
  "qt-build-utils",
@@ -1631,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "opencompositor-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "exr",
  "half",

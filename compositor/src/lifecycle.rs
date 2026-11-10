@@ -29,6 +29,7 @@ use opencompositor_core::{
     Anchor, Event, FileIntent, FrameCheck, Input, Key, NodeId, NodeKind, Pane, Request, Slot, Value,
 };
 
+use crate::check::Seen;
 use crate::keys::qt_key;
 use crate::qt::ffi;
 
@@ -96,7 +97,6 @@ thread_local! {
     /// new one finished showing the image again.
     static DESTROYED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
     static RECOVERED_IN: Cell<Option<Duration>> = const { Cell::new(None) };
-    /// The longest an attempt to make a device took.
     static LONGEST_ATTEMPT: Cell<Option<Duration>> = const { Cell::new(None) };
     /// How long retiring the lost device took, which has no budget yet.
     static RETIREMENT: Cell<Option<Duration>> = const { Cell::new(None) };
@@ -109,14 +109,13 @@ pub fn start(image: PathBuf) {
     ffi::single_shot(STEPS[0].0, step, 0);
 }
 
-/// Records how long an attempt to make a GPU device blocked the GUI thread.
-pub fn attempt_took(duration: Duration) {
-    LONGEST_ATTEMPT.with(|cell| cell.set(cell.get().max(Some(duration))));
-}
-
-/// Records how long retiring a lost device blocked the GUI thread.
-pub fn retirement_took(duration: Duration) {
-    RETIREMENT.with(|cell| cell.set(Some(duration)));
+/// Records how long making a device and retiring one blocked the GUI thread.
+pub fn observe(seen: &Seen) {
+    match *seen {
+        Seen::Attempted(took) => LONGEST_ATTEMPT.with(|cell| cell.set(cell.get().max(Some(took)))),
+        Seen::Retired(took) => RETIREMENT.with(|cell| cell.set(Some(took))),
+        _ => {}
+    }
 }
 
 fn step(index: usize) {
@@ -169,10 +168,8 @@ fn step(index: usize) {
         10 => {
             let at = Point::default();
             let image = IMAGE.with(|cell| cell.borrow().clone());
-            crate::dispatch(Event::FilesChosen {
-                intent: FileIntent::CreateReaders(Anchor { at, current: None }),
-                paths: vec![image],
-            });
+            // Created as given: a file chosen in the dialog waits for a scan of its sequence.
+            crate::edit(|session| session.create_readers(vec![image], at, None));
             crate::dispatch(Event::KeyPressed {
                 key: Key::Slot(Slot::new(1).expect("1 is a slot")),
                 modifiers: Modifiers {
@@ -270,11 +267,7 @@ fn step(index: usize) {
                 0 => {}
                 errors => fail(format!("the GPU reported {errors} uncaptured errors")),
             }
-            let failures = FAILURES.with(|cell| cell.take());
-            for failure in &failures {
-                eprintln!("lifecycle check failed: {failure}");
-            }
-            ffi::exit(i32::from(!failures.is_empty()));
+            crate::check::finish("lifecycle check", &FAILURES.with(|cell| cell.take()));
         }
     }
 }
@@ -375,9 +368,8 @@ fn new_frames(before: Option<FrameCheck>, now: Option<FrameCheck>) -> u64 {
     }
 }
 
-/// Records when the viewer's last finished frame is on a new device and has the centre it had
-/// before the loss, so shows the image again, re-evaluated in a GPU session; until then looks
-/// again each millisecond.
+/// Records when the viewer's last finished frame is on a new device with the centre it had before
+/// the loss; until then looks again each millisecond.
 fn watch_recovery(_: usize) {
     let (Some(destroyed), Some(at)) = (DESTROYED.with(Cell::get), DESTROYED_AT.with(Cell::get))
     else {

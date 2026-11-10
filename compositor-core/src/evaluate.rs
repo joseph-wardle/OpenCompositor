@@ -1,8 +1,9 @@
 //! Computing nodes' images on the CPU, without a window or a GPU: the keys that name them and the
 //! evaluator that computes and retains them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -15,10 +16,11 @@ use crate::document::{
     BlurVersion, Document, ExposureVersion, InputSlot, MergeVersion, Node, NodeId, NodeKind,
     ReaderVersion,
 };
+use crate::files::{Files, reading};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::{self, Level};
 use crate::parameter::resolve;
-use crate::read::{ReadError, read_image};
+use crate::read::{ReadError, read_image_until};
 
 pub(crate) mod blur;
 mod gpu;
@@ -27,42 +29,36 @@ mod merge;
 pub(crate) use gpu::poll_device;
 pub use gpu::{DeviceLost, GpuEvaluation, GpuImage, Recorded};
 
-/// How many times each file has been reloaded, by the path Readers name it with. Unsaved and not
-/// undoable.
-///
-/// Counted per path, not per Reader: per-Reader counts let two Readers of one file reach equal
-/// keys after reloads made at different times, and one would be given the other's stale pixels.
-#[derive(Clone, Debug, Default)]
-pub struct Reloads {
-    counts: HashMap<Arc<Path>, u64>,
-}
-
-impl Reloads {
-    pub fn count(&self, path: &Path) -> u64 {
-        self.counts.get(path).copied().unwrap_or(0)
-    }
-
-    /// Makes every Reader of the path read its file again.
-    pub fn reload(&mut self, path: Arc<Path>) {
-        *self.counts.entry(path).or_default() += 1;
-    }
-}
-
 /// Everything that decides a node's image: each node on its upstream chain with its kind,
 /// version and resolved values, its inputs in declaration order, and for a Reader with a file
-/// that path's reload count. Within one evaluator, equal keys name the same image.
+/// the file it reads, a sequence's frame file, with its reload count. Within one evaluator, equal
+/// keys name the same image.
 ///
 /// Node IDs, positions and selection are outside it, so equal nodes have equal keys and moving
 /// a node changes nothing. Inputs are shared keys: cloning one is a reference count, and
 /// comparing stops at the first input two keys share. Comparing visits each pair of inputs once,
 /// without recursion; dropping a key recurses once per node of its chain.
+///
+/// Each key carries a fingerprint of its whole chain, equal for equal keys, so that telling
+/// unequal keys apart is one comparison: the viewer cache and the timeline compare every frame's
+/// key with every copy held. Equal fingerprints are then confirmed by walking both chains.
 #[derive(Clone, Debug)]
-pub struct ResultKey(Arc<Recipe>);
+pub struct ResultKey(Arc<Recipe>, u64);
+
+impl ResultKey {
+    fn new(recipe: Recipe) -> ResultKey {
+        let fingerprint = recipe.fingerprint();
+        ResultKey(Arc::new(recipe), fingerprint)
+    }
+}
 
 impl PartialEq for ResultKey {
     fn eq(&self, other: &ResultKey) -> bool {
         if Arc::ptr_eq(&self.0, &other.0) {
             return true;
+        }
+        if self.1 != other.1 {
+            return false;
         }
         // Keys from separate builds share no inputs. Where a graph branches and rejoins, walking
         // both chains would compare a shared input once per path to it, exponentially many.
@@ -103,7 +99,7 @@ impl ResultKey {
 enum Recipe {
     Reader {
         version: ReaderVersion,
-        /// `None` while the Reader has no file, and the reload count 0.
+        /// The file read, `None` while the Reader has no file, with the reload count 0.
         path: Option<Arc<Path>>,
         reload: u64,
     },
@@ -194,6 +190,39 @@ impl Recipe {
         }
     }
 
+    /// A hash of what [`same_but_inputs`](Recipe::same_but_inputs) compares and of the inputs'
+    /// fingerprints, in order, so that equal keys have equal fingerprints.
+    fn fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        match self {
+            Recipe::Reader {
+                version,
+                path,
+                reload,
+            } => (0u8, version, path, reload).hash(&mut hasher),
+            Recipe::Exposure {
+                version,
+                stops,
+                source,
+            } => (1u8, version, stops, source.is_some()).hash(&mut hasher),
+            Recipe::Merge {
+                version,
+                mix,
+                background,
+                layers,
+            } => (2u8, version, mix, background.is_some(), layers.len()).hash(&mut hasher),
+            Recipe::Blur {
+                version,
+                size,
+                source,
+            } => (3u8, version, size, source.is_some()).hash(&mut hasher),
+        }
+        for input in self.inputs() {
+            input.1.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     /// Whether two recipes are equal, where equal inputs are known to be the same key: one step,
     /// where `==` walks both chains.
     fn same_as(&self, other: &Recipe) -> bool {
@@ -280,25 +309,39 @@ impl Recipe {
     }
 }
 
-/// The key of a node's image in the document as it stands, or `None` if the document has no
-/// such node.
+/// The key of a node's image at a frame in the document as it stands, or `None` if the document
+/// has no such node.
+///
+/// A key holds what the frame resolves to, not the frame, so a branch that is the same at two
+/// frames has equal keys at both and its image is computed once: a still, or a sequence holding
+/// its last frame. Building one never reads the filesystem, only what scans found.
 ///
 /// Each upstream node is visited once, however many nodes take its image, and without recursion,
 /// however deep the chain.
-pub fn result_key(document: &Document, reloads: &Reloads, node: NodeId) -> Option<ResultKey> {
+pub fn result_key(
+    document: &Document,
+    files: &Files,
+    node: NodeId,
+    frame: f64,
+) -> Option<ResultKey> {
     document.node(node)?;
-    keys(document, reloads, [node]).remove(&node)
+    keys(document, files, frame, [node]).remove(&node)
 }
 
-/// The key of every node in the document, each upstream node visited once.
-pub(crate) fn result_keys(document: &Document, reloads: &Reloads) -> BTreeMap<NodeId, ResultKey> {
-    keys(document, reloads, document.nodes().map(|(id, _)| id))
+/// The key of every node in the document at a frame, each upstream node visited once.
+pub(crate) fn result_keys(
+    document: &Document,
+    files: &Files,
+    frame: f64,
+) -> BTreeMap<NodeId, ResultKey> {
+    keys(document, files, frame, document.nodes().map(|(id, _)| id))
 }
 
 /// The keys of existing nodes and of everything upstream of them.
 fn keys(
     document: &Document,
-    reloads: &Reloads,
+    files: &Files,
+    frame: f64,
     nodes: impl IntoIterator<Item = NodeId>,
 ) -> BTreeMap<NodeId, ResultKey> {
     let mut built: BTreeMap<NodeId, ResultKey> = BTreeMap::new();
@@ -315,15 +358,15 @@ fn keys(
         }
         pending.pop();
         if !built.contains_key(&id) {
-            let key = ResultKey(Arc::new(recipe(current, reloads, &built)));
+            let key = ResultKey::new(recipe(current, files, frame, &built));
             built.insert(id, key);
         }
     }
     built
 }
 
-/// A node's recipe, from the keys of its inputs.
-fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -> Recipe {
+/// A node's recipe at a frame, from the keys of its inputs at that frame.
+fn recipe(node: &Node, files: &Files, frame: f64, built: &BTreeMap<NodeId, ResultKey>) -> Recipe {
     let key_of = |source: NodeId| -> ResultKey {
         built
             .get(&source)
@@ -331,17 +374,18 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
             .clone()
     };
     let input = |input: InputSlot<'_>| node.input(input).map(key_of);
+    let resolved = resolve(node, frame);
     match &node.kind {
         NodeKind::Reader { version } => {
-            let path = resolve(node).file("file").cloned();
+            let path = reading(&resolved, files, frame).map(|reading| reading.file().clone());
             Recipe::Reader {
                 version: *version,
-                reload: path.as_deref().map_or(0, |path| reloads.count(path)),
+                reload: path.as_deref().map_or(0, |path| files.reloads(path)),
                 path,
             }
         }
         NodeKind::Exposure { version } => {
-            let stops = resolve(node).float("stops").expect("Exposure has Stops");
+            let stops = resolved.float("stops").expect("Exposure has Stops");
             Recipe::Exposure {
                 version: *version,
                 stops: stops.to_bits(),
@@ -349,7 +393,7 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
             }
         }
         NodeKind::Merge { version } => {
-            let mix = resolve(node).float("mix").expect("Merge has Mix");
+            let mix = resolved.float("mix").expect("Merge has Mix");
             Recipe::Merge {
                 version: *version,
                 mix: mix.to_bits(),
@@ -361,7 +405,7 @@ fn recipe(node: &Node, reloads: &Reloads, built: &BTreeMap<NodeId, ResultKey>) -
             }
         }
         NodeKind::Blur { version } => {
-            let size = resolve(node).float("size").expect("Blur has Size");
+            let size = resolved.float("size").expect("Blur has Size");
             Recipe::Blur {
                 version: *version,
                 size: size.to_bits(),
@@ -400,7 +444,8 @@ const NODE_BYTES_CAP: u64 = 1 << 30;
 /// Operations run on the evaluator's own threads, a chunk of rows at a time, and a request's
 /// outputs take the planes of the results it releases before making new ones.
 ///
-/// Time is fixed, the whole data window is computed and every channel produced.
+/// A key is one frame's, so the evaluator never sees the frame. The whole data window is computed
+/// and every channel produced.
 #[derive(Debug)]
 pub struct Evaluator {
     retained: Vec<Retained>,
@@ -447,9 +492,10 @@ impl Evaluator {
 
     /// The image a key names, its failure, or `None` if `stop` returned true before it was done.
     ///
-    /// `stop` is asked before each node is computed, and by an operation long enough to matter
-    /// before each chunk of its work, from the pool's threads. Nodes completed before stopping
-    /// stay retained until the next request.
+    /// The request's files are read first, together. `stop` is asked before each node is
+    /// computed, and by an operation long enough to matter before each chunk of its work, from
+    /// the pool's threads; a Reader asks before each chunk of an EXR file, from the decoder's.
+    /// Nodes completed before stopping stay retained until the next request.
     pub fn evaluate(
         &mut self,
         key: &ResultKey,
@@ -464,6 +510,18 @@ impl Evaluator {
         let (needed, mut uses) = needs(&steps, |index| steps[index].retained.is_some());
         let mut images: Vec<Option<Image>> = steps.iter().map(|_| None).collect();
         let mut kept: Vec<bool> = steps.iter().map(|step| step.retained.is_some()).collect();
+        let readers: Vec<usize> = (0..steps.len())
+            .filter(|&index| needed[index] && steps[index].retained.is_none())
+            .filter(|&index| matches!(*steps[index].key.0, Recipe::Reader { .. }))
+            .collect();
+        if !readers.is_empty() && stop() {
+            return None;
+        }
+        let mut files: Vec<Option<Result<Option<Image>, EvalError>>> =
+            steps.iter().map(|_| None).collect();
+        for (&index, read) in readers.iter().zip(read_files(&steps, &readers, &stop)) {
+            files[index] = Some(read);
+        }
         for (index, step) in steps.iter().enumerate() {
             if !needed[index] {
                 continue;
@@ -472,13 +530,19 @@ impl Evaluator {
                 images[index] = Some(image.clone());
                 continue;
             }
-            if stop() {
+            // A file already read is kept, as a completed node is.
+            let read = files[index].take();
+            if read.is_none() && stop() {
                 return None;
             }
             let inputs: Vec<&Image> = (step.inputs.iter())
                 .map(|&input| images[input].as_ref().expect("inputs come first"))
                 .collect();
-            let image = match self.compute(&step.key, &inputs, &mut released, &stop) {
+            let computed = match read {
+                Some(read) => read,
+                None => self.compute(&step.key, &inputs, &mut released, &stop),
+            };
+            let image = match computed {
                 Ok(Some(image)) => image,
                 Ok(None) => return None,
                 Err(error) => return Some(Err(error)),
@@ -550,7 +614,7 @@ impl Evaluator {
                 (Some(retained), _) => retained.key.clone(),
                 (None, Some(key)) => key.clone(),
                 (None, None) if unchanged => current.clone(),
-                (None, None) => ResultKey(Arc::new(recipe)),
+                (None, None) => ResultKey::new(recipe),
             };
             steps.push(Step {
                 key,
@@ -629,6 +693,54 @@ fn needs(steps: &[Step], held: impl Fn(usize) -> bool) -> (Vec<bool>, Vec<usize>
     (needed, uses)
 }
 
+/// The images of the Readers at `readers` in `steps`, in that order, each read on a thread of its
+/// own when there are several: one file's chunks are read in turn, so reading files together
+/// overlaps their storage's latency, which on NFS is most of a cold read.
+fn read_files(
+    steps: &[Step],
+    readers: &[usize],
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Vec<Result<Option<Image>, EvalError>> {
+    let read = |index: usize| read_file(&steps[index].key, stop);
+    match readers {
+        [] => Vec::new(),
+        [only] => vec![read(*only)],
+        _ => std::thread::scope(|scope| {
+            let threads: Vec<_> = (readers.iter())
+                .map(|&index| scope.spawn(move || read(index)))
+                .collect();
+            (threads.into_iter())
+                .map(|thread| thread.join().expect("a read's panic fails its Reader"))
+                .collect()
+        }),
+    }
+}
+
+/// A Reader's image, read from its file, or `None` if `stop` returned true first. A panic while
+/// reading fails the Reader.
+fn read_file(
+    key: &ResultKey,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Image>, EvalError> {
+    let Recipe::Reader { path, .. } = &*key.0 else {
+        unreachable!("a Reader's key");
+    };
+    let Some(path) = path else {
+        return Ok(Some(Image::empty()));
+    };
+    let read = || {
+        read_image_until(path, stop).map_err(|error| EvalError::Read {
+            origin: key.clone(),
+            error,
+        })
+    };
+    std::panic::catch_unwind(AssertUnwindSafe(read)).unwrap_or_else(|_| {
+        Err(EvalError::Panicked {
+            origin: key.clone(),
+        })
+    })
+}
+
 /// The bytes of the planes' storage, each counted once however often it appears.
 fn distinct_bytes<'a>(planes: impl Iterator<Item = &'a Plane>) -> u64 {
     let mut counted = BTreeSet::new();
@@ -657,13 +769,7 @@ impl Evaluator {
             None => &empty,
         };
         let operation = || match &*key.0 {
-            Recipe::Reader { path: None, .. } => Ok(Some(Image::empty())),
-            Recipe::Reader {
-                path: Some(path), ..
-            } => read_image(path).map(Some).map_err(|error| EvalError::Read {
-                origin: key.clone(),
-                error,
-            }),
+            Recipe::Reader { .. } => read_file(key, stop),
             Recipe::Exposure { stops, source, .. } => Ok(Some(exposure(
                 &self.pool,
                 image_of(source),
@@ -695,11 +801,10 @@ impl Evaluator {
 }
 
 /// The threads operations and the viewer's conversion of their results run on, and the level the
-/// kernels run at. Each evaluator builds its
-/// own when it is built, so a request never waits for threads to start; the global rayon pool is
-/// never used, and no operation threads otherwise. A pool of the machine's physical cores leaves
-/// the GUI thread a core to wake on: hyperthreads added nothing to a memory-bound kernel and made
-/// its wake-ups late.
+/// kernels run at. Each evaluator builds its own when it is built, so a request never waits for
+/// threads to start; the global rayon pool is never used. A pool of the machine's physical cores
+/// leaves the GUI thread a core to wake on: hyperthreads added nothing to a memory-bound kernel
+/// and made its wake-ups late.
 #[derive(Debug)]
 pub struct Pool {
     threads: rayon::ThreadPool,

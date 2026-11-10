@@ -20,10 +20,24 @@ pub const MAX_PIXELS: u64 = 1 << 26;
 
 /// Reads an EXR or PNG file, recognised by its signature rather than its name.
 pub fn read_image(path: &Path) -> Result<Image, ReadError> {
-    read_from(BufReader::new(File::open(path)?))
+    let read = read_image_until(path, &|| false)?;
+    Ok(read.expect("a read that is never stopped finishes"))
 }
 
-fn read_from(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadError> {
+/// Reads a file as [`read_image`] does, or `Ok(None)` if `stop` returned true first. An EXR's
+/// decoder threads ask `stop` before taking each chunk of the file, so a read stops within a
+/// chunk's reading and decompression; a PNG is read whole. Nothing partly read is kept.
+pub(crate) fn read_image_until(
+    path: &Path,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Image>, ReadError> {
+    read_from(BufReader::new(File::open(path)?), stop)
+}
+
+fn read_from(
+    mut file: impl BufRead + Seek + Send,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Image>, ReadError> {
     let mut signature = [0; 8];
     if let Err(error) = file.read_exact(&mut signature) {
         return Err(match error.kind() {
@@ -33,9 +47,9 @@ fn read_from(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadError> {
     }
     file.rewind()?;
     if signature.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
-        exr::read(file)
+        exr::read(file, stop)
     } else if signature == *b"\x89PNG\r\n\x1a\n" {
-        png::read(file)
+        png::read(file).map(Some)
     } else {
         Err(ReadError::UnknownFormat)
     }

@@ -1,30 +1,19 @@
 # OpenCompositor
 
-This repository contains two very early WIP Rust projects developed together:
+Two early, work-in-progress Rust projects developed together:
 
-- **OpenCompositor** (`compositor/`) — a USD-based compositor.
-- **OpenNG** (`open-ng/`) — a node-editor library. It is usable on its own and does not depend on the compositor.
+- **OpenCompositor** (`compositor/`, with its headless core in `compositor-core/`): a node-based compositor for image sequences such as EXR renders.
+- **OpenNG** (`open-ng/`): a node-editor library, usable on its own, natively and in the browser. See [open-ng/README.md](open-ng/README.md).
 
 ## Status
 
-OpenNG has a first working step: views of a shared graph with selection, moving, panning and zooming, and connection editing, drawn with wgpu. See [open-ng/README.md](open-ng/README.md).
+- **Nodes:** Reader, Exposure, Merge and Blur, with undo, viewer slots and a parameters panel.
+- **Files:** EXR and PNG stills and numbered sequences, with a frame range, offset and reload. A frame missing inside the range fails visibly; outside it, the nearest end is held and the viewer says so. EXR files the viewer cannot honour yet are refused or load with a warning.
+- **Time:** a timebar, playback forwards and backwards in real time or every frame, looping and scrubbing, from a viewer cache of reduced copies.
+- **Evaluation:** on the GPU or the CPU (at the widest SIMD level the machine has), off the GUI thread. Everything but the window lives in `opencompositor-core`, which runs headless without Qt.
+- **Not yet:** OpenColorIO, Python, USD scenes or OpenFX plugins.
 
-OpenCompositor has a Qt window with a node graph and an image viewer:
-
-- **Tab** over the graph opens a menu of node types at the pointer; type to filter it, and **Enter** or a click creates the node, inserted to the right of the selected one. Choosing Reader asks for its files first.
-- The node types are Reader, Exposure, which multiplies R, G and B by two to the power of its Stops, and Merge, which composes its layers over its background with premultiplied over and dissolves the result against the base by its Mix. Connecting a Merge's last Layer input adds another, and a layer keeps its input whatever is connected below it.
-- **R** reads EXR and PNG files into Reader nodes at the pointer, or below the selected node. *File ▸ Reload the Selected Readers* reads them again.
-- The **Parameters** panel shows the selected node's parameters: drag a slider or type a value, right-click to reset one, **Browse…** to choose a file, and **Pin** to keep the panel on that node.
-- **Ctrl+digit** marks the selected node in a viewer slot, the **digit** views that slot, and **Shift+digit** frames its node in the graph. Digits are read by their position on the keyboard, so the top row works whatever the layout.
-- In the viewer, **H** fits the image, **Shift+H** shows it at actual size, and **Space+drag** or **middle-drag** pans.
-- **Ctrl+Z** undoes and **Ctrl+Shift+Z** redoes.
-- **Delete** removes the selected nodes.
-
-EXR files are read uncompressed or with RLE, ZIP, PIZ, PXR24, B44 or DWA compression, and the first part with RGB is shown. Files that are deep, use HTJ2K, ZSTD or LJ2K compression, have XYZ primaries or have no RGB are refused with a message. Colour the viewer cannot honour yet, such as other primaries or non-square pixels, loads with a warning.
-
-Nodes are evaluated on the CPU, at the widest SIMD level the machine has; the GPU only draws the window.
-
-Everything but the window lives in `compositor-core/` (package `opencompositor-core`), which builds and runs headless without Qt.
+The shortcuts are listed in the window's menus.
 
 ## Goals
 
@@ -49,11 +38,15 @@ cargo run -p opencompositor
 cargo test --workspace
 ```
 
-The window must run against the Qt it was built with, and refuses to start otherwise. It draws with Vulkan; `WGPU_BACKEND` chooses another backend, and `WGPU_ADAPTER_NAME` or `WGPU_POWER_PREF` another GPU.
+The window must run against the Qt it was built with, and refuses to start otherwise. It draws with Vulkan; `WGPU_BACKEND` chooses another backend, and `WGPU_ADAPTER_NAME` or `WGPU_POWER_PREF` another GPU. `--cpu` evaluates on the CPU.
 
-`cargo run -p opencompositor -- --lifecycle-check IMAGE` docks, floats, tabs and closes the panes, reads `IMAGE` with a dialog open, creates an Exposure from the creation menu and moves its slider from a script, destroys the GPU device, and exits non-zero if a pane lost its surface or stopped drawing or the new device did not draw. Run it after upgrading Qt, since the window uses Qt's private Wayland API.
+## Checks
 
-`cargo run --release -p opencompositor -- --drag-check IMAGE` drags Exposure's Stops over a Reader of `IMAGE`, then Merge's Mix with `IMAGE` as the background and as a layer, with synthetic mouse events, each chain in its own process, and exits non-zero if the viewer missed the 50 ms budget on either or a drag did not undo as one step. `--drag-check IMAGE merge` runs one chain.
+Each exits non-zero on failure. Run the last two in release, on the machine being judged.
+
+- `--lifecycle-check IMAGE`: docks, floats and closes the panes and replaces the GPU device, checking that every pane keeps drawing. Run it after upgrading Qt.
+- `--drag-check IMAGE [exposure | merge | blur]`: drags a parameter with synthetic mouse events, against each chain's latency budget and one undo step per drag.
+- `--playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]`: plays, scrubs and edits a sequence, against playback, scrub and memory budgets.
 
 ## License
 

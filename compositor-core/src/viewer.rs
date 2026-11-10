@@ -120,13 +120,12 @@ impl Viewer {
         }
     }
 
-    fn fitting_zoom(&self, display: Window) -> f32 {
-        if display.width == 0 || display.height == 0 {
-            return 1.0;
+    /// How large the viewer draws images, for an image not made yet.
+    pub(crate) fn zoom(&self) -> Zoom {
+        Zoom {
+            camera: self.camera,
+            size: self.size,
         }
-        let across = self.size.width as f32 / display.width as f32;
-        let down = self.size.height as f32 / display.height as f32;
-        (FIT_FILL * across.min(down)).clamp(MIN_ZOOM, MAX_ZOOM)
     }
 
     /// Fits the display window to the pane from now on, as H does.
@@ -201,9 +200,45 @@ impl Viewer {
     /// The camera's centre and zoom, as a fitted camera has them now.
     fn placed(&self, display: Window) -> ([f32; 2], f32) {
         match self.camera {
-            Camera::Fit => (centre_of(display), self.fitting_zoom(display)),
+            Camera::Fit => (centre_of(display), self.zoom().scale(display)),
             Camera::Placed { centre, zoom } => (centre, zoom),
         }
+    }
+}
+
+/// How large the viewer draws an image, in physical pixels per image pixel, whatever image it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Zoom {
+    camera: Camera,
+    size: PaneSize,
+}
+
+impl Zoom {
+    /// Physical pixels per image pixel for an image with this display window.
+    fn scale(self, display: Window) -> f32 {
+        match self.camera {
+            Camera::Placed { zoom, .. } => zoom,
+            Camera::Fit if display.width == 0 || display.height == 0 => 1.0,
+            Camera::Fit => {
+                let across = self.size.width as f32 / display.width as f32;
+                let down = self.size.height as f32 / display.height as f32;
+                (FIT_FILL * across.min(down)).clamp(MIN_ZOOM, MAX_ZOOM)
+            }
+        }
+    }
+
+    /// How many times an image with this display window can be halved while each of its pixels
+    /// still covers at least a physical pixel. `None` while the pane has no size.
+    pub(crate) fn halvings(self, display: Window) -> Option<u32> {
+        if self.size.width == 0 || self.size.height == 0 {
+            return None;
+        }
+        let scale = self.scale(display);
+        let mut halvings = 0;
+        while scale * (1u32 << (halvings + 1)) as f32 <= 1.0 {
+            halvings += 1;
+        }
+        Some(halvings)
     }
 }
 

@@ -25,7 +25,7 @@ fn reader() -> Node {
 }
 
 fn stops(node: &Node) -> Option<Value> {
-    resolve(node).get("stops").cloned()
+    resolve(node, 1.0).get("stops").cloned()
 }
 
 /// Every built-in node type at every version.
@@ -47,6 +47,16 @@ fn built_in_descriptions_are_consistent() {
         let names: HashSet<_> = parameters.iter().map(|parameter| parameter.name).collect();
         assert_eq!(names.len(), parameters.len(), "{kind:?}: names repeat");
         for parameter in parameters {
+            if let ParameterKind::Frame {
+                default: Some(default),
+            } = parameter.kind
+            {
+                assert!(
+                    default.fract() == 0.0 && default.abs() <= FRAME_LIMIT,
+                    "{}",
+                    parameter.name
+                );
+            }
             let ParameterKind::Float(float) = &parameter.kind else {
                 continue;
             };
@@ -83,11 +93,11 @@ fn a_value_set_to_its_default_stays_set_until_reset() {
 
     node.set_value("stops", Value::Float(0.0)).unwrap();
     assert_eq!(node.authored_value("stops"), Some(&Value::Float(0.0)));
-    let set_to_default = resolve(&node);
+    let set_to_default = resolve(&node, 1.0);
 
     node.reset("stops").unwrap();
     assert_eq!(node.authored_value("stops"), None);
-    assert_eq!(resolve(&node), set_to_default);
+    assert_eq!(resolve(&node, 1.0), set_to_default);
     assert_eq!(node, exposure());
 }
 
@@ -126,7 +136,7 @@ fn values_the_description_does_not_allow_are_refused() {
 #[test]
 fn a_file_is_absent_until_set_and_never_empty() {
     let mut node = reader();
-    assert_eq!(resolve(&node).get("file"), None);
+    assert_eq!(resolve(&node, 1.0).get("file"), None);
 
     let refusals = [
         (Value::File(Path::new("").into()), ValueError::EmptyPath),
@@ -149,7 +159,7 @@ fn a_file_is_absent_until_set_and_never_empty() {
     node.set_value("file", Value::File(Path::new("missing.exr").into()))
         .unwrap();
     assert_eq!(
-        resolve(&node).file("file").map(|path| &**path),
+        resolve(&node, 1.0).file("file").map(|path| &**path),
         Some(Path::new("missing.exr"))
     );
     node.reset("file").unwrap();
@@ -160,6 +170,49 @@ fn a_file_is_absent_until_set_and_never_empty() {
 fn negative_zero_is_stored_as_zero() {
     let mut node = exposure();
     node.set_value("stops", Value::Float(-0.0)).unwrap();
-    let stored = resolve(&node).float("stops").unwrap();
+    let stored = resolve(&node, 1.0).float("stops").unwrap();
     assert_eq!(stored.to_bits(), 0.0f64.to_bits());
+}
+
+#[test]
+fn a_frame_is_whole_and_unset_without_a_default() {
+    let mut node = reader();
+    let resolved = resolve(&node, 1.0);
+    assert_eq!(
+        (resolved.float("first"), resolved.float("offset")),
+        (None, Some(0.0))
+    );
+
+    let limits = -FRAME_LIMIT..=FRAME_LIMIT;
+    let refusals = [
+        (1.5, ValueError::NotWhole),
+        (f64::NAN, ValueError::NotFinite),
+        (FRAME_LIMIT + 1.0, ValueError::OutOfLimits(limits)),
+    ];
+    for (value, error) in refusals {
+        assert_eq!(
+            node.set_value("first", Value::Float(value)),
+            Err(error),
+            "{value}"
+        );
+    }
+    node.set_value("first", Value::Float(-1001.0)).unwrap();
+    node.set_value("offset", Value::Float(-0.0)).unwrap();
+    let resolved = resolve(&node, 1.0);
+    assert_eq!(resolved.float("first"), Some(-1001.0));
+    assert_eq!(
+        resolved.float("offset").unwrap().to_bits(),
+        0.0f64.to_bits()
+    );
+}
+
+#[test]
+fn a_printf_frame_number_in_a_file_is_stored_as_hashes() {
+    let mut node = reader();
+    node.set_value("file", Value::File(Path::new("plate.%04d.exr").into()))
+        .unwrap();
+    assert_eq!(
+        node.authored_value("file"),
+        Some(&Value::File(Path::new("plate.####.exr").into()))
+    );
 }

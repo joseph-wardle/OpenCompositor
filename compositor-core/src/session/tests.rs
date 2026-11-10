@@ -8,8 +8,7 @@ use open_ng::{
 };
 
 use super::*;
-use crate::document::ExposureVersion;
-use crate::evaluate::result_key;
+use crate::document::{ExposureVersion, Timeline};
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
 
@@ -29,9 +28,12 @@ fn set_file(session: &mut Session, id: NodeId, name: &str) -> Result<Changes, Ed
 }
 
 fn file(session: &Session, id: NodeId) -> Option<Arc<Path>> {
-    resolve(session.document().node(id).expect("the node exists"))
-        .file("file")
-        .cloned()
+    resolve(
+        session.document().node(id).expect("the node exists"),
+        session.frame(),
+    )
+    .file("file")
+    .cloned()
 }
 
 fn slot(digit: u8) -> Slot {
@@ -553,7 +555,7 @@ fn a_reader_without_a_file_is_named_for_its_kind_and_reloads_nothing() {
     for id in [*created.nodes.first().unwrap(), empty] {
         assert_eq!(file(&session, id), None);
         assert_eq!(session.graph().node(id.into()).unwrap().title, "Reader");
-        assert!(!session.reload(&[id]));
+        assert!(session.reload(&[id]).is_empty());
     }
     assert_eq!(
         set_file(&mut session, empty, ""),
@@ -571,12 +573,15 @@ fn reloading_a_reader_reloads_every_reader_of_its_file() {
     let other = create(&mut session, "b.exr", ORIGIN);
     let twin = create(&mut session, "a.exr", ORIGIN);
     let selected = create(&mut session, "a.exr", ORIGIN);
-    let key = |session: &Session, id| result_key(session.document(), session.reloads(), id);
+    let key = |session: &Session, id| session.result_key(id);
     let before = [selected, twin, other].map(|id| key(&session, id));
     session.record_failure(before[1].as_ref().unwrap());
     assert!(session.failures.nodes.contains(&twin));
 
-    assert!(session.reload(&[selected]));
+    assert_eq!(
+        session.reload(&[selected]).stills,
+        [Path::new("a.exr").into()]
+    );
 
     let after = [selected, twin, other].map(|id| key(&session, id));
     assert_ne!(after[0], before[0]);
@@ -586,7 +591,7 @@ fn reloading_a_reader_reloads_every_reader_of_its_file() {
     assert_presented(&session);
 
     let exposure = create_exposure(&mut session, ORIGIN);
-    assert!(!session.reload(&[exposure]));
+    assert!(session.reload(&[exposure]).is_empty());
 }
 
 #[test]
@@ -596,8 +601,7 @@ fn a_node_shows_a_failure_while_its_current_key_failed() {
     let twin = create(&mut session, "a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", reader).unwrap();
-    let key =
-        |session: &Session, id| result_key(session.document(), session.reloads(), id).unwrap();
+    let key = |session: &Session, id| session.result_key(id).unwrap();
     let failing = |session: &Session| session.failures.nodes.iter().copied().collect::<Vec<_>>();
 
     // At the Reader, and at its twin, whose key is equal; not at the Exposure that took it.
@@ -635,9 +639,12 @@ fn create_exposure(session: &mut Session, at: Point) -> NodeId {
 }
 
 fn stops(session: &Session, id: NodeId) -> Option<Value> {
-    resolve(session.document().node(id).expect("the node exists"))
-        .get("stops")
-        .cloned()
+    resolve(
+        session.document().node(id).expect("the node exists"),
+        session.frame(),
+    )
+    .get("stops")
+    .cloned()
 }
 
 #[test]
@@ -1334,4 +1341,80 @@ fn a_merge_inserted_after_the_current_node_takes_it_as_its_background() {
     assert_eq!(source_of(&session, exposure), Some(merge));
     assert_eq!(session.undo_label(), Some("Create Merge"));
     assert_presented(&session);
+}
+
+#[test]
+fn the_frame_is_outside_undo_and_the_timeline_is_inside() {
+    let mut session = Session::new();
+    let exposure = create_exposure(&mut session, ORIGIN);
+    assert_eq!(session.frame(), 1.0);
+
+    let version = session.version();
+    session.set_frame(-12.0).unwrap();
+    assert_eq!(session.frame(), -12.0);
+    assert!(session.version() > version);
+    // Undo restores the document, and leaves the frame where it is.
+    session.undo();
+    assert_eq!(session.frame(), -12.0);
+    session.redo();
+
+    let changes = session.set_frame_range(-10.0, 250.0).unwrap();
+    assert!(changes.timeline && changes.nodes.is_empty());
+    session.set_frame_rate(25.0).unwrap();
+    assert_eq!(session.undo_label(), Some("Frame Rate"));
+    let timeline = session.document().timeline();
+    assert_eq!(
+        (timeline.first(), timeline.last(), timeline.rate()),
+        (-10.0, 250.0, 25.0)
+    );
+    session.undo();
+    session.undo();
+    assert_eq!(session.document().timeline(), Timeline::default());
+    assert!(session.document().node(exposure).is_some());
+
+    // The same range again changes nothing and records nothing.
+    assert!(session.set_frame_range(1.0, 100.0).unwrap().is_empty());
+    assert_eq!(session.undo_label(), Some("Create Exposure"));
+}
+
+#[test]
+fn invalid_frames_ranges_and_rates_are_refused() {
+    let mut session = Session::new();
+    assert_eq!(session.set_frame(f64::NAN), Err(TimelineError::NotFinite));
+    assert_eq!(session.frame(), 1.0);
+    let refused = |result: Result<Changes, EditError>| match result {
+        Err(EditError::Timeline(error)) => error,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        refused(session.set_frame_range(10.0, 9.0)),
+        TimelineError::LastBeforeFirst
+    );
+    assert_eq!(
+        refused(session.set_frame_range(1.0, f64::INFINITY)),
+        TimelineError::NotFinite
+    );
+    assert_eq!(
+        refused(session.set_frame_rate(0.0)),
+        TimelineError::RateNotPositive
+    );
+    assert!(session.undo_label().is_none());
+    // One frame is a range.
+    assert!(session.set_frame_range(5.0, 5.0).is_ok());
+}
+
+#[test]
+fn keys_hold_what_a_frame_resolves_to_not_the_frame() {
+    let mut session = Session::new();
+    let reader = create(&mut session, "a.exr", ORIGIN);
+    let exposure = create_exposure(&mut session, ORIGIN);
+    session.connect(exposure, "source", reader).unwrap();
+    let key = |session: &Session, id| session.result_key(id).unwrap();
+    let at_first = key(&session, exposure);
+    session.record_failure(&key(&session, reader));
+
+    session.set_frame(48.0).unwrap();
+    assert_eq!(key(&session, exposure), at_first);
+    // The failure is of the key, which every frame shares.
+    assert_eq!(session.failures.nodes, BTreeSet::from([reader]));
 }

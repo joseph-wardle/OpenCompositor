@@ -2,6 +2,7 @@
 //! worker, changed only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
 
 use std::fmt;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,15 +11,27 @@ use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{EvalError, ResultKey, result_key};
+use crate::files::{Pattern, Scan, Scanner, readings};
 use crate::gpu::{
-    Drawn, FrameCheck, FrameTiming, Gpu, NativeWindow, PaneSize, PixelRead, Probe, ViewerFrame,
+    Drawn, FrameCheck, FrameTiming, Gpu, GpuMemory, NativeWindow, PaneSize, PixelRead, Probe,
+    ViewerFrame,
 };
-use crate::image::{ImageInfo, Window};
+use crate::image::Window;
 use crate::panel::Panel;
 use crate::parameter::Value;
+use crate::playback::{
+    Direction, FrameMark, Frames, MAX_MARKED_FRAMES, Playback, PlaybackMode, RangeSource, Timebar,
+    ntsc_rate,
+};
 use crate::session::Session;
-use crate::viewer::EXPOSURE_STEP;
-use crate::worker::{Evaluated, EvaluationDevice, ViewerError, Wanted, Worker};
+use crate::viewer::{EXPOSURE_STEP, Zoom};
+use crate::viewer_cache::{ViewerCache, ViewerCopy};
+use crate::worker::{Evaluated, EvaluationDevice, Job, ViewerError, Worker};
+
+mod viewing;
+
+pub use viewing::Displayed;
+use viewing::{Asked, Shown, Viewing};
 
 /// A part of the window that the GPU draws. Panes are docked, floated and closed independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,13 +97,24 @@ pub enum Event {
     /// keyboard to another pane or a dialog, or the window lost it to another application.
     FocusLost(Pane),
     /// The files chosen in the dialog a [`Request::ChooseFiles`] opened: none if it was cancelled.
+    /// A file that may be a frame of a sequence is read as the sequence if a scan finds other
+    /// frames.
     FilesChosen {
         intent: FileIntent,
         paths: Vec<PathBuf>,
     },
+    /// Reload files, from the Reader's panel.
+    ReloadFiles(NodeId),
+    /// A scan of a sequence finished on its own thread.
+    Scanned {
+        sequence: Pattern,
+        scan: io::Result<Scan>,
+    },
     /// An evaluation finished on the evaluator's thread.
     Evaluated(Evaluated),
-    /// The GPU device of the generation was lost, when wgpu reported it.
+    /// The evaluator's thread made a copy of an image it evaluated, for the viewer cache.
+    Copied(ViewerCopy),
+    /// The GPU device of the generation was lost.
     DeviceLost {
         generation: u64,
         at: Instant,
@@ -101,6 +125,26 @@ pub enum Event {
     CollectPixelRead,
     /// The artist set the viewer's exposure, in stops, in the viewer's own control.
     ViewerExposureSet(f32),
+    /// The time to advance playback, after [`Request::Advance`], with the time it is.
+    Advance(Instant),
+    /// The artist went to a frame, typing it or scrubbing the timebar. It stops playback.
+    FrameSet(f64),
+    /// The artist set the timeline's first and last frames, as one step.
+    FrameRangeSet {
+        first: f64,
+        last: f64,
+    },
+    /// The artist set the rate the timeline plays at, in frames per second, as one step. A rate
+    /// near an NTSC rate becomes it, as [`ntsc_rate`](crate::ntsc_rate) does.
+    FrameRateSet(f64),
+    /// The artist chose the mode playback plays in, from now on and at once if playing.
+    PlaybackModeSet(PlaybackMode),
+    /// The artist chose whether playback wraps round at the range's end.
+    LoopingSet(bool),
+    /// The artist chose whether frames read as timecode rather than as numbers.
+    TimecodeSet(bool),
+    /// The artist chose which frames the timebar spans and playback plays through.
+    RangeSourceChosen(RangeSource),
 }
 
 /// What another thread, or wgpu inside a call, tells the GUI thread through the waker
@@ -112,14 +156,24 @@ pub enum Event {
 )]
 pub enum Notice {
     Evaluated(Evaluated),
-    DeviceLost { generation: u64, at: Instant },
+    Copied(ViewerCopy),
+    DeviceLost {
+        generation: u64,
+        at: Instant,
+    },
+    Scanned {
+        sequence: Pattern,
+        scan: io::Result<Scan>,
+    },
 }
 
 impl From<Notice> for Event {
     fn from(notice: Notice) -> Event {
         match notice {
             Notice::Evaluated(evaluated) => Event::Evaluated(evaluated),
+            Notice::Copied(copy) => Event::Copied(copy),
             Notice::DeviceLost { generation, at } => Event::DeviceLost { generation, at },
+            Notice::Scanned { sequence, scan } => Event::Scanned { sequence, scan },
         }
     }
 }
@@ -160,7 +214,7 @@ pub enum Request {
     AttachSurface(Pane),
     /// Open a file dialog, then dispatch [`Event::FilesChosen`].
     ChooseFiles(FileIntent),
-    /// Show the text in the status bar for a few seconds, as the answer to what was just done.
+    /// Show the text in the status bar for a few seconds.
     ShowStatus(String),
     /// Show the text in the status bar until the next status replaces it, for what stays wrong.
     ShowError(String),
@@ -185,13 +239,17 @@ pub enum Request {
     /// `None`. The panel starts empty.
     ShowPanel(Option<Panel>),
     /// Show the text in the status bar's permanent GPU label, or hide the label with `None`.
-    /// It changes when the panes stop or start drawing, and when a GPU error is counted.
     ShowGpuLabel(Option<String>),
     /// Dispatch [`Event::RetryDeviceCreation`] with the attempt after the delay. An attempt not
     /// the last one requested is ignored, so dispatching every one is safe.
     RetryDeviceCreation { attempt: u64, after: Duration },
     /// Dispatch [`Event::CollectPixelRead`] after the delay.
     CollectPixelRead { after: Duration },
+    /// Dispatch [`Event::Advance`] after the delay, with the time it is then. The app asks for one
+    /// at a time.
+    Advance { after: Duration },
+    /// Show the timebar under the viewer as given. It starts empty.
+    ShowTimebar(Timebar),
 }
 
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
@@ -203,10 +261,9 @@ pub enum Command {
     /// Keeps the parameter panel on the node it shows, whatever is selected, until unpinned or
     /// the node is deleted.
     PinPanel,
-    /// Has the parameter panel show the current node, the last selected, again.
+    /// Has the parameter panel follow the current node, the last selected, again.
     UnpinPanel,
-    /// Reads the selected Readers' files again, for every Reader of them, when they are next
-    /// viewed, at once if they are.
+    /// Reload files on each selected Reader.
     Reload,
     Undo,
     Redo,
@@ -228,6 +285,16 @@ pub enum Command {
     ResetExposure,
     /// Evaluates on the device from now on, also after the app moved evaluation off the GPU.
     EvaluateOn(EvaluationDevice),
+    /// Plays the timeline that way in the mode chosen, or stops if it plays that way already.
+    Play(Direction),
+    /// Stops playback, staying on the frame.
+    Stop,
+    /// Stops playback and goes one frame that way, round to the other end when looping.
+    Step(Direction),
+    /// Stops playback and goes to the timeline's first frame.
+    FirstFrame,
+    /// Stops playback and goes to the timeline's last frame.
+    LastFrame,
 }
 
 /// The keys the window uses. The pane under the pointer receives all but the slot keys.
@@ -243,6 +310,13 @@ pub enum Key {
     Delete,
     /// Opens the node creation menu while the pointer is over the graph.
     Tab,
+    /// Over the viewer, the arrows step a frame, and J, K and L play backwards, stop and play
+    /// forwards.
+    Left,
+    Right,
+    J,
+    K,
+    L,
     /// A key of the digit row, by its position rather than the character it types, so that
     /// layouts that type digits with Shift, as AZERTY does, use the same keys. Alone it views
     /// the slot, with Ctrl it marks the selected node there, with Shift it frames that node.
@@ -257,7 +331,15 @@ impl Key {
             Key::G => open_ng::Key::G,
             Key::H => open_ng::Key::H,
             Key::Y => open_ng::Key::Y,
-            Key::E | Key::Delete | Key::Tab | Key::Slot(_) => return None,
+            Key::E
+            | Key::Delete
+            | Key::Tab
+            | Key::Left
+            | Key::Right
+            | Key::J
+            | Key::K
+            | Key::L
+            | Key::Slot(_) => return None,
         })
     }
 }
@@ -279,6 +361,14 @@ impl FileIntent {
     pub fn allows_several(self) -> bool {
         matches!(self, FileIntent::CreateReaders(_))
     }
+}
+
+/// Files chosen in a dialog, waiting for the scans that say which are frames of a sequence.
+#[derive(Debug)]
+struct Choice {
+    intent: FileIntent,
+    /// Each file chosen, with the sequence it may be a frame of until a scan decides.
+    files: Vec<(PathBuf, Option<Pattern>)>,
 }
 
 /// Where a new node goes, as it was when the artist asked for it, so that a menu or dialog taking
@@ -313,43 +403,6 @@ pub enum Input {
         position: PhysicalPoint,
         lines: f32,
     },
-}
-
-/// What the viewer shows.
-#[derive(Debug)]
-enum Shown {
-    Nothing,
-    Image {
-        wanted: Wanted,
-        info: ImageInfo,
-    },
-    /// An empty frame, never an older image.
-    Failed {
-        wanted: Wanted,
-        error: String,
-    },
-}
-
-impl Shown {
-    /// The request whose result is shown.
-    fn wanted(&self) -> Option<&Wanted> {
-        match self {
-            Shown::Nothing => None,
-            Shown::Image { wanted, .. } | Shown::Failed { wanted, .. } => Some(wanted),
-        }
-    }
-
-    /// The image the viewer frames: none for an empty display window, which has no size to fit.
-    fn framed(&self) -> Option<&ImageInfo> {
-        match self {
-            Shown::Image { info, .. } if !info.display_window.is_empty() => Some(info),
-            Shown::Image { .. } | Shown::Nothing | Shown::Failed { .. } => None,
-        }
-    }
-
-    fn display_window(&self) -> Option<Window> {
-        self.framed().map(|info| info.display_window)
-    }
 }
 
 /// Waited for before the first attempt after a loss, so that the shell paints the GPU label
@@ -416,12 +469,14 @@ pub struct App {
     losses_during_evaluation: u32,
     /// Nothing is delivered once the app has dropped.
     worker: Worker,
-    /// What the worker was last asked for.
-    sent: Option<Wanted>,
+    scanner: Scanner,
+    /// Files chosen, in the order chosen, waiting for scans.
+    choices: Vec<Choice>,
+    viewing: Viewing,
     /// The session's version and the viewed node when the viewer last followed them.
     followed: Option<(u64, Option<NodeId>)>,
-    /// How many requests the worker was sent, which numbers them.
-    requests_sent: u64,
+    /// How many jobs the worker was given, which numbers them.
+    jobs_sent: u64,
     drawing: Drawing,
     /// How many attempts to make a device were requested, which numbers them.
     attempts_requested: u64,
@@ -429,8 +484,7 @@ pub struct App {
     hovered: Option<Pane>,
     /// The pointer's last position over the graph pane.
     graph_pointer: Option<PhysicalPoint>,
-    shown: Shown,
-    /// The request whose image the viewer's last presented frame showed.
+    /// The job whose image the viewer's last presented frame showed.
     presented: Option<u64>,
     /// Images given to the GPU to show, which numbers them for their pixel reads.
     images_shown: u64,
@@ -442,22 +496,43 @@ pub struct App {
     probed: Option<Probe>,
     /// The last pixel read back, shown until a newer read arrives.
     last_read: Option<LastRead>,
-    /// The readout as last requested.
-    readout: String,
-    /// The viewer's exposure as its control last showed it.
-    exposure_shown: f32,
-    /// The viewer's caption as last requested.
-    caption: String,
-    /// The Edit menu's undo and redo labels as last requested.
-    undo_labels: [Option<&'static str>; 2],
-    /// The status bar's GPU label as last requested.
-    gpu_label: Option<String>,
     /// The node the parameter panel stays on instead of the current node.
     pinned: Option<NodeId>,
     /// The session's version and the pin when the panel last followed them.
     panel_followed: Option<(u64, Option<NodeId>)>,
-    /// The parameter panel as last requested.
+    playback: Playback,
+    /// The keys of the frames the worker was last asked to prepare.
+    ahead_sent: Vec<ResultKey>,
+    /// What is known of each frame of the viewed node.
+    marks: Marks,
+    shell: Shell,
+}
+
+/// What the shell was last asked to show, which it is asked again only once changed.
+#[derive(Debug, Default)]
+struct Shell {
+    gpu_label: Option<String>,
+    undo_labels: [Option<&'static str>; 2],
     panel: Option<Panel>,
+    timebar: Option<Timebar>,
+    caption: String,
+    readout: String,
+    exposure: f32,
+}
+
+/// How many frames ahead of playback's the worker prepares, at most: a provisional depth, which
+/// bounds the work done for frames a stop then makes unneeded.
+const LOOK_AHEAD: i64 = 24;
+
+/// The viewed node's key at each frame of the timeline, and what the timebar shows of each.
+#[derive(Debug, Default)]
+struct Marks {
+    /// The session's content version, the viewed node and the frames the keys were built for.
+    built_for: Option<(u64, Option<NodeId>, Frames)>,
+    keys: Vec<Option<ResultKey>>,
+    marks: Vec<FrameMark>,
+    /// The viewer cache's changes and the zoom the marks' `cached` was learned at.
+    cached_for: Option<(u64, Zoom)>,
 }
 
 impl App {
@@ -468,35 +543,39 @@ impl App {
         let deliver = waker.clone();
         App {
             session: Session::new(),
-            gpu: Gpu::new(waker),
+            gpu: Gpu::new(waker.clone()),
             device,
             left_gpu: None,
             losses_during_evaluation: 0,
-            worker: Worker::start(device, move |evaluated| {
-                deliver.wake(Notice::Evaluated(evaluated));
-            }),
-            sent: None,
+            worker: Worker::start(
+                device,
+                {
+                    let deliver = deliver.clone();
+                    move |evaluated| deliver.wake(Notice::Evaluated(evaluated))
+                },
+                move |copy| deliver.wake(Notice::Copied(copy)),
+            ),
+            scanner: Scanner::new(waker),
+            choices: Vec::new(),
+            viewing: Viewing::default(),
             followed: None,
-            requests_sent: 0,
+            jobs_sent: 0,
             drawing: Drawing::Ready { recovered: None },
             attempts_requested: 0,
             hovered: None,
             graph_pointer: None,
-            shown: Shown::Nothing,
             presented: None,
             images_shown: 0,
             viewer_pointer: None,
             left_pixel: None,
             probed: None,
             last_read: None,
-            readout: String::new(),
-            exposure_shown: 0.0,
-            caption: String::new(),
-            undo_labels: [None, None],
-            gpu_label: None,
             pinned: None,
             panel_followed: None,
-            panel: None,
+            playback: Playback::default(),
+            ahead_sent: Vec::new(),
+            marks: Marks::default(),
+            shell: Shell::default(),
         }
     }
 
@@ -512,10 +591,46 @@ impl App {
         (requests, edited)
     }
 
-    /// The number of the latest request to the worker, whose result shows the session as it is,
-    /// for the drag check.
-    pub fn latest_request(&self) -> u64 {
-        self.requests_sent
+    /// The number of the latest job given the worker, whose result shows the session as it is.
+    pub fn latest_job(&self) -> u64 {
+        self.jobs_sent
+    }
+
+    /// Plays the timeline from the session's frame, that way, in the mode, from the first
+    /// [`advance`](App::advance) on. A frame outside the timeline plays from the end it plays
+    /// from.
+    pub fn play(&mut self, direction: Direction, mode: PlaybackMode) -> Vec<Request> {
+        let mut requests = self.dispatch(Event::PlaybackModeSet(mode));
+        // The command stops playback already going that way.
+        if self.playback.direction() != Some(direction) {
+            requests.extend(self.dispatch(Event::Command(Command::Play(direction))));
+        }
+        requests
+    }
+
+    /// Stops playback, staying on the frame.
+    pub fn stop(&mut self) -> Vec<Request> {
+        self.dispatch(Event::Command(Command::Stop))
+    }
+
+    /// Moves playback's clock to `now`, as the shell does when [`Request::Advance`] asks.
+    pub fn advance(&mut self, now: Instant) -> Vec<Request> {
+        self.dispatch(Event::Advance(now))
+    }
+
+    /// Goes to a frame, stopping playback, as the artist does in the timebar.
+    pub fn set_frame(&mut self, frame: f64) -> Vec<Request> {
+        self.dispatch(Event::FrameSet(frame))
+    }
+
+    /// Which way and how playback plays, if it does.
+    pub fn playing(&self) -> Option<(Direction, PlaybackMode)> {
+        self.playback.playing()
+    }
+
+    /// The timebar as last shown.
+    pub fn timebar(&self) -> Option<&Timebar> {
+        self.shell.timebar.as_ref()
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
@@ -553,7 +668,20 @@ impl App {
                 Vec::new()
             }
             Event::FilesChosen { intent, paths } => self.files_chosen(intent, paths),
+            Event::ReloadFiles(node) => self.reload(&[node]),
+            Event::Scanned { sequence, scan } => self.scanned(sequence, scan),
             Event::Evaluated(evaluated) => self.evaluated(evaluated),
+            Event::Copied(copy) => {
+                self.viewing.cache.insert(copy);
+                // Look-ahead may have prepared the frame the viewer waits for.
+                let mut requests = Vec::new();
+                if let Asked::Evaluating(job) = &self.viewing.asked
+                    && !self.viewing.shows_asked()
+                {
+                    self.show_cached(job.clone(), &mut requests);
+                }
+                requests
+            }
             Event::DeviceLost { generation, at } => self.device_lost(generation, at),
             Event::RetryDeviceCreation(attempt) => match self.drawing {
                 Drawing::Unavailable { attempt: last, .. } if attempt == last => {
@@ -569,7 +697,7 @@ impl App {
             },
             Event::CollectPixelRead => {
                 if let Some(read) = self.gpu.take_pixel_read()
-                    && let Some(info) = self.shown.framed()
+                    && let Some(info) = self.viewing.shown.framed()
                 {
                     self.last_read = Some(LastRead::new(read, info.data_window));
                 }
@@ -578,8 +706,45 @@ impl App {
             Event::ViewerExposureSet(stops) => {
                 self.session.viewer_mut().set_exposure(stops);
                 // The control shows what the artist typed, which echoing could rewrite.
-                self.exposure_shown = self.session.viewer().exposure();
+                self.shell.exposure = self.session.viewer().exposure();
                 vec![Request::Redraw(Pane::Viewer)]
+            }
+            Event::Advance(now) => {
+                let (frame, next) = self.playback.advance(now, &self.session);
+                let mut requests = frame.map(|frame| self.go_to(frame)).unwrap_or_default();
+                requests.extend(next);
+                requests
+            }
+            Event::FrameSet(frame) => {
+                self.playback.stop();
+                self.go_to(frame)
+            }
+            Event::FrameRangeSet { first, last } => {
+                match self.session.set_frame_range(first, last) {
+                    Ok(_) => Vec::new(),
+                    Err(error) => vec![Request::ShowStatus(format!(
+                        "Cannot set the frame range: {error}"
+                    ))],
+                }
+            }
+            Event::FrameRateSet(rate) => match self.session.set_frame_rate(ntsc_rate(rate)) {
+                Ok(_) => Vec::new(),
+                Err(error) => vec![Request::ShowStatus(format!(
+                    "Cannot set the frame rate: {error}"
+                ))],
+            },
+            Event::PlaybackModeSet(mode) => self.playback.set_mode(mode).into_iter().collect(),
+            Event::LoopingSet(looping) => {
+                self.playback.looping = looping;
+                Vec::new()
+            }
+            Event::TimecodeSet(timecode) => {
+                self.playback.timecode = timecode;
+                Vec::new()
+            }
+            Event::RangeSourceChosen(source) => {
+                self.playback.range_source = source;
+                Vec::new()
             }
         };
         self.after_change(requests)
@@ -611,36 +776,56 @@ impl App {
         requests
     }
 
-    /// Follows whatever the event or edit changed: the viewer, then the panel and the labels the
-    /// shell shows.
+    /// Follows what the event or edit changed. What the shell shows comes before other requests,
+    /// since performing one may dispatch again and show something newer.
     fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
+        self.scanner.scan_unscanned(&self.session);
+        self.follow_marks();
         self.follow_viewer(&mut requests);
+        let shown = self.viewing.shows_asked_at(self.session.frame());
+        requests.extend(self.playback.follow_shown(shown));
+        self.follow_look_ahead();
         self.follow_readout(&mut requests);
-        let exposure = self.session.viewer().exposure();
-        if exposure != self.exposure_shown {
-            self.exposure_shown = exposure;
-            requests.push(Request::ShowViewerExposure(exposure));
-        }
-        // These go first, since performing another request may dispatch again and show newer
-        // ones.
-        self.follow_panel(&mut requests);
-        let undo_labels = [self.session.undo_label(), self.session.redo_label()];
-        if undo_labels != self.undo_labels {
-            self.undo_labels = undo_labels;
-            let [undo, redo] = undo_labels;
-            requests.insert(0, Request::ShowUndoLabels { undo, redo });
-        }
+        let mut shows = Vec::new();
         let gpu_label = self.gpu_label();
-        if gpu_label != self.gpu_label {
-            self.gpu_label.clone_from(&gpu_label);
-            requests.insert(0, Request::ShowGpuLabel(gpu_label));
+        if gpu_label != self.shell.gpu_label {
+            self.shell.gpu_label.clone_from(&gpu_label);
+            shows.push(Request::ShowGpuLabel(gpu_label));
         }
-        requests
+        let undo_labels = [self.session.undo_label(), self.session.redo_label()];
+        if undo_labels != self.shell.undo_labels {
+            self.shell.undo_labels = undo_labels;
+            let [undo, redo] = undo_labels;
+            shows.push(Request::ShowUndoLabels { undo, redo });
+        }
+        self.follow_panel(&mut shows);
+        let timebar = self.playback.timebar(&self.session, &self.marks.marks);
+        if self.shell.timebar.as_ref() != Some(&timebar) {
+            self.shell.timebar = Some(timebar.clone());
+            shows.push(Request::ShowTimebar(timebar));
+        }
+        let caption = self.caption();
+        if caption != self.shell.caption {
+            self.shell.caption.clone_from(&caption);
+            shows.push(Request::ShowViewerCaption(caption));
+        }
+        let readout = self.readout();
+        if readout != self.shell.readout {
+            self.shell.readout.clone_from(&readout);
+            shows.push(Request::ShowReadout(readout));
+        }
+        let exposure = self.session.viewer().exposure();
+        if exposure != self.shell.exposure {
+            self.shell.exposure = exposure;
+            shows.push(Request::ShowViewerExposure(exposure));
+        }
+        shows.extend(requests);
+        shows
     }
 
     /// Keeps the panel on the pinned node, or the current node: shows it when it changed. A pin
     /// on a deleted node is dropped, so undoing the delete does not pin it again.
-    fn follow_panel(&mut self, requests: &mut Vec<Request>) {
+    fn follow_panel(&mut self, shows: &mut Vec<Request>) {
         let document = self.session.document();
         if self
             .pinned
@@ -654,20 +839,38 @@ impl App {
             return;
         }
         self.panel_followed = followed;
+        let (files, frame) = (self.session.files(), self.session.frame());
         let panel = match self.pinned {
-            Some(pinned) => Panel::of(document, pinned, true),
+            Some(pinned) => Panel::of(document, files, pinned, true, frame),
             None => (document.selection().last())
-                .and_then(|&current| Panel::of(document, current, false)),
+                .and_then(|&current| Panel::of(document, files, current, false, frame)),
         };
-        if panel != self.panel {
-            self.panel.clone_from(&panel);
-            requests.insert(0, Request::ShowPanel(panel));
+        if panel != self.shell.panel {
+            self.shell.panel.clone_from(&panel);
+            shows.push(Request::ShowPanel(panel));
         }
     }
 
     /// The parameter panel as last shown.
     pub fn panel(&self) -> Option<&Panel> {
-        self.panel.as_ref()
+        self.shell.panel.as_ref()
+    }
+
+    /// What the viewer shows, if anything.
+    pub fn displayed(&self) -> Option<Displayed> {
+        self.viewing.displayed()
+    }
+
+    /// Copies of the images the viewer showed, which show their frames again without evaluating
+    /// them.
+    pub fn viewer_cache(&self) -> &ViewerCache {
+        &self.viewing.cache
+    }
+
+    /// Has the viewer cache hold at most `bytes` of copies, dropping those least recently
+    /// requested that no longer fit.
+    pub fn set_viewer_cache_budget(&mut self, bytes: u64) {
+        self.viewing.cache.set_budget(bytes);
     }
 
     /// Whether the panes cannot draw, and how many GPU errors there were, which the status bar
@@ -683,11 +886,10 @@ impl App {
         Some(label)
     }
 
-    /// Retires the lost device, which stops the panes drawing, and requests the first attempt to
-    /// replace it. A device lost before it worked for the longest wait counts as a failed
-    /// attempt, so that a device lost again at once is not rebuilt at once forever. Evaluation
-    /// stays on the GPU, since nothing could show a CPU result meanwhile, unless this loss makes
-    /// too many while it had work there.
+    /// Retires the lost device and requests an attempt to replace it. A device lost before it
+    /// worked for the longest wait counts as a failed attempt, so that a device lost again at once
+    /// is not rebuilt at once forever. Evaluation stays on the GPU, since nothing could show a CPU
+    /// result meanwhile, unless this loss makes too many while it had work there.
     fn device_lost(&mut self, generation: u64, at: Instant) -> Vec<Request> {
         if !self.gpu.retire_lost_device(generation) {
             return Vec::new();
@@ -710,20 +912,33 @@ impl App {
         vec![self.request_attempt(delay)]
     }
 
-    /// Moves evaluation to the CPU, which evaluates the last request again, saying why.
+    /// Moves evaluation to the CPU, which evaluates the last request again.
     fn leave_gpu(&mut self, why: LeftGpu) {
-        self.device = EvaluationDevice::Cpu;
         self.left_gpu = Some(why);
-        self.worker.evaluate_on(EvaluationDevice::Cpu);
+        self.evaluate_on(EvaluationDevice::Cpu);
     }
 
-    /// Makes a device for every pane with a native window, which the worker then uses. On
-    /// failure, requests the next attempt. Why the first attempt failed is shown, and why a
-    /// later one did is logged, so that retrying does not churn the status bar.
+    /// Evaluates on the device from the next request. The viewer cache's copies are dropped,
+    /// and a copy shown is evaluated anew, since results never mix devices.
+    fn evaluate_on(&mut self, device: EvaluationDevice) {
+        self.device = device;
+        self.viewing.cache.clear();
+        self.worker.evaluate_on(device);
+        self.resume();
+    }
+
+    /// Makes a device for every pane with a native window, and for the worker, or requests the
+    /// next attempt. Only the first failure is shown; later ones are logged, so that retrying does
+    /// not churn the status bar.
     fn make_device(&mut self) -> Vec<Request> {
         match self.gpu.make_device() {
             Ok(new) => {
                 (self.worker).connect(new.device, new.queue, new.lost, new.generation);
+                // The paused worker shows nothing again, so the copy is shown anew.
+                if let Shown::Copy { copy, .. } = &self.viewing.shown {
+                    self.images_shown += 1;
+                    self.gpu.show_copy(copy, self.images_shown);
+                }
                 let mut requests = Vec::new();
                 if !new.pane_errors.is_empty() {
                     requests.push(Request::ShowError(new.pane_errors.join("; ")));
@@ -762,12 +977,29 @@ impl App {
 
     fn draw(&mut self, pane: Pane) -> Vec<Request> {
         let viewer = self.session.viewer();
-        let frame = self.shown.framed().map(|info| ViewerFrame {
-            placement: viewer.placement(info.display_window),
-            display_window: info.display_window,
-            data_window: info.data_window,
-            scale_factor: viewer.scale_factor(),
-            gain: viewer.gain(),
+        let frame = self.viewing.shown.framed().map(|info| {
+            let (data_window, pixels_per_texel) = match &self.viewing.shown {
+                Shown::Copy { copy, .. } => {
+                    let window = copy.window;
+                    let halvings = copy.halvings();
+                    let covered = Window {
+                        x: window.x << halvings,
+                        y: window.y << halvings,
+                        width: window.width << halvings,
+                        height: window.height << halvings,
+                    };
+                    (covered, 1 << halvings)
+                }
+                _ => (info.data_window, 1),
+            };
+            ViewerFrame {
+                placement: viewer.placement(info.display_window),
+                display_window: info.display_window,
+                data_window,
+                scale_factor: viewer.scale_factor(),
+                gain: viewer.gain(),
+                pixels_per_texel,
+            }
         });
         match self
             .gpu
@@ -775,8 +1007,8 @@ impl App {
         {
             Drawn::Presented => {
                 if pane == Pane::Viewer {
-                    self.presented = match &self.shown {
-                        Shown::Image { wanted, .. } => Some(wanted.number),
+                    self.presented = match &self.viewing.shown {
+                        Shown::Image { job, .. } | Shown::Copy { job, .. } => Some(job.number),
                         Shown::Nothing | Shown::Failed { .. } => None,
                     };
                 }
@@ -846,7 +1078,7 @@ impl App {
             }
             Input::PointerEntered => {}
         }
-        let display = self.shown.display_window();
+        let display = self.viewing.shown.display_window();
         let viewer = self.session.viewer_mut();
         let moved = match input {
             Input::PointerPressed {
@@ -915,6 +1147,11 @@ impl App {
             Key::E if modifiers.ctrl => self.command(Command::ResetExposure),
             Key::E if modifiers.shift => self.command(Command::ExposureDown),
             Key::E => self.command(Command::ExposureUp),
+            Key::Left => self.command(Command::Step(Direction::Backward)),
+            Key::Right => self.command(Command::Step(Direction::Forward)),
+            Key::J => self.command(Command::Play(Direction::Backward)),
+            Key::K => self.command(Command::Stop),
+            Key::L => self.command(Command::Play(Direction::Forward)),
             _ => Vec::new(),
         }
     }
@@ -948,7 +1185,7 @@ impl App {
             Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders(
                 self.anchor(),
             ))],
-            Command::PinPanel => match &self.panel {
+            Command::PinPanel => match &self.shell.panel {
                 Some(panel) => {
                     self.pinned = Some(panel.node);
                     Vec::new()
@@ -961,11 +1198,7 @@ impl App {
             }
             Command::Reload => {
                 let selection = self.session.document().selection().to_vec();
-                if self.session.reload(&selection) {
-                    vec![Request::Redraw(Pane::Graph)]
-                } else {
-                    vec![Request::ShowStatus("Select Readers to reload".to_owned())]
-                }
+                self.reload(&selection)
             }
             Command::Undo => redraw_if(Pane::Graph, !self.session.undo().is_empty()),
             Command::Redo => redraw_if(Pane::Graph, !self.session.redo().is_empty()),
@@ -993,7 +1226,7 @@ impl App {
                 }
             }
             Command::FitImage | Command::ActualSize => {
-                let Some(display) = self.shown.display_window() else {
+                let Some(display) = self.viewing.shown.display_window() else {
                     return vec![Request::ShowStatus("The viewer shows no image".to_owned())];
                 };
                 let viewer = self.session.viewer_mut();
@@ -1015,13 +1248,145 @@ impl App {
                 vec![Request::Redraw(Pane::Viewer)]
             }
             Command::EvaluateOn(device) => {
-                self.device = device;
                 self.left_gpu = None;
                 self.losses_during_evaluation = 0;
-                self.worker.evaluate_on(device);
+                if device != self.device {
+                    self.evaluate_on(device);
+                }
                 Vec::new()
             }
+            Command::Play(direction) if self.playback.direction() == Some(direction) => {
+                self.playback.stop();
+                Vec::new()
+            }
+            Command::Play(direction) => self.playback.play(direction).into_iter().collect(),
+            Command::Stop => {
+                self.playback.stop();
+                Vec::new()
+            }
+            Command::Step(direction) => {
+                self.playback.stop();
+                self.go_to(self.playback.step(&self.session, direction))
+            }
+            Command::FirstFrame | Command::LastFrame => {
+                self.playback.stop();
+                let range = self.playback.range(&self.session);
+                self.go_to(match command {
+                    Command::FirstFrame => range.first,
+                    _ => range.last,
+                })
+            }
         }
+    }
+
+    fn go_to(&mut self, frame: f64) -> Vec<Request> {
+        match self.session.set_frame(frame) {
+            Ok(()) => Vec::new(),
+            Err(error) => vec![Request::ShowStatus(format!(
+                "Cannot go to the frame: {error}"
+            ))],
+        }
+    }
+
+    /// Keeps the viewed node's key and timebar mark at each frame current, except during an edit
+    /// in progress, which would rebuild them for every value a drag passes.
+    fn follow_marks(&mut self) {
+        let session = &self.session;
+        let (version, viewed, frames) = self.marks_for();
+        let built_for = Some((version, viewed, frames));
+        let marks = &mut self.marks;
+        if marks.built_for != built_for && session.editing().is_none() {
+            marks.built_for = built_for;
+            marks.keys.clear();
+            marks.marks.clear();
+            marks.cached_for = None;
+            if let Some(node) = viewed
+                && frames.count() <= MAX_MARKED_FRAMES
+            {
+                let (document, files) = (session.document(), session.files());
+                for index in 0..frames.count() {
+                    let frame = frames.frame(index);
+                    marks.keys.push(result_key(document, files, node, frame));
+                    let readings = readings(document, files, node, frame);
+                    marks.marks.push(FrameMark {
+                        cached: false,
+                        missing: (readings.iter()).any(|(_, read)| read.missing().is_some()),
+                        held: (readings.iter()).any(|(_, read)| read.held().is_some()),
+                    });
+                }
+            }
+        }
+        let cache = &self.viewing.cache;
+        let zoom = session.viewer().zoom();
+        let cached_for = Some((cache.changes(), zoom));
+        if marks.cached_for != cached_for {
+            marks.cached_for = cached_for;
+            for (mark, key) in marks.marks.iter_mut().zip(&marks.keys) {
+                mark.cached = key.as_ref().is_some_and(|key| cache.serves(key, zoom));
+            }
+        }
+    }
+
+    fn marks_for(&self) -> (u64, Option<NodeId>, Frames) {
+        let session = &self.session;
+        let frames = self.playback.frames(session);
+        (session.content_version(), session.viewed(), frames)
+    }
+
+    /// Asks the worker to prepare the frames playback shows next, or nothing when not playing.
+    fn follow_look_ahead(&mut self) {
+        let ahead = self.look_ahead();
+        if (ahead.iter().map(|job| &job.key)).ne(self.ahead_sent.iter()) {
+            self.ahead_sent = ahead.iter().map(|job| job.key.clone()).collect();
+            self.worker.look_ahead(ahead);
+        }
+    }
+
+    /// The frames playback shows next, in order, that neither the viewer cache serves nor the
+    /// viewer asked for. None while the cache is full: each copy ahead would drop the next frame
+    /// not yet played.
+    fn look_ahead(&self) -> Vec<Job> {
+        let (Some(direction), Some(node)) = (self.playback.direction(), self.session.viewed())
+        else {
+            return Vec::new();
+        };
+        let session = &self.session;
+        if !self.viewing.cache.has_room() {
+            return Vec::new();
+        }
+        let frames = self.playback.frames(session);
+        let Some(current) = frames.index(session.frame()) else {
+            return Vec::new();
+        };
+        let (cache, zoom) = (&self.viewing.cache, session.viewer().zoom());
+        // The marks' keys, unless an edit in progress has left them behind.
+        let marked = (self.marks.built_for == Some(self.marks_for())).then_some(&self.marks.keys);
+        let mut ahead: Vec<Job> = Vec::new();
+        for steps in 1..=LOOK_AHEAD.min(frames.count() - 1) {
+            let Ok(index) = frames.step(current, steps, direction, self.playback.looping) else {
+                break;
+            };
+            let frame = frames.frame(index);
+            let key = match marked.and_then(|keys| keys.get(index as usize)) {
+                Some(key) => key.clone(),
+                None => result_key(session.document(), session.files(), node, frame),
+            };
+            let Some(key) = key else {
+                continue;
+            };
+            let requested = (self.viewing.asked.job()).is_some_and(|asked| asked.key == key);
+            if requested || cache.serves(&key, zoom) || ahead.iter().any(|job| job.key == key) {
+                continue;
+            }
+            ahead.push(Job {
+                node,
+                key,
+                frame,
+                number: self.jobs_sent,
+                copy: Some(zoom),
+            });
+        }
+        ahead
     }
 
     fn anchor(&self) -> Anchor {
@@ -1051,7 +1416,108 @@ impl App {
         }
     }
 
+    /// Reload files on each Reader: stills at once, sequences once rescanned.
+    fn reload(&mut self, nodes: &[NodeId]) -> Vec<Request> {
+        let reload = self.session.reload(nodes);
+        if reload.is_empty() {
+            return vec![Request::ShowStatus("Select Readers to reload".to_owned())];
+        }
+        for sequence in reload.sequences {
+            self.scanner.rescan(sequence);
+        }
+        vec![Request::Redraw(Pane::Graph)]
+    }
+
+    /// Records a finished scan and decides the files chosen that waited for it.
+    fn scanned(&mut self, sequence: Pattern, scan: io::Result<Scan>) -> Vec<Request> {
+        let again = self.scanner.returned(&sequence, scan.is_err());
+        let mut requests = Vec::new();
+        match scan {
+            Ok(scan) => {
+                if let Some(reloaded) = self.session.record_scan(&sequence, scan) {
+                    requests.push(Request::Redraw(Pane::Graph));
+                    if reloaded > 0 {
+                        requests.push(Request::ShowStatus(format!(
+                            "{}: {reloaded} {} changed on disk",
+                            sequence.path().display(),
+                            if reloaded == 1 { "frame" } else { "frames" }
+                        )));
+                    }
+                }
+            }
+            Err(error) => requests.push(Request::ShowError(format!(
+                "Cannot scan {}: {error}",
+                sequence.directory().display()
+            ))),
+        }
+        requests.extend(self.decide_choices());
+        if again {
+            self.scanner.scan(sequence);
+        }
+        requests
+    }
+
     fn files_chosen(&mut self, intent: FileIntent, paths: Vec<PathBuf>) -> Vec<Request> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let files: Vec<(PathBuf, Option<Pattern>)> = (paths.into_iter())
+            .map(|path| {
+                let sequence = Pattern::candidate(&path);
+                (path, sequence)
+            })
+            .collect();
+        for sequence in files.iter().filter_map(|(_, sequence)| sequence.clone()) {
+            if self.session.files().scan(sequence.path()).is_none() {
+                self.scanner.scan(sequence);
+            }
+        }
+        self.choices.push(Choice { intent, files });
+        self.decide_choices()
+    }
+
+    /// Decides each file chosen whose scan returned: the sequence if the scan found it with
+    /// another frame, otherwise the file. Choices apply in the order chosen, none before an
+    /// earlier one is decided.
+    fn decide_choices(&mut self) -> Vec<Request> {
+        let files = self.session.files();
+        for choice in &mut self.choices {
+            for (path, candidate) in &mut choice.files {
+                let Some(sequence) = candidate.as_ref() else {
+                    continue;
+                };
+                if self.scanner.is_scanning(sequence.path()) {
+                    continue;
+                }
+                let scan = files.scan(sequence.path());
+                let is_sequence = scan.is_some_and(|scan| {
+                    sequence
+                        .frame_of(path)
+                        .is_some_and(|frame| scan.contains(frame) && scan.frames().nth(1).is_some())
+                });
+                if is_sequence {
+                    *path = sequence.path().to_path_buf();
+                }
+                *candidate = None;
+            }
+        }
+        let mut requests = Vec::new();
+        while let Some(choice) = self.choices.first() {
+            if choice
+                .files
+                .iter()
+                .any(|(_, candidate)| candidate.is_some())
+            {
+                break;
+            }
+            let choice = self.choices.remove(0);
+            let paths = choice.files.into_iter().map(|(path, _)| path).collect();
+            requests.extend(self.apply_choice(choice.intent, paths));
+        }
+        requests
+    }
+
+    fn apply_choice(&mut self, intent: FileIntent, paths: Vec<PathBuf>) -> Vec<Request> {
         let Some(first) = paths.first().cloned() else {
             return Vec::new();
         };
@@ -1071,14 +1537,14 @@ impl App {
         vec![Request::Redraw(Pane::Graph)]
     }
 
-    /// Shows a finished evaluation of the node the viewer marks, even one an edit has superseded
-    /// since, so that an edit faster than evaluation keeps the viewer updating. It is not shown if
-    /// the image shown came from a later request, and how it ended is recorded only if it is
-    /// shown or failed. A failure is shown only while its key is still wanted, so that an edit in
-    /// progress never blanks the viewer. What is not shown is dropped, which returns its staging
-    /// buffer to the worker.
+    /// Shows a finished evaluation of the viewed node even if an edit has superseded it, so that
+    /// an edit faster than evaluation keeps the viewer updating. A failure is shown only while its
+    /// key is still asked for, so that an edit in progress never blanks the viewer. Dropping what
+    /// is not shown returns its staging buffer to the worker.
     fn evaluated(&mut self, evaluated: Evaluated) -> Vec<Request> {
-        let Evaluated { wanted, result, .. } = evaluated;
+        let Evaluated {
+            mut job, result, ..
+        } = evaluated;
         // Not the node's failure, nor shown: the CPU evaluates the request again, and the last
         // frame stays until it does. One evaluated on the GPU before a move to the CPU may
         // still arrive.
@@ -1097,21 +1563,25 @@ impl App {
             self.gpu.count_error(error);
         }
         // Not only later: connecting the GPU delivers the request shown again, with its pixels.
-        let not_older = (self.shown.wanted()).is_none_or(|shown| wanted.number >= shown.number);
-        if self.session.viewed() != Some(wanted.node) || !not_older {
+        let not_older = (self.viewing.shown.job()).is_none_or(|shown| job.number >= shown.number);
+        if self.session.viewed() != Some(job.node) || !not_older {
             return Vec::new();
         }
-        // What was sent is current: the viewer follows every change before this runs.
-        let current = (self.sent.as_ref()).is_some_and(|sent| sent.key == wanted.key);
+        // What was asked for is current: the viewer follows every change before this runs.
+        let current = (self.viewing.asked.job()).is_some_and(|asked| asked.key == job.key);
+        // A current image is the current frame's, whichever frame asked for it.
+        if let Some(asked) = self.viewing.asked.job().filter(|_| current) {
+            job.frame = asked.frame;
+        }
         let graph_changed = match &result {
             Err(ViewerError::Eval(error)) => self.session.record_failure(error.origin()),
             // What the GPU cannot hold is the viewer's limitation, not the node's failure.
-            Ok(_) | Err(ViewerError::CannotShow(_)) => self.session.record_success(&wanted.key),
+            Ok(_) | Err(ViewerError::CannotShow(_)) => self.session.record_success(&job.key),
         };
         if result.is_err() && !current {
             return redraw_if(Pane::Graph, graph_changed);
         }
-        self.shown = match result {
+        self.viewing.shown = match result {
             Ok(image) => {
                 self.images_shown += 1;
                 match image.pixels {
@@ -1122,14 +1592,14 @@ impl App {
                     None => self.gpu.clear_image(),
                 }
                 Shown::Image {
-                    wanted,
+                    job,
                     info: image.info,
                 }
             }
             Err(error) => {
                 self.gpu.clear_image();
                 Shown::Failed {
-                    wanted,
+                    job,
                     error: error.to_string(),
                 }
             }
@@ -1141,54 +1611,130 @@ impl App {
         requests
     }
 
-    /// The node the viewer's slot marks, and its key.
-    fn wanted(&self) -> Option<(NodeId, ResultKey)> {
+    fn viewed_key(&self) -> Option<(NodeId, ResultKey)> {
         let node = self.session.viewed()?;
-        let key = result_key(self.session.document(), self.session.reloads(), node)?;
+        let session = &self.session;
+        let key = session.result_key(node)?;
         Some((node, key))
     }
 
-    /// Keeps the viewer on what its slot marks: asks the worker for it, shows nothing if the slot
-    /// marks nothing, and describes the result.
+    /// Keeps the viewer on what its slot marks: asks the worker for it, and shows nothing if the
+    /// slot marks nothing.
     fn follow_viewer(&mut self, requests: &mut Vec<Request>) {
         // Building a key walks the viewed node's whole upstream, so not on every pointer move.
         let followed = Some((self.session.version(), self.session.viewed()));
         if followed != self.followed {
             self.followed = followed;
-            self.send_wanted(requests);
+            self.send_job(requests);
         }
-        let caption = self.caption();
-        if caption != self.caption {
-            self.caption.clone_from(&caption);
-            requests.push(Request::ShowViewerCaption(caption));
+        if self.copy_falls_short() {
+            self.resume();
         }
     }
 
-    fn send_wanted(&mut self, requests: &mut Vec<Request>) {
-        let wanted = self.wanted();
-        if wanted.is_none() && !matches!(self.shown, Shown::Nothing) {
-            self.shown = Shown::Nothing;
+    fn send_job(&mut self, requests: &mut Vec<Request>) {
+        let viewed = self.viewed_key();
+        if viewed.is_none() && !matches!(self.viewing.shown, Shown::Nothing) {
+            self.viewing.shown = Shown::Nothing;
             self.gpu.clear_image();
             requests.push(Request::Redraw(Pane::Viewer));
         }
-        // Compared with what was sent, not with what is shown: a key already shown is sent again
-        // so that the worker releases what the last request retained, and stops working on it.
-        // Nothing is sent too, which releases everything.
-        let sent = (self.sent.as_ref()).map(|sent| (sent.node, &sent.key));
-        if wanted.as_ref().map(|(node, key)| (*node, key)) != sent {
-            self.requests_sent += 1;
-            let number = self.requests_sent;
-            let wanted = wanted.map(|(node, key)| Wanted { node, key, number });
-            self.worker.request(wanted.clone());
-            self.sent = wanted;
+        let frame = self.session.frame();
+        let asked = (self.viewing.asked.job()).map(|asked| (asked.node, &asked.key));
+        if viewed.as_ref().map(|(node, key)| (*node, key)) != asked {
+            self.jobs_sent += 1;
+            let number = self.jobs_sent;
+            let Some((node, key)) = viewed else {
+                self.worker.request(None);
+                self.viewing.asked = Asked::Nothing;
+                return;
+            };
+            let job = Job {
+                node,
+                key,
+                frame,
+                number,
+                copy: None,
+            };
+            if !self.show_cached(job.clone(), requests) {
+                let job = Job {
+                    copy: self.copy_wanted(),
+                    ..job
+                };
+                self.worker.request(Some(job.clone()));
+                self.viewing.asked = Asked::Evaluating(job);
+            }
+        } else if let Asked::Evaluating(asked) | Asked::ServedFromCache(asked) =
+            &mut self.viewing.asked
+        {
+            // An equal key at another frame is the same image.
+            asked.frame = frame;
+            if let Shown::Image { job, .. } | Shown::Copy { job, .. } | Shown::Failed { job, .. } =
+                &mut self.viewing.shown
+                && job.key == asked.key
+            {
+                job.frame = frame;
+            }
         }
     }
 
+    /// Shows the viewer cache's copy of the job's image, if it holds one the viewer can show at
+    /// its zoom, and pauses the worker rather than have it evaluate the image. Returns whether it
+    /// did.
+    fn show_cached(&mut self, job: Job, requests: &mut Vec<Request>) -> bool {
+        let zoom = self.session.viewer().zoom();
+        let Some(copy) = self.viewing.cache.get(&job.key, zoom) else {
+            return false;
+        };
+        self.worker.pause();
+        self.images_shown += 1;
+        self.gpu.show_copy(&copy, self.images_shown);
+        self.viewing.asked = Asked::ServedFromCache(job.clone());
+        self.viewing.shown = Shown::Copy { job, copy };
+        requests.push(Request::Redraw(Pane::Viewer));
+        true
+    }
+
+    /// Whether the cached copy shown falls short of the image: the readout points at one of its
+    /// pixels, whose working values only the image has, or the viewer draws it larger than its
+    /// texels, as after zooming in.
+    fn copy_falls_short(&self) -> bool {
+        let Shown::Copy { copy, .. } = &self.viewing.shown else {
+            return false;
+        };
+        let zoom = self.session.viewer().zoom();
+        let halvings = zoom.halvings(copy.info.display_window);
+        let coarse = halvings.is_none_or(|halvings| copy.halvings() > halvings);
+        coarse || matches!(self.pointed(), Some((_, Some(_))))
+    }
+
+    /// Asks the worker for what the viewer cache served after all, under the same number, with a
+    /// copy for the cache if it has none to serve the viewer's zoom and no edit is in progress.
+    fn resume(&mut self) {
+        let Asked::ServedFromCache(job) = &self.viewing.asked else {
+            return;
+        };
+        let zoom = self.session.viewer().zoom();
+        let served = self.viewing.cache.serves(&job.key, zoom);
+        let job = Job {
+            copy: self.copy_wanted().filter(|_| !served),
+            ..job.clone()
+        };
+        self.worker.request(Some(job.clone()));
+        self.viewing.asked = Asked::Evaluating(job);
+    }
+
+    /// The zoom to copy the viewed result at for the viewer cache, unless an edit is in
+    /// progress: each value a drag passes is stale by the next, and copying it costs GUI frames
+    /// their budget.
+    fn copy_wanted(&self) -> Option<Zoom> {
+        (self.session.editing().is_none()).then(|| self.session.viewer().zoom())
+    }
+
     /// Keeps the readout on the shown image's pixel under the pointer, or the one it left the
-    /// viewer from: asks the GPU to read it, and describes the last read until a newer arrives.
+    /// viewer from: asks the GPU to read it.
     fn follow_readout(&mut self, requests: &mut Vec<Request>) {
-        let pointed = self.pointed();
-        if let Some((_, Some(probe))) = pointed
+        if let Some((_, Some(probe))) = self.pointed()
             && self.probed != Some(probe)
         {
             self.probed = Some(probe);
@@ -1199,7 +1745,11 @@ impl App {
                 requests.extend(self.poll_pixel_read());
             }
         }
-        let readout = match pointed {
+    }
+
+    /// The readout of the pointed pixel's last read, until a newer arrives.
+    fn readout(&self) -> String {
+        match self.pointed() {
             None => String::new(),
             Some(([x, y], None)) => {
                 format!("x {x} y {y} · R 0 G 0 B 0 A 0, outside the data window")
@@ -1210,10 +1760,6 @@ impl App {
                 Some(read) => format!("{} · reading", read.describe()),
                 None => format!("x {} y {}", pixel[0], pixel[1]),
             },
-        };
-        if readout != self.readout {
-            self.readout.clone_from(&readout);
-            requests.push(Request::ShowReadout(readout));
         }
     }
 
@@ -1231,7 +1777,7 @@ impl App {
     /// The shown image's pixel the readout describes, in image pixels with y up, and the probe
     /// that reads it, or `None` for a pixel outside the data window, whose values are zero.
     fn pointed(&self) -> Option<([i32; 2], Option<Probe>)> {
-        let info = self.shown.framed()?;
+        let info = self.viewing.shown.framed()?;
         let [x, y] = match self.viewer_pointer {
             // The pixel drawn at the centre of the physical pixel the pointer is in, where the
             // viewer's shader samples.
@@ -1253,9 +1799,8 @@ impl App {
         Some(([x, y], probe))
     }
 
-    /// Names the viewed node from the document as it stands, then says what is shown of it, what
-    /// upstream of it is not connected, and the device evaluating it. Called once the wanted key
-    /// has been sent.
+    /// Describes the viewed node and what is shown of it. Called once the viewed key has been
+    /// asked for.
     fn caption(&self) -> String {
         let slot = self.session.viewer().slot().digit();
         let document = self.session.document();
@@ -1270,12 +1815,9 @@ impl App {
             };
         };
         let node = document.node(viewed).expect("marks name existing nodes");
-        let current = match (&self.sent, self.shown.wanted()) {
-            (Some(sent), Some(shown)) => shown.key == sent.key,
-            _ => false,
-        };
+        let current = self.viewing.shows_asked();
         let mut details = Vec::new();
-        match &self.shown {
+        match &self.viewing.shown {
             Shown::Image { info, .. } if current => {
                 let window = info.display_window;
                 if !window.is_empty() {
@@ -1283,11 +1825,30 @@ impl App {
                 }
                 details.extend(info.warnings.iter().map(ToString::to_string));
             }
+            Shown::Copy { copy, .. } if current => {
+                let window = copy.info.display_window;
+                if !window.is_empty() {
+                    details.push(format!("{} × {}", window.width, window.height));
+                }
+                details.extend(copy.info.warnings.iter().map(ToString::to_string));
+                details.push(match copy.halvings() {
+                    0 => "cached".to_owned(),
+                    halvings => format!("cached at 1/{}", 1u32 << halvings),
+                });
+            }
             Shown::Failed { error, .. } if current => details.push(error.clone()),
-            // The previous image stays until then.
+            // The previous image stays until then, and says which frame it is of.
+            Shown::Image { job, .. } | Shown::Copy { job, .. }
+                if job.frame != self.session.frame() =>
+            {
+                let frame = self.session.frame();
+                details.push(format!("frame {} shown, {frame} updating…", job.frame));
+            }
             _ => details.push("updating…".to_owned()),
         }
-        for (id, what) in missing(document, viewed) {
+        let (files, frame) = (self.session.files(), self.session.frame());
+        let name = |id| document.node(id).expect("upstream nodes exist").name();
+        for (id, what) in missing(document, viewed, frame) {
             let (label, lack) = match what {
                 Missing::Input(input) => (input.label, "is not connected"),
                 Missing::File(parameter) => (parameter.label, "is not set"),
@@ -1295,8 +1856,17 @@ impl App {
             details.push(if id == viewed {
                 format!("{label} {lack}")
             } else {
-                let upstream = document.node(id).expect("inputs name existing nodes");
-                format!("{label} of {} {lack}", upstream.name())
+                format!("{label} of {} {lack}", name(id))
+            });
+        }
+        for (id, reading) in readings(document, files, viewed, frame) {
+            let Some(read) = reading.held() else {
+                continue;
+            };
+            details.push(if id == viewed {
+                format!("holds frame {read}")
+            } else {
+                format!("{} holds frame {read}", name(id))
             });
         }
         if details.is_empty() {
@@ -1321,14 +1891,14 @@ impl App {
         self.gpu.has_surface(pane)
     }
 
-    /// Has every frame from now on record what it proves, for the lifecycle check. Each frame
-    /// then waits for the GPU. Call it before the first surface is attached, so that every
-    /// surface is made readable where it allows.
+    /// Has every frame from now on record what it proves, each waiting for the GPU. Call it
+    /// before the first surface is attached, so that every surface is made readable where it
+    /// allows.
     pub fn check_frames(&mut self) {
         self.gpu.check_frames();
     }
 
-    /// Has every frame from now on record when it passed each stage, for the drag check.
+    /// Has every frame from now on record when it passed each stage.
     pub fn time_frames(&mut self) {
         self.gpu.time_frames();
     }
@@ -1344,7 +1914,6 @@ impl App {
         self.gpu.poll();
     }
 
-    /// The device evaluating the session.
     pub fn evaluation_device(&self) -> EvaluationDevice {
         self.device
     }
@@ -1360,15 +1929,19 @@ impl App {
         self.gpu.errors()
     }
 
-    /// Destroys the GPU device for the lifecycle check. Its loss then arrives as a driver's
-    /// would, as [`Notice::DeviceLost`].
+    /// What the GPU's allocator holds.
+    pub fn gpu_memory(&self) -> Option<GpuMemory> {
+        self.gpu.memory()
+    }
+
+    /// Destroys the GPU device, whose loss then arrives as a driver's would, as
+    /// [`Notice::DeviceLost`].
     pub fn destroy_device(&mut self) {
         self.gpu.destroy_device();
     }
 
-    /// The number of the request whose image the viewer's last presented frame showed, for the
-    /// drag check.
-    pub fn presented_request(&self) -> Option<u64> {
+    /// The number of the job whose image the viewer's last presented frame showed.
+    pub fn presented_job(&self) -> Option<u64> {
         self.presented
     }
 }

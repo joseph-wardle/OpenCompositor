@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use open_ng::Point;
 
 use super::*;
-use crate::evaluate::result_key;
 use crate::fixtures::{self, directory};
 use crate::gpu::{noop_device, noop_device_pair};
 use crate::read::{ReadError, read_image};
@@ -18,15 +17,17 @@ fn key(path: impl Into<PathBuf>) -> ResultKey {
     let mut session = Session::new();
     let changes = session.create_readers(vec![path.into()], Point::default(), None);
     let id = *changes.nodes.first().unwrap();
-    result_key(session.document(), session.reloads(), id).unwrap()
+    session.result_key(id).unwrap()
 }
 
 /// A request for the node with the key, as the worker cares only about which node it is.
-fn on(node: u64, key: ResultKey) -> Wanted {
-    Wanted {
+fn on(node: u64, key: ResultKey) -> Job {
+    Job {
         node: NodeId(node),
         key,
+        frame: 1.0,
         number: 0,
+        copy: None,
     }
 }
 
@@ -42,13 +43,16 @@ fn write_png(path: &Path, width: u32, height: u32) {
 
 fn worker() -> (Worker, Receiver<Evaluated>) {
     let (delivered, deliveries) = mpsc::channel();
-    let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
-        delivered.send(evaluated).unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Cpu,
+        move |evaluated| {
+            delivered.send(evaluated).unwrap();
+        },
+        |_| {},
+    );
     (worker, deliveries)
 }
 
-/// Connects the worker to the device and its queue as the generation.
 fn connect(worker: &Worker, (device, queue): (wgpu::Device, wgpu::Queue), generation: u64) {
     worker.connect(device, queue, Arc::default(), generation);
 }
@@ -61,7 +65,6 @@ fn staged(evaluated: Evaluated) -> Pixels {
     }
 }
 
-/// The staging buffer staged planes are copied from.
 fn buffer(pixels: &Pixels) -> &wgpu::Buffer {
     pixels.staged.as_ref().expect("staged").buffer()
 }
@@ -86,7 +89,6 @@ fn wait_until(worker: &Worker, what: &str, done: impl Fn(&MailboxState) -> bool)
     }
 }
 
-/// Waits until the worker has started the last request.
 fn wait_until_started(worker: &Worker) {
     wait_until(worker, "started", |state| state.request.is_none());
 }
@@ -105,10 +107,14 @@ fn a_request_replaces_any_the_worker_has_not_started() {
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
     // Each delivery waits for the test, holding the worker as a long evaluation would.
-    let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
-        delivered.send(evaluated.wanted.key).unwrap();
-        released.lock().unwrap().recv().unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Cpu,
+        move |evaluated| {
+            delivered.send(evaluated.job.key).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        },
+        |_| {},
+    );
 
     worker.request(Some(on(1, missing("first"))));
     assert_eq!(deliveries.recv().unwrap(), missing("first"));
@@ -140,10 +146,14 @@ fn dropping_the_worker_waits_for_the_delivery_in_progress() {
     let (started, delivering) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
-    let worker = Worker::start(EvaluationDevice::Cpu, move |_| {
-        started.send(()).unwrap();
-        released.lock().unwrap().recv().unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Cpu,
+        move |_| {
+            started.send(()).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        },
+        |_| {},
+    );
     worker.request(Some(on(1, missing("missing"))));
     delivering.recv().unwrap();
 
@@ -159,28 +169,31 @@ fn dropping_the_worker_waits_for_the_delivery_in_progress() {
     drop_returned.recv_timeout(Duration::from_secs(10)).unwrap();
 }
 
+/// A named pipe in its own directory. Reading it waits for a writer, and then for what it
+/// writes, as a long decode would.
 #[cfg(unix)]
-#[test]
-fn dropping_the_worker_does_not_wait_for_an_evaluation() {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // Reading a named pipe waits for a writer, and then for what it writes, as a long decode
-    // would.
-    let pipe = directory("decode-in-progress").join("pipe.exr");
+fn pipe(name: &str) -> PathBuf {
+    let pipe = directory(name).join("pipe.exr");
     let made = std::process::Command::new("mkfifo").arg(&pipe).status();
     assert!(made.unwrap().success());
-    let (worker, deliveries) = worker();
-    worker.request(Some(on(1, key(&pipe))));
-    // Opening for writing without blocking fails until the worker has the pipe open for
-    // reading; once it succeeds, the worker waits on the read for as long as this end is open.
+    pipe
+}
+
+/// The pipe's writing end, once the worker has it open for reading. The worker then waits on
+/// the read for as long as this end is open.
+#[cfg(unix)]
+fn writer_once_read(pipe: &Path) -> File {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Opening for writing without blocking fails until a reader has the pipe open.
     let deadline = Instant::now() + Duration::from_secs(10);
-    let writer = loop {
+    loop {
         let opened = File::options()
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open(&pipe);
+            .open(pipe);
         match opened {
-            Ok(writer) => break writer,
+            Ok(writer) => return writer,
             Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
                 assert!(
                     Instant::now() < deadline,
@@ -190,7 +203,16 @@ fn dropping_the_worker_does_not_wait_for_an_evaluation() {
             }
             Err(error) => panic!("{error}"),
         }
-    };
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_the_worker_does_not_wait_for_an_evaluation() {
+    let pipe = pipe("decode-in-progress");
+    let (worker, deliveries) = worker();
+    worker.request(Some(on(1, key(&pipe))));
+    let writer = writer_once_read(&pipe);
 
     let drop_returned = drop_elsewhere(worker);
 
@@ -209,7 +231,7 @@ fn a_failure_is_delivered_with_its_key() {
     worker.request(Some(on(1, missing("missing"))));
     let evaluated = receive(&deliveries);
 
-    assert_eq!(evaluated.wanted.key, missing("missing"));
+    assert_eq!(evaluated.job.key, missing("missing"));
     assert!(matches!(
         evaluated.result,
         Err(ViewerError::Eval(EvalError::Read {
@@ -245,7 +267,7 @@ fn connecting_a_gpu_delivers_the_last_key_again_with_its_pixels() {
     connect(&worker, noop_device(None), 1);
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, key(&path));
+    assert_eq!(evaluated.job.key, key(&path));
     assert!(evaluated.result.unwrap().pixels.is_some());
 }
 
@@ -406,7 +428,7 @@ fn a_newer_request_for_another_node_ends_the_wait_for_the_staging_buffer() {
     worker.request(Some(on(2, missing("missing"))));
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, missing("missing"));
+    assert_eq!(evaluated.job.key, missing("missing"));
     assert!(evaluated.result.is_err());
     drop(held);
     wait_until_done_after_evaluating(&worker);
@@ -416,46 +438,115 @@ fn a_newer_request_for_another_node_ends_the_wait_for_the_staging_buffer() {
     );
 }
 
-#[test]
-fn a_newer_request_for_the_same_node_lets_the_started_one_be_delivered() {
-    let directory = directory("same-node");
-    let [first, second, third] =
-        ["first.png", "second.png", "third.png"].map(|name| directory.join(name));
-    for path in [&first, &second, &third] {
-        write_png(path, 3, 2);
+/// Asks for three images of one node, at the three frames: the first, delivered and held, which
+/// keeps the second waiting for the staging buffer; and the third while it waits, once the viewer
+/// last caught up at `caught_up`. Returns the images then delivered, by key, and the three keys.
+fn same_node(name: &str, frames: [f64; 3], caught_up: Instant) -> (Vec<ResultKey>, [ResultKey; 3]) {
+    let keys = images(name).map(key);
+    let at = |index: usize| Job {
+        frame: frames[index],
+        ..on(1, keys[index].clone())
+    };
+    let (worker, deliveries) = worker();
+    connect(&worker, noop_device(None), 1);
+    worker.request(Some(at(0)));
+    let held = staged(receive(&deliveries));
+
+    worker.request(Some(at(1)));
+    wait_until_finishing(&worker);
+    worker.mailbox.lock().caught_up = caught_up;
+    worker.request(Some(at(2)));
+    drop(held);
+
+    let mut delivered = Vec::new();
+    loop {
+        let evaluated = receive(&deliveries);
+        assert!(evaluated.result.unwrap().pixels.is_some());
+        let last = evaluated.job.key == keys[2];
+        delivered.push(evaluated.job.key);
+        if last {
+            break;
+        }
     }
+    (delivered, keys)
+}
+
+/// Caught up for the whole test, however slowly it runs.
+fn caught_up_throughout() -> Instant {
+    Instant::now() + Duration::from_secs(600)
+}
+
+#[test]
+fn a_newer_request_for_another_frame_stops_the_started_one_while_the_viewer_is_fed() {
+    let frames = [1.0, 2.0, 3.0];
+    let (delivered, [.., third]) = same_node("scrub-fed", frames, caught_up_throughout());
+    assert_eq!(delivered, [third]);
+}
+
+#[test]
+fn a_newer_request_for_another_frame_lets_the_started_one_finish_once_the_viewer_waited() {
+    let waited = Instant::now().checked_sub(FEEDBACK_INTERVAL).unwrap();
+    let (delivered, [_, second, third]) = same_node("scrub-waited", [1.0, 2.0, 3.0], waited);
+    assert_eq!(delivered, [second, third]);
+}
+
+#[test]
+fn a_newer_request_for_the_same_frame_lets_the_started_one_finish() {
+    let frames = [1.0; 3];
+    let (delivered, [_, second, third]) = same_node("edit", frames, caught_up_throughout());
+    assert_eq!(delivered, [second, third]);
+}
+
+/// Decoder threads that saw the stop have already left, so the read cannot carry on as though it
+/// never had.
+#[test]
+fn a_started_request_found_superseded_stays_so_after_the_feedback_interval() {
+    let [first, second] = images("stop-stays");
+    let (worker, _deliveries) = worker();
+    let mut state = worker.mailbox.lock();
+    state.started = Some(on(1, key(&first)));
+    state.request = Some(Ask::Show(Job {
+        frame: 2.0,
+        ..on(1, key(&second))
+    }));
+    state.caught_up = Instant::now();
+    assert!(state.superseded());
+
+    state.caught_up = Instant::now().checked_sub(FEEDBACK_INTERVAL).unwrap();
+    assert!(state.superseded());
+}
+
+#[test]
+fn a_request_reaching_an_idle_worker_starts_the_feedback_interval_again() {
+    let [first, second] = images("idle-request");
     let (worker, deliveries) = worker();
     connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
     let held = staged(receive(&deliveries));
+    wait_until_done_after_evaluating(&worker);
 
-    // Waiting for the buffer the test holds when the edit goes on.
+    let asked = Instant::now();
     worker.request(Some(on(1, key(&second))));
+    // Waiting for the buffer the test holds, so not yet delivered.
     wait_until_finishing(&worker);
-    worker.request(Some(on(1, key(&third))));
+    assert!(worker.mailbox.lock().caught_up >= asked);
     drop(held);
-
-    let staged = |evaluated: Evaluated| {
-        assert!(evaluated.result.unwrap().pixels.is_some());
-        evaluated.wanted.key
-    };
-    assert_eq!(staged(receive(&deliveries)), key(&second));
-    assert_eq!(staged(receive(&deliveries)), key(&third));
+    receive(&deliveries);
 }
 
-/// Two white images in a directory of the test's own.
-fn two_images(name: &str) -> [PathBuf; 2] {
+/// `N` white 3 × 2 PNGs in the test's directory `name`.
+fn images<const N: usize>(name: &str) -> [PathBuf; N] {
     let directory = directory(name);
-    let paths = ["first.png", "second.png"].map(|name| directory.join(name));
-    for path in &paths {
-        write_png(path, 3, 2);
-    }
-    paths
+    std::array::from_fn(|index| {
+        let path = directory.join(format!("{index}.png"));
+        write_png(&path, 3, 2);
+        path
+    })
 }
 
 #[test]
 fn a_staging_buffer_returned_after_its_device_was_replaced_is_dropped() {
-    let [first, second] = two_images("replaced-return");
+    let [first, second] = images("replaced-return");
     let (worker, deliveries) = worker();
     let [replaced, replacement] = noop_device_pair();
     connect(&worker, replaced, 1);
@@ -509,7 +600,7 @@ fn a_staging_buffer_returned_once_the_session_is_on_the_gpu_is_dropped() {
 
 #[test]
 fn an_image_finishing_for_a_replaced_device_is_staged_again_for_the_new_one() {
-    let [first, second] = two_images("replaced-finishing");
+    let [first, second] = images("replaced-finishing");
     let (worker, deliveries) = worker();
     connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
@@ -521,14 +612,14 @@ fn an_image_finishing_for_a_replaced_device_is_staged_again_for_the_new_one() {
     connect(&worker, noop_device(None), 2);
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, key(&second));
+    assert_eq!(evaluated.job.key, key(&second));
     assert!(evaluated.result.unwrap().pixels.is_some());
     drop(held);
 }
 
 #[test]
 fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
-    let [first, second] = two_images("lost-staging");
+    let [first, second] = images("lost-staging");
     let (worker, deliveries) = worker();
     let (device, queue) = noop_device(None);
     worker.connect(device.clone(), queue, Arc::default(), 1);
@@ -544,13 +635,13 @@ fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
 
     connect(&worker, noop_device(None), 2);
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, key(&second));
+    assert_eq!(evaluated.job.key, key(&second));
     assert!(evaluated.result.unwrap().pixels.is_some());
 }
 
 #[test]
 fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels() {
-    let [first, second] = two_images("disconnect");
+    let [first, second] = images("disconnect");
     let (worker, deliveries) = worker();
     connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
@@ -562,7 +653,7 @@ fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels(
     worker.disconnect(Instant::now());
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, key(&second));
+    assert_eq!(evaluated.job.key, key(&second));
     assert!(evaluated.result.unwrap().pixels.is_none());
     drop(held);
     wait_until_done_after_evaluating(&worker);
@@ -653,9 +744,13 @@ fn a_file_is_staged_bottom_row_first() {
 /// A GPU session's worker, connected to a device on the adapter the kernel tests use.
 fn gpu_worker() -> (Worker, Receiver<Evaluated>, wgpu::Device, wgpu::Queue) {
     let (delivered, deliveries) = mpsc::channel();
-    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
-        delivered.send(evaluated).unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        move |evaluated| {
+            delivered.send(evaluated).unwrap();
+        },
+        |_| {},
+    );
     let (device, queue) = crate::kernels::headless::device();
     worker.connect(device.clone(), queue.clone(), Arc::default(), 1);
     (worker, deliveries, device, queue)
@@ -679,12 +774,10 @@ fn exposed(path: &Path, stops: f64) -> ResultKey {
     key(&chain([reader(path), exposure(Some(stops))]), 2)
 }
 
-/// Waits until the worker has left its GPU phase.
 fn wait_until_out_of_gpu_phase(worker: &Worker) {
     wait_until(worker, "left its GPU phase", |state| !state.in_gpu_phase);
 }
 
-/// The keys retained on the connected device.
 fn retained_on_gpu(worker: &Worker) -> Vec<ResultKey> {
     wait_until_out_of_gpu_phase(worker);
     worker.mailbox.retained_on_gpu()
@@ -715,9 +808,13 @@ fn a_gpu_session_evaluates_nothing_until_a_device_is_connected() {
     let path = directory("gpu-unconnected").join("image.png");
     write_png(&path, 3, 2);
     let (delivered, deliveries) = mpsc::channel();
-    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
-        delivered.send(evaluated).unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        move |evaluated| {
+            delivered.send(evaluated).unwrap();
+        },
+        |_| {},
+    );
 
     worker.request(Some(on(1, exposed(&path, 1.0))));
     assert!(
@@ -736,9 +833,13 @@ fn a_gpu_session_fails_a_request_on_a_lost_device_and_shows_it_on_the_next() {
     let path = directory("gpu-lost").join("image.png");
     write_png(&path, 3, 2);
     let (delivered, deliveries) = mpsc::channel();
-    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
-        delivered.send(evaluated).unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        move |evaluated| {
+            delivered.send(evaluated).unwrap();
+        },
+        |_| {},
+    );
     let (device, queue) = crate::kernels::headless::device();
     worker.connect(device, queue, Arc::new(AtomicBool::new(true)), 1);
     let requested = exposed(&path, 1.0);
@@ -757,7 +858,7 @@ fn a_gpu_session_fails_a_request_on_a_lost_device_and_shows_it_on_the_next() {
     let (device, queue) = crate::kernels::headless::device();
     worker.connect(device, queue, Arc::default(), 2);
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, requested);
+    assert_eq!(evaluated.job.key, requested);
     let (_, generation) = evaluated_planes(evaluated);
     assert_eq!(generation, 2);
 }
@@ -776,7 +877,7 @@ fn a_replaced_device_drops_its_state_and_the_new_one_shows_the_request_again() {
     worker.connect(device, queue, Arc::default(), 2);
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, requested);
+    assert_eq!(evaluated.job.key, requested);
     let (second, generation) = evaluated_planes(evaluated);
     assert_eq!(generation, 2);
     assert!(!Arc::ptr_eq(&first[0], &second[0]));
@@ -811,10 +912,14 @@ fn dropping_a_gpu_session_worker_waits_for_its_gpu_phase() {
     let (started, delivering) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
-    let worker = Worker::start(EvaluationDevice::Gpu, move |evaluated| {
-        started.send(evaluated).unwrap();
-        released.lock().unwrap().recv().unwrap();
-    });
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        move |evaluated| {
+            started.send(evaluated).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        },
+        |_| {},
+    );
     let (device, queue) = crate::kernels::headless::device();
     worker.connect(device, queue, Arc::default(), 1);
     worker.request(Some(on(1, exposed(&path, 1.0))));
@@ -850,7 +955,7 @@ fn moving_a_gpu_session_to_the_cpu_drops_its_gpu_state_and_stages_the_request_ag
     worker.evaluate_on(EvaluationDevice::Cpu);
 
     let again = receive(&deliveries);
-    assert_eq!(again.wanted.key, exposed(&path, 1.0));
+    assert_eq!(again.job.key, exposed(&path, 1.0));
     staged(again);
     assert!(retained_on_gpu(&worker).is_empty());
     worker.evaluate_on(EvaluationDevice::Gpu);
@@ -880,5 +985,189 @@ fn a_loss_counts_as_during_evaluation_only_until_the_gpu_completed_its_work() {
         // Without a submission on the device connected now, a loss is not during evaluation.
         connect(&worker, (device, queue), 2);
         assert!(!worker.disconnect(Instant::now()));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pause_stops_the_request_in_progress_and_the_next_request_is_evaluated() {
+    let pipe = pipe("paused");
+    let (worker, deliveries) = worker();
+    worker.request(Some(on(1, key(&pipe))));
+    let writer = writer_once_read(&pipe);
+
+    worker.pause();
+    // The read fails once the pipe closes, and the failure is not delivered.
+    drop(writer);
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        "delivered after the pause"
+    );
+    worker.request(Some(on(1, missing("next"))));
+    assert_eq!(receive(&deliveries).job.key, missing("next"));
+}
+
+/// A worker on the device that also hands its copies for the viewer cache to the test.
+fn copying_worker(device: EvaluationDevice) -> (Worker, Receiver<Evaluated>, Receiver<ViewerCopy>) {
+    let (delivered, deliveries) = mpsc::channel();
+    let (copied, copies) = mpsc::channel();
+    let worker = Worker::start(
+        device,
+        move |evaluated| delivered.send(evaluated).unwrap(),
+        move |copy| copied.send(copy).unwrap(),
+    );
+    (worker, deliveries, copies)
+}
+
+#[test]
+fn a_result_asked_for_with_a_copy_is_delivered_then_copied_on_its_device() {
+    let path = directory("copied").join("image.png");
+    write_png(&path, 8, 4);
+    let zoom = fixtures::fitted(4, 4);
+    for device in [EvaluationDevice::Cpu, EvaluationDevice::Gpu] {
+        let (worker, deliveries, copies) = copying_worker(device);
+        let (gpu, queue) = crate::kernels::headless::device();
+        worker.connect(gpu, queue, Arc::default(), 1);
+        let key = exposed(&path, -1.0);
+
+        worker.request(Some(on(1, key.clone())));
+        receive(&deliveries);
+        assert!(
+            copies.recv_timeout(Duration::from_millis(200)).is_err(),
+            "copied unasked on the {device}"
+        );
+
+        worker.request(Some(Job {
+            copy: Some(zoom),
+            ..on(1, key.clone())
+        }));
+        receive(&deliveries);
+        let copy = (copies.recv_timeout(Duration::from_secs(10))).expect("a copy");
+        assert!(copy.key == key);
+        assert_eq!(copy.halvings(), 1);
+        assert_eq!(
+            copy.window,
+            Window {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 2,
+            }
+        );
+        let texels: Vec<f32> = copy.texels.iter().map(|value| value.to_f32()).collect();
+        assert_eq!(texels, [0.5, 0.5, 0.5, 1.0].repeat(8), "on the {device}");
+    }
+}
+
+#[test]
+fn a_gpu_session_copies_a_frame_although_a_newer_request_came_while_the_gpu_made_it() {
+    let path = directory("copied-superseded").join("image.png");
+    write_png(&path, 8, 4);
+    let mailbox: Arc<std::sync::OnceLock<Arc<Mailbox>>> = Arc::default();
+    let (copied, copies) = mpsc::channel();
+    let worker = Worker::start(
+        EvaluationDevice::Gpu,
+        {
+            let mailbox = Arc::clone(&mailbox);
+            // As playback asks for the next frame once this one is shown, before the GPU is done.
+            move |_| mailbox.get().unwrap().lock().request = Some(Ask::Release)
+        },
+        move |copy| copied.send(copy).unwrap(),
+    );
+    mailbox.set(Arc::clone(&worker.mailbox)).unwrap();
+    let (gpu, queue) = crate::kernels::headless::device();
+    worker.connect(gpu, queue, Arc::default(), 1);
+    let zoom = fixtures::fitted(4, 4);
+    let key = exposed(&path, -1.0);
+    worker.request(Some(Job {
+        copy: Some(zoom),
+        ..on(1, key.clone())
+    }));
+    let copy = (copies.recv_timeout(Duration::from_secs(10))).expect("a copy");
+    assert!(copy.key == key);
+}
+
+#[cfg(unix)]
+#[test]
+fn look_ahead_yields_to_a_request_and_prepares_its_frame_again_after() {
+    let pipe = pipe("look-ahead-yields");
+    let (worker, deliveries) = worker();
+    let ahead = key(&pipe);
+    worker.look_ahead(vec![on(1, ahead.clone())]);
+    let writer = writer_once_read(&pipe);
+
+    worker.request(Some(on(1, missing("request"))));
+    drop(writer);
+    assert_eq!(receive(&deliveries).job.key, missing("request"));
+
+    // Stopped, it was not prepared, so the worker reads it again.
+    drop(writer_once_read(&pipe));
+    wait_until(&worker, "prepared the frame", |state| {
+        state.prepared.contains(&ahead)
+    });
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        "delivered a frame it prepared"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_request_for_the_frame_being_prepared_lets_it_finish_then_is_evaluated() {
+    let pipe = pipe("look-ahead-same-frame");
+    let (worker, deliveries) = worker();
+    let ahead = key(&pipe);
+    worker.look_ahead(vec![on(1, ahead.clone())]);
+    let writer = writer_once_read(&pipe);
+
+    worker.request(Some(on(1, ahead.clone())));
+    drop(writer);
+    wait_until(&worker, "prepared the frame", |state| {
+        state.prepared.contains(&ahead)
+    });
+    drop(writer_once_read(&pipe));
+    assert!(receive(&deliveries).job.key == ahead);
+}
+
+#[test]
+fn look_ahead_copies_each_frame_once_and_delivers_none() {
+    let directory = directory("look-ahead-copies");
+    let zoom = fixtures::fitted(4, 4);
+    for device in [EvaluationDevice::Cpu, EvaluationDevice::Gpu] {
+        let (worker, deliveries, copies) = copying_worker(device);
+        let (gpu, queue) = crate::kernels::headless::device();
+        worker.connect(gpu, queue, Arc::default(), 1);
+        let keys: Vec<ResultKey> = (1..=3)
+            .map(|frame| {
+                let path = directory.join(format!("{device}.{frame}.png"));
+                write_png(&path, 8, 4);
+                exposed(&path, f64::from(frame))
+            })
+            .collect();
+        let ahead = |keys: &[ResultKey]| {
+            (keys.iter())
+                .map(|key| Job {
+                    copy: Some(zoom),
+                    ..on(1, key.clone())
+                })
+                .collect()
+        };
+
+        worker.look_ahead(ahead(&keys));
+        for key in &keys {
+            let copy = (copies.recv_timeout(Duration::from_secs(10))).expect("a copy");
+            assert!(copy.key == *key, "prepared out of order on the {device}");
+            assert_eq!(copy.halvings(), 1);
+        }
+        // The same frames again, as the app asks after each copy, are not prepared again.
+        worker.look_ahead(ahead(&keys[1..]));
+        assert!(
+            copies.recv_timeout(Duration::from_millis(200)).is_err(),
+            "prepared a frame twice on the {device}"
+        );
+        assert!(
+            deliveries.try_recv().is_err(),
+            "delivered a prepared frame on the {device}"
+        );
     }
 }

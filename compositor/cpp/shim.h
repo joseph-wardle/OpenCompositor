@@ -1,6 +1,5 @@
-// What cxx cannot bind: one-liners for constructors, statics, templates and casts, and the
-// parameter panel, creation menu and viewer strip, plain Qt classes that Rust fills and that send
-// its gestures back.
+// What cxx cannot bind: one-liners for constructors, statics, templates and casts, and the plain
+// Qt widgets that Rust fills and that send its gestures back.
 #pragma once
 #include <QtCore/QByteArray>
 #include <QtCore/QEvent>
@@ -28,6 +27,10 @@ struct PanelData;
 struct PanelRow;
 struct PanelGesture;
 enum class PanelGestureKind : uint8_t;
+struct TimebarData;
+struct TimebarGesture;
+enum class TimebarGestureKind : uint8_t;
+class QComboBox;
 class QDoubleSpinBox;
 class QLineEdit;
 class QListWidget;
@@ -74,7 +77,6 @@ class ParameterPanel : public QWidget {
 
     rust::Fn<void(PanelGesture)> gestures;
     bool refreshing = false;
-    // The node the rows are of, if any.
     std::optional<uint64_t> node;
     QLabel *title;
     QToolButton *pin;
@@ -83,11 +85,50 @@ class ParameterPanel : public QWidget {
     std::vector<Row> rows;
 };
 
-// Under the viewer: its caption, then the readout and the viewer's exposure, which sends each value
-// the artist sets in stops. Nothing is sent when Rust shows a value.
+class FrameBar;
+
+// The timeline under the viewer, shown as Rust sends it. Each gesture is sent back; nothing is sent
+// while Rust shows the timebar.
+class Timebar : public QWidget {
+  public:
+    Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rates, QWidget *parent);
+    void show_timebar(const TimebarData &data);
+
+  protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
+  private:
+    // A field that sends what is typed into it as the gesture, if the artist changed it.
+    QLineEdit *field(TimebarGestureKind kind, const QString &tooltip);
+    QToolButton *button(TimebarGestureKind kind, const QIcon &icon, const QString &tooltip);
+    void send(TimebarGestureKind kind, double frame = 0, const QString &text = QString());
+
+    rust::Fn<void(TimebarGesture)> gestures;
+    bool refreshing = false;
+    FrameBar *bar;
+    QComboBox *rate;
+    QLabel *status;
+    QToolButton *timecode;
+    QToolButton *play_backward;
+    QToolButton *play_forward;
+    QLineEdit *frame;
+    QToolButton *looping;
+    QToolButton *mode;
+    QComboBox *range;
+    QLineEdit *first;
+    QLineEdit *last;
+    QIcon play_backward_icon, play_forward_icon, stop_icon;
+    QIcon loop_icon, once_icon;
+};
+
+// Under the viewer. The exposure sends each value the artist sets, in stops; nothing is sent when
+// Rust shows a value.
 class ViewerStrip : public QWidget {
   public:
-    ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set, QWidget *parent);
+    ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set,
+                rust::Fn<void(TimebarGesture)> timebar_gestures, const QStringList &rates,
+                QWidget *parent);
+    Timebar *timebar;
     QLabel *caption;
     QLabel *readout;
     QDoubleSpinBox *exposure;
@@ -134,7 +175,10 @@ void set_action(QAction *action, const QString &text, bool enabled);
 QDockWidget *new_dock(QMainWindow *window, QMenu *menu, const QString &title, int area);
 QWidget *container(Pane *pane, QDockWidget *dock);
 ViewerStrip *container_with_strip(Pane *pane, QDockWidget *dock, double limit, double step,
-                                  rust::Fn<void(double)> exposure_set);
+                                  rust::Fn<void(double)> exposure_set,
+                                  rust::Fn<void(TimebarGesture)> timebar_gestures,
+                                  const QStringList &rates);
+void show_timebar(ViewerStrip *strip, const TimebarData &data);
 QLabel *strip_caption(ViewerStrip *strip);
 void set_readout(ViewerStrip *strip, const QString &text);
 void show_viewer_exposure(ViewerStrip *strip, double stops);

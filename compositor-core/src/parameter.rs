@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::document::Node;
+use crate::files::with_hashes;
 
 /// One parameter of a node type. OpenFX properties beyond these stay in the plugin adapter.
 #[derive(Clone, Debug, PartialEq)]
@@ -21,7 +22,13 @@ pub struct Parameter {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ParameterKind {
     Float(FloatParameter),
+    /// A whole frame number, within [`FRAME_LIMIT`] of 0. Without a default, an unset value is
+    /// the node's to decide from what it reads, as a Reader's First and Last follow its scan.
+    Frame {
+        default: Option<f64>,
+    },
     /// A file, with no default: until one is set, the node has none, and reports it as missing.
+    /// A sequence writes its frame number as a run of `#`; printf's `%04d` is stored so.
     File,
 }
 
@@ -30,6 +37,7 @@ impl ParameterKind {
     pub fn default_value(&self) -> Option<Value> {
         match self {
             ParameterKind::Float(float) => Some(Value::Float(float.default)),
+            ParameterKind::Frame { default } => default.map(Value::Float),
             ParameterKind::File => None,
         }
     }
@@ -45,9 +53,14 @@ pub struct FloatParameter {
     pub limits: RangeInclusive<f64>,
 }
 
+/// How far from 0 a frame parameter may be: far beyond any sequence, and well inside the integers
+/// an `f64` holds exactly.
+pub const FRAME_LIMIT: f64 = 1e9;
+
 /// One parameter's value, of the kind its description names.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
+    /// A number, for a float or a frame.
     Float(f64),
     /// Kept as the artist chose it, never empty. Shared, so cloning a node to move it does not
     /// copy the path. Resolving relative paths, variables or assets belongs between the value and
@@ -75,12 +88,26 @@ pub(crate) fn validate(
             // result's key, which compares values, never tells them apart.
             Value::Float(value + 0.0)
         }
+        (ParameterKind::Frame { .. }, Value::Float(frame)) => {
+            if !frame.is_finite() {
+                return Err(ValueError::NotFinite);
+            }
+            if frame.fract() != 0.0 {
+                return Err(ValueError::NotWhole);
+            }
+            if frame.abs() > FRAME_LIMIT {
+                return Err(ValueError::OutOfLimits(-FRAME_LIMIT..=FRAME_LIMIT));
+            }
+            Value::Float(frame + 0.0)
+        }
         // Whether the file exists is the read's to say.
         (ParameterKind::File, Value::File(path)) if path.as_os_str().is_empty() => {
             return Err(ValueError::EmptyPath);
         }
-        (ParameterKind::File, value @ Value::File(_)) => value,
-        (ParameterKind::Float(_) | ParameterKind::File, _) => return Err(ValueError::WrongKind),
+        (ParameterKind::File, Value::File(path)) => Value::File(with_hashes(path)),
+        (ParameterKind::Float(_) | ParameterKind::Frame { .. } | ParameterKind::File, _) => {
+            return Err(ValueError::WrongKind);
+        }
     };
     Ok((parameter.name, value))
 }
@@ -104,6 +131,8 @@ pub enum ValueError {
     /// The value is of another kind than the parameter, such as a number for a file.
     WrongKind,
     NotFinite,
+    /// A frame with a fraction.
+    NotWhole,
     OutOfLimits(RangeInclusive<f64>),
     EmptyPath,
 }
@@ -114,6 +143,7 @@ impl fmt::Display for ValueError {
             ValueError::UnknownParameter => write!(f, "no such parameter"),
             ValueError::WrongKind => write!(f, "the value is of another kind"),
             ValueError::NotFinite => write!(f, "the value is not a finite number"),
+            ValueError::NotWhole => write!(f, "the value is not a whole frame"),
             ValueError::OutOfLimits(limits) => write!(
                 f,
                 "the value is outside {} to {}",
@@ -164,7 +194,10 @@ impl Resolved {
 ///
 /// Setting a value equal to its default and resetting it resolve alike, though only the first
 /// keeps the value authored.
-pub fn resolve(node: &Node) -> Resolved {
+///
+/// Values are resolved at a frame, so that animated values can be sampled there; until a
+/// parameter can be animated, every value is the same at every frame.
+pub fn resolve(node: &Node, _frame: f64) -> Resolved {
     let values = node
         .kind
         .parameters()

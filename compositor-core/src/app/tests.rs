@@ -5,6 +5,7 @@ use std::time::Duration;
 use super::*;
 use crate::document::NodeKind;
 use crate::evaluate::EvalError;
+use crate::image::ImageInfo;
 use crate::panel::ValueState;
 use crate::parameter::{Value, resolve};
 use crate::read::ReadError;
@@ -26,11 +27,46 @@ const SHIFT: Modifiers = Modifiers {
 
 /// An app whose worker hands its results to the test, with a 400 × 300 graph pane at scale 2.
 fn app() -> (App, Receiver<Evaluated>) {
+    let (app, deliveries, _) = app_scanning();
+    (app, deliveries)
+}
+
+/// A scan as the app's thread hands it over.
+type Scanned = (Pattern, io::Result<Scan>);
+
+/// An app as [`app`] makes it, whose scans also come back to the test, as the events the shell
+/// would dispatch for them.
+fn app_scanning() -> (App, Receiver<Evaluated>, Receiver<Scanned>) {
+    let (app, deliveries, scans, _) = app_with_every_notice();
+    (app, deliveries, scans)
+}
+
+/// An app as [`app`] makes it, whose copies for the viewer cache also come back to the test.
+fn app_copying() -> (App, Receiver<Evaluated>, Receiver<ViewerCopy>) {
+    let (app, deliveries, _, copies) = app_with_every_notice();
+    (app, deliveries, copies)
+}
+
+fn app_with_every_notice() -> (
+    App,
+    Receiver<Evaluated>,
+    Receiver<Scanned>,
+    Receiver<ViewerCopy>,
+) {
     let (delivered, deliveries) = mpsc::channel();
-    let mut app = App::new(EvaluationDevice::Cpu, move |notice| {
-        if let Notice::Evaluated(evaluated) = notice {
+    let (scanned, scans) = mpsc::channel();
+    let (copied, copies) = mpsc::channel();
+    let mut app = App::new(EvaluationDevice::Cpu, move |notice| match notice {
+        Notice::Evaluated(evaluated) => {
             let _ = delivered.send(evaluated);
         }
+        Notice::Copied(copy) => {
+            let _ = copied.send(copy);
+        }
+        Notice::Scanned { sequence, scan } => {
+            let _ = scanned.send((sequence, scan));
+        }
+        Notice::DeviceLost { .. } => {}
     });
     let size = PaneSize {
         width: 400,
@@ -43,9 +79,20 @@ fn app() -> (App, Receiver<Evaluated>) {
     });
     assert!(matches!(
         requests.as_slice(),
-        [Request::Redraw(Pane::Graph), Request::ShowViewerCaption(_)]
+        [
+            Request::ShowTimebar(_),
+            Request::ShowViewerCaption(_),
+            Request::Redraw(Pane::Graph)
+        ]
     ));
-    (app, deliveries)
+    (app, deliveries, scans, copies)
+}
+
+fn next_scan(scans: &Receiver<Scanned>) -> Event {
+    let (sequence, scan) = scans
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scan finishes");
+    Event::Scanned { sequence, scan }
 }
 
 fn input(pane: Pane, input: Input) -> Event {
@@ -54,7 +101,7 @@ fn input(pane: Pane, input: Input) -> Event {
 
 fn file(app: &App, id: NodeId) -> Option<Arc<Path>> {
     let node = app.session().document().node(id)?;
-    resolve(node).file("file").cloned()
+    resolve(node, 1.0).file("file").cloned()
 }
 
 /// Creates a Reader for the path, selected, and returns it.
@@ -77,12 +124,16 @@ fn slot_key(digit: u8, modifiers: Modifiers) -> Event {
 }
 
 /// What the worker was last asked for.
-fn sent(app: &App) -> Wanted {
-    app.sent.clone().expect("a key was sent")
+fn asked(app: &App) -> Job {
+    app.viewing
+        .asked
+        .job()
+        .cloned()
+        .expect("a key was asked for")
 }
 
 /// A finished evaluation of a `width` × `height` image whose pixels the GPU never received.
-fn read(wanted: &Wanted, width: u32, height: u32) -> Event {
+fn read(job: &Job, width: u32, height: u32) -> Event {
     let window = Window {
         x: 0,
         y: 0,
@@ -91,7 +142,7 @@ fn read(wanted: &Wanted, width: u32, height: u32) -> Event {
     };
     Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: wanted.clone(),
+        job: job.clone(),
         result: Ok(ViewerImage {
             info: ImageInfo {
                 display_window: window,
@@ -154,10 +205,10 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
                 undo: Some("Create Reader"),
                 redo: None
             },
-            Request::Redraw(Pane::Graph),
             Request::ShowViewerCaption(
                 "Slot 1: nothing marked. Ctrl+1 marks the selected node".to_owned()
-            )
+            ),
+            Request::Redraw(Pane::Graph)
         ]
     );
     let document = app.session().document();
@@ -384,25 +435,23 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     assert_eq!(app.session().viewer().slot().digit(), 3);
     // Only the caption says it is updating, so the node keeps its size.
     assert_eq!(title(&app, id), "a.exr [3]");
-    assert_eq!(
-        requests.last(),
-        Some(&Request::ShowViewerCaption(
-            "Slot 3 · a.exr · updating… · CPU".to_owned()
-        ))
-    );
+    assert!(requests.contains(&Request::ShowViewerCaption(
+        "Slot 3 · a.exr · updating… · CPU".to_owned()
+    )));
 
     let evaluated = receive(&deliveries);
-    assert_eq!(evaluated.wanted.key, sent(&app).key);
+    assert_eq!(evaluated.job.key, asked(&app).key);
     app.dispatch(Event::Evaluated(evaluated));
 
     // Failed: the error under the viewer, and the node coloured unlike others.
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
     assert_ne!(color(id), color(other));
     assert!(
-        app.caption
+        app.shell
+            .caption
             .starts_with("Slot 3 · a.exr · /nonexistent/a.exr: No such file"),
         "{}",
-        app.caption
+        app.shell.caption
     );
 }
 
@@ -427,29 +476,29 @@ fn a_result_for_a_node_no_longer_viewed_is_not_shown() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let first = sent(&app);
+    let first = asked(&app);
     create(&mut app, "/nonexistent/b.exr");
     app.dispatch(slot_key(2, CTRL));
-    let second = sent(&app);
+    let second = asked(&app);
     assert_ne!(second.key, first.key);
 
     // The first read finishes after the viewer moved on.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
-    assert_eq!(app.caption, "Slot 2 · b.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · b.exr · updating… · CPU");
 
     app.dispatch(read(&second, 8, 2));
-    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
 
     // Back to slot 1, which is read again, showing slot 2's image until then.
     app.dispatch(slot_key(1, NONE));
-    assert_eq!(sent(&app).key, first.key);
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
-    assert!(matches!(app.shown, Shown::Image { .. }));
+    assert_eq!(asked(&app).key, first.key);
+    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert!(matches!(app.viewing.shown, Shown::Image { .. }));
     // Back to slot 2, which is shown already and asked for again, so that the worker lets slot
     // 1's read go.
     app.dispatch(slot_key(2, NONE));
-    assert_eq!(sent(&app).key, second.key);
-    assert_eq!(app.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
+    assert_eq!(asked(&app).key, second.key);
+    assert_eq!(app.shell.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
 }
 
 #[test]
@@ -457,22 +506,22 @@ fn an_edit_faster_than_evaluation_shows_each_later_result_as_it_finishes() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let first = sent(&app);
+    let first = asked(&app);
     app.dispatch(Event::Command(Command::Reload));
-    let second = sent(&app);
+    let second = asked(&app);
     app.dispatch(Event::Command(Command::Reload));
-    let third = sent(&app);
+    let third = asked(&app);
 
     // Superseded, but later than anything shown.
     app.dispatch(read(&second, 8, 2));
-    assert!(matches!(&app.shown, Shown::Image { info, .. } if info.data_window.width == 8));
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert!(matches!(&app.viewing.shown, Shown::Image { info, .. } if info.data_window.width == 8));
+    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
     // Earlier than what is shown.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
-    assert!(matches!(&app.shown, Shown::Image { info, .. } if info.data_window.width == 8));
+    assert!(matches!(&app.viewing.shown, Shown::Image { info, .. } if info.data_window.width == 8));
 
     app.dispatch(read(&third, 5, 1));
-    assert_eq!(app.caption, "Slot 1 · a.exr · 5 × 1 · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a.exr · 5 × 1 · CPU");
 }
 
 #[test]
@@ -480,30 +529,30 @@ fn a_superseded_failure_leaves_the_viewer_and_the_node_as_they_are() {
     let (mut app, _deliveries) = app();
     let id = create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    app.dispatch(read(&sent(&app), 4, 4));
+    app.dispatch(read(&asked(&app), 4, 4));
     let color = |app: &App| app.session().graph().node(id.into()).unwrap().color;
     let unfailed = color(&app);
     app.dispatch(Event::Command(Command::Reload));
-    let superseded = sent(&app);
+    let superseded = asked(&app);
     app.dispatch(Event::Command(Command::Reload));
-    let failed = |wanted: Wanted| {
+    let failed = |job: Job| {
         Event::Evaluated(Evaluated {
             timing: Timing::now(),
             result: Err(ViewerError::Eval(EvalError::Read {
-                origin: wanted.key.clone(),
+                origin: job.key.clone(),
                 error: ReadError::UnknownFormat,
             })),
-            wanted,
+            job,
         })
     };
 
     app.dispatch(failed(superseded));
 
-    assert!(matches!(app.shown, Shown::Image { .. }));
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert!(matches!(app.viewing.shown, Shown::Image { .. }));
+    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
     assert_eq!(color(&app), unfailed);
-    app.dispatch(failed(sent(&app)));
-    assert!(matches!(app.shown, Shown::Failed { .. }));
+    app.dispatch(failed(asked(&app)));
+    assert!(matches!(app.viewing.shown, Shown::Failed { .. }));
     assert_ne!(color(&app), unfailed);
 }
 
@@ -679,25 +728,25 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     let (mut app, _deliveries) = app();
     let id = create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let before = sent(&app);
+    let before = asked(&app);
     app.dispatch(read(&before, 4, 4));
-    assert!(matches!(app.shown, Shown::Image { .. }));
+    assert!(matches!(app.viewing.shown, Shown::Image { .. }));
 
     app.dispatch(Event::Command(Command::Reload));
-    let reload = sent(&app);
+    let reload = asked(&app);
     assert_ne!(reload.key, before.key);
     app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: reload.clone(),
+        job: reload.clone(),
         result: Err(ViewerError::Eval(EvalError::Read {
             origin: reload.key,
             error: ReadError::UnknownFormat,
         })),
     }));
 
-    assert!(matches!(app.shown, Shown::Failed { .. }));
+    assert!(matches!(app.viewing.shown, Shown::Failed { .. }));
     assert_eq!(
-        app.caption,
+        app.shell.caption,
         "Slot 1 · a.exr · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let failed = app.session().graph().node(id.into()).unwrap().color;
@@ -712,20 +761,20 @@ fn undoing_a_mark_leaves_the_viewer_showing_nothing() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    app.dispatch(read(&sent(&app), 4, 4));
+    app.dispatch(read(&asked(&app), 4, 4));
 
     let requests = app.dispatch(Event::Command(Command::Undo));
 
     assert!(requests.contains(&Request::Redraw(Pane::Viewer)));
-    assert!(matches!(app.shown, Shown::Nothing));
+    assert!(matches!(app.viewing.shown, Shown::Nothing));
     assert_eq!(
-        app.caption,
+        app.shell.caption,
         "Slot 1: nothing marked. Ctrl+1 marks the selected node"
     );
 
     // Redo marks it again, and the file is read again.
     app.dispatch(Event::Command(Command::Redo));
-    assert_eq!(app.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
 }
 
 #[test]
@@ -741,9 +790,9 @@ fn h_fits_and_shift_h_shows_actual_size_in_the_viewer_under_the_pointer() {
     });
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    app.dispatch(read(&sent(&app), 4000, 2000));
+    app.dispatch(read(&asked(&app), 4000, 2000));
     app.dispatch(input(Pane::Viewer, Input::PointerEntered));
-    let display = app.shown.display_window().unwrap();
+    let display = app.viewing.shown.display_window().unwrap();
     let scale = |app: &App| app.session().viewer().placement(display).scale;
     assert_eq!(scale(&app), 0.9 / 4.0);
 
@@ -780,9 +829,9 @@ fn delete_in_the_graph_deletes_the_selection_and_the_viewer_lets_go() {
     assert_eq!(app.session().document().node(id), None);
     assert!(app.session().document().node(kept).is_some());
     assert_eq!(app.session().undo_label(), Some("Delete"));
-    assert!(app.sent.is_none());
+    assert!(matches!(app.viewing.asked, Asked::Nothing));
     assert_eq!(
-        app.caption,
+        app.shell.caption,
         "Slot 1: nothing marked. Ctrl+1 marks the selected node"
     );
 
@@ -809,27 +858,27 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
 
     app.dispatch(slot_key(2, CTRL));
     assert_eq!(
-        app.caption,
+        app.shell.caption,
         "Slot 2 · Exposure · updating…; Source of Exposure is not connected · CPU"
     );
     // The empty image, which the viewer does not frame.
-    app.dispatch(read(&sent(&app), 0, 0));
+    app.dispatch(read(&asked(&app), 0, 0));
     assert_eq!(
-        app.caption,
+        app.shell.caption,
         "Slot 2 · Exposure · Source of Exposure is not connected · CPU"
     );
-    assert_eq!(app.shown.display_window(), None);
+    assert_eq!(app.viewing.shown.display_window(), None);
 
     app.session.connect(first, "source", reader).unwrap();
     app.dispatch(Event::Draw(Pane::Viewer));
-    assert_eq!(app.caption, "Slot 2 · Exposure · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · Exposure · updating… · CPU");
     let key = |app: &App, id| {
         let session = app.session();
-        result_key(session.document(), session.reloads(), id).unwrap()
+        session.result_key(id).unwrap()
     };
     let requests = app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: sent(&app),
+        job: asked(&app),
         result: Err(ViewerError::Eval(EvalError::Read {
             origin: key(&app, reader),
             error: ReadError::UnknownFormat,
@@ -838,7 +887,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
 
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
     assert_eq!(
-        app.caption,
+        app.shell.caption,
         "Slot 2 · Exposure · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
@@ -854,15 +903,15 @@ fn a_viewed_reader_without_a_file_says_so_where_it_is() {
         .unwrap();
     let reader = *changes.nodes.first().unwrap();
     app.dispatch(slot_key(1, CTRL));
-    app.dispatch(read(&sent(&app), 0, 0));
-    assert_eq!(app.caption, "Slot 1 · Reader · File is not set · CPU");
+    app.dispatch(read(&asked(&app), 0, 0));
+    assert_eq!(app.shell.caption, "Slot 1 · Reader · File is not set · CPU");
 
     let exposure = create_exposure(&mut app);
     app.session.connect(exposure, "source", reader).unwrap();
     app.dispatch(slot_key(2, CTRL));
-    app.dispatch(read(&sent(&app), 0, 0));
+    app.dispatch(read(&asked(&app), 0, 0));
     assert_eq!(
-        app.caption,
+        app.shell.caption,
         "Slot 2 · Exposure · File of Reader is not set · CPU"
     );
 }
@@ -980,11 +1029,11 @@ fn a_viewer_draw_without_a_surface_presents_nothing() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    app.dispatch(read(&sent(&app), 4, 4));
-    assert!(matches!(app.shown, Shown::Image { .. }));
+    app.dispatch(read(&asked(&app), 4, 4));
+    assert!(matches!(app.viewing.shown, Shown::Image { .. }));
 
     assert_eq!(app.dispatch(Event::Draw(Pane::Viewer)), []);
-    assert_eq!(app.presented_request(), None);
+    assert_eq!(app.presented_job(), None);
 }
 
 #[test]
@@ -994,20 +1043,45 @@ fn the_viewer_follows_value_edits_and_their_undo() {
     let exposure = create_exposure(&mut app);
     app.session.connect(exposure, "source", reader).unwrap();
     app.dispatch(slot_key(1, CTRL));
-    let before = sent(&app).key;
+    let before = asked(&app).key;
 
     app.edit(|session| {
         session.begin_edit(exposure, "Stops").unwrap();
         session.edit_value("stops", Value::Float(1.0)).unwrap();
         session.finish_edit();
     });
-    let edited = sent(&app).key;
+    let edited = asked(&app).key;
     assert_ne!(edited, before);
 
     app.dispatch(Event::Command(Command::Undo));
-    assert_eq!(sent(&app).key, before);
+    assert_eq!(asked(&app).key, before);
     app.dispatch(Event::Command(Command::Redo));
-    assert_eq!(sent(&app).key, edited);
+    assert_eq!(asked(&app).key, edited);
+}
+
+/// Each value a drag passes is stale by the next, so the viewer cache gets a copy only once the
+/// edit is over.
+#[test]
+fn a_request_during_an_edit_asks_for_no_copy() {
+    let (mut app, _deliveries) = app();
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    let exposure = create_exposure(&mut app);
+    app.session.connect(exposure, "source", reader).unwrap();
+    app.dispatch(slot_key(1, CTRL));
+    assert!(asked(&app).copy.is_some());
+
+    app.edit(|session| {
+        session.begin_edit(exposure, "Stops").unwrap();
+        session.edit_value("stops", Value::Float(1.0)).unwrap();
+    });
+    assert_eq!(asked(&app).copy, None);
+
+    app.edit(|session| {
+        session.edit_value("stops", Value::Float(2.0)).unwrap();
+        session.finish_edit();
+    });
+    app.dispatch(Event::Command(Command::Undo));
+    assert!(asked(&app).copy.is_some());
 }
 
 #[test]
@@ -1047,7 +1121,7 @@ fn only_row(requests: &[Request]) -> (Option<Value>, ValueState) {
 fn the_panel_follows_the_current_node_and_whether_its_values_were_set() {
     let (mut app, _deliveries) = app();
     let reader = create(&mut app, "/nonexistent/a.exr");
-    let panel = app.panel.clone().unwrap();
+    let panel = app.shell.panel.clone().unwrap();
     assert_eq!(
         (
             panel.node,
@@ -1060,7 +1134,7 @@ fn the_panel_follows_the_current_node_and_whether_its_values_were_set() {
 
     let requests = choose_in_menu(&mut app, "exposure");
     let exposure = app.session().document().selection()[0];
-    assert_eq!(app.panel.as_ref().unwrap().node, exposure);
+    assert_eq!(app.shell.panel.as_ref().unwrap().node, exposure);
     let default = (Some(Value::Float(0.0)), ValueState::Absent);
     assert_eq!(only_row(&requests), default);
 
@@ -1122,9 +1196,9 @@ fn a_pinned_panel_stays_on_its_node_until_unpinned_or_the_node_is_deleted() {
         key: Key::Delete,
         modifiers: NONE,
     });
-    assert_eq!(app.panel, None);
+    assert_eq!(app.shell.panel, None);
     app.dispatch(Event::Command(Command::Undo));
-    let panel = app.panel.as_ref().unwrap();
+    let panel = app.shell.panel.as_ref().unwrap();
     assert_eq!((panel.node, panel.pinned), (exposure, false));
 }
 
@@ -1139,8 +1213,8 @@ fn a_viewed_merge_with_nothing_connected_is_empty_and_misses_nothing() {
         .set_mark(Slot::new(1).unwrap(), Some(merge))
         .unwrap();
     app.dispatch(Event::Draw(Pane::Viewer));
-    app.dispatch(read(&sent(&app), 0, 0));
-    assert_eq!(app.caption, "Slot 1 · Merge · empty · CPU");
+    app.dispatch(read(&asked(&app), 0, 0));
+    assert_eq!(app.shell.caption, "Slot 1 · Merge · empty · CPU");
 }
 
 #[test]
@@ -1149,27 +1223,30 @@ fn out_of_gpu_memory_moves_evaluation_to_the_cpu_until_the_artist_chooses_the_gp
     app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let wanted = sent(&app);
-    app.dispatch(read(&wanted, 4, 4));
+    let job = asked(&app);
+    app.dispatch(read(&job, 4, 4));
 
     app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: wanted.clone(),
+        job: job.clone(),
         result: Err(ViewerError::Eval(EvalError::OutOfGpuMemory {
-            origin: wanted.key.clone(),
+            origin: job.key.clone(),
         })),
     }));
 
     assert_eq!(app.evaluation_device(), EvaluationDevice::Cpu);
-    assert!(matches!(app.shown, Shown::Image { .. }), "the frame stays");
+    assert!(
+        matches!(app.viewing.shown, Shown::Image { .. }),
+        "the frame stays"
+    );
     assert_eq!(
-        app.caption,
+        app.shell.caption,
         "Slot 1 · a.exr · 4 × 4 · CPU (the GPU ran out of memory)"
     );
-    assert_eq!(receive(&deliveries).wanted.number, wanted.number);
+    assert_eq!(receive(&deliveries).job.number, job.number);
     app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
     assert_eq!(app.evaluation_device(), EvaluationDevice::Gpu);
-    assert_eq!(app.caption, "Slot 1 · a.exr · 4 × 4 · GPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a.exr · 4 × 4 · GPU");
 }
 
 #[test]
@@ -1178,21 +1255,24 @@ fn a_request_failed_by_a_lost_device_leaves_the_frame_and_fails_no_node() {
     app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let wanted = sent(&app);
-    app.dispatch(read(&wanted, 4, 4));
-    let caption = app.caption.clone();
+    let job = asked(&app);
+    app.dispatch(read(&job, 4, 4));
+    let caption = app.shell.caption.clone();
 
     let requests = app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: wanted.clone(),
+        job: job.clone(),
         result: Err(ViewerError::Eval(EvalError::GpuLost {
-            origin: wanted.key.clone(),
+            origin: job.key.clone(),
         })),
     }));
 
     assert_eq!(requests, []);
-    assert!(matches!(app.shown, Shown::Image { .. }), "the frame stays");
-    assert_eq!(app.caption, caption);
+    assert!(
+        matches!(app.viewing.shown, Shown::Image { .. }),
+        "the frame stays"
+    );
+    assert_eq!(app.shell.caption, caption);
     assert_eq!(app.evaluation_device(), EvaluationDevice::Gpu);
     assert_eq!(app.gpu_errors(), 0);
 }
@@ -1202,18 +1282,18 @@ fn a_request_wgpu_rejects_fails_its_node_and_counts_a_gpu_error() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    let wanted = sent(&app);
+    let job = asked(&app);
 
     let requests = app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),
-        wanted: wanted.clone(),
+        job: job.clone(),
         result: Err(ViewerError::Eval(EvalError::GpuValidation {
-            origin: wanted.key.clone(),
+            origin: job.key.clone(),
             message: "rejected".to_owned(),
         })),
     }));
 
-    assert!(matches!(app.shown, Shown::Failed { .. }));
+    assert!(matches!(app.viewing.shown, Shown::Failed { .. }));
     let label = Request::ShowGpuLabel(Some("1 GPU error, logged on standard error".to_owned()));
     assert!(requests.contains(&label), "{requests:?}");
     assert_eq!(app.gpu.take_errors(), 1);
@@ -1268,12 +1348,12 @@ fn viewing_a_cropped_image() -> (App, Receiver<Evaluated>) {
     });
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
-    app.dispatch(cropped(&sent(&app)));
+    app.dispatch(cropped(&asked(&app)));
     (app, deliveries)
 }
 
-fn cropped(wanted: &Wanted) -> Event {
-    let Event::Evaluated(mut evaluated) = read(wanted, 4000, 2000) else {
+fn cropped(job: &Job) -> Event {
+    let Event::Evaluated(mut evaluated) = read(job, 4000, 2000) else {
         unreachable!("an evaluation");
     };
     if let Ok(image) = &mut evaluated.result {
@@ -1299,7 +1379,7 @@ fn pointer_at(x: f32, y: f32) -> Event {
 /// The GPU's read of the probe last asked for arriving.
 fn read_arrives(app: &mut App, values: [f32; 4]) -> Vec<Request> {
     let probe = app.probed.expect("a probe");
-    let info = app.shown.framed().expect("a framed image");
+    let info = app.viewing.shown.framed().expect("a framed image");
     app.last_read = Some(LastRead::new(PixelRead { probe, values }, info.data_window));
     app.dispatch(Event::CollectPixelRead)
 }
@@ -1342,7 +1422,7 @@ fn the_readout_follows_the_pointer_and_keeps_the_last_read_marked_until_the_next
     );
 
     // So does a newer image, whose own read of the pixel replaces it.
-    let requests = app.dispatch(cropped(&sent(&app)));
+    let requests = app.dispatch(cropped(&asked(&app)));
     assert_eq!(
         shown_readout(&requests),
         Some("x 2006 y 997 · R 1 G 1 B 1 A 1 · reading")
@@ -1364,10 +1444,10 @@ fn the_readout_stays_on_the_pixel_the_pointer_left_the_viewer_from() {
     assert_eq!(shown_readout(&requests), None);
     // One to one moves another pixel under where the pointer was, but not the readout.
     app.dispatch(Event::Command(Command::ActualSize));
-    assert_eq!(app.readout, "x 2002 y 997 · R 1 G 1 B 1 A 1");
+    assert_eq!(app.shell.readout, "x 2002 y 997 · R 1 G 1 B 1 A 1");
 
     // A newer image is read at the same pixel.
-    let requests = app.dispatch(cropped(&sent(&app)));
+    let requests = app.dispatch(cropped(&asked(&app)));
     assert_eq!(
         shown_readout(&requests),
         Some("x 2002 y 997 · R 1 G 1 B 1 A 1 · reading")
@@ -1386,10 +1466,10 @@ fn at_one_to_one_the_readout_names_the_pixel_drawn_under_the_pointer() {
 
     for (x, y) in [(500.0, 250.0), (500.75, 250.75)] {
         app.dispatch(pointer_at(x, y));
-        assert_eq!(app.readout, "x 2000 y 999");
+        assert_eq!(app.shell.readout, "x 2000 y 999");
     }
     app.dispatch(pointer_at(501.0, 251.0));
-    assert_eq!(app.readout, "x 2001 y 998");
+    assert_eq!(app.shell.readout, "x 2001 y 998");
 }
 
 #[test]
@@ -1421,8 +1501,8 @@ fn e_steps_the_viewers_exposure_and_its_control_follows_without_editing_the_docu
     assert_eq!(
         app.dispatch(key(NONE)),
         [
-            Request::Redraw(Pane::Viewer),
-            Request::ShowViewerExposure(0.5)
+            Request::ShowViewerExposure(0.5),
+            Request::Redraw(Pane::Viewer)
         ]
     );
     app.dispatch(key(SHIFT));
@@ -1462,4 +1542,637 @@ fn working_values_read_with_four_decimals_or_an_exponent() {
     for (value, text) in cases {
         assert_eq!(working_value(value), text, "{value}");
     }
+}
+
+#[test]
+fn displayed_names_the_frame_its_image_is_of() {
+    let (mut app, _deliveries) = app();
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    let exposure = create_exposure(&mut app);
+    app.session.connect(exposure, "source", reader).unwrap();
+    app.dispatch(slot_key(1, CTRL));
+    assert_eq!(app.displayed(), None);
+    let first = asked(&app);
+    app.dispatch(read(&first, 4, 4));
+    let shown = |frame| {
+        Some(Displayed {
+            node: exposure,
+            frame,
+            failed: false,
+            copy_halvings: None,
+        })
+    };
+    assert_eq!(app.displayed(), shown(1.0));
+
+    // Another frame whose key is the same is not asked for: what is shown is its image.
+    app.edit(|session| session.set_frame(5.0).unwrap());
+    assert_eq!(asked(&app).number, first.number);
+    assert_eq!(app.displayed(), shown(5.0));
+
+    // An edit at another frame shows the frame asked for before, until its image arrives.
+    app.edit(|session| {
+        session.set_frame(9.0).unwrap();
+        session
+            .set_value(exposure, "stops", Value::Float(1.0))
+            .unwrap();
+    });
+    let second = asked(&app);
+    assert_eq!(second.frame, 9.0);
+    assert_eq!(app.displayed(), shown(5.0));
+    assert_eq!(
+        app.shell.caption,
+        "Slot 1 · Exposure · frame 5 shown, 9 updating… · CPU"
+    );
+    app.dispatch(read(&second, 4, 4));
+    assert_eq!(app.displayed(), shown(9.0));
+    assert_eq!(app.shell.caption, "Slot 1 · Exposure · 4 × 4 · CPU");
+}
+
+#[test]
+fn an_image_finishing_after_a_move_to_a_frame_with_its_key_is_shown_as_that_frame() {
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(slot_key(1, CTRL));
+    let first = asked(&app);
+    app.edit(|session| session.set_frame(30.0).unwrap());
+
+    app.dispatch(read(&first, 4, 4));
+    assert_eq!(app.displayed().map(|shown| shown.frame), Some(30.0));
+}
+
+/// A directory of empty files for these frames of `plate.####.png`, each `bytes` long.
+fn plate(name: &str, frames: &[i64], bytes: usize) -> PathBuf {
+    let directory = crate::fixtures::directory(name);
+    for frame in frames {
+        std::fs::write(
+            directory.join(format!("plate.{frame:04}.png")),
+            vec![0; bytes],
+        )
+        .unwrap();
+    }
+    directory
+}
+
+fn files_of(app: &App, ids: &[NodeId]) -> Vec<PathBuf> {
+    (ids.iter())
+        .map(|&id| file(app, id).expect("a file").to_path_buf())
+        .collect()
+}
+
+#[test]
+fn a_frame_chosen_in_the_dialog_reads_its_sequence_once_a_scan_finds_other_frames() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let directory = plate("chosen", &[1, 2], 1);
+    std::fs::write(directory.join("shot_v002.png"), [0]).unwrap();
+    let chosen = vec![
+        directory.join("plate.0002.png"),
+        directory.join("shot_v002.png"),
+    ];
+
+    app.dispatch(Event::FilesChosen {
+        intent: FileIntent::CreateReaders(Anchor {
+            at: Point::default(),
+            current: None,
+        }),
+        paths: chosen,
+    });
+    assert_eq!(app.session().document().nodes().count(), 0);
+    let first = next_scan(&scans);
+    app.dispatch(first);
+    assert_eq!(app.session().document().nodes().count(), 0);
+    let requests = app.dispatch(next_scan(&scans));
+
+    assert!(requests.contains(&Request::Redraw(Pane::Graph)));
+    let created = app.session().document().selection().to_vec();
+    assert_eq!(
+        files_of(&app, &created),
+        [
+            directory.join("plate.####.png"),
+            directory.join("shot_v002.png")
+        ]
+    );
+    assert_eq!(app.session().undo_label(), Some("Create Reader"));
+    // The scan that decided is the sequence's first: nothing scans it again.
+    assert!(app.session().unscanned().is_empty() && app.scanner.is_idle());
+}
+
+#[test]
+fn a_typed_sequence_is_scanned_and_its_range_and_hold_are_shown() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let directory = plate("typed", &[1, 2], 1);
+    let id = create(&mut app, "a.exr");
+    let pattern = directory.join("plate.%04d.png");
+    app.edit(|session| {
+        session
+            .set_value(id, "file", Value::File(pattern.into()))
+            .unwrap()
+    });
+    app.dispatch(next_scan(&scans));
+    app.dispatch(slot_key(1, CTRL));
+
+    let (requests, _) = app.edit(|session| session.set_frame(5.0).unwrap());
+    assert!(
+        app.shell
+            .caption
+            .ends_with("· updating…; holds frame 2 · CPU"),
+        "{}",
+        app.shell.caption
+    );
+    let shown = |name| {
+        let panel = app.shell.panel.as_ref().unwrap();
+        let row = panel
+            .rows
+            .iter()
+            .find(|row| row.parameter.name == name)
+            .unwrap();
+        (row.value.clone(), row.state)
+    };
+    assert_eq!(
+        shown("first"),
+        (Some(Value::Float(1.0)), ValueState::Absent)
+    );
+    assert_eq!(shown("last"), (Some(Value::Float(2.0)), ValueState::Absent));
+    assert!(
+        requests
+            .iter()
+            .all(|request| !matches!(request, Request::ShowError(_)))
+    );
+}
+
+#[test]
+fn reload_files_rescans_off_the_gui_thread_and_says_how_many_frames_changed() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let directory = plate("reload", &[1, 2], 1);
+    let id = create(&mut app, directory.join("plate.####.png").to_str().unwrap());
+    app.dispatch(next_scan(&scans));
+
+    std::fs::write(directory.join("plate.0001.png"), [0; 2]).unwrap();
+    app.dispatch(Event::ReloadFiles(id));
+    // Asked for again while the first rescan runs, whose listing may predate the change.
+    app.dispatch(Event::ReloadFiles(id));
+    let requests = app.dispatch(next_scan(&scans));
+    let status = format!(
+        "{}: 1 frame changed on disk",
+        directory.join("plate.####.png").display()
+    );
+    assert!(
+        requests.contains(&Request::ShowStatus(status)),
+        "{requests:?}"
+    );
+    let requests = app.dispatch(next_scan(&scans));
+    assert!(
+        !requests
+            .iter()
+            .any(|request| matches!(request, Request::ShowStatus(_)))
+    );
+    assert!(app.scanner.is_idle());
+
+    let gone = directory.join("gone/plate.####.png");
+    app.edit(|session| {
+        session
+            .set_value(id, "file", Value::File(gone.into()))
+            .unwrap()
+    });
+    let requests = app.dispatch(next_scan(&scans));
+    assert!(
+        matches!(requests.as_slice(), [Request::ShowError(error), ..] if error.starts_with("Cannot scan")),
+        "{requests:?}"
+    );
+    // Not scanned again until reloaded.
+    app.edit(|session| session.set_frame(7.0).unwrap());
+    assert!(app.scanner.is_idle());
+}
+
+#[test]
+fn a_scrub_shows_frames_in_the_order_asked_and_ends_on_the_last() {
+    let (mut app, deliveries, scans) = app_scanning();
+    // Each frame as wide as its number and ten.
+    let pattern = crate::fixtures::png_sequence("scrub", 1..=10, |frame| (frame + 10, 1));
+    create(&mut app, pattern.to_str().unwrap());
+    app.dispatch(next_scan(&scans));
+    app.dispatch(slot_key(1, CTRL));
+
+    for frame in 2..=10 {
+        app.edit(|session| session.set_frame(f64::from(frame)).unwrap());
+    }
+    let mut shown = Vec::new();
+    while app
+        .displayed()
+        .is_none_or(|displayed| displayed.frame != 10.0)
+    {
+        let evaluated = deliveries
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the last frame is delivered");
+        app.dispatch(Event::Evaluated(evaluated));
+        if let Some(displayed) = app.displayed()
+            && shown.last() != Some(&displayed.frame)
+        {
+            assert!(!displayed.failed);
+            shown.push(displayed.frame);
+        }
+    }
+
+    assert!(shown.is_sorted(), "{shown:?}");
+    assert_eq!(app.shell.caption, "Slot 1 · plate.####.png · 20 × 1 · CPU");
+}
+
+/// Views three 64 × 8 frames of a sequence in slot 1, in a 16-pixel-square viewer pane, which
+/// copies them for the viewer cache halved twice.
+fn view_sequence(app: &mut App, name: &str) {
+    let pattern = crate::fixtures::png_sequence(name, 1..=3, |_| (64, 8));
+    app.dispatch(Event::Resized {
+        pane: Pane::Viewer,
+        size: PaneSize {
+            width: 16,
+            height: 16,
+            scale_factor: 1.0,
+        },
+    });
+    create(app, pattern.to_str().unwrap());
+    app.dispatch(slot_key(1, CTRL));
+}
+
+/// An app as [`view_sequence`] leaves it, frames 1 and 2 shown and copied, then back on frame 1.
+fn back_on_a_cached_frame(name: &str) -> (App, Receiver<Evaluated>, Receiver<ViewerCopy>) {
+    let (mut app, deliveries, copies) = app_copying();
+    view_sequence(&mut app, name);
+    for frame in [2.0, 1.0] {
+        app.dispatch(Event::Evaluated(receive(&deliveries)));
+        let copy = copies
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a copy");
+        assert_eq!(copy.halvings(), 2);
+        app.dispatch(Event::Copied(copy));
+        app.edit(|session| session.set_frame(frame).unwrap());
+    }
+    (app, deliveries, copies)
+}
+
+#[test]
+fn a_frame_shown_before_is_shown_again_from_the_viewer_cache_without_the_worker() {
+    let (app, deliveries, _) = back_on_a_cached_frame("cached-frame");
+
+    assert_eq!(app.viewer_cache().len(), 2);
+    let displayed = app.displayed().unwrap();
+    assert_eq!((displayed.frame, displayed.copy_halvings), (1.0, Some(2)));
+    assert_eq!(app.session().frame(), 1.0);
+    assert_eq!(
+        app.shell.caption,
+        "Slot 1 · plate.####.png · 64 × 8; cached at 1/4 · CPU"
+    );
+    assert!(
+        deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the worker evaluated a cached frame"
+    );
+}
+
+#[test]
+fn pointing_at_a_cached_copy_evaluates_its_frame_for_its_working_values() {
+    let (mut app, deliveries, copies) = back_on_a_cached_frame("cached-pointed");
+    let shown = app.displayed().unwrap();
+
+    let centre = PhysicalPoint { x: 8.0, y: 8.0 };
+    app.dispatch(input(Pane::Viewer, Input::PointerEntered));
+    app.dispatch(input(
+        Pane::Viewer,
+        Input::PointerMoved { position: centre },
+    ));
+    let evaluated = receive(&deliveries);
+    assert_eq!(evaluated.job(), app.latest_job());
+    app.dispatch(Event::Evaluated(evaluated));
+
+    let displayed = app.displayed().unwrap();
+    assert_eq!(
+        (displayed.frame, displayed.copy_halvings),
+        (shown.frame, None)
+    );
+    assert!(
+        copies.recv_timeout(Duration::from_millis(200)).is_err(),
+        "copied again what the cache holds"
+    );
+}
+
+#[test]
+fn zooming_in_past_a_cached_copy_evaluates_its_frame_and_copies_it_finer() {
+    let (mut app, deliveries, copies) = back_on_a_cached_frame("cached-zoomed");
+
+    // Ten notches in, 1.2 times each, draws a pixel at 1.39 physical pixels.
+    let corner = PhysicalPoint { x: 0.0, y: 0.0 };
+    app.dispatch(input(
+        Pane::Viewer,
+        Input::Scrolled {
+            position: corner,
+            lines: 10.0,
+        },
+    ));
+    app.dispatch(Event::Evaluated(receive(&deliveries)));
+
+    assert_eq!(app.displayed().unwrap().copy_halvings, None);
+    let copy = copies
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a copy");
+    assert_eq!(copy.halvings(), 0);
+}
+
+#[test]
+fn choosing_another_device_drops_the_viewer_cache_and_evaluates_the_copy_shown() {
+    let (mut app, _deliveries, _copies) = back_on_a_cached_frame("cached-device");
+
+    app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
+
+    assert!(app.viewer_cache().is_empty());
+    assert!(
+        matches!(app.viewing.asked, Asked::Evaluating(_)),
+        "the worker was not asked for the frame"
+    );
+}
+
+/// Dispatches results and copies as they arrive until `done` holds of the app, failing after a
+/// generous while.
+fn settle(
+    app: &mut App,
+    deliveries: &Receiver<Evaluated>,
+    copies: &Receiver<ViewerCopy>,
+    done: impl Fn(&App) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !done(app) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the app never settled"
+        );
+        if let Ok(evaluated) = deliveries.recv_timeout(Duration::from_millis(5)) {
+            app.dispatch(Event::Evaluated(evaluated));
+        }
+        while let Ok(copy) = copies.try_recv() {
+            app.dispatch(Event::Copied(copy));
+        }
+    }
+}
+
+/// Whether the app shows the session's frame, evaluated or from the viewer cache.
+fn shows_frame(app: &App) -> bool {
+    (app.displayed()).is_some_and(|shown| shown.frame == app.session().frame() && !shown.failed)
+}
+
+fn advance_asked(requests: &[Request]) -> Option<Duration> {
+    requests.iter().find_map(|request| match request {
+        Request::Advance { after } => Some(*after),
+        _ => None,
+    })
+}
+
+/// An app as [`view_sequence`] leaves it, timed 1 to 3 at 24 frames a second, showing frame 1.
+fn viewing_three_frames(name: &str) -> (App, Receiver<Evaluated>, Receiver<ViewerCopy>) {
+    let (mut app, deliveries, copies) = app_copying();
+    app.dispatch(Event::FrameRangeSet {
+        first: 1.0,
+        last: 3.0,
+    });
+    view_sequence(&mut app, name);
+    settle(&mut app, &deliveries, &copies, shows_frame);
+    (app, deliveries, copies)
+}
+
+#[test]
+fn every_frame_playback_steps_once_each_frame_is_shown_and_wraps_round() {
+    let (mut app, deliveries, copies) = viewing_three_frames("every-frame");
+    let period = Duration::from_secs_f64(1.0 / 24.0);
+
+    let requests = app.play(Direction::Forward, PlaybackMode::EveryFrame);
+    assert_eq!(advance_asked(&requests), Some(Duration::ZERO));
+    let start = std::time::Instant::now();
+    let requests = app.advance(start);
+    assert_eq!(
+        app.session().frame(),
+        1.0,
+        "it starts on the frame it is at"
+    );
+    assert!(advance_asked(&requests).is_some_and(|after| after <= period));
+
+    let mut shown = vec![1.0];
+    let mut now = start;
+    for _ in 0..3 {
+        now += period;
+        app.advance(now);
+        let frame = app.session().frame();
+        assert_eq!(frame, *shown.last().unwrap() % 3.0 + 1.0);
+        // However late, it waits for a frame not yet shown, unless look-ahead has cached it.
+        if !shows_frame(&app) {
+            app.advance(now + period * 5);
+            assert_eq!(
+                app.session().frame(),
+                frame,
+                "stepped from a frame not shown"
+            );
+        }
+        settle(&mut app, &deliveries, &copies, shows_frame);
+        shown.push(frame);
+        now += period * 5;
+    }
+    assert_eq!(shown, [1.0, 2.0, 3.0, 1.0]);
+    assert_eq!(app.timebar().unwrap().drops, 0);
+    assert_eq!(
+        app.playing(),
+        Some((Direction::Forward, PlaybackMode::EveryFrame))
+    );
+}
+
+#[test]
+fn playing_prepares_the_frames_ahead_for_the_viewer_cache_without_showing_them() {
+    let (mut app, deliveries, copies) = viewing_three_frames("look-ahead");
+    app.play(Direction::Forward, PlaybackMode::EveryFrame);
+
+    settle(&mut app, &deliveries, &copies, |app| {
+        app.viewer_cache().len() == 3
+    });
+    let marks = &app.timebar().unwrap().marks;
+    assert!(marks.iter().all(|mark| mark.cached), "{marks:?}");
+    assert_eq!(app.displayed().unwrap().frame, 1.0);
+
+    // Every frame is then shown from the cache, the worker paused.
+    let start = std::time::Instant::now();
+    app.advance(start);
+    app.advance(start + Duration::from_millis(50));
+    assert_eq!(app.session().frame(), 2.0);
+    assert_eq!(app.displayed().unwrap().copy_halvings, Some(2));
+    assert!(matches!(app.viewing.asked, Asked::ServedFromCache(_)));
+}
+
+#[test]
+fn playing_prepares_nothing_ahead_while_the_viewer_cache_is_full() {
+    let (mut app, deliveries, copies) = viewing_three_frames("look-ahead-full");
+    settle(&mut app, &deliveries, &copies, |app| {
+        app.viewer_cache().len() == 1
+    });
+    let bytes = app.viewer_cache().bytes();
+    app.set_viewer_cache_budget(bytes);
+    app.play(Direction::Forward, PlaybackMode::EveryFrame);
+    assert!(
+        app.look_ahead().is_empty(),
+        "looked ahead over a full cache"
+    );
+
+    app.set_viewer_cache_budget(bytes * 3);
+    let ahead: Vec<f64> = app.look_ahead().iter().map(|job| job.frame).collect();
+    assert_eq!(ahead, [2.0, 3.0]);
+}
+
+#[test]
+fn real_time_playback_keeps_time_counting_drops_and_stops_at_the_end_unless_looping() {
+    let (mut app, _deliveries) = app();
+    app.dispatch(Event::FrameRangeSet {
+        first: 1.0,
+        last: 5.0,
+    });
+    // Frames that never arrive.
+    create(&mut app, "/nonexistent/plate.####.exr");
+    app.dispatch(slot_key(1, CTRL));
+    app.dispatch(Event::LoopingSet(false));
+    let period = Duration::from_secs_f64(1.0 / 24.0);
+
+    app.play(Direction::Forward, PlaybackMode::RealTime);
+    let start = std::time::Instant::now();
+    app.advance(start);
+    let requests = app.advance(start + period * 3);
+    assert!(app.session().frame() > 1.0 && app.timebar().unwrap().drops > 0);
+    assert!(advance_asked(&requests).is_some());
+
+    app.advance(start + period * 9);
+    assert_eq!(app.session().frame(), 5.0);
+    assert_eq!(app.playing(), None);
+}
+
+#[test]
+fn stepping_and_going_to_a_frame_stop_playback() {
+    let (mut app, _deliveries) = app();
+    app.dispatch(Event::FrameRangeSet {
+        first: 1.0,
+        last: 3.0,
+    });
+    app.dispatch(Event::Command(Command::Play(Direction::Forward)));
+    app.dispatch(Event::Command(Command::Step(Direction::Backward)));
+    assert_eq!(app.playing(), None);
+    assert_eq!(app.session().frame(), 3.0, "looping, it steps round");
+
+    app.dispatch(Event::Command(Command::Play(Direction::Backward)));
+    // The same way again stops.
+    app.dispatch(Event::Command(Command::Play(Direction::Backward)));
+    assert_eq!(app.playing(), None);
+
+    app.dispatch(Event::Command(Command::Play(Direction::Forward)));
+    app.dispatch(Event::FrameSet(2.5));
+    assert_eq!(app.playing(), None);
+    app.dispatch(Event::Command(Command::Step(Direction::Forward)));
+    assert_eq!(app.session().frame(), 3.0);
+    app.dispatch(Event::Command(Command::FirstFrame));
+    assert_eq!(app.session().frame(), 1.0);
+    let requests = app.dispatch(Event::FrameSet(f64::NAN));
+    assert!(matches!(requests.as_slice(), [Request::ShowStatus(_)]));
+}
+
+#[test]
+fn the_timebar_marks_the_frames_a_sequence_lacks_and_those_it_holds() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let pattern = crate::fixtures::png_sequence("timebar-marks", [1, 2, 4], |_| (4, 4));
+    app.dispatch(Event::FrameRangeSet {
+        first: 0.0,
+        last: 5.0,
+    });
+    create(&mut app, pattern.to_str().unwrap());
+    app.dispatch(next_scan(&scans));
+    let requests = app.dispatch(slot_key(1, CTRL));
+
+    let timebar = (requests.iter())
+        .find_map(|request| match request {
+            Request::ShowTimebar(timebar) => Some(timebar),
+            _ => None,
+        })
+        .expect("the timebar shows the viewed node's frames");
+    let marked = |what: fn(&FrameMark) -> bool| -> Vec<usize> {
+        (timebar.marks.iter().enumerate())
+            .filter(|(_, mark)| what(mark))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    assert_eq!(timebar.marks.len(), 6);
+    assert_eq!(marked(|mark| mark.missing), [3]);
+    assert_eq!(marked(|mark| mark.held), [0, 5]);
+}
+
+#[test]
+fn a_drag_leaves_the_timebar_marks_until_it_finishes() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let pattern = crate::fixtures::png_sequence("drag-marks", [1, 2, 4], |_| (4, 4));
+    app.dispatch(Event::FrameRangeSet {
+        first: 1.0,
+        last: 4.0,
+    });
+    let reader = create(&mut app, pattern.to_str().unwrap());
+    app.dispatch(next_scan(&scans));
+    app.dispatch(slot_key(1, CTRL));
+    let marks = |app: &App| app.timebar().unwrap().marks.clone();
+    let before = marks(&app);
+
+    app.edit(|session| {
+        session.begin_edit(reader, "File").unwrap();
+        let file = Value::File(Path::new("/nonexistent/other.####.png").into());
+        session.edit_value("file", file).unwrap();
+    });
+    assert_eq!(marks(&app), before);
+
+    app.edit(Session::finish_edit);
+    assert_ne!(marks(&app), before);
+}
+
+#[test]
+fn the_input_range_spans_the_viewed_sequence_moved_by_its_offset_and_playback_keeps_to_it() {
+    let (mut app, _deliveries, scans) = app_scanning();
+    let pattern = crate::fixtures::png_sequence("input-range", [1, 2, 4], |_| (4, 4));
+    app.dispatch(Event::FrameRangeSet {
+        first: 0.0,
+        last: 9.0,
+    });
+    let reader = create(&mut app, pattern.to_str().unwrap());
+    app.dispatch(next_scan(&scans));
+    app.dispatch(slot_key(1, CTRL));
+    let span = |app: &App| {
+        let timebar = app.timebar().unwrap();
+        (timebar.first, timebar.last, timebar.input_found)
+    };
+    assert_eq!(span(&app), (0.0, 9.0, false));
+
+    app.dispatch(Event::RangeSourceChosen(RangeSource::Input));
+    assert_eq!(span(&app), (1.0, 4.0, true));
+    assert_eq!(app.timebar().unwrap().marks.len(), 4);
+    app.dispatch(Event::Command(Command::LastFrame));
+    assert_eq!(app.session().frame(), 4.0);
+    app.dispatch(Event::Command(Command::Step(Direction::Forward)));
+    assert_eq!(
+        app.session().frame(),
+        1.0,
+        "stepping wraps round the input range"
+    );
+
+    app.edit(|session| {
+        session.begin_edit(reader, "Offset").unwrap();
+        session.edit_value("offset", Value::Float(10.0)).unwrap();
+        session.finish_edit();
+    });
+    assert_eq!(span(&app), (11.0, 14.0, true));
+    assert_eq!(
+        app.session().document().timeline().last(),
+        9.0,
+        "the document's range is left alone"
+    );
+
+    let still = pattern.with_file_name("still.png");
+    crate::fixtures::write_png(&still, 4, 4, png::ColorType::Rgba, &[255; 4 * 4 * 4]);
+    create(&mut app, still.to_str().unwrap());
+    app.dispatch(slot_key(2, CTRL));
+    assert_eq!(
+        span(&app),
+        (0.0, 9.0, false),
+        "a still has no range of its own"
+    );
 }

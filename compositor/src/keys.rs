@@ -18,12 +18,17 @@ pub mod qt_key {
     pub const E: i32 = 0x45;
     pub const G: i32 = 0x47;
     pub const H: i32 = 0x48;
+    pub const J: i32 = 0x4a;
+    pub const K: i32 = 0x4b;
+    pub const L: i32 = 0x4c;
     pub const Y: i32 = 0x59;
     pub const ESCAPE: i32 = 0x0100_0000;
     pub const TAB: i32 = 0x0100_0001;
     pub const BACKSPACE: i32 = 0x0100_0003;
     pub const RETURN: i32 = 0x0100_0004;
     pub const DELETE: i32 = 0x0100_0007;
+    pub const LEFT: i32 = 0x0100_0012;
+    pub const RIGHT: i32 = 0x0100_0014;
 }
 
 /// The XKB keycodes of the digit row, 1 to 9 then 0: positions, whatever the layout types there.
@@ -80,6 +85,11 @@ fn key(fields: &ffi::InputFields) -> Option<Key> {
         qt_key::E => Key::E,
         qt_key::G => Key::G,
         qt_key::H => Key::H,
+        qt_key::J => Key::J,
+        qt_key::K => Key::K,
+        qt_key::L => Key::L,
+        qt_key::LEFT => Key::Left,
+        qt_key::RIGHT => Key::Right,
         qt_key::Y => Key::Y,
         qt_key::BACKSPACE | qt_key::DELETE => Key::Delete,
         _ => return None,

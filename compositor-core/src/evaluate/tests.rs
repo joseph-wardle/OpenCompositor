@@ -1,10 +1,12 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use open_ng::Point;
 use opencompositor_kernels::BoxPass;
 
 use super::*;
 use crate::document::{Assignment, BlurVersion, ReaderVersion};
+use crate::files::Files;
 use crate::fixtures::{self, directory};
 use crate::image::{Channel, Warning, Window};
 use crate::parameter::Value;
@@ -131,7 +133,7 @@ pub(crate) fn chain(nodes: impl IntoIterator<Item = Node>) -> Document {
 }
 
 pub(crate) fn key(document: &Document, id: u64) -> ResultKey {
-    result_key(document, &Reloads::default(), NodeId(id)).unwrap()
+    result_key(document, &Files::default(), NodeId(id), 1.0).unwrap()
 }
 
 /// An image of these planes over `width` × `height`, as a reader would make it.
@@ -217,21 +219,24 @@ fn an_unconnected_input_keys_apart_from_any_connection() {
 #[test]
 fn reloading_a_path_changes_the_key_of_everything_downstream_of_it() {
     let document = chain([reader("a.exr"), exposure(None), reader("b.exr")]);
-    let mut reloads = Reloads::default();
-    let before = |id| result_key(&document, &Reloads::default(), NodeId(id));
+    let mut files = Files::default();
+    let before = |id| result_key(&document, &Files::default(), NodeId(id), 1.0);
 
-    reloads.reload(Path::new("a.exr").into());
-    let after = |id| result_key(&document, &reloads, NodeId(id));
+    files.reload(Path::new("a.exr").into());
+    let after = |id| result_key(&document, &files, NodeId(id), 1.0);
     assert_ne!(after(1), before(1));
     assert_ne!(after(2), before(2));
     assert_eq!(after(3), before(3));
-    assert_eq!(reloads.count(Path::new("a.exr")), 1);
+    assert_eq!(files.reloads(Path::new("a.exr")), 1);
 }
 
 #[test]
 fn a_missing_node_has_no_key() {
     let document = chain([reader("a.exr")]);
-    assert_eq!(result_key(&document, &Reloads::default(), NodeId(2)), None);
+    assert_eq!(
+        result_key(&document, &Files::default(), NodeId(2), 1.0),
+        None
+    );
 }
 
 #[test]
@@ -375,10 +380,10 @@ fn a_stops_edit_reuses_the_read_and_reload_reads_again() {
     write_png(&path, 0);
     assert_eq!(red(&run(&mut evaluator, &two).unwrap()), before * 2.0);
 
-    let mut reloads = Reloads::default();
-    reloads.reload(path.as_path().into());
+    let mut files = Files::default();
+    files.reload(path.as_path().into());
     let document = chain([reader(&path), exposure(Some(2.0))]);
-    let reloaded = result_key(&document, &reloads, NodeId(2)).unwrap();
+    let reloaded = result_key(&document, &files, NodeId(2), 1.0).unwrap();
     assert_eq!(red(&run(&mut evaluator, &reloaded).unwrap()), 0.0);
 }
 
@@ -427,6 +432,53 @@ fn stopping_keeps_what_was_completed() {
 
     write_png(&path, 0);
     assert_ne!(red(&run(&mut evaluator, &exposed).unwrap()), 0.0);
+}
+
+/// A Merge's two files are read at once, for the CPU and for the GPU alike: each file's decoder
+/// asks `stop` before its one chunk, and waits there for the other file's to ask too.
+#[test]
+fn a_request_reads_its_files_together() {
+    let directory = directory("together");
+    let paths = ["background.exr", "layer.exr"].map(|name| directory.join(name));
+    for path in &paths {
+        let channels = ["R", "G", "B", "A"].map(|name| (name, vec![1.0; 2]));
+        fixtures::write_exr(path, ((0, 0), (2, 1)), (0, 0), (2, 1), channels.into());
+    }
+    let document = graph(
+        [reader(&paths[0]), reader(&paths[1]), merge(None)],
+        &[(3, "background".into(), 1), (3, ("layer", 1).into(), 2)],
+    );
+    let merged = key(&document, 3);
+    let requester = std::thread::current().id();
+    for on_gpu in [false, true] {
+        let asking = Mutex::new(Vec::new());
+        let asked = std::sync::Condvar::new();
+        let alone = AtomicUsize::new(0);
+        let stop = || {
+            let thread = std::thread::current().id();
+            if thread == requester {
+                return false;
+            }
+            let mut threads = asking.lock().unwrap();
+            if !threads.contains(&thread) {
+                threads.push(thread);
+                asked.notify_all();
+            }
+            let wait = Duration::from_secs(10);
+            let (_threads, waited) =
+                (asked.wait_timeout_while(threads, wait, |threads| threads.len() < 2)).unwrap();
+            if waited.timed_out() {
+                alone.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        };
+        let mut evaluator = Evaluator::new();
+        match on_gpu {
+            false => drop(evaluator.evaluate(&merged, stop).unwrap().unwrap()),
+            true => evaluator.read_for_gpu(&merged, &[], stop).unwrap().unwrap(),
+        }
+        assert_eq!(alone.load(Ordering::Relaxed), 0, "on the GPU: {on_gpu}");
+    }
 }
 
 #[test]

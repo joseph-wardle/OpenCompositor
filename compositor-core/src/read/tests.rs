@@ -5,8 +5,12 @@ use crate::image::Channel;
 
 #[test]
 fn files_are_recognised_by_signature_not_name() {
-    let unknown =
-        |bytes: &[u8]| matches!(read_from(Cursor::new(bytes)), Err(ReadError::UnknownFormat));
+    let unknown = |bytes: &[u8]| {
+        matches!(
+            read_from(Cursor::new(bytes), &|| false),
+            Err(ReadError::UnknownFormat)
+        )
+    };
     assert!(unknown(b"not an image, whatever its name"));
     // Shorter than either signature, even if it starts like one.
     assert!(unknown(b"\x89PNG"));

@@ -1,4 +1,5 @@
-//! One open document with its history, its presentation in OpenNG, and the viewer's state.
+//! One open document with its history, its presentation in OpenNG, the current frame, and the
+//! viewer's state.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -9,9 +10,10 @@ use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 
 use crate::document::{
     Assignment, Changes, ConnectionError, Document, InputSlot, Node, NodeId, NodeKind,
-    ReaderVersion, Slot, node_types,
+    ReaderVersion, Slot, TimelineError, node_types,
 };
-use crate::evaluate::{Reloads, ResultKey, result_keys};
+use crate::evaluate::{ResultKey, result_key, result_keys};
+use crate::files::{Files, Pattern, Scan};
 use crate::parameter::{Value, ValueError, describe, resolve};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
@@ -57,6 +59,7 @@ pub enum EditError {
         error: ValueError,
     },
     Connection(ConnectionError),
+    Timeline(TimelineError),
 }
 
 impl fmt::Display for EditError {
@@ -71,6 +74,7 @@ impl fmt::Display for EditError {
                 error,
             } => write!(f, "node {}, {parameter}: {error}", node.0),
             EditError::Connection(error) => write!(f, "{error}"),
+            EditError::Timeline(error) => write!(f, "{error}"),
         }
     }
 }
@@ -80,6 +84,7 @@ impl std::error::Error for EditError {
         match self {
             EditError::InvalidValue { error, .. } => Some(error),
             EditError::Connection(error) => Some(error),
+            EditError::Timeline(error) => Some(error),
             _ => None,
         }
     }
@@ -91,12 +96,11 @@ impl std::error::Error for EditError {
 #[derive(Debug, Default)]
 struct Failures {
     keys: Vec<ResultKey>,
-    /// The nodes the graph shows failed.
     nodes: BTreeSet<NodeId>,
 }
 
-/// A document with its undo history, its OpenNG graph and the view of it, the viewer, how many
-/// times each file has been reloaded, and which evaluations failed.
+/// A document with its undo history, its OpenNG graph and the view of it, the current frame, the
+/// viewer, what is known of its files on disk, and which evaluations failed.
 ///
 /// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
 /// before returning the [`Changes`] it made. An edit that changes nothing records no step.
@@ -117,12 +121,17 @@ pub struct Session {
     next_id: u64,
     graph: Graph,
     graph_view: View,
+    /// The frame evaluated and viewed, one for every pane. Interface state, outside the document,
+    /// so undo never moves it.
+    frame: f64,
     viewer: Viewer,
     /// Unsaved and not undoable.
-    reloads: Reloads,
+    files: Files,
     failures: Failures,
-    /// Counts changes to the document and the reloads, which every key is made from.
+    /// Counts changes to the document, the frame and the files, which every key is made from.
     version: u64,
+    /// Counts the changes of `version` that were to the frame alone.
+    frames_set: u64,
 }
 
 impl Default for Session {
@@ -147,10 +156,12 @@ impl Session {
                 height: 0,
                 scale_factor: 1.0,
             }),
+            frame: Document::default().timeline().first(),
             viewer: Viewer::new(),
-            reloads: Reloads::default(),
+            files: Files::default(),
             failures: Failures::default(),
             version: 0,
+            frames_set: 0,
         }
     }
 
@@ -174,15 +185,62 @@ impl Session {
         &mut self.viewer
     }
 
-    /// Changes whenever the document or the reloads do, so that a key built at one version is
-    /// current while the version is.
+    /// Changes whenever the document, the frame or the files do, so that a key built at one
+    /// version is current while the version is.
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Changes whenever the document or the files do, but not the frame: what is known of every
+    /// frame at once, such as which are missing, is current while this is.
+    pub fn content_version(&self) -> u64 {
+        self.version - self.frames_set
     }
 
     /// The node the viewer's slot marks.
     pub fn viewed(&self) -> Option<NodeId> {
         self.document.mark(self.viewer.slot())
+    }
+
+    pub fn frame(&self) -> f64 {
+        self.frame
+    }
+
+    /// The key of a node's image at the session's frame, or `None` for no such node.
+    pub fn result_key(&self, node: NodeId) -> Option<ResultKey> {
+        result_key(&self.document, &self.files, node, self.frame)
+    }
+
+    /// Goes to a frame, refused unless it is finite. Any frame is allowed, inside the document's
+    /// range or not; what a source gives outside its own frames is the source's to say.
+    pub fn set_frame(&mut self, frame: f64) -> Result<(), TimelineError> {
+        if !frame.is_finite() {
+            return Err(TimelineError::NotFinite);
+        }
+        // Adding zero turns -0 into 0, which reads the same frame.
+        let frame = frame + 0.0;
+        if frame != self.frame {
+            self.frame = frame;
+            self.version += 1;
+            self.frames_set += 1;
+            self.present_failures();
+        }
+        Ok(())
+    }
+
+    /// Sets the frames the document spans as one step.
+    pub fn set_frame_range(&mut self, first: f64, last: f64) -> Result<Changes, EditError> {
+        let mut document = self.document.clone();
+        document.timeline =
+            (document.timeline.with_range(first, last)).map_err(EditError::Timeline)?;
+        Ok(self.commit("Frame Range", document))
+    }
+
+    /// Sets the rate the document plays at, in frames per second, as one step.
+    pub fn set_frame_rate(&mut self, rate: f64) -> Result<Changes, EditError> {
+        let mut document = self.document.clone();
+        document.timeline = (document.timeline.with_rate(rate)).map_err(EditError::Timeline)?;
+        Ok(self.commit("Frame Rate", document))
     }
 
     /// Records that a key was evaluated, which clears the failures of it and of every key
@@ -195,41 +253,98 @@ impl Session {
         self.present_failures()
     }
 
-    /// Records a failure at the key of the node it happened at, if that is still some node's
-    /// key: a failure superseded by an edit would otherwise stay recorded with nothing to clear
-    /// it. Every key inside that one was evaluated, which clears their failures. Returns whether
-    /// the graph changed.
+    /// Records a failure at the key of the node it happened at, if that is still some node's key
+    /// at the current frame: a failure superseded by an edit would otherwise stay recorded with
+    /// nothing to clear it. Every key inside that one was evaluated, which clears their failures.
+    /// Returns whether the graph changed.
     pub(crate) fn record_failure(&mut self, origin: &ResultKey) -> bool {
         let inside = origin.with_upstream();
         self.failures
             .keys
             .retain(|failed| !inside.contains(&failed));
-        let keys = result_keys(&self.document, &self.reloads);
+        let keys = result_keys(&self.document, &self.files, self.frame);
         if keys.values().any(|key| key == origin) {
             self.failures.keys.push(origin.clone());
         }
         self.present_failures()
     }
 
-    /// How many times each file has been reloaded.
-    pub fn reloads(&self) -> &Reloads {
-        &self.reloads
+    /// What is known of the files Readers read: the scans of their sequences and how many times
+    /// each file has been reloaded.
+    pub fn files(&self) -> &Files {
+        &self.files
     }
 
-    /// Makes every Reader of each given Reader's file read it again the next time it is viewed.
-    /// Returns whether any of the nodes is a Reader with a file.
-    pub fn reload(&mut self, nodes: &[NodeId]) -> bool {
-        let paths: BTreeSet<Arc<Path>> = (nodes.iter())
-            .filter_map(|&id| resolve(self.document.node(id)?).file("file").cloned())
-            .collect();
-        for path in &paths {
-            self.reloads.reload(path.clone());
+    /// Makes every Reader of each given Reader's still read it again the next time it is viewed,
+    /// and returns the sequences the others read, each to be reloaded by recording a new scan of
+    /// it: what Reload files does.
+    ///
+    /// ```no_run
+    /// # fn reload(session: &mut opencompositor_core::Session, reader: opencompositor_core::NodeId) -> std::io::Result<()> {
+    /// use opencompositor_core::Scan;
+    /// for sequence in session.reload(&[reader]).sequences {
+    ///     let scan = Scan::of(&sequence)?;
+    ///     session.record_scan(&sequence, scan);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn reload(&mut self, nodes: &[NodeId]) -> Reload {
+        let mut reload = Reload::default();
+        let files: BTreeSet<Arc<Path>> =
+            (nodes.iter()).filter_map(|&id| self.file_of(id)).collect();
+        for file in files {
+            match Pattern::parse(&file) {
+                Some(sequence) => reload.sequences.push(sequence),
+                None => {
+                    self.files.reload(file.clone());
+                    reload.stills.push(file);
+                }
+            }
         }
-        if !paths.is_empty() {
+        if !reload.stills.is_empty() {
             self.version += 1;
+            self.present_failures();
         }
-        self.present_failures();
-        !paths.is_empty()
+        reload
+    }
+
+    /// The file a node reads, a sequence's pattern: `None` unless it is a Reader with a file.
+    fn file_of(&self, node: NodeId) -> Option<Arc<Path>> {
+        let reader = self.document.node(node)?;
+        if !matches!(reader.kind, NodeKind::Reader { .. }) {
+            return None;
+        }
+        resolve(reader, self.frame).file("file").cloned()
+    }
+
+    /// Records what a scan of a sequence found, which every Reader of it reads from now on:
+    /// its range, its missing frames, and a reload of each frame whose file differs from the last
+    /// scan's, changed, new or gone. The first scan reloads nothing. Returns how many frames it
+    /// reloaded, or `None` if it found what the last scan did.
+    pub fn record_scan(&mut self, sequence: &Pattern, scan: Scan) -> Option<usize> {
+        let reloaded = self.files.record(sequence, scan);
+        if reloaded.is_some() {
+            self.version += 1;
+            self.present_failures();
+        }
+        reloaded
+    }
+
+    /// The sequences the document's Readers read that have not been scanned, each once, in the
+    /// order of the nodes reading them. Until scanned, a sequence holds nothing and misses
+    /// nothing.
+    pub fn unscanned(&self) -> Vec<Pattern> {
+        let mut unscanned: Vec<Pattern> = Vec::new();
+        for (id, _) in self.document.nodes() {
+            if let Some(sequence) = self.file_of(id).as_ref().and_then(Pattern::parse)
+                && self.files.scan(sequence.path()).is_none()
+                && !unscanned.contains(&sequence)
+            {
+                unscanned.push(sequence);
+            }
+        }
+        unscanned
     }
 
     /// Centres the node a slot marks in the graph view. Returns whether the slot marks one.
@@ -718,6 +833,7 @@ impl Session {
         let changes = Changes {
             nodes,
             selection: changes.selection,
+            timeline: changes.timeline,
         };
         let changed = present(
             &mut self.graph,
@@ -736,15 +852,31 @@ impl Session {
         self.present(&Changes::default())
     }
 
-    /// The nodes whose current key failed.
+    /// The nodes whose key at the current frame failed.
     fn failing_nodes(&self) -> BTreeSet<NodeId> {
         if self.failures.keys.is_empty() {
             return BTreeSet::new();
         }
-        (result_keys(&self.document, &self.reloads).into_iter())
+        (result_keys(&self.document, &self.files, self.frame).into_iter())
             .filter(|(_, key)| self.failures.keys.contains(key))
             .map(|(id, _)| id)
             .collect()
+    }
+}
+
+/// What [`Session::reload`] found to read again.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Reload {
+    /// Files that are no sequence, reloaded at once.
+    pub stills: Vec<Arc<Path>>,
+    /// Sequences, each reloaded once a new scan of it is recorded.
+    pub sequences: Vec<Pattern>,
+}
+
+impl Reload {
+    /// Whether no node was a Reader with a file.
+    pub fn is_empty(&self) -> bool {
+        self.stills.is_empty() && self.sequences.is_empty()
     }
 }
 

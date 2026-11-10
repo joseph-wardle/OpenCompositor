@@ -1,6 +1,8 @@
 //! Every Qt declaration the shell uses: Qt's own headers where `cxx` can bind them, and
 //! `cpp/shim.h` one-liners where it cannot.
 
+pub use crate::timebar::frame_label;
+
 #[cxx_qt::bridge]
 pub mod ffi {
     unsafe extern "C++" {
@@ -164,7 +166,6 @@ pub mod ffi {
         kind: RowKind,
         authored: bool,
         tooltip: QString,
-        /// The field's text.
         text: QString,
         /// Float only: the slider's positions from 0, and where it is.
         ticks: i32,
@@ -174,6 +175,8 @@ pub mod ffi {
     #[derive(Debug)]
     enum RowKind {
         Float,
+        /// A whole frame number, in a field alone.
+        Frame,
         File,
     }
 
@@ -198,8 +201,92 @@ pub mod ffi {
         Typed,
         Reset,
         Browse,
+        /// Reload files, on a file's row.
+        Reload,
         Pin,
         Unpin,
+    }
+
+    /// The timebar as Rust sends it.
+    #[derive(Debug)]
+    struct TimebarData {
+        first: f64,
+        last: f64,
+        frame: f64,
+        /// Frames per second, which the bar's ticks follow.
+        rate: f64,
+        /// Whether the texts and the ticks read as timecode rather than as numbers.
+        timecode: bool,
+        frame_text: QString,
+        first_text: QString,
+        last_text: QString,
+        rate_text: QString,
+        playing: Playing,
+        real_time: bool,
+        looping: bool,
+        /// Whether the range is the viewed node's input range rather than the timeline's.
+        input: bool,
+        input_found: bool,
+        /// How playback keeps up, or nothing.
+        status: QString,
+        /// Each whole frame's from the first.
+        marks: Vec<FrameMark>,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum Playing {
+        Stopped,
+        Forward,
+        Backward,
+    }
+
+    /// [`opencompositor_core::FrameMark`], for the bar.
+    #[derive(Debug)]
+    struct FrameMark {
+        cached: bool,
+        missing: bool,
+        held: bool,
+    }
+
+    /// What the artist did to the timebar.
+    #[derive(Debug)]
+    struct TimebarGesture {
+        kind: TimebarGestureKind,
+        /// The frame scrubbed to.
+        frame: f64,
+        text: QString,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum TimebarGestureKind {
+        Scrubbed,
+        FrameTyped,
+        FirstTyped,
+        LastTyped,
+        RateTyped,
+        /// Escape in a field: show the timebar as it was.
+        Restore,
+        FirstFrame,
+        StepBackward,
+        /// Plays backwards, or stops if it does.
+        PlayBackward,
+        /// Plays forwards, or stops if it does.
+        PlayForward,
+        StepForward,
+        LastFrame,
+        /// Each of these three turns its choice to the other of what the timebar shows.
+        ToggleLooping,
+        ToggleRealTime,
+        ToggleTimecode,
+        GlobalRange,
+        InputRange,
+    }
+
+    extern "Rust" {
+        /// A frame as the bar labels it: its number, or its timecode at the rate.
+        fn frame_label(frame: f64, rate: f64, timecode: bool) -> String;
     }
 
     #[namespace = "shim"]
@@ -251,15 +338,19 @@ pub mod ffi {
         /// Puts the pane in the dock, which owns it from then on.
         unsafe fn container(pane: *mut Pane, dock: *mut QDockWidget) -> *mut QWidget;
         /// Puts the pane in the dock above the viewer's strip, which the dock owns too: its
-        /// caption, readout and exposure control, from `-limit` to `limit` stops by `step`. The
-        /// control sends each value the artist sets to `exposure_set`.
+        /// timebar, which sends each gesture to `timebar_gesture`, caption, readout and exposure
+        /// control, from `-limit` to `limit` stops by `step`. The control sends each value the
+        /// artist sets to `exposure_set`.
         unsafe fn container_with_strip(
             pane: *mut Pane,
             dock: *mut QDockWidget,
             limit: f64,
             step: f64,
             exposure_set: fn(f64),
+            timebar_gesture: fn(TimebarGesture),
+            rates: &QStringList,
         ) -> *mut ViewerStrip;
+        unsafe fn show_timebar(strip: *mut ViewerStrip, data: &TimebarData);
         /// The strip's one-line caption.
         unsafe fn strip_caption(strip: *mut ViewerStrip) -> *mut QLabel;
         unsafe fn set_readout(strip: *mut ViewerStrip, text: &QString);

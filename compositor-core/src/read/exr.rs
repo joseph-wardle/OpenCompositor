@@ -3,6 +3,7 @@
 use std::io::{BufRead, Read, Seek};
 use std::num::NonZero;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 
 use ::exr::block::chunk::{Chunk, CompressedBlock};
@@ -21,7 +22,11 @@ use opencompositor_kernels::flush;
 use super::{ReadError, Refusal, check_size, window};
 use crate::image::{Channel, Chromaticities, Image, Plane, Warning, Window};
 
-pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadError> {
+/// The file's image, or `Ok(None)` if `stop` returned true before its pixels were decoded.
+pub(super) fn read(
+    mut file: impl BufRead + Seek + Send,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Image>, ReadError> {
     // Only the headers, nothing allocated for pixels yet. Unvalidated, because validation
     // rejects deep and subsampled parts as unsupported before they can be refused for what they
     // contain.
@@ -80,18 +85,30 @@ pub(super) fn read(mut file: impl BufRead + Seek + Send) -> Result<Image, ReadEr
     );
 
     file.rewind()?;
-    let planes = read_planes(file, shown_part)?;
+    let Some(planes) = read_planes(file, shown_part, stop)? else {
+        return Ok(None);
+    };
     let data_window = flipped(
         header,
         header.own_attributes.layer_position,
         header.layer_size,
     )?;
-    Ok(Image::new(display_window, data_window, planes, warnings))
+    Ok(Some(Image::new(
+        display_window,
+        data_window,
+        planes,
+        warnings,
+    )))
 }
 
 /// The part's R, G, B and A at its largest resolution, in `Channel::ALL`'s order, bottom row
-/// first. A missing A reads as 1. EXR stores premultiplied colour.
-fn read_planes(file: impl BufRead + Seek + Send, part: usize) -> Result<[Plane; 4], ReadError> {
+/// first, or `Ok(None)` if `stop` returned true first. A missing A reads as 1. EXR stores
+/// premultiplied colour.
+fn read_planes(
+    file: impl BufRead + Seek + Send,
+    part: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<[Plane; 4]>, ReadError> {
     let chunks = ::exr::block::read(file, false).map_err(decode_error)?;
     let header = &chunks.headers()[part];
     let (width, height) = (header.layer_size.width(), header.layer_size.height());
@@ -130,7 +147,7 @@ fn read_planes(file: impl BufRead + Seek + Send, part: usize) -> Result<[Plane; 
         })
         .map_err(decode_error)?;
     let mut halves = Vec::new();
-    decode(chunks, |block| {
+    let decoded = decode(chunks, stop, |block| {
         let BlockIndex {
             pixel_position: Vec2(left, top),
             pixel_size: Vec2(block_width, block_height),
@@ -182,31 +199,39 @@ fn read_planes(file: impl BufRead + Seek + Send, part: usize) -> Result<[Plane; 
         }
         Ok(())
     })?;
-    Ok(planes)
+    Ok(decoded.map(|()| planes))
 }
 
 /// Decompresses the chunks across the machine's cores, handing each block to `insert` on this
-/// thread in whatever order they finish.
+/// thread in whatever order they finish, or `Ok(None)` if `stop` returned true before the last
+/// was taken. Each thread asks `stop` before taking a chunk: `exr` cannot stop within one, nor
+/// within a read from the file.
 ///
 /// `exr` decompresses on a rayon pool of its own, where a panic aborts the process. Here a chunk
 /// whose decoder panics fails the read instead.
 fn decode(
     chunks: FilteredChunksReader<impl BufRead + Seek + Send>,
+    stop: &(dyn Fn() -> bool + Sync),
     mut insert: impl FnMut(UncompressedBlock) -> Result<(), ReadError>,
-) -> Result<(), ReadError> {
+) -> Result<Option<()>, ReadError> {
     let meta = chunks.meta_data().clone();
     let threads = std::thread::available_parallelism()
         .map_or(1, NonZero::get)
         .min(chunks.len());
     let chunks = Mutex::new(chunks);
+    let stopped = AtomicBool::new(false);
     let (sender, blocks) = mpsc::sync_channel(threads);
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            let (chunks, meta, sender) = (&chunks, &meta, sender.clone());
+            let (chunks, meta, stopped, sender) = (&chunks, &meta, &stopped, sender.clone());
             scope.spawn(move || {
                 loop {
                     // A panic while reading poisons the lock, which stops the other threads.
                     let block = catch_unwind(AssertUnwindSafe(|| {
+                        if stop() {
+                            stopped.store(true, Ordering::Relaxed);
+                            return None;
+                        }
                         let chunk = chunks.lock().ok()?.next()?;
                         Some(
                             chunk
@@ -230,8 +255,10 @@ fn decode(
         for block in blocks {
             insert(block?)?;
         }
-        Ok(())
-    })
+        Ok::<_, ReadError>(())
+    })?;
+    // The scope's end joined the threads.
+    Ok((!stopped.into_inner()).then_some(()))
 }
 
 fn decompress(chunk: Chunk, meta: &MetaData) -> Result<UncompressedBlock, ReadError> {

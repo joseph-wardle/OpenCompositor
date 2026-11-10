@@ -13,6 +13,7 @@ use crate::app::{Notice, Pane, Waker};
 use crate::evaluate::poll_device;
 use crate::image::Window;
 use crate::viewer::Placement;
+use crate::viewer_cache::ViewerCopy;
 use crate::worker::Pixels;
 
 /// Behind everything a pane draws.
@@ -59,6 +60,16 @@ impl PaneSize {
             scale_factor: self.scale_factor,
         }
     }
+}
+
+/// What wgpu's allocator holds on the panes' device, which evaluation shares, in bytes. Neither
+/// counts the swapchains' images nor the driver's own memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuMemory {
+    /// In use by buffers and textures.
+    pub allocated: u64,
+    /// In the blocks the allocator holds, used or not.
+    pub reserved: u64,
 }
 
 #[derive(Debug)]
@@ -151,6 +162,9 @@ pub(crate) struct ViewerFrame {
     pub(crate) scale_factor: f32,
     /// The viewer's exposure as a factor on the working values, before they are clamped.
     pub(crate) gain: f32,
+    /// Image pixels on a side of each texel shown: 1 for an image's planes, more for a reduced
+    /// copy, whose data window is then the one its texels cover.
+    pub(crate) pixels_per_texel: u32,
 }
 
 /// A pixel of a shown image to read its working values at.
@@ -235,6 +249,15 @@ impl Gpu {
     /// The pane's last timed frame; `None` before one or without [`Gpu::time_frames`].
     pub(crate) fn frame_timing(&self, pane: Pane) -> Option<FrameTiming> {
         self.timings.as_ref()?[pane.index()].clone()
+    }
+
+    /// `None` without a device, or on a backend whose allocator does not report.
+    pub(crate) fn memory(&self) -> Option<GpuMemory> {
+        let report = self.device.as_ref()?.device.generate_allocator_report()?;
+        Some(GpuMemory {
+            allocated: report.total_allocated_bytes,
+            reserved: report.total_reserved_bytes,
+        })
     }
 
     /// Runs the callbacks of the device's completed work, without waiting for any.
@@ -428,6 +451,60 @@ impl Gpu {
             number,
         );
         device.viewer.image = Some(image);
+    }
+
+    /// Shows a copy from the viewer cache in the viewer from the next frame. A copy has no
+    /// working values, so pixel probes of image `number` read nothing; one without texels clears
+    /// the image.
+    pub(crate) fn show_copy(&mut self, copy: &ViewerCopy, number: u64) {
+        let Some(device) = &mut self.device else {
+            return;
+        };
+        let window = copy.window;
+        if window.width == 0 || window.height == 0 {
+            device.viewer.image = None;
+            return;
+        }
+        let size = wgpu::Extent3d {
+            width: window.width,
+            height: window.height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("viewer copy"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        device.queue.write_texture(
+            texture.as_image_copy(),
+            copy.texel_bytes(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(window.width * 8),
+                rows_per_image: None,
+            },
+            size,
+        );
+        let view = texture.create_view(&Default::default());
+        let group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("viewer copy"),
+            layout: &device.viewer.copy_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+        device.viewer.image = Some(ShownImage {
+            group,
+            textures: ShownTextures::Copy,
+            size: [window.width, window.height],
+            number,
+        });
     }
 
     /// Stops drawing the viewer's image, which a failed read or an unmarked slot replaces.
@@ -928,10 +1005,12 @@ impl Device {
 #[derive(Debug)]
 struct ViewerRenderer {
     image_pipeline: wgpu::RenderPipeline,
+    copy_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     frame_buffer: wgpu::Buffer,
     frame_group: wgpu::BindGroup,
     image_layout: wgpu::BindGroupLayout,
+    copy_layout: wgpu::BindGroupLayout,
     /// The shown image's planes, while the viewer has one.
     image: Option<ShownImage>,
     reader: PixelReader,
@@ -940,12 +1019,20 @@ struct ViewerRenderer {
 #[derive(Debug)]
 struct ShownImage {
     group: wgpu::BindGroup,
-    /// Held so that the worker writes no later result into them while they are shown, and for
-    /// reading their pixels.
-    planes: [Arc<wgpu::Texture>; 4],
-    /// The data window's width and height, which the planes may exceed.
+    textures: ShownTextures,
+    /// The data window's width and height, which the planes may exceed, or the copy's.
     size: [u32; 2],
     number: u64,
+}
+
+#[derive(Debug)]
+enum ShownTextures {
+    /// Held so that the worker writes no later result into them while they are shown, and for
+    /// reading their pixels.
+    Planes([Arc<wgpu::Texture>; 4]),
+    /// A copy from the viewer cache, which has no working values to read. Its bind group holds
+    /// its texture.
+    Copy,
 }
 
 impl ShownImage {
@@ -973,7 +1060,7 @@ impl ShownImage {
         });
         ShownImage {
             group,
-            planes,
+            textures: ShownTextures::Planes(planes),
             size: [window.width, window.height],
             number,
         }
@@ -1020,13 +1107,16 @@ impl PixelReader {
         let Some(image) = image.filter(|image| image.number == probe.image) else {
             return;
         };
+        let ShownTextures::Planes(planes) = &image.textures else {
+            return;
+        };
         let [x, y] = probe.texel;
         let [width, height] = image.size;
         if x >= width || y >= height {
             return;
         }
         let mut encoder = device.create_command_encoder(&Default::default());
-        for (plane, offset) in image.planes.iter().zip((0..).step_by(4)) {
+        for (plane, offset) in planes.iter().zip((0..).step_by(4)) {
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
                     texture: plane,
@@ -1112,6 +1202,10 @@ impl ViewerRenderer {
             label: Some("viewer image"),
             entries: &[plane(0), plane(1), plane(2), plane(3)],
         });
+        let copy_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("viewer copy"),
+            entries: &[plane(0)],
+        });
         let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("viewer frame"),
             size: FRAME_BYTES,
@@ -1159,10 +1253,12 @@ impl ViewerRenderer {
         };
         ViewerRenderer {
             image_pipeline: pipeline("image", &[Some(&frame_layout), Some(&image_layout)]),
+            copy_pipeline: pipeline("copy", &[Some(&frame_layout), Some(&copy_layout)]),
             outline_pipeline: pipeline("outline", &[Some(&frame_layout)]),
             frame_buffer,
             frame_group,
             image_layout,
+            copy_layout,
             image: None,
             reader: PixelReader::new(device),
         }
@@ -1193,7 +1289,7 @@ impl ViewerRenderer {
             config.width as f32,
             config.height as f32,
             frame.gain,
-            0.0,
+            frame.pixels_per_texel as f32,
             data[0],
             data[1],
             data[2],
@@ -1213,7 +1309,10 @@ impl ViewerRenderer {
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_bind_group(0, &self.frame_group, &[]);
         if let Some(image) = &self.image {
-            pass.set_pipeline(&self.image_pipeline);
+            pass.set_pipeline(match image.textures {
+                ShownTextures::Planes(_) => &self.image_pipeline,
+                ShownTextures::Copy => &self.copy_pipeline,
+            });
             pass.set_bind_group(1, &image.group, &[]);
             pass.draw(0..4, 0..1);
         }
@@ -1393,10 +1492,9 @@ mod tests {
     fn an_image_staged_for_an_earlier_device_is_not_shown() {
         use std::sync::mpsc;
 
-        use crate::evaluate::result_key;
         use crate::fixtures;
         use crate::session::Session;
-        use crate::worker::{EvaluationDevice, Wanted, Worker};
+        use crate::worker::{EvaluationDevice, Job, Worker};
 
         let mut gpu = Gpu::with_noop_device(Waker::channel().0);
         let device = gpu.device.as_ref().expect("a device").device.clone();
@@ -1406,11 +1504,13 @@ mod tests {
         let mut session = Session::new();
         let changes = session.create_readers(vec![path], open_ng::Point::default(), None);
         let node = *changes.nodes.first().expect("one Reader");
-        let key = result_key(session.document(), session.reloads(), node).expect("a key");
+        let key = session.result_key(node).expect("a key");
         let (delivered, deliveries) = mpsc::channel();
-        let worker = Worker::start(EvaluationDevice::Cpu, move |evaluated| {
-            delivered.send(evaluated).unwrap()
-        });
+        let worker = Worker::start(
+            EvaluationDevice::Cpu,
+            move |evaluated| delivered.send(evaluated).unwrap(),
+            |_| {},
+        );
         let staged = || {
             let evaluated = deliveries.recv_timeout(Duration::from_secs(10)).unwrap();
             let image = evaluated.result.unwrap();
@@ -1419,10 +1519,12 @@ mod tests {
 
         // Staged for the generation before the GPU's own, as after a loss.
         worker.connect(device.clone(), queue.clone(), Arc::default(), 0);
-        worker.request(Some(Wanted {
+        worker.request(Some(Job {
             node,
             key,
+            frame: 1.0,
             number: 1,
+            copy: None,
         }));
         let (pixels, window) = staged();
         gpu.show_image(pixels, window, 1);

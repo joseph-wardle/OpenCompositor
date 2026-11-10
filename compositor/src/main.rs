@@ -1,6 +1,7 @@
 //! OpenCompositor's Qt shell. Qt owns the windows, docks, dialogs and event loop; the core's
 //! [`App`] owns everything else. Everything here runs on Qt's GUI thread.
 
+mod check;
 mod creation;
 mod drag;
 mod keys;
@@ -8,7 +9,9 @@ mod lifecycle;
 mod pace;
 mod pane;
 mod panel;
+mod playback_check;
 mod qt;
+mod timebar;
 
 use std::cell::{OnceCell, RefCell};
 use std::ffi::OsString;
@@ -20,10 +23,11 @@ use std::time::Instant;
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
 use cxx_qt_lib::{QList, QString};
 use opencompositor_core::{
-    App, Command, EXPOSURE_STEP, EvaluationDevice, Event, FileIntent, FrameCheck, FrameTiming,
-    MAX_EXPOSURE, Notice, Pane, Request, Session, Slot,
+    App, Command, Direction, EXPOSURE_STEP, EvaluationDevice, Event, FileIntent, FrameCheck,
+    FrameTiming, MAX_EXPOSURE, Notice, Pane, Request, Session, Slot,
 };
 
+use crate::check::Seen;
 use crate::qt::ffi;
 
 /// A `Qt::DockWidgetArea` value.
@@ -60,15 +64,15 @@ pub struct Widgets {
     pub redo: *mut ffi::QAction,
 }
 
-/// A scripted check of the shell, from the command line.
 enum Check {
     Lifecycle(PathBuf),
     Drag(PathBuf, drag::Chain),
+    Playback(playback_check::Run),
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--cpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur]]"
+        "usage: opencompositor [--cpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur] | --playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]]"
     );
     std::process::exit(2)
 }
@@ -88,6 +92,12 @@ fn main() {
         [flag, image, name] if flag == "--drag-check" => {
             match name.to_str().and_then(drag::Chain::from_name) {
                 Some(chain) => Some(Check::Drag(image.into(), chain)),
+                None => usage(),
+            }
+        }
+        [flag, pattern, rest @ ..] if flag == "--playback-check" => {
+            match playback_check::Run::parse(pattern, rest) {
+                Some(run) => Some(Check::Playback(run)),
                 None => usage(),
             }
         }
@@ -113,7 +123,7 @@ fn main() {
     });
     match check {
         Some(Check::Lifecycle(_)) => app.check_frames(),
-        Some(Check::Drag(..)) => app.time_frames(),
+        Some(Check::Drag(..) | Check::Playback { .. }) => app.time_frames(),
         None => {}
     }
     APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -196,6 +206,20 @@ fn main() {
     );
     // SAFETY: the viewer menu is live.
     unsafe { ffi::add_separator(viewer_menu) };
+    let playback = [
+        ("&Play Forwards\tL", Command::Play(Direction::Forward)),
+        ("Play &Backwards\tJ", Command::Play(Direction::Backward)),
+        ("&Stop\tK", Command::Stop),
+        ("Step F&orwards\tRight", Command::Step(Direction::Forward)),
+        ("Step Back&wards\tLeft", Command::Step(Direction::Backward)),
+        ("F&irst Frame", Command::FirstFrame),
+        ("&Last Frame", Command::LastFrame),
+    ];
+    for (text, command) in playback {
+        add(viewer_menu, text, "", command);
+    }
+    // SAFETY: the viewer menu is live.
+    unsafe { ffi::add_separator(viewer_menu) };
     add(
         viewer_menu,
         "Evaluate on the &GPU",
@@ -209,7 +233,6 @@ fn main() {
         Command::EvaluateOn(EvaluationDevice::Cpu),
     );
     COMMANDS.with(|cell| cell.set(commands).expect("menus are made once"));
-    // In one area, which the parameter panel's dock then divides.
     let docks = Pane::ALL.map(|pane| {
         let title = match pane {
             Pane::Graph => "Node Graph",
@@ -246,6 +269,8 @@ fn main() {
             f64::from(MAX_EXPOSURE),
             f64::from(EXPOSURE_STEP),
             exposure_set,
+            timebar::gesture,
+            &timebar::rates(),
         );
         (strip, ffi::strip_caption(strip))
     };
@@ -274,6 +299,7 @@ fn main() {
     match check {
         Some(Check::Lifecycle(image)) => lifecycle::start(image),
         Some(Check::Drag(image, chain)) => drag::start(image, chain),
+        Some(Check::Playback(run)) => playback_check::start(run),
         None => {}
     }
     let status = ffi::exec();
@@ -298,8 +324,10 @@ pub fn dispatch(event: Event) {
     else {
         return;
     };
-    if let Some(pane) = drawn {
-        drag::frame_drawn(pane);
+    if let Some(pane) = drawn
+        && let Some(frame) = frame_timing(pane)
+    {
+        check::observe(Seen::Frame(pane, frame));
     }
     for request in requests {
         perform(request);
@@ -412,28 +440,44 @@ pub fn perform(request: Request) {
             let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
             ffi::single_shot(milliseconds, collect_pixel_read, 0);
         }
+        Request::Advance { after } => {
+            // Qt's timers count whole milliseconds, so the advance is at the nearest; the clock
+            // keeps time from when it started, not from each tick.
+            let milliseconds = (after.as_micros() + 500) / 1000;
+            let milliseconds = i32::try_from(milliseconds).unwrap_or(i32::MAX);
+            ffi::single_shot(milliseconds, advance, 0);
+        }
+        Request::ShowTimebar(shown) => timebar::show(&shown),
     }
 }
 
-/// Dispatches a notice from another thread. Retiring a lost device blocks the GUI thread, so
-/// the lifecycle check reports how long; the drag check records each result's arrival.
+/// One whose timer fires after the app has dropped dispatches to nothing.
+fn advance(_: usize) {
+    let started = Instant::now();
+    dispatch(Event::Advance(started));
+    check::observe(Seen::Advanced(started.elapsed()));
+}
+
+/// Dispatches a notice from another thread, and tells the checks.
 fn receive(notice: Notice) {
     let lost = matches!(notice, Notice::DeviceLost { .. });
-    let evaluated = match &notice {
-        Notice::Evaluated(evaluated) => Some((
-            evaluated.request(),
-            evaluated.timing,
-            evaluated.data_window(),
-        )),
-        Notice::DeviceLost { .. } => None,
+    let received = Instant::now();
+    let delivered = match &notice {
+        Notice::Evaluated(evaluated) => Some(Seen::Delivered {
+            job: evaluated.job(),
+            frame: evaluated.frame(),
+            timing: evaluated.timing,
+            window: evaluated.data_window(),
+            received,
+        }),
+        Notice::DeviceLost { .. } | Notice::Scanned { .. } | Notice::Copied(_) => None,
     };
-    let started = Instant::now();
     dispatch(Event::from(notice));
     if lost {
-        lifecycle::retirement_took(started.elapsed());
+        check::observe(Seen::Retired(received.elapsed()));
     }
-    if let Some((request, timing, window)) = evaluated {
-        drag::delivered(request, timing, window, started);
+    if let Some(delivered) = delivered {
+        check::observe(delivered);
     }
 }
 
@@ -442,7 +486,7 @@ fn receive(notice: Notice) {
 fn retry_device_creation(attempt: usize) {
     let started = Instant::now();
     dispatch(Event::RetryDeviceCreation(attempt as u64));
-    lifecycle::attempt_took(started.elapsed());
+    check::observe(Seen::Attempted(started.elapsed()));
 }
 
 /// One whose timer fires after the app has dropped dispatches to nothing.
@@ -455,7 +499,6 @@ pub fn path(name: &QString) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes.as_slice().to_vec()))
 }
 
-/// Whether the pane has a surface to draw to.
 pub fn has_surface(pane: Pane) -> bool {
     APP.with(|cell| {
         cell.borrow()
@@ -478,17 +521,25 @@ pub fn destroy_device() {
     });
 }
 
-/// How many GPU errors this session went uncaptured.
+/// Has the viewer cache hold at most `bytes` of copies, in the playback check.
+pub fn set_viewer_cache_budget(bytes: u64) {
+    APP.with(|cell| {
+        if let Some(app) = cell.borrow_mut().as_mut() {
+            app.set_viewer_cache_budget(bytes);
+        }
+    });
+}
+
+/// How many GPU errors this session left uncaptured.
 pub fn gpu_errors() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))
 }
 
-/// The number of the latest request to the worker, in the drag check.
-pub fn latest_request() -> u64 {
-    APP.with(|cell| cell.borrow().as_ref().map_or(0, App::latest_request))
+/// The latest job given the worker.
+pub fn latest_job() -> u64 {
+    APP.with(|cell| cell.borrow().as_ref().map_or(0, App::latest_job))
 }
 
-/// The pane's last frame, in the drag check.
 pub fn frame_timing(pane: Pane) -> Option<FrameTiming> {
     APP.with(|cell| cell.borrow().as_ref()?.frame_timing(pane))
 }
@@ -502,14 +553,13 @@ pub fn poll_gpu() {
     });
 }
 
-/// The device evaluating the session.
 pub fn evaluation_device() -> EvaluationDevice {
     APP.with(|cell| (cell.borrow().as_ref()).map_or(EvaluationDevice::Cpu, App::evaluation_device))
 }
 
-/// The number of the request whose image the viewer last presented, in the drag check.
-pub fn presented_request() -> Option<u64> {
-    APP.with(|cell| cell.borrow().as_ref()?.presented_request())
+/// The job whose image the viewer last presented.
+pub fn presented_job() -> Option<u64> {
+    APP.with(|cell| cell.borrow().as_ref()?.presented_job())
 }
 
 pub fn widgets() -> Widgets {

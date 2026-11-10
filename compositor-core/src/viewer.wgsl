@@ -1,5 +1,5 @@
-// The viewer: an image's data window from its working planes, exposed, and an outline around its
-// display window.
+// The viewer: an image's data window from its working planes, or from a reduced copy of them in
+// the viewer cache, exposed, and an outline around its display window.
 //
 // Positions are in image pixels, y up, until `placed` turns them into the pane's physical pixels,
 // y down. The target is sRGB, so fragments are linear values that the target encodes.
@@ -15,6 +15,8 @@ struct Frame {
     target_size: vec2<f32>,
     // The viewer's exposure, a factor on working values.
     gain: f32,
+    // Image pixels on a side of each texel: 1 for planes, a power of two for a copy.
+    pixels_per_texel: f32,
     // x, y, width, height in image pixels; (x, y) is the bottom-left corner.
     data_window: vec4<f32>,
     display_window: vec4<f32>,
@@ -25,6 +27,8 @@ struct Frame {
 @group(1) @binding(1) var green: texture_2d<f32>;
 @group(1) @binding(2) var blue: texture_2d<f32>;
 @group(1) @binding(3) var alpha: texture_2d<f32>;
+// A copy's RGBA, in place of the planes.
+@group(1) @binding(0) var copy: texture_2d<f32>;
 
 fn placed(point: vec2<f32>) -> vec2<f32> {
     return vec2(point.x * frame.scale + frame.offset.x, frame.offset.y - point.y * frame.scale);
@@ -47,11 +51,27 @@ struct ImageVertex {
     @location(0) pixel: vec2<f32>,
 }
 
-@vertex
-fn image_vertex(@builtin(vertex_index) vertex: u32) -> ImageVertex {
+fn data_window_corner(vertex: u32) -> ImageVertex {
     let from_bottom_left = corner(vertex) * frame.data_window.zw;
     let point = frame.data_window.xy + from_bottom_left;
     return ImageVertex(to_clip(placed(point)), from_bottom_left);
+}
+
+@vertex
+fn image_vertex(@builtin(vertex_index) vertex: u32) -> ImageVertex {
+    return data_window_corner(vertex);
+}
+
+@vertex
+fn copy_vertex(@builtin(vertex_index) vertex: u32) -> ImageVertex {
+    return data_window_corner(vertex);
+}
+
+// The texel under a point of the data window: the planes or the copy may be larger than it, and
+// nothing beyond it is drawn.
+fn texel_at(pixel: vec2<f32>) -> vec2<i32> {
+    let last = vec2<i32>(ceil(frame.data_window.zw / frame.pixels_per_texel)) - 1;
+    return clamp(vec2<i32>(floor(pixel / frame.pixels_per_texel)), vec2(0), last);
 }
 
 // A working value exposed, then clamped to what the display shows, in f32 throughout, so that
@@ -66,9 +86,7 @@ fn shown(value: f32) -> f32 {
 
 @fragment
 fn image_fragment(vertex: ImageVertex) -> @location(0) vec4<f32> {
-    // The planes may be larger than the data window; nothing beyond it is drawn.
-    let last = vec2<i32>(frame.data_window.zw) - 1;
-    let texel = clamp(vec2<i32>(floor(vertex.pixel)), vec2(0), last);
+    let texel = texel_at(vertex.pixel);
     // Premultiplied over black is the colour itself.
     return vec4(
         shown(textureLoad(red, texel, 0).r),
@@ -76,6 +94,12 @@ fn image_fragment(vertex: ImageVertex) -> @location(0) vec4<f32> {
         shown(textureLoad(blue, texel, 0).r),
         1.0,
     );
+}
+
+@fragment
+fn copy_fragment(vertex: ImageVertex) -> @location(0) vec4<f32> {
+    let value = textureLoad(copy, texel_at(vertex.pixel), 0);
+    return vec4(shown(value.r), shown(value.g), shown(value.b), 1.0);
 }
 
 // One of the outline's four sides, drawn just outside the display window.
