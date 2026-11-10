@@ -4,10 +4,9 @@ use open_ng::Point;
 
 use super::*;
 use crate::evaluate::result_key;
-use crate::gpu::PaneSize;
+use crate::fixtures::fitted;
 use crate::kernels::headless;
 use crate::session::Session;
-use crate::viewer::Viewer;
 
 /// The key of a Reader of the path, which need not exist.
 fn key(name: &str) -> ResultKey {
@@ -33,17 +32,6 @@ fn info(display: Window, data: Window) -> ImageInfo {
         data_window: data,
         warnings: Vec::new(),
     }
-}
-
-/// How a fitted viewer draws, in a pane of that size.
-fn fitted(width: u32, height: u32) -> Zoom {
-    let mut viewer = Viewer::new();
-    viewer.resize(PaneSize {
-        width,
-        height,
-        scale_factor: 1.0,
-    });
-    viewer.zoom()
 }
 
 /// A copy halved that many times of a `width` × `height` image, its data window its display
@@ -217,7 +205,6 @@ fn a_copy_on_the_gpu_is_the_cpu_copy() {
 #[test]
 fn the_cache_serves_the_most_reduced_copy_that_the_viewer_draws_no_larger_than_its_texels() {
     let mut cache = ViewerCache::default();
-    // A 400-pixel image fitted to a 200-pixel pane is drawn at 0.45 physical pixels a pixel.
     let zoom = fitted(200, 200);
     let a = key("a");
     cache.insert(copy_of(a.clone(), 400, 400, 2));

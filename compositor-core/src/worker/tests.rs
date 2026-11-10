@@ -446,12 +446,7 @@ fn a_newer_request_for_another_node_ends_the_wait_for_the_staging_buffer() {
 /// keeps the second waiting for the staging buffer; and the third while it waits, once the viewer
 /// last caught up at `caught_up`. Returns the images then delivered, by key, and the three keys.
 fn same_node(name: &str, frames: [f64; 3], caught_up: Instant) -> (Vec<ResultKey>, [ResultKey; 3]) {
-    let directory = directory(name);
-    let paths = ["first.png", "second.png", "third.png"].map(|name| directory.join(name));
-    for path in &paths {
-        write_png(path, 3, 2);
-    }
-    let keys = paths.map(key);
+    let keys = images(name).map(key);
     let at = |index: usize| Job {
         frame: frames[index],
         ..on(1, keys[index].clone())
@@ -510,7 +505,7 @@ fn a_newer_request_for_the_same_frame_lets_the_started_one_finish() {
 /// never had, which once read whole frames on a thread or two, only to drop them.
 #[test]
 fn a_started_request_found_superseded_stays_so_after_the_feedback_interval() {
-    let [first, second] = two_images("stop-stays");
+    let [first, second] = images("stop-stays");
     let (worker, _deliveries) = worker();
     let mut state = worker.mailbox.lock();
     state.started = Some(on(1, key(&first)));
@@ -527,7 +522,7 @@ fn a_started_request_found_superseded_stays_so_after_the_feedback_interval() {
 
 #[test]
 fn a_request_reaching_an_idle_worker_starts_the_feedback_interval_again() {
-    let [first, second] = two_images("idle-request");
+    let [first, second] = images("idle-request");
     let (worker, deliveries) = worker();
     connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
@@ -544,18 +539,19 @@ fn a_request_reaching_an_idle_worker_starts_the_feedback_interval_again() {
 }
 
 /// Two white images in a directory of the test's own.
-fn two_images(name: &str) -> [PathBuf; 2] {
+/// `N` white 3 × 2 PNGs in the test's directory `name`.
+fn images<const N: usize>(name: &str) -> [PathBuf; N] {
     let directory = directory(name);
-    let paths = ["first.png", "second.png"].map(|name| directory.join(name));
-    for path in &paths {
-        write_png(path, 3, 2);
-    }
-    paths
+    std::array::from_fn(|index| {
+        let path = directory.join(format!("{index}.png"));
+        write_png(&path, 3, 2);
+        path
+    })
 }
 
 #[test]
 fn a_staging_buffer_returned_after_its_device_was_replaced_is_dropped() {
-    let [first, second] = two_images("replaced-return");
+    let [first, second] = images("replaced-return");
     let (worker, deliveries) = worker();
     let [replaced, replacement] = noop_device_pair();
     connect(&worker, replaced, 1);
@@ -609,7 +605,7 @@ fn a_staging_buffer_returned_once_the_session_is_on_the_gpu_is_dropped() {
 
 #[test]
 fn an_image_finishing_for_a_replaced_device_is_staged_again_for_the_new_one() {
-    let [first, second] = two_images("replaced-finishing");
+    let [first, second] = images("replaced-finishing");
     let (worker, deliveries) = worker();
     connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
@@ -628,7 +624,7 @@ fn an_image_finishing_for_a_replaced_device_is_staged_again_for_the_new_one() {
 
 #[test]
 fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
-    let [first, second] = two_images("lost-staging");
+    let [first, second] = images("lost-staging");
     let (worker, deliveries) = worker();
     let (device, queue) = noop_device(None);
     worker.connect(device.clone(), queue, Arc::default(), 1);
@@ -650,7 +646,7 @@ fn a_device_lost_while_staging_fails_the_image_and_the_next_device_shows_it() {
 
 #[test]
 fn disconnecting_drops_the_image_finishing_and_delivers_it_again_without_pixels() {
-    let [first, second] = two_images("disconnect");
+    let [first, second] = images("disconnect");
     let (worker, deliveries) = worker();
     connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
@@ -1034,13 +1030,7 @@ fn copying_worker(device: EvaluationDevice) -> (Worker, Receiver<Evaluated>, Rec
 fn a_result_asked_for_with_a_copy_is_delivered_then_copied_on_its_device() {
     let path = directory("copied").join("image.png");
     write_png(&path, 8, 4);
-    // An 8-pixel-wide image fitted to a 4-pixel pane is drawn at 0.45 physical pixels a pixel.
-    let mut viewer = crate::viewer::Viewer::new();
-    viewer.resize(crate::gpu::PaneSize {
-        width: 4,
-        height: 4,
-        scale_factor: 1.0,
-    });
+    let zoom = fixtures::fitted(4, 4);
     for device in [EvaluationDevice::Cpu, EvaluationDevice::Gpu] {
         let (worker, deliveries, copies) = copying_worker(device);
         let (gpu, queue) = crate::kernels::headless::device();
@@ -1055,7 +1045,7 @@ fn a_result_asked_for_with_a_copy_is_delivered_then_copied_on_its_device() {
         );
 
         worker.request(Some(Job {
-            copy: Some(viewer.zoom()),
+            copy: Some(zoom),
             ..on(1, key.clone())
         }));
         receive(&deliveries);
@@ -1094,15 +1084,10 @@ fn a_gpu_session_copies_a_frame_although_a_newer_request_came_while_the_gpu_made
     mailbox.set(Arc::clone(&worker.mailbox)).unwrap();
     let (gpu, queue) = crate::kernels::headless::device();
     worker.connect(gpu, queue, Arc::default(), 1);
-    let mut viewer = crate::viewer::Viewer::new();
-    viewer.resize(crate::gpu::PaneSize {
-        width: 4,
-        height: 4,
-        scale_factor: 1.0,
-    });
+    let zoom = fixtures::fitted(4, 4);
     let key = exposed(&path, -1.0);
     worker.request(Some(Job {
-        copy: Some(viewer.zoom()),
+        copy: Some(zoom),
         ..on(1, key.clone())
     }));
     let copy = (copies.recv_timeout(Duration::from_secs(10))).expect("a copy");
@@ -1154,12 +1139,7 @@ fn a_request_for_the_frame_being_prepared_lets_it_finish_then_is_evaluated() {
 #[test]
 fn look_ahead_copies_each_frame_once_and_delivers_none() {
     let directory = directory("look-ahead-copies");
-    let mut viewer = crate::viewer::Viewer::new();
-    viewer.resize(crate::gpu::PaneSize {
-        width: 4,
-        height: 4,
-        scale_factor: 1.0,
-    });
+    let zoom = fixtures::fitted(4, 4);
     for device in [EvaluationDevice::Cpu, EvaluationDevice::Gpu] {
         let (worker, deliveries, copies) = copying_worker(device);
         let (gpu, queue) = crate::kernels::headless::device();
@@ -1174,7 +1154,7 @@ fn look_ahead_copies_each_frame_once_and_delivers_none() {
         let ahead = |keys: &[ResultKey]| {
             (keys.iter())
                 .map(|key| Job {
-                    copy: Some(viewer.zoom()),
+                    copy: Some(zoom),
                     ..on(1, key.clone())
                 })
                 .collect()

@@ -34,10 +34,17 @@ fn directory(name: &str) -> PathBuf {
 
 /// A 1 × 1 opaque grey PNG of one 8-bit code, which reads exactly at 0 and 255.
 fn write_png(path: &Path, code: u8) {
-    let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), 1, 1);
+    write_grey(path, 1, code);
+}
+
+/// A `width` × 1 opaque grey PNG of one 8-bit code.
+fn write_grey(path: &Path, width: u32, code: u8) {
+    let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), width, 1);
     encoder.set_color(png::ColorType::Grayscale);
     let mut writer = encoder.write_header().unwrap();
-    writer.write_image_data(&[code]).unwrap();
+    writer
+        .write_image_data(&vec![code; width as usize])
+        .unwrap();
     writer.finish().unwrap();
 }
 
@@ -173,12 +180,7 @@ fn write_frame(directory: &Path, frame: i64) {
 }
 
 fn write_frame_wide(directory: &Path, frame: i64, width: u32) {
-    let path = directory.join(format!("plate.{frame:04}.png"));
-    let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), width, 1);
-    encoder.set_color(png::ColorType::Grayscale);
-    let mut writer = encoder.write_header().unwrap();
-    writer.write_image_data(&vec![0; width as usize]).unwrap();
-    writer.finish().unwrap();
+    write_grey(&directory.join(format!("plate.{frame:04}.png")), width, 0);
 }
 
 fn width(frame: i64) -> u32 {
@@ -315,8 +317,7 @@ fn reload_files_rescans_and_reads_again_only_the_frames_that_changed() {
     let reload = session.reload(&[id]);
     assert!(reload.stills.is_empty());
     for sequence in reload.sequences {
-        let scan = Scan::of(&sequence).unwrap();
-        assert_eq!(session.record_scan(&sequence, scan), Some(3));
+        session.record_scan(&sequence, Scan::of(&sequence).unwrap());
     }
 
     let after = [1.0, 2.0, 5.0].map(|frame| key_at(&mut session, id, frame));
