@@ -1,14 +1,12 @@
 //! `--playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]`:
-//! the step 5 workloads on a sequence, over the frames its scan finds, at most the first 150, at
-//! the timeline's 24 frames a second. The chain is `exposure`, Reader → Exposure at one stop (W1,
-//! the default); `blur`, Reader → Blur at Size 50 (W2); or `merge`, Readers of both patterns →
-//! Merge → Blur at Size 50 (W3). BUDGET_MIB sets the viewer cache's budget, 4 GiB by default; one
-//! too small for every frame narrows real time and the cached scrub to the longest run of frames
-//! the cache holds.
+//! the step 5 workloads over at most the first 150 frames the scan finds, at 24 frames a second.
+//! `exposure` is Reader → Exposure at one stop (W1, the default); `blur`, Reader → Blur at Size
+//! 50 (W2); `merge`, Readers of both patterns → Merge → Blur at Size 50 (W3). BUDGET_MIB sets the
+//! viewer cache's budget, 4 GiB by default; one too small for every frame narrows real time and
+//! the cached scrub to the longest run of frames the cache holds.
 //!
-//! With `cold`, the sequences' files are dropped from this machine's page cache before each
-//! stage that reads them; without, they are read as they come. Whether the NFS server's cache
-//! was warm is the runner's to say. Run it in a release build, on the workstation, pinned.
+//! `cold` drops the sequences' files from this machine's page cache before each stage that reads
+//! them; whether the NFS server's cache was warm is the runner's to say.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -27,16 +25,13 @@ use opencompositor_core::{
 use crate::check::{Durations, Seen, finish, gui_frames, resident_memory};
 use crate::qt::ffi;
 
-/// How often the check looks for what it waits for, and for how long at most.
 const POLL: Duration = Duration::from_millis(50);
 const LONGEST_WAIT: Duration = Duration::from_secs(600);
 
-/// The most frames played, as many as the workloads' sequences have.
 const MOST_FRAMES: f64 = 150.0;
 
-/// The most frames each scrub passes over, the jumps that time an uncached frame, and the scrubs
-/// over uncached frames. A scrub faster than evaluation presents a frame about each feedback
-/// interval, so there are several, for enough frames that their p95 is not just the slowest.
+/// A scrub faster than evaluation presents a frame about each feedback interval, so there are
+/// several uncached scrubs, for enough frames that their p95 is not just the slowest.
 const SCRUB_FRAMES: f64 = 48.0;
 const JUMPS: usize = 20;
 const UNCACHED_SCRUBS: usize = 10;
@@ -74,7 +69,6 @@ impl Chain {
     }
 }
 
-/// What the command line asks the check for.
 pub struct Run {
     pub pattern: PathBuf,
     pub chain: Chain,
@@ -83,7 +77,7 @@ pub struct Run {
 }
 
 impl Run {
-    /// From the arguments after the pattern; `None` if they make no sense.
+    /// `None` if the arguments after the pattern make no sense.
     pub fn parse(pattern: &OsString, rest: &[OsString]) -> Option<Run> {
         let mut run = Run {
             pattern: pattern.into(),
@@ -128,7 +122,6 @@ struct Check {
     failures: Vec<String>,
 }
 
-/// What the check waits for, what it does then, and since when.
 struct Wait {
     what: &'static str,
     until: fn() -> bool,
@@ -138,14 +131,12 @@ struct Wait {
 
 /// What the shell did during a playback, scrub or jump.
 struct Recording {
-    /// Each frame of the sequence the viewer presented, at its first presentation; the first is
-    /// what was on screen when it began.
+    /// Each frame of the sequence at its first presentation; the first is what was on screen
+    /// when it began.
     presented: Vec<(f64, Instant)>,
-    /// The viewer's frames.
     frames: Vec<FrameTiming>,
     /// The most frames the timebar said real-time playback dropped.
     drops: u64,
-    /// How long the GUI thread took for each advance of playback.
     advances: Vec<Duration>,
     /// When the worker took each frame it delivered.
     started: Vec<(f64, Instant)>,
@@ -187,7 +178,6 @@ fn running() -> bool {
     CHECK.with(|cell| cell.borrow().is_some())
 }
 
-/// Prints a line of the report.
 fn say(line: &str) {
     with(|check| eprintln!("{}: {line}", check.name));
 }
@@ -222,8 +212,6 @@ pub fn start(run: Run) {
     ffi::single_shot(1000, setup, 0);
 }
 
-/// Records, while the check records, the viewer's frames and the frame of the sequence each
-/// presented, each advance of playback, and when the worker took each frame it delivered.
 pub fn observe(seen: &Seen) {
     if !running() {
         return;
@@ -275,7 +263,6 @@ fn wait_for(what: &'static str, until: fn() -> bool, then: fn()) {
     });
 }
 
-/// Looks for what the check waits for, while it runs.
 fn poll(_: usize) {
     if !running() {
         return;
@@ -301,7 +288,6 @@ fn poll(_: usize) {
     }
 }
 
-/// Makes the chain on Readers of the patterns, views it, and waits for the scans.
 fn setup(_: usize) {
     let refresh =
         crate::with_pane_window(Pane::Viewer, |window| crate::pace::refresh_period(&window));
@@ -359,8 +345,7 @@ fn created(changes: Changes) -> NodeId {
     *changes.nodes.iter().next().expect("one node was created")
 }
 
-/// The frames the scan found, at most the first 150, once it has, and once a second
-/// sequence's scan has too.
+/// The frames the scan found, at most `MOST_FRAMES`; `None` until every pattern's scan is in.
 fn scanned() -> Option<(f64, f64)> {
     let (pattern, second) = with(|check| {
         let second = match &check.run.chain {
@@ -506,7 +491,6 @@ fn after_uncached_scrub() {
     report();
 }
 
-/// The timeline's first and last frames.
 fn range() -> (f64, f64) {
     let timeline = crate::read_app(|app| app.session().document().timeline());
     (timeline.first(), timeline.last())
@@ -521,12 +505,11 @@ fn shown_is_cached(app: &App) -> bool {
     (timebar.marks.get(index)).is_some_and(|mark| mark.cached)
 }
 
-/// Whether the viewer shows the timeline's first frame, evaluated or cached.
 fn shows_first() -> bool {
     shows(range().0)
 }
 
-/// Whether the viewer shows the frame asked for, evaluated or cached.
+/// Whether the viewer shows the frame, evaluated or cached.
 fn shows(frame: f64) -> bool {
     crate::read_app(|app| {
         app.session().frame() == frame
@@ -611,7 +594,6 @@ fn describe_playback(name: &str, real_time: bool) {
     }
 }
 
-/// The process's resident memory and what the GPU's allocator holds.
 fn memory() -> String {
     let gpu = crate::read_app(|app| app.gpu_memory()).map_or_else(
         || "GPU allocator unreported".to_owned(),
@@ -705,8 +687,8 @@ fn asked_presented() -> bool {
     last.is_some_and(shows)
 }
 
-/// Measures the scrub just finished: each frame presented during it from being asked for, and
-/// the last, which its own gate judges, since it may wait for a frame the worker lets finish.
+/// The last frame is measured apart from the others, since it may wait for a frame the worker
+/// lets finish, and has its own gate.
 fn finish_scrub() -> Scrub {
     with(|check| {
         let recording = check.recording.take().expect("the scrub records");
@@ -744,7 +726,6 @@ fn finish_scrub() -> Scrub {
     })
 }
 
-/// Describes scrubs together: each frame presented from being asked for, the slowest last.
 fn scrub_line(name: &str, scrubs: &[&Scrub]) -> String {
     let latencies: Durations = scrubs
         .iter()
@@ -782,9 +763,9 @@ fn scrub_line(name: &str, scrubs: &[&Scrub]) -> String {
     )
 }
 
-/// Edits the viewed node so that no frame is cached, over the whole range again, at its last
-/// frame, which neither the jumps nor the uncached scrubs reach unless the range is short, then
-/// waits for it to be shown before `then`.
+/// Edits the viewed node so that no frame is cached, then `then` once it is shown. It is shown
+/// at the whole range's last frame, which neither the jumps nor the uncached scrubs reach unless
+/// the range is short.
 fn edit_viewed(then: fn()) {
     let (viewed, parameter, edited, (first, last)) = with(|check| {
         check.recording = None;
@@ -809,7 +790,6 @@ fn edit_viewed(then: fn()) {
     );
 }
 
-/// Drops the sequences' files in the range from this machine's page cache, when the run asks.
 fn evict_if_cold() {
     let (cold, patterns) = with(|check| {
         let mut patterns = vec![check.run.pattern.clone()];
@@ -859,7 +839,7 @@ fn evict(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Judges the scrubs, which need the uncached frame time the jumps measured, then reports.
+/// Judges the scrubs, which need the uncached frame time the jumps measured, and reports.
 fn report() {
     let check = CHECK.with(|cell| cell.borrow_mut().take());
     let mut check = check.expect("the check has started");

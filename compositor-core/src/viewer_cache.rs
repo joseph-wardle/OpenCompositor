@@ -91,7 +91,6 @@ impl ViewerCopy {
         }
     }
 
-    /// The copy of an image whose data window is empty.
     pub(crate) fn empty(key: ResultKey, info: ImageInfo, halvings: u32) -> ViewerCopy {
         ViewerCopy {
             window: copy_window(info.data_window, halvings),
@@ -107,7 +106,6 @@ impl ViewerCopy {
         (self.texels.len() * size_of::<f16>()) as u64
     }
 
-    /// How many times the image was halved.
     pub fn halvings(&self) -> u32 {
         self.halvings
     }
@@ -157,7 +155,6 @@ pub(crate) fn copy_window(data: Window, halvings: u32) -> Window {
 }
 
 /// Copies of images the viewer showed, by result key and halvings, within a budget of bytes.
-/// The session owns it, the worker fills it, and the app shows from it without the worker.
 ///
 /// When full, it drops the copies least recently requested. Keys are compared one by one, each by
 /// its fingerprint first: a cache within its budget holds hundreds of copies at most.
@@ -195,7 +192,6 @@ impl ViewerCache {
         self.budget
     }
 
-    /// The bytes of the copies held.
     pub fn bytes(&self) -> u64 {
         self.bytes
     }

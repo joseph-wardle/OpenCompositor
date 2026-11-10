@@ -187,7 +187,6 @@ QIcon glyph_icon(Glyph glyph, const QColor &color) {
         bar(11.4);
         break;
     case Glyph::Loop: {
-        // Flat-bottomed: along the top to the right, round and back along the bottom.
         painter.setPen(line);
         painter.setBrush(Qt::NoBrush);
         QPainterPath top;
@@ -209,7 +208,6 @@ QIcon glyph_icon(Glyph glyph, const QColor &color) {
         break;
     }
     case Glyph::Once:
-        // Forwards to the end, and stops there.
         painter.setPen(line);
         painter.drawLine(QPointF(2.5, 8), QPointF(9, 8));
         painter.setPen(Qt::NoPen);
@@ -217,7 +215,6 @@ QIcon glyph_icon(Glyph glyph, const QColor &color) {
         bar(12.6);
         break;
     case Glyph::RealTime:
-        // A clock, as Houdini's: the rate kept.
         painter.setPen(QPen(color, 1.4));
         painter.setBrush(Qt::NoBrush);
         painter.drawEllipse(QPointF(8, 8), 6.2, 6.2);
@@ -231,11 +228,8 @@ QIcon glyph_icon(Glyph glyph, const QColor &color) {
 }
 } // namespace
 
-// The range's whole frames side by side, ticked each frame and at each whole second of the rate,
-// labelled where there is room, marked, with the frame shown as a line. A press or a drag sends
-// the frame under the pointer, once per frame it passes. The wheel zooms round the pointer and a
-// middle drag or a sideways wheel scrolls; the view is the bar's own, kept within the range, and
-// pages on to keep a frame that moves out of it in sight.
+// The range's whole frames side by side. A press or a drag sends the frame under the pointer, once
+// per frame it passes. The view is the bar's own, kept within the range.
 class FrameBar : public QWidget {
   public:
     explicit FrameBar(std::function<void(double)> scrubbed) : scrubbed(std::move(scrubbed)) {
@@ -462,7 +456,6 @@ Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rat
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(2);
-    // The range's ends either side of the bar.
     auto *ends = new QHBoxLayout;
     ends->setSpacing(4);
     first = field(TimebarGestureKind::FirstTyped, QString());
@@ -544,7 +537,6 @@ Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rat
     right->addStretch(1);
     looping = button(TimebarGestureKind::ToggleLooping, loop_icon, QString());
     right->addWidget(looping);
-    // Lit when on, as Houdini's.
     mode = button(TimebarGestureKind::ToggleRealTime, glyph_icon(Glyph::RealTime, color), QString());
     mode->setCheckable(true);
     right->addWidget(mode);

@@ -64,7 +64,6 @@ pub struct Widgets {
     pub redo: *mut ffi::QAction,
 }
 
-/// A scripted check of the shell, from the command line.
 enum Check {
     Lifecycle(PathBuf),
     Drag(PathBuf, drag::Chain),
@@ -234,7 +233,6 @@ fn main() {
         Command::EvaluateOn(EvaluationDevice::Cpu),
     );
     COMMANDS.with(|cell| cell.set(commands).expect("menus are made once"));
-    // In one area, which the parameter panel's dock then divides.
     let docks = Pane::ALL.map(|pane| {
         let title = match pane {
             Pane::Graph => "Node Graph",
@@ -460,8 +458,7 @@ fn advance(_: usize) {
     check::observe(Seen::Advanced(started.elapsed()));
 }
 
-/// Dispatches a notice from another thread, telling the checks of each result and of how long
-/// retiring a lost device blocked the GUI thread.
+/// Dispatches a notice from another thread, and tells the checks.
 fn receive(notice: Notice) {
     let lost = matches!(notice, Notice::DeviceLost { .. });
     let received = Instant::now();
@@ -502,7 +499,6 @@ pub fn path(name: &QString) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes.as_slice().to_vec()))
 }
 
-/// Whether the pane has a surface to draw to.
 pub fn has_surface(pane: Pane) -> bool {
     APP.with(|cell| {
         cell.borrow()
@@ -534,17 +530,16 @@ pub fn set_viewer_cache_budget(bytes: u64) {
     });
 }
 
-/// How many GPU errors this session went uncaptured.
+/// How many GPU errors this session left uncaptured.
 pub fn gpu_errors() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, |app| app.gpu_errors()))
 }
 
-/// The number of the latest job given the worker, in the drag check.
+/// The latest job given the worker.
 pub fn latest_job() -> u64 {
     APP.with(|cell| cell.borrow().as_ref().map_or(0, App::latest_job))
 }
 
-/// The pane's last frame, in the drag check.
 pub fn frame_timing(pane: Pane) -> Option<FrameTiming> {
     APP.with(|cell| cell.borrow().as_ref()?.frame_timing(pane))
 }
@@ -558,12 +553,11 @@ pub fn poll_gpu() {
     });
 }
 
-/// The device evaluating the session.
 pub fn evaluation_device() -> EvaluationDevice {
     APP.with(|cell| (cell.borrow().as_ref()).map_or(EvaluationDevice::Cpu, App::evaluation_device))
 }
 
-/// The number of the job whose image the viewer last presented, in the drag check.
+/// The job whose image the viewer last presented.
 pub fn presented_job() -> Option<u64> {
     APP.with(|cell| cell.borrow().as_ref()?.presented_job())
 }

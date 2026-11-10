@@ -41,24 +41,17 @@ pub enum RangeSource {
 /// what is known of each frame of the viewed node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Timebar {
-    /// The range's first frame.
     pub first: f64,
-    /// The range's last frame.
     pub last: f64,
-    /// Where the range comes from.
     pub source: RangeSource,
     /// With [`RangeSource::Input`], whether the viewed node's range was found; if not, the range
     /// is the timeline's.
     pub input_found: bool,
     /// Frames per second.
     pub rate: f64,
-    /// The session's frame.
     pub frame: f64,
-    /// Which way playback plays, if it does.
     pub playing: Option<Direction>,
-    /// The mode playback plays in, or will.
     pub mode: PlaybackMode,
-    /// Whether playback wraps round at the timeline's end, rather than stopping there.
     pub looping: bool,
     /// Whether frames read as [`timecode`] rather than as numbers.
     pub timecode: bool,
@@ -84,7 +77,7 @@ pub struct FrameMark {
 }
 
 /// The longest timeline whose frames the timebar marks: each frame costs a key and an upstream
-/// walk, about 2 µs on the workstation, whenever the document or the files change.
+/// walk whenever the document or the files change.
 pub const MAX_MARKED_FRAMES: i64 = 2_000;
 
 /// The frames per second a timecode counts at a rate: the whole number nearest it, so that
@@ -152,7 +145,6 @@ pub fn parse_timecode(text: &str, rate: f64) -> Result<f64, TimecodeError> {
         return Err(TimecodeError::Unreadable);
     }
     let base = timecode_base(rate) as u64;
-    // Hours, minutes, seconds, frames, the missing leading ones zero.
     let mut fields = [0u64; 4];
     fields[4 - parts.len()..].copy_from_slice(&parts);
     let [hours, minutes, seconds, frames] = fields;
@@ -184,7 +176,6 @@ pub(crate) struct Playback {
 pub(crate) struct Range {
     pub(crate) first: f64,
     pub(crate) last: f64,
-    /// With [`RangeSource::Input`], whether the viewed node's range was found.
     pub(crate) input_found: bool,
 }
 
@@ -317,7 +308,6 @@ impl Playback {
         }
     }
 
-    /// Asks for an advance after the delay, unless one is waiting already.
     fn request_advance(&mut self, after: Duration) -> Option<Request> {
         if self.advance_requested {
             return None;
@@ -351,8 +341,8 @@ impl Playback {
 /// How long before the latest frame shown the achieved rate counts frames over.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
-/// The frames playback steps through: the timeline's first frame and each whole frame after it,
-/// up to its last.
+/// The frames playback steps through: a range's first frame and each whole frame after it, up to
+/// its last.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Frames {
     first: f64,
@@ -426,7 +416,6 @@ pub(crate) struct Clock {
     mode: PlaybackMode,
     /// When the clock started, at its first advance, and the index it started from.
     started: Option<(Instant, i64)>,
-    /// Steps taken since it started.
     steps: i64,
     /// In every-frame mode, when the next step may be taken.
     due: Option<Instant>,
@@ -434,7 +423,6 @@ pub(crate) struct Clock {
     shown: bool,
     /// When each frame recently shown was first shown, oldest first.
     recent: VecDeque<Instant>,
-    /// Frames the clock passed without their being shown, in real-time mode.
     drops: u64,
 }
 
@@ -494,7 +482,6 @@ impl Clock {
         }
     }
 
-    /// Whether the clock's frame has been shown since it stepped to it.
     pub(crate) fn is_shown(&self) -> bool {
         self.shown
     }

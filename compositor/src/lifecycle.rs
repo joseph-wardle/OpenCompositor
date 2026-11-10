@@ -97,7 +97,6 @@ thread_local! {
     /// new one finished showing the image again.
     static DESTROYED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
     static RECOVERED_IN: Cell<Option<Duration>> = const { Cell::new(None) };
-    /// The longest an attempt to make a device took.
     static LONGEST_ATTEMPT: Cell<Option<Duration>> = const { Cell::new(None) };
     /// How long retiring the lost device took, which has no budget yet.
     static RETIREMENT: Cell<Option<Duration>> = const { Cell::new(None) };
@@ -369,9 +368,8 @@ fn new_frames(before: Option<FrameCheck>, now: Option<FrameCheck>) -> u64 {
     }
 }
 
-/// Records when the viewer's last finished frame is on a new device and has the centre it had
-/// before the loss, so shows the image again, re-evaluated in a GPU session; until then looks
-/// again each millisecond.
+/// Records when the viewer's last finished frame is on a new device with the centre it had before
+/// the loss; until then looks again each millisecond.
 fn watch_recovery(_: usize) {
     let (Some(destroyed), Some(at)) = (DESTROYED.with(Cell::get), DESTROYED_AT.with(Cell::get))
     else {

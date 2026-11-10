@@ -23,8 +23,6 @@ pub struct Displayed {
 
 #[derive(Debug, Default)]
 pub(super) struct Viewing {
-    /// Copies of the images the viewer showed, which show their frames again without evaluating
-    /// them.
     pub(super) cache: ViewerCache,
     pub(super) asked: Asked,
     pub(super) shown: Shown,

@@ -62,7 +62,6 @@ impl Pattern {
         &self.path
     }
 
-    /// The file of a frame.
     pub fn frame_path(&self, frame: i64) -> PathBuf {
         let name = format!(
             "{}{frame:0padding$}{}",
@@ -82,7 +81,6 @@ impl Pattern {
         (format!("{frame:0padding$}", padding = self.padding) == number).then_some(frame)
     }
 
-    /// The directory the pattern's files are in.
     pub fn directory(&self) -> &Path {
         match self.path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -194,7 +192,6 @@ pub struct Files {
 }
 
 impl Files {
-    /// How many times the file has been reloaded.
     pub fn reloads(&self, file: &Path) -> u64 {
         self.reloads.get(file).copied().unwrap_or(0)
     }
@@ -424,10 +421,8 @@ pub(crate) fn scanned_end(resolved: &Resolved, files: &Files, parameter: &str) -
     }
 }
 
-/// The frames the node's sequences span on the timeline: from the earliest first frame to the
-/// latest last frame of the sequences its upstream Readers read, each moved by its Offset, at
-/// the frame their parameters are resolved at. `None` if none reads a sequence with both ends
-/// known, as for a still.
+/// The frames the sequences the node's upstream Readers read span on the timeline, each moved by
+/// its Offset, resolved at the frame. `None` if none reads a sequence with both ends known.
 pub fn input_range(
     document: &Document,
     files: &Files,

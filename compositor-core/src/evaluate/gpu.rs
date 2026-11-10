@@ -535,10 +535,10 @@ impl GpuEvaluation {
         Ok(image)
     }
 
-    /// Records into a recorded request the copy of its image for the viewer cache, halved that
-    /// many times, into a buffer to map once the GPU has completed the submission: the copy
-    /// costs the GPU its dispatch and no wait of its own. `Ok(None)` for an empty data window.
-    /// Fails if the GPU cannot hold the copy.
+    /// Records into a recorded request the copy of its image for the viewer cache, halved
+    /// `halvings` times, into a buffer to map once the GPU has completed the submission, so the
+    /// copy adds no wait of its own. `Ok(None)` for an empty data window; fails if the GPU cannot
+    /// hold the copy.
     pub(crate) fn record_copy_for_viewer(
         &self,
         recorded: &mut Recorded,
@@ -732,8 +732,8 @@ impl Evaluator {
 
     /// Reads the files of the Readers a request on a GPU retaining `on_gpu` would upload, unless
     /// this evaluator retains them already, so that recording it decodes nothing. They are read
-    /// together, as [`read_files`] reads them. `None` if `stop` returned true first. Fails as the
-    /// first file that cannot be read.
+    /// together. `None` if `stop` returned true first. Fails as the first file that cannot be
+    /// read.
     ///
     /// Like a request, it releases every retained result the key does not contain.
     pub fn read_for_gpu(

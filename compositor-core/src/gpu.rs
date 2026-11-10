@@ -251,7 +251,6 @@ impl Gpu {
         self.timings.as_ref()?[pane.index()].clone()
     }
 
-    /// Runs the callbacks of the device's completed work, without waiting for any.
     /// `None` without a device, or on a backend whose allocator does not report.
     pub(crate) fn memory(&self) -> Option<GpuMemory> {
         let report = self.device.as_ref()?.device.generate_allocator_report()?;
@@ -261,6 +260,7 @@ impl Gpu {
         })
     }
 
+    /// Runs the callbacks of the device's completed work, without waiting for any.
     pub(crate) fn poll(&self) {
         if let Some(device) = &self.device {
             // A loss runs the lost callback, which notices it.
@@ -453,8 +453,9 @@ impl Gpu {
         device.viewer.image = Some(image);
     }
 
-    /// Shows a copy from the viewer cache in the viewer from the next frame, numbered for the
-    /// probes that read it, which find nothing to read. A copy without texels clears the image.
+    /// Shows a copy from the viewer cache in the viewer from the next frame. A copy has no
+    /// working values, so pixel probes of image `number` read nothing; one without texels clears
+    /// the image.
     pub(crate) fn show_copy(&mut self, copy: &ViewerCopy, number: u64) {
         let Some(device) = &mut self.device else {
             return;

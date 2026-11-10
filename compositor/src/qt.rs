@@ -166,7 +166,6 @@ pub mod ffi {
         kind: RowKind,
         authored: bool,
         tooltip: QString,
-        /// The field's text.
         text: QString,
         /// Float only: the slider's positions from 0, and where it is.
         ticks: i32,
@@ -211,11 +210,10 @@ pub mod ffi {
     /// The timebar as Rust sends it.
     #[derive(Debug)]
     struct TimebarData {
-        /// The range's first and last frame, the frame, and the timeline's rate, which the bar's
-        /// ticks follow.
         first: f64,
         last: f64,
         frame: f64,
+        /// Frames per second, which the bar's ticks follow.
         rate: f64,
         /// Whether the texts and the ticks read as timecode rather than as numbers.
         timecode: bool,
@@ -228,7 +226,6 @@ pub mod ffi {
         looping: bool,
         /// Whether the range is the viewed node's input range rather than the timeline's.
         input: bool,
-        /// With `input`, whether the viewed node's range was found.
         input_found: bool,
         /// How playback keeps up, or nothing.
         status: QString,
@@ -258,7 +255,6 @@ pub mod ffi {
         kind: TimebarGestureKind,
         /// The frame scrubbed to.
         frame: f64,
-        /// What was typed.
         text: QString,
     }
 

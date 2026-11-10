@@ -29,7 +29,6 @@ pub fn rates() -> QStringList {
     QStringList::from(&rates)
 }
 
-/// A rate as the timebar writes it.
 fn rate_text(rate: f64) -> String {
     match RATES.iter().find(|(_, listed)| *listed == rate) {
         Some((text, _)) => (*text).to_owned(),

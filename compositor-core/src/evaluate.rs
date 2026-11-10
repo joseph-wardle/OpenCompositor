@@ -444,8 +444,8 @@ const NODE_BYTES_CAP: u64 = 1 << 30;
 /// Operations run on the evaluator's own threads, a chunk of rows at a time, and a request's
 /// outputs take the planes of the results it releases before making new ones.
 ///
-/// A key is one frame's, so the evaluator never sees the frame. The whole data window is computed and
-/// every channel produced.
+/// A key is one frame's, so the evaluator never sees the frame. The whole data window is computed
+/// and every channel produced.
 #[derive(Debug)]
 pub struct Evaluator {
     retained: Vec<Retained>,
@@ -492,11 +492,10 @@ impl Evaluator {
 
     /// The image a key names, its failure, or `None` if `stop` returned true before it was done.
     ///
-    /// The request's files are read first, together, as [`read_files`] reads them. `stop` is
-    /// asked before each node is computed, and by an operation long enough to matter before each
-    /// chunk of its work, from the pool's threads, as by a Reader before each chunk of an EXR
-    /// file, from the decoder's. Nodes completed before stopping stay retained until the next
-    /// request.
+    /// The request's files are read first, together. `stop` is asked before each node is
+    /// computed, and by an operation long enough to matter before each chunk of its work, from
+    /// the pool's threads; a Reader asks before each chunk of an EXR file, from the decoder's.
+    /// Nodes completed before stopping stay retained until the next request.
     pub fn evaluate(
         &mut self,
         key: &ResultKey,
@@ -802,11 +801,10 @@ impl Evaluator {
 }
 
 /// The threads operations and the viewer's conversion of their results run on, and the level the
-/// kernels run at. Each evaluator builds its
-/// own when it is built, so a request never waits for threads to start; the global rayon pool is
-/// never used, and no operation threads otherwise. A pool of the machine's physical cores leaves
-/// the GUI thread a core to wake on: hyperthreads added nothing to a memory-bound kernel and made
-/// its wake-ups late.
+/// kernels run at. Each evaluator builds its own when it is built, so a request never waits for
+/// threads to start; the global rayon pool is never used. A pool of the machine's physical cores
+/// leaves the GUI thread a core to wake on: hyperthreads added nothing to a memory-bound kernel
+/// and made its wake-ups late.
 #[derive(Debug)]
 pub struct Pool {
     threads: rayon::ThreadPool,

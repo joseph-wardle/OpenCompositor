@@ -1,6 +1,5 @@
 //! The compositor without a window: a document built by the same edits the interface makes,
-//! evaluated to pixels from files on disk. What each format reads as, and how edits undo, are
-//! the readers' and the session's own tests.
+//! evaluated to pixels from files on disk.
 
 use std::fs::File;
 use std::io::BufWriter;

@@ -21,7 +21,7 @@ fn playback_steps_through_whole_frames_and_wraps_round_or_stops_at_the_end() {
     assert_eq!(frames.step(0, 6, Direction::Backward, true), Ok(2));
     assert_eq!(frames.step(3, 1, Direction::Forward, false), Err(3));
     assert_eq!(frames.step(1, 2, Direction::Backward, false), Err(0));
-    // Outside the timeline, playback starts from the end it plays from.
+    // Outside the range, playback starts from the end it plays from.
     assert_eq!(frames.start(7.0, Direction::Forward), 0);
     assert_eq!(frames.start(7.0, Direction::Backward), 3);
     assert_eq!(frames.start(-0.4, Direction::Forward), 2);
@@ -64,7 +64,7 @@ fn real_time_playback_keeps_to_the_rate_and_counts_the_frames_it_drops() {
     let (frames, period) = (frames(), period());
     let mut clock = Clock::new(Direction::Backward, PlaybackMode::RealTime);
     let start = Instant::now();
-    // Outside the timeline, it starts from the end it plays from.
+    // Outside the range, it starts from the end it plays from.
     let first = clock.advance(start, 900.0, frames, 24.0, true);
     assert_eq!(first.frame, Some(1005.0));
     clock.frame_shown(start);

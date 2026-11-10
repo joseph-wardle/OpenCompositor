@@ -1,6 +1,5 @@
-// What cxx cannot bind: one-liners for constructors, statics, templates and casts, and the
-// parameter panel, creation menu and viewer strip, plain Qt classes that Rust fills and that send
-// its gestures back.
+// What cxx cannot bind: one-liners for constructors, statics, templates and casts, and the plain
+// Qt widgets that Rust fills and that send its gestures back.
 #pragma once
 #include <QtCore/QByteArray>
 #include <QtCore/QEvent>
@@ -78,7 +77,6 @@ class ParameterPanel : public QWidget {
 
     rust::Fn<void(PanelGesture)> gestures;
     bool refreshing = false;
-    // The node the rows are of, if any.
     std::optional<uint64_t> node;
     QLabel *title;
     QToolButton *pin;
@@ -89,10 +87,8 @@ class ParameterPanel : public QWidget {
 
 class FrameBar;
 
-// The timeline under the viewer: its frames as a bar to scrub and zoom, ticked and marked as Rust
-// sends them, between the range's first and last; under it the rate and how playback keeps up,
-// the transport round the frame, and playback's looping and mode and the range. Frames read as numbers or as timecode. Each gesture is sent back;
-// nothing is sent while Rust shows the timebar.
+// The timeline under the viewer, shown as Rust sends it. Each gesture is sent back; nothing is sent
+// while Rust shows the timebar.
 class Timebar : public QWidget {
   public:
     Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rates, QWidget *parent);
@@ -125,8 +121,8 @@ class Timebar : public QWidget {
     QIcon loop_icon, once_icon;
 };
 
-// Under the viewer: its timebar and caption, then the readout and the viewer's exposure, which
-// sends each value the artist sets in stops. Nothing is sent when Rust shows a value.
+// Under the viewer. The exposure sends each value the artist sets, in stops; nothing is sent when
+// Rust shows a value.
 class ViewerStrip : public QWidget {
   public:
     ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set,

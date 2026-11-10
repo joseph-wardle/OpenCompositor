@@ -1,35 +1,19 @@
-//! `--drag-check IMAGE [CHAIN]`: drags a parameter panel slider with synthetic mouse events, a
-//! press at the groove's start, a move one pixel along it each refresh of the viewer's screen,
-//! and a release at its end, on a chain: `exposure`, Stops on Reader → Exposure of IMAGE,
-//! `merge`, Mix on Reader → Merge with IMAGE as the background and as one layer, or `blur`, Size
-//! on Reader → Blur of IMAGE. Without CHAIN it runs each chain in a child process of its own and
-//! fails if any failed. It reports how the viewer kept up with each. The worker evaluates the
-//! latest request and discards the rest, so an edit's latency ends at the first viewer frame
-//! submitted that samples a result from its request or a later one: a superseded edit is
-//! answered by the frame showing a newer value, as the artist sees it. For each chain the check
-//! reports the latencies over every edit, the final edit's own, how many edits' own values were
-//! shown, how long the GUI thread took to dispatch each mouse event from the slider to the
-//! requests performed, the stages of the worker's path for the edits whose result it delivered,
-//! the same stages for the delivered edits whose data window differed from the one delivered
-//! before, which Blur's growing reach makes of some edits, every stage of the edits that set the
-//! p95, the longest latency and the final edit's, and the process's resident memory.
-//! Then it checks that the drag undoes as one step and that a drag cancelled with Escape leaves
-//! the value as it was. It exits 0 if those held and the chain's latencies' p95 and final edit
-//! met the chain's budget, and 1 otherwise.
+//! `--drag-check IMAGE [CHAIN]`: drags a parameter panel slider with synthetic mouse events, one
+//! pixel each refresh of the viewer's screen, on a chain: `exposure`, Stops on Reader → Exposure;
+//! `merge`, Mix on Reader → Merge with IMAGE as background and layer; or `blur`, Size on Reader →
+//! Blur. Without CHAIN it runs each chain in a child process of its own and fails if any failed.
 //!
-//! The session evaluates on the GPU unless `--cpu` comes first. An edit's latency then ends when
-//! the GPU completes the frame, not when it is submitted, since a frame queued behind the worker's
-//! compute completes only after it; the check polls the GPU every millisecond to learn when.
-//! The budget is two of the viewer's refreshes for every chain, and the GUI's frames must meet
-//! theirs during the drag: from acquiring a frame to submitting it p99 1 ms and at most 4 ms,
-//! and to the GPU's completion at most two refreshes. Both sessions report those frame times,
-//! and how long the first image took from marking the chain's node to its frame, cold.
+//! The worker evaluates the latest request and discards the rest, so an edit's latency ends at
+//! the first viewer frame that samples a result from its request or a later one: a superseded
+//! edit is answered by the frame showing a newer value, as the artist sees it. In a GPU session
+//! (unless `--cpu` comes first) that end is the GPU's completion of the frame, since a frame
+//! queued behind the worker's compute completes only after it; in a CPU session it is the GUI
+//! thread's presentation, since when the display shows it would need the display.
 //!
-//! Run it in a release build on the workstation, and twice, since the first run's shader and
-//! file caches are cold. In a CPU session an edit's latency ends when the GUI thread has
-//! presented the frame, handing it to the display; when the display shows it would need the
-//! display. Blur shows two Sizes before the drag, one summed directly and one by blocks, so that
-//! the images shown before it have built the pipelines the drag uses.
+//! It fails unless the latencies' p95 and the final edit's meet the chain's budget, the GUI's
+//! frames meet theirs (in a GPU session, also acquired → completed within two refreshes), the
+//! drag undoes as one step, and a drag cancelled with Escape leaves the value as it was. Run it
+//! twice, since the first run's shader and file caches are cold.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -50,13 +34,11 @@ const MOUSE_BUTTON_PRESS: i32 = 2;
 const MOUSE_BUTTON_RELEASE: i32 = 3;
 const MOUSE_MOVE: i32 = 5;
 
-/// How often the check looks for the image before the drag and for the final edit's frame after,
-/// and for how long at most.
 const POLL: Duration = Duration::from_millis(100);
 const LONGEST_WAIT: Duration = Duration::from_secs(60);
 
-/// The Blur's Sizes shown in turn before the drag, the last its starting value: the first is
-/// summed directly on the GPU and the second by blocks, either side of `DIRECT_T`.
+/// The Blur's Sizes shown before the drag, the last its starting value: one summed directly on
+/// the GPU and one by blocks, either side of `DIRECT_T`, so that the drag's pipelines are built.
 const BLUR_SIZES: [f64; 2] = [3.0, 30.0];
 
 /// A chain the check drags a slider on, from its Reader to the node whose panel has the slider.
@@ -76,7 +58,6 @@ impl Chain {
         CHAINS.into_iter().find(|chain| chain.type_name() == name)
     }
 
-    /// The node type after the Reader, which the chain is named for.
     fn type_name(self) -> &'static str {
         match self {
             Chain::Exposure => "exposure",
@@ -94,10 +75,9 @@ impl Chain {
         }
     }
 
-    /// What the latencies' p95 and the final edit's latency must meet on the workstation, whose
-    /// viewer refreshes every `refresh`. In a CPU session, Blur's evaluation takes about as long
-    /// as the gap between slider events, so edits wait behind the one running; its budget is set
-    /// from that, measured.
+    /// What the latencies' p95 and the final edit's must meet on the workstation. In a CPU
+    /// session Blur's evaluation takes about as long as the gap between slider events, so edits
+    /// wait behind the one running; its budget is set from that, measured.
     fn budget(self, device: EvaluationDevice, refresh: Duration) -> Duration {
         match (device, self) {
             (EvaluationDevice::Cpu, Chain::Exposure | Chain::Merge) => Duration::from_millis(50),
@@ -115,24 +95,21 @@ struct Check {
     nodes: Vec<NodeId>,
     /// The dragged parameter's authored value before the drag, which one undo restores.
     before: Option<Value>,
-    /// The request marking the chain's node made, which the viewer must show before the drag,
-    /// and when.
+    /// The request marking the chain's node made, which the viewer must show before the drag.
     marked: u64,
     marked_at: Option<Instant>,
-    /// How many of `BLUR_SIZES` the viewer has shown.
     blur_sizes_shown: usize,
-    /// The viewer's first frame showing the marked node's image.
     first_frame: Option<FrameTiming>,
     /// The panel's slider, and how many pixels its drag covers.
     slider: *mut ffi::QSlider,
     span: i32,
-    /// The viewer's refresh period, and between moves the same to Qt's millisecond timers.
+    /// The viewer's refresh period, and the same in Qt's milliseconds, between moves.
     refresh: Duration,
     period: i32,
     edits: Vec<Edit>,
     /// How long each mouse event took the GUI thread.
     dispatches: Vec<Duration>,
-    /// The number of the last frame recorded, of any pane.
+    /// The last frame recorded, of any pane.
     last_frame: u64,
     /// Every pane's frames from the drag's start.
     frames: Vec<FrameTiming>,
@@ -153,11 +130,10 @@ impl Check {
 }
 
 struct Edit {
-    /// The worker's request for it.
     request: u64,
     at: Instant,
-    /// When its result arrived on the GUI thread, with the worker's record and the image's data
-    /// window, `None` for a failure; `None` if the worker discarded it.
+    /// When its result arrived on the GUI thread, with the worker's record and the data window
+    /// (`None` for a failure); `None` if the worker discarded it.
     delivered: Option<(Instant, Timing, Option<Window>)>,
     /// The first viewer frame sampling its result or a later one.
     answer: Option<Answer>,
@@ -182,11 +158,9 @@ thread_local! {
     static CHECK: RefCell<Option<Check>> = const { RefCell::new(None) };
 }
 
-/// Runs every chain, each as a child process of this binary dragging that chain alone, and
-/// exits: 1 if any child did not exit 0, else 0. One process per chain because a chain run
-/// after another in the same process showed its staging several times slower, whichever chain
-/// it was; the hypothesis is that the staging buffer, recreated for the second chain, lands in a
-/// slower heap. Either way the chains are only comparable from equal starts.
+/// Runs each chain in a child process of its own, and exits 1 if any failed, else 0. A chain run
+/// after another in the same process stages several times slower (hypothesis: the recreated
+/// staging buffer lands in a slower heap), so chains are only comparable from equal starts.
 pub fn run_chains(image: &Path, device: EvaluationDevice) -> ! {
     let binary = std::env::current_exe().expect("the binary knows its own path");
     let mut failed = false;
@@ -258,8 +232,6 @@ fn poll_gpu(_: usize) {
     ffi::single_shot(1, poll_gpu, 0);
 }
 
-/// Records, if the drag check is running, a result's arrival for the edit that asked for it, and
-/// each frame.
 pub fn observe(seen: &Seen) {
     match seen {
         Seen::Frame(pane, frame) => frame_drawn(*pane, frame),
@@ -328,7 +300,7 @@ fn poll_in(tries: usize) -> i32 {
 }
 
 /// Makes the chain, which selects its last node for the panel, and marks that node in the
-/// viewer's slot, which asks the worker for it.
+/// viewer's slot.
 fn setup(_: usize) {
     let (image, chain) = with(|check| (check.image.clone(), check.chain));
     let nodes = crate::edit(|session| {
@@ -361,7 +333,6 @@ fn setup(_: usize) {
     ffi::single_shot(poll_in(1), wait_for_image, 1);
 }
 
-/// The one node a change created.
 fn created(changes: Changes) -> NodeId {
     *changes.nodes.iter().next().expect("one node was created")
 }
@@ -402,7 +373,6 @@ fn wait_for_image(tries: usize) {
     }
 }
 
-/// Presses the slider at the start of its groove and schedules the first move a refresh away.
 fn begin() {
     let (parameter, label) = with(|check| check.chain.parameter());
     // SAFETY: the panel lives as long as its dock, until the main window is destroyed after the
@@ -449,7 +419,7 @@ fn input_blocked() -> Option<String> {
     ))
 }
 
-/// Sends the slider a mouse event, timing it, and records the edit if it asked for a new result.
+/// Sends the slider a mouse event, timing it, and records an edit if it asked for a new result.
 fn send(kind: i32, pixel: i32) {
     let slider = with(|check| check.slider);
     let request = crate::latest_job();
@@ -471,8 +441,6 @@ fn send(kind: i32, pixel: i32) {
     });
 }
 
-/// One move a pixel along, and the next a refresh later, until the end of the groove, where the
-/// slider is released.
 fn step(pixel: usize) {
     let (span, period) = with(|check| (check.span, check.period));
     if let Some(failure) = input_blocked() {
@@ -505,8 +473,7 @@ fn wait_for_final(tries: usize) {
     }
 }
 
-/// Checks that the drag was one step, which one undo removes, and that a drag cancelled with
-/// Escape changes nothing. Returns the failures.
+/// Checks that one undo removes the drag and that a drag cancelled with Escape changes nothing.
 fn check_steps() -> Vec<String> {
     let (node, before, slider, span, (parameter, label)) = with(|check| {
         let node = *check.nodes.last().expect("set up");
@@ -581,7 +548,6 @@ fn caption() -> String {
     String::from(&unsafe { ffi::label_text(crate::widgets().caption) })
 }
 
-/// Prints what the chain's drag showed and exits: 1 with any failure, else 0.
 fn report(mut failures: Vec<String>) {
     let check = CHECK
         .with(|cell| cell.borrow_mut().take())
@@ -726,8 +692,8 @@ fn report(mut failures: Vec<String>) {
         "{name}: stage medians of the {changes} of them whose data window changed: {}",
         medians(&|index| changed[index])
     );
-    // The edits that set the latencies the budget is checked against, each with every stage of
-    // the result that answered it, which for a superseded edit is a later edit's.
+    // The edits that set the latencies the budget judges, with every stage of the result that
+    // answered each, which for a superseded edit is a later edit's.
     let p95 = latencies.p(0.95);
     let longest_latency = latencies.max();
     let mut attributed: Vec<(Vec<&str>, &Edit)> = Vec::new();

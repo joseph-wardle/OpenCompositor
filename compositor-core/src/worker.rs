@@ -230,32 +230,16 @@ impl std::error::Error for ViewerError {
     }
 }
 
-/// One worker evaluating one key at a time with its own [`Evaluator`], on the session's device. A
-/// request replaces any request it has not started, so after a burst of requests it evaluates at
-/// most the one in progress and the last.
+/// One worker evaluating one key at a time with its own [`Evaluator`], on the session's device.
 ///
-/// Once it has delivered a result, unless a newer request is waiting, it makes the result's copy
-/// for the viewer cache if asked, on the device that evaluated it, and passes it on.
+/// A request replaces any request not yet started. A newer request stops the one in progress at
+/// its next stopping point, except one for the same frame, an edit, which lets it finish: an
+/// edit's work is mostly done when the next arrives. A read blocked on the file and work
+/// submitted to the GPU are not interrupted. With no request waiting, it prepares the viewer
+/// cache's copies of the frames the app expects next.
 ///
-/// A newer request for another node, or for nothing, stops the evaluation in progress at its
-/// next stopping point: between nodes, between chunks of an operation long enough to ask or of an
-/// EXR file's decoding, before staging or submitting, and while waiting for the staging buffer;
-/// and skips its delivery after. A read blocked on the file or work submitted to the GPU is not
-/// interrupted. So does a newer request for another frame of the same node, so that a scrub's
-/// final frame comes first, unless the viewer has gone the [`FEEDBACK_INTERVAL`] without a
-/// result. A newer request for the same frame, an edit, lets the evaluation in progress finish
-/// and be delivered: an edit's work is mostly done when the next arrives, and stopping it showed
-/// fewer edits, later.
-///
-/// With no request waiting, it prepares the frames the app expects to want next, in order: it
-/// evaluates each and makes its copy for the viewer cache, delivering nothing. Look-ahead yields
-/// to every request but one for the frame it is preparing, whose copy the viewer then shows,
-/// and to a pause, which only stops requests. It prepares each key once, until a device change.
-///
-/// The worker never writes to a texture with `Queue::write_texture`, which copies under a
-/// queue-wide lock that the GUI thread's submit then waits for. In a CPU session it never
-/// submits; in a GPU session it submits each request once, and submits the next only once the GPU
-/// has completed it, so that superseded work on the GPU is at most one request.
+/// It never writes to a texture with `Queue::write_texture`, which copies under a queue-wide lock
+/// that the GUI thread's submit then waits for.
 #[derive(Debug)]
 pub struct Worker {
     mailbox: Arc<Mailbox>,
@@ -273,30 +257,24 @@ struct Mailbox {
 /// holds them only in a GPU phase, which the worker's drop waits for.
 #[derive(Debug)]
 struct MailboxState {
-    /// A request the worker has not started.
+    /// Not yet started.
     request: Option<Ask>,
-    /// The request the worker started last.
     started: Option<Job>,
-    /// What to prepare with no request waiting, in order: the frames the app expects next.
+    /// The frames the app expects next, in order.
     ahead: Vec<Job>,
-    /// The keys of `ahead` already prepared, or that failed.
+    /// Including keys that failed.
     prepared: Vec<ResultKey>,
-    /// The key the worker is preparing, if it is.
     preparing: Option<ResultKey>,
-    /// When the viewer last caught up: the worker's last delivery, or a request reaching it
-    /// idle. Within the feedback interval of this, a newer request for another frame stops the
-    /// started one.
+    /// The worker's last delivery, or a request reaching it idle.
     caught_up: Instant,
     /// Whether the started request, or the key being prepared, was found superseded. It stays so
     /// although the feedback interval may pass meanwhile: work stopped in part has been dropped,
     /// as by decoder threads that stopped while others went on.
     found_superseded: bool,
     shutting_down: bool,
-    /// The device the worker evaluates or stages for, from `connect` until the worker drops.
     connection: Option<Connection>,
-    /// Whether the worker is in a GPU phase, and so may hold GPU objects.
     in_gpu_phase: bool,
-    /// Where requests are evaluated from the next one started.
+    /// Applies from the next request started.
     device: EvaluationDevice,
     /// Evaluation's last submission in a GPU session, for telling whether a device was lost
     /// while it had work on the GPU.
@@ -343,7 +321,6 @@ struct Connection {
     generation: u64,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// Set by the device's lost callback.
     lost: Arc<AtomicBool>,
     /// A CPU session's.
     staging: StagingSlot,
@@ -621,8 +598,8 @@ impl Mailbox {
     }
 
     /// Waits for the device's staging buffer to come back and takes it, or takes its empty slot
-    /// to fill. `None` once the started request is superseded,
-    /// the device is no longer connected or the worker is shutting down.
+    /// to fill. `None` once the started request is superseded, the device is no longer connected
+    /// or the worker is shutting down.
     fn take_staging(self: &Arc<Mailbox>, device_generation: u64) -> Option<Staging> {
         let buffer = self.wait_for(|state| {
             let superseded = state.superseded();
@@ -708,7 +685,6 @@ impl Mailbox {
             .map_or_else(Vec::new, GpuEvaluation::retained_keys)
     }
 
-    /// Waits until the state changes or for at most `timeout`.
     fn wait_timeout(&self, timeout: Duration) {
         let state = self.lock();
         if !state.shutting_down {
@@ -762,7 +738,6 @@ impl MailboxState {
 /// it to end.
 struct GpuPhase<'a> {
     mailbox: &'a Arc<Mailbox>,
-    /// The device connected when it began.
     device: Option<PhaseDevice>,
 }
 
@@ -786,10 +761,9 @@ impl GpuPhase<'_> {
             .is_some_and(|began| current != Some(began.generation))
     }
 
-    /// Calls `use_evaluation` with evaluation's state on the phase's device, taken out of the
-    /// connection, or made if the connection has none yet, then returns it there, or drops it
-    /// if another device has been connected since or evaluation has left the GPU. `None` without
-    /// a device, or once replaced.
+    /// Calls `use_evaluation` with evaluation's state on the phase's device, made if the
+    /// connection has none yet. Drops the state after if the device was replaced or evaluation
+    /// has left the GPU. `None` without a device, or once replaced.
     fn with_evaluation<R>(
         &self,
         use_evaluation: impl FnOnce(&mut GpuEvaluation, &PhaseDevice) -> R,
@@ -822,8 +796,7 @@ impl GpuPhase<'_> {
         Some(result)
     }
 
-    /// Whether the worker is shutting down or another device, or none, has been connected since this
-    /// began, so that waiting on this one's GPU is pointless.
+    /// Whether waiting on this phase's GPU is pointless: shutting down, or the device replaced.
     fn abandoned(&self) -> bool {
         let shutting_down = self.mailbox.lock().shutting_down;
         shutting_down || self.device_replaced()
@@ -976,11 +949,8 @@ fn deliver_unless_superseded(
     true
 }
 
-/// Evaluates the job's key in a GPU session: reads the files of the Readers it uploads on the
-/// worker's thread, then in a GPU phase records the key's request, submits it as one, finishes
-/// the result, and waits without blocking for the GPU to complete it, unless it is superseded
-/// first, then makes its copy there. Without a device it evaluates nothing: connecting one asks
-/// again.
+/// Evaluates the job's key in a GPU session, reading files outside the GPU phase. Without a
+/// device it evaluates nothing: connecting one asks again.
 fn evaluate_on_gpu(
     mailbox: &Arc<Mailbox>,
     evaluator: &mut Evaluator,

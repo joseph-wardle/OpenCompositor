@@ -54,7 +54,6 @@ fn worker() -> (Worker, Receiver<Evaluated>) {
     (worker, deliveries)
 }
 
-/// Connects the worker to the device and its queue as the generation.
 fn connect(worker: &Worker, (device, queue): (wgpu::Device, wgpu::Queue), generation: u64) {
     worker.connect(device, queue, Arc::default(), generation);
 }
@@ -67,7 +66,6 @@ fn staged(evaluated: Evaluated) -> Pixels {
     }
 }
 
-/// The staging buffer staged planes are copied from.
 fn buffer(pixels: &Pixels) -> &wgpu::Buffer {
     pixels.staged.as_ref().expect("staged").buffer()
 }
@@ -92,7 +90,6 @@ fn wait_until(worker: &Worker, what: &str, done: impl Fn(&MailboxState) -> bool)
     }
 }
 
-/// Waits until the worker has started the last request.
 fn wait_until_started(worker: &Worker) {
     wait_until(worker, "started", |state| state.request.is_none());
 }
@@ -502,7 +499,7 @@ fn a_newer_request_for_the_same_frame_lets_the_started_one_finish() {
 }
 
 /// Decoder threads that saw the stop have already left, so the read cannot carry on as though it
-/// never had, which once read whole frames on a thread or two, only to drop them.
+/// never had.
 #[test]
 fn a_started_request_found_superseded_stays_so_after_the_feedback_interval() {
     let [first, second] = images("stop-stays");
@@ -538,7 +535,6 @@ fn a_request_reaching_an_idle_worker_starts_the_feedback_interval_again() {
     receive(&deliveries);
 }
 
-/// Two white images in a directory of the test's own.
 /// `N` white 3 × 2 PNGs in the test's directory `name`.
 fn images<const N: usize>(name: &str) -> [PathBuf; N] {
     let directory = directory(name);
@@ -779,12 +775,10 @@ fn exposed(path: &Path, stops: f64) -> ResultKey {
     key(&chain([reader(path), exposure(Some(stops))]), 2)
 }
 
-/// Waits until the worker has left its GPU phase.
 fn wait_until_out_of_gpu_phase(worker: &Worker) {
     wait_until(worker, "left its GPU phase", |state| !state.in_gpu_phase);
 }
 
-/// The keys retained on the connected device.
 fn retained_on_gpu(worker: &Worker) -> Vec<ResultKey> {
     wait_until_out_of_gpu_phase(worker);
     worker.mailbox.retained_on_gpu()

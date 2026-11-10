@@ -11,9 +11,8 @@ use crate::{drag, lifecycle, playback_check};
 
 /// Something the shell did that a check may be timing.
 pub enum Seen {
-    /// The pane drew a frame.
     Frame(Pane, FrameTiming),
-    /// The GUI thread advanced playback, taking so long.
+    /// The GUI thread advanced playback, taking this long.
     Advanced(Duration),
     /// A result arrived on the GUI thread at `received`, and was dispatched.
     Delivered {
@@ -23,13 +22,13 @@ pub enum Seen {
         window: Option<Window>,
         received: Instant,
     },
-    /// Retiring a lost device blocked the GUI thread so long.
+    /// Retiring a lost device blocked the GUI thread this long.
     Retired(Duration),
-    /// An attempt to make a GPU device blocked the GUI thread so long.
+    /// An attempt to make a GPU device blocked the GUI thread this long.
     Attempted(Duration),
 }
 
-/// Tells the checks; those not running ignore it.
+/// Tells every check; those not running ignore it.
 pub fn observe(seen: Seen) {
     drag::observe(&seen);
     playback_check::observe(&seen);
@@ -49,7 +48,7 @@ impl Durations {
         self.0.is_empty()
     }
 
-    /// The value at the quantile, or zero of none.
+    /// The value at the quantile, or zero if there are none.
     pub fn p(&self, quantile: f64) -> Duration {
         match self.0.len() {
             0 => Duration::ZERO,
@@ -88,13 +87,12 @@ impl fmt::Display for Durations {
     }
 }
 
-/// The GUI's frame budget in a GPU session: from acquiring a frame to submitting it, p99 and
-/// at most, but for one frame per run: the driver alone occasionally takes milliseconds to
-/// submit.
+/// The GUI's frame budget in a GPU session, from acquiring a frame to submitting it: p99, and at
+/// most for all but one frame per run, since the driver alone occasionally takes milliseconds.
 const FRAME_GUI_P99: Duration = Duration::from_millis(1);
 const FRAME_GUI_MAX: Duration = Duration::from_millis(4);
 
-/// The frames from acquiring to submitting, described; in a GPU session, failed against the
+/// Describes the frames from acquiring to submitting; in a GPU session, fails them against the
 /// GUI's budget.
 pub fn gui_frames(frames: &[FrameTiming], gpu: bool, failures: &mut Vec<String>) -> String {
     let times: Durations = frames
@@ -124,7 +122,7 @@ pub fn gui_frames(frames: &[FrameTiming], gpu: bool, failures: &mut Vec<String>)
     )
 }
 
-/// The process's resident set from /proc, as Linux reports it.
+/// The process's resident set, from /proc.
 pub fn resident_memory() -> String {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     status
