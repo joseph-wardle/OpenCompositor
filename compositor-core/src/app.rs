@@ -1,10 +1,9 @@
 //! The interactive compositor: a session, the GPU that draws its panes, and the evaluator's
 //! worker, changed only by [`App::dispatch`]. What only the shell can do comes back as [`Request`]s.
 
-use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +11,7 @@ use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
 use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{EvalError, ResultKey, result_key};
-use crate::files::{Pattern, Scan, input_range, readings};
+use crate::files::{Pattern, Scan, Scanner, readings};
 use crate::gpu::{
     Drawn, FrameCheck, FrameTiming, Gpu, GpuMemory, NativeWindow, PaneSize, PixelRead, Probe,
     ViewerFrame,
@@ -21,7 +20,7 @@ use crate::image::Window;
 use crate::panel::Panel;
 use crate::parameter::Value;
 use crate::playback::{
-    Clock, Direction, FrameMark, Frames, MAX_MARKED_FRAMES, PlaybackMode, RangeSource, Timebar,
+    Direction, FrameMark, Frames, MAX_MARKED_FRAMES, Playback, PlaybackMode, RangeSource, Timebar,
 };
 use crate::session::Session;
 use crate::viewer::{EXPOSURE_STEP, Zoom};
@@ -468,15 +467,7 @@ pub struct App {
     losses_during_evaluation: u32,
     /// Nothing is delivered once the app has dropped.
     worker: Worker,
-    /// Hands each scan's result to the GUI thread.
-    waker: Waker,
-    /// Sequences being scanned on threads of their own, by path, each with whether it is to be
-    /// scanned again when its scan returns, as Reload files asks while one runs.
-    scanning: HashMap<Arc<Path>, bool>,
-    /// Sequences whose scan failed, which are not scanned again until reloaded.
-    unscannable: BTreeSet<Arc<Path>>,
-    /// The session's version when the app last looked for sequences to scan.
-    scans_followed: Option<u64>,
+    scanner: Scanner,
     /// Files chosen, in the order chosen, waiting for scans.
     choices: Vec<Choice>,
     viewing: Viewing,
@@ -503,38 +494,28 @@ pub struct App {
     probed: Option<Probe>,
     /// The last pixel read back, shown until a newer read arrives.
     last_read: Option<LastRead>,
-    /// The readout as last requested.
-    readout: String,
-    /// The viewer's exposure as its control last showed it.
-    exposure_shown: f32,
-    /// The viewer's caption as last requested.
-    caption: String,
-    /// The Edit menu's undo and redo labels as last requested.
-    undo_labels: [Option<&'static str>; 2],
-    /// The status bar's GPU label as last requested.
-    gpu_label: Option<String>,
     /// The node the parameter panel stays on instead of the current node.
     pinned: Option<NodeId>,
     /// The session's version and the pin when the panel last followed them.
     panel_followed: Option<(u64, Option<NodeId>)>,
-    /// The parameter panel as last requested.
-    panel: Option<Panel>,
-    /// Playback in progress.
-    clock: Option<Clock>,
-    /// The mode playback plays in.
-    playback_mode: PlaybackMode,
-    /// Whether playback wraps round at the range's end.
-    looping: bool,
-    /// Which frames the timebar spans and playback plays through.
-    range_source: RangeSource,
-    /// Whether a [`Request::Advance`] is waiting to be dispatched.
-    advance_requested: bool,
+    playback: Playback,
     /// The keys of the frames the worker was last asked to prepare.
     ahead_sent: Vec<ResultKey>,
     /// What is known of each frame of the viewed node.
     marks: Marks,
-    /// The timebar as last requested.
+    shell: Shell,
+}
+
+/// What the shell was last asked to show, which it is asked again only once changed.
+#[derive(Debug, Default)]
+struct Shell {
+    gpu_label: Option<String>,
+    undo_labels: [Option<&'static str>; 2],
+    panel: Option<Panel>,
     timebar: Option<Timebar>,
+    caption: String,
+    readout: String,
+    exposure: f32,
 }
 
 /// How many frames ahead of playback's the worker prepares, at most: a provisional depth, which
@@ -573,10 +554,7 @@ impl App {
                 },
                 move |copy| deliver.wake(Notice::Copied(copy)),
             ),
-            waker,
-            scanning: HashMap::new(),
-            unscannable: BTreeSet::new(),
-            scans_followed: None,
+            scanner: Scanner::new(waker),
             choices: Vec::new(),
             viewing: Viewing::default(),
             followed: None,
@@ -591,22 +569,12 @@ impl App {
             left_pixel: None,
             probed: None,
             last_read: None,
-            readout: String::new(),
-            exposure_shown: 0.0,
-            caption: String::new(),
-            undo_labels: [None, None],
-            gpu_label: None,
             pinned: None,
             panel_followed: None,
-            panel: None,
-            clock: None,
-            playback_mode: PlaybackMode::default(),
-            looping: true,
-            range_source: RangeSource::default(),
-            advance_requested: false,
+            playback: Playback::default(),
             ahead_sent: Vec::new(),
             marks: Marks::default(),
-            timebar: None,
+            shell: Shell::default(),
         }
     }
 
@@ -632,9 +600,9 @@ impl App {
     /// [`advance`](App::advance) on. A frame outside the timeline plays from the end it plays
     /// from.
     pub fn play(&mut self, direction: Direction, mode: PlaybackMode) -> Vec<Request> {
-        self.playback_mode = mode;
-        let requests = self.start_playing(direction);
-        self.after_change(requests)
+        let restarted = self.playback.set_mode(mode);
+        let requests = restarted.into_iter().chain(self.playback.play(direction));
+        self.after_change(requests.collect())
     }
 
     /// Stops playback, staying on the frame.
@@ -654,13 +622,12 @@ impl App {
 
     /// Which way and how playback plays, if it does.
     pub fn playing(&self) -> Option<(Direction, PlaybackMode)> {
-        let clock = self.clock.as_ref()?;
-        Some((clock.direction(), clock.mode()))
+        self.playback.playing()
     }
 
     /// The timebar as last shown.
     pub fn timebar(&self) -> Option<&Timebar> {
-        self.timebar.as_ref()
+        self.shell.timebar.as_ref()
     }
 
     pub fn dispatch(&mut self, event: Event) -> Vec<Request> {
@@ -736,12 +703,17 @@ impl App {
             Event::ViewerExposureSet(stops) => {
                 self.session.viewer_mut().set_exposure(stops);
                 // The control shows what the artist typed, which echoing could rewrite.
-                self.exposure_shown = self.session.viewer().exposure();
+                self.shell.exposure = self.session.viewer().exposure();
                 vec![Request::Redraw(Pane::Viewer)]
             }
-            Event::Advance(now) => self.advance_clock(now),
+            Event::Advance(now) => {
+                let (frame, next) = self.playback.advance(now, &self.session);
+                let mut requests = frame.map(|frame| self.go_to(frame)).unwrap_or_default();
+                requests.extend(next);
+                requests
+            }
             Event::FrameSet(frame) => {
-                self.clock = None;
+                self.playback.stop();
                 self.go_to(frame)
             }
             Event::FrameRangeSet { first, last } => {
@@ -758,22 +730,13 @@ impl App {
                     "Cannot set the frame rate: {error}"
                 ))],
             },
-            Event::PlaybackModeSet(mode) => {
-                self.playback_mode = mode;
-                match &self.clock {
-                    Some(clock) if clock.mode() != mode => {
-                        let direction = clock.direction();
-                        self.start_playing(direction)
-                    }
-                    _ => Vec::new(),
-                }
-            }
+            Event::PlaybackModeSet(mode) => self.playback.set_mode(mode).into_iter().collect(),
             Event::LoopingSet(looping) => {
-                self.looping = looping;
+                self.playback.looping = looping;
                 Vec::new()
             }
             Event::RangeSourceChosen(source) => {
-                self.range_source = source;
+                self.playback.range_source = source;
                 Vec::new()
             }
         };
@@ -806,41 +769,56 @@ impl App {
         requests
     }
 
-    /// Follows whatever the event or edit changed: the viewer, then the panel and the labels the
-    /// shell shows.
+    /// Follows whatever the event or edit changed, then shows the shell what changed of what it
+    /// shows, before any other request: performing another may dispatch again and show newer.
     fn after_change(&mut self, mut requests: Vec<Request>) -> Vec<Request> {
-        self.scan_unscanned();
+        self.scanner.scan_unscanned(&self.session);
         self.follow_marks();
         self.follow_viewer(&mut requests);
-        self.follow_playback(&mut requests);
+        let shown = self.viewing.shows_asked_at(self.session.frame());
+        requests.extend(self.playback.follow_shown(shown));
         self.follow_look_ahead();
-        self.follow_timebar(&mut requests);
         self.follow_readout(&mut requests);
-        let exposure = self.session.viewer().exposure();
-        if exposure != self.exposure_shown {
-            self.exposure_shown = exposure;
-            requests.push(Request::ShowViewerExposure(exposure));
-        }
-        // These go first, since performing another request may dispatch again and show newer
-        // ones.
-        self.follow_panel(&mut requests);
-        let undo_labels = [self.session.undo_label(), self.session.redo_label()];
-        if undo_labels != self.undo_labels {
-            self.undo_labels = undo_labels;
-            let [undo, redo] = undo_labels;
-            requests.insert(0, Request::ShowUndoLabels { undo, redo });
-        }
+        let mut shows = Vec::new();
         let gpu_label = self.gpu_label();
-        if gpu_label != self.gpu_label {
-            self.gpu_label.clone_from(&gpu_label);
-            requests.insert(0, Request::ShowGpuLabel(gpu_label));
+        if gpu_label != self.shell.gpu_label {
+            self.shell.gpu_label.clone_from(&gpu_label);
+            shows.push(Request::ShowGpuLabel(gpu_label));
         }
-        requests
+        let undo_labels = [self.session.undo_label(), self.session.redo_label()];
+        if undo_labels != self.shell.undo_labels {
+            self.shell.undo_labels = undo_labels;
+            let [undo, redo] = undo_labels;
+            shows.push(Request::ShowUndoLabels { undo, redo });
+        }
+        self.follow_panel(&mut shows);
+        let timebar = self.playback.timebar(&self.session, &self.marks.marks);
+        if self.shell.timebar.as_ref() != Some(&timebar) {
+            self.shell.timebar = Some(timebar.clone());
+            shows.push(Request::ShowTimebar(timebar));
+        }
+        let caption = self.caption();
+        if caption != self.shell.caption {
+            self.shell.caption.clone_from(&caption);
+            shows.push(Request::ShowViewerCaption(caption));
+        }
+        let readout = self.readout();
+        if readout != self.shell.readout {
+            self.shell.readout.clone_from(&readout);
+            shows.push(Request::ShowReadout(readout));
+        }
+        let exposure = self.session.viewer().exposure();
+        if exposure != self.shell.exposure {
+            self.shell.exposure = exposure;
+            shows.push(Request::ShowViewerExposure(exposure));
+        }
+        shows.extend(requests);
+        shows
     }
 
     /// Keeps the panel on the pinned node, or the current node: shows it when it changed. A pin
     /// on a deleted node is dropped, so undoing the delete does not pin it again.
-    fn follow_panel(&mut self, requests: &mut Vec<Request>) {
+    fn follow_panel(&mut self, shows: &mut Vec<Request>) {
         let document = self.session.document();
         if self
             .pinned
@@ -860,15 +838,15 @@ impl App {
             None => (document.selection().last())
                 .and_then(|&current| Panel::of(document, files, current, false, frame)),
         };
-        if panel != self.panel {
-            self.panel.clone_from(&panel);
-            requests.insert(0, Request::ShowPanel(panel));
+        if panel != self.shell.panel {
+            self.shell.panel.clone_from(&panel);
+            shows.push(Request::ShowPanel(panel));
         }
     }
 
     /// The parameter panel as last shown.
     pub fn panel(&self) -> Option<&Panel> {
-        self.panel.as_ref()
+        self.shell.panel.as_ref()
     }
 
     /// What the viewer shows, if anything.
@@ -1201,7 +1179,7 @@ impl App {
             Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders(
                 self.anchor(),
             ))],
-            Command::PinPanel => match &self.panel {
+            Command::PinPanel => match &self.shell.panel {
                 Some(panel) => {
                     self.pinned = Some(panel.node);
                     Vec::new()
@@ -1271,41 +1249,25 @@ impl App {
                 }
                 Vec::new()
             }
-            Command::Play(direction) => {
-                if self
-                    .playing()
-                    .is_some_and(|(playing, _)| playing == direction)
-                {
-                    self.clock = None;
-                    return Vec::new();
-                }
-                self.start_playing(direction)
+            Command::Play(direction) if self.playback.direction() == Some(direction) => {
+                self.playback.stop();
+                Vec::new()
             }
+            Command::Play(direction) => self.playback.play(direction).into_iter().collect(),
             Command::Stop => {
-                self.clock = None;
+                self.playback.stop();
                 Vec::new()
             }
             Command::Step(direction) => {
-                self.clock = None;
-                let frame = self.session.frame();
-                let frames = self.frames();
-                let stepped = match frames.index(frame) {
-                    Some(index) => match frames.step(index, 1, direction, self.looping) {
-                        Ok(index) | Err(index) => frames.frame(index),
-                    },
-                    None => match direction {
-                        Direction::Forward => frame.floor() + 1.0,
-                        Direction::Backward => frame.ceil() - 1.0,
-                    },
-                };
-                self.go_to(stepped)
+                self.playback.stop();
+                self.go_to(self.playback.step(&self.session, direction))
             }
             Command::FirstFrame | Command::LastFrame => {
-                self.clock = None;
-                let (first, last, _) = self.range();
+                self.playback.stop();
+                let range = self.playback.range(&self.session);
                 self.go_to(match command {
-                    Command::FirstFrame => first,
-                    _ => last,
+                    Command::FirstFrame => range.first,
+                    _ => range.last,
                 })
             }
         }
@@ -1318,67 +1280,6 @@ impl App {
             Err(error) => vec![Request::ShowStatus(format!(
                 "Cannot go to the frame: {error}"
             ))],
-        }
-    }
-
-    /// Starts playing that way in the mode chosen, from the next advance, asked for at once.
-    fn start_playing(&mut self, direction: Direction) -> Vec<Request> {
-        self.clock = Some(Clock::new(direction, self.playback_mode));
-        self.request_advance(Duration::ZERO).into_iter().collect()
-    }
-
-    /// Asks for an advance after the delay, unless one is waiting already.
-    fn request_advance(&mut self, after: Duration) -> Option<Request> {
-        if self.advance_requested {
-            return None;
-        }
-        self.advance_requested = true;
-        Some(Request::Advance { after })
-    }
-
-    /// Moves playback's clock to `now`, and the session to its frame. Asks for the next advance
-    /// when the clock knows when; in every-frame mode, following the viewer asks once the frame
-    /// is shown.
-    fn advance_clock(&mut self, now: Instant) -> Vec<Request> {
-        self.advance_requested = false;
-        let frames = self.frames();
-        let Some(clock) = &mut self.clock else {
-            return Vec::new();
-        };
-        let tick = clock.advance(
-            now,
-            self.session.frame(),
-            frames,
-            self.session.document().timeline().rate(),
-            self.looping,
-        );
-        if tick.stopped {
-            self.clock = None;
-        }
-        let mut requests = match tick.frame {
-            Some(frame) => self.go_to(frame),
-            None => Vec::new(),
-        };
-        if let Some(next) = tick.next {
-            let after = next.saturating_duration_since(Instant::now());
-            requests.extend(self.request_advance(after));
-        }
-        requests
-    }
-
-    /// Tells the clock when its frame is shown, and in every-frame mode asks for the advance
-    /// that steps once it is due.
-    fn follow_playback(&mut self, requests: &mut Vec<Request>) {
-        let shown = self.viewing.shows_asked()
-            && (self.viewing.shown.job()).is_some_and(|shown| shown.frame == self.session.frame());
-        let Some(clock) = &mut self.clock else {
-            return;
-        };
-        if shown {
-            clock.frame_shown(Instant::now());
-        }
-        if clock.mode() == PlaybackMode::EveryFrame && clock.is_shown() {
-            requests.extend(self.request_advance(Duration::ZERO));
         }
     }
 
@@ -1427,30 +1328,8 @@ impl App {
     /// and the range's frames.
     fn marks_for(&self) -> (u64, Option<NodeId>, Frames) {
         let session = &self.session;
-        (session.content_version(), session.viewed(), self.frames())
-    }
-
-    /// The first and last frame of the range chosen, and with [`RangeSource::Input`] whether the
-    /// viewed node's was found, without which it is the timeline's.
-    fn range(&self) -> (f64, f64, bool) {
-        let session = &self.session;
-        let timeline = session.document().timeline();
-        let input = match (self.range_source, session.viewed()) {
-            (RangeSource::Input, Some(node)) => {
-                input_range(session.document(), session.files(), node, session.frame())
-            }
-            _ => None,
-        };
-        match input {
-            Some((first, last)) => (first, last, true),
-            None => (timeline.first(), timeline.last(), false),
-        }
-    }
-
-    /// The frames of the range chosen, which playback steps through.
-    fn frames(&self) -> Frames {
-        let (first, last, _) = self.range();
-        Frames::between(first, last)
+        let frames = self.playback.frames(session);
+        (session.content_version(), session.viewed(), frames)
     }
 
     /// Asks the worker to prepare the frames playback shows next that the viewer cache cannot
@@ -1469,14 +1348,15 @@ impl App {
     /// the next frame not yet played, and preparing that would drop the one after, each frame
     /// prepared again on the device as playback reaches it.
     fn look_ahead(&self) -> Vec<Job> {
-        let (Some(clock), Some(node)) = (&self.clock, self.session.viewed()) else {
+        let (Some(direction), Some(node)) = (self.playback.direction(), self.session.viewed())
+        else {
             return Vec::new();
         };
         let session = &self.session;
         if !self.viewing.cache.has_room() {
             return Vec::new();
         }
-        let frames = self.frames();
+        let frames = self.playback.frames(session);
         let Some(current) = frames.index(session.frame()) else {
             return Vec::new();
         };
@@ -1485,7 +1365,7 @@ impl App {
         let marked = (self.marks.built_for == Some(self.marks_for())).then_some(&self.marks.keys);
         let mut ahead: Vec<Job> = Vec::new();
         for steps in 1..=LOOK_AHEAD.min(frames.count() - 1) {
-            let Ok(index) = frames.step(current, steps, clock.direction(), self.looping) else {
+            let Ok(index) = frames.step(current, steps, direction, self.playback.looping) else {
                 break;
             };
             let frame = frames.frame(index);
@@ -1509,31 +1389,6 @@ impl App {
             });
         }
         ahead
-    }
-
-    /// Shows the timebar again when anything it shows changed.
-    fn follow_timebar(&mut self, requests: &mut Vec<Request>) {
-        let (first, last, input_found) = self.range();
-        let clock = self.clock.as_ref();
-        let timebar = Timebar {
-            first,
-            last,
-            source: self.range_source,
-            input_found,
-            rate: self.session.document().timeline().rate(),
-            frame: self.session.frame(),
-            playing: clock.map(Clock::direction),
-            mode: self.playback_mode,
-            looping: self.looping,
-            achieved: (clock.and_then(Clock::achieved_rate))
-                .map(|rate| (rate * 10.0).round() / 10.0),
-            drops: clock.map_or(0, Clock::drops),
-            marks: self.marks.marks.clone(),
-        };
-        if self.timebar.as_ref() != Some(&timebar) {
-            self.timebar = Some(timebar.clone());
-            requests.insert(0, Request::ShowTimebar(timebar));
-        }
     }
 
     fn anchor(&self) -> Anchor {
@@ -1570,54 +1425,18 @@ impl App {
             return vec![Request::ShowStatus("Select Readers to reload".to_owned())];
         }
         for sequence in reload.sequences {
-            self.unscannable.remove(sequence.path());
-            self.scan(sequence);
+            self.scanner.rescan(sequence);
         }
         vec![Request::Redraw(Pane::Graph)]
-    }
-
-    /// Scans a sequence on a thread of its own, or again once the scan running returns, whose
-    /// listing may predate a change.
-    fn scan(&mut self, sequence: Pattern) {
-        if let Some(again) = self.scanning.get_mut(sequence.path()) {
-            *again = true;
-            return;
-        }
-        self.scanning.insert(sequence.path().clone(), false);
-        let waker = self.waker.clone();
-        std::thread::Builder::new()
-            .name("scan".to_owned())
-            .spawn(move || {
-                let scan = Scan::of(&sequence);
-                waker.wake(Notice::Scanned { sequence, scan });
-            })
-            .expect("the system starts a thread");
-    }
-
-    /// Scans each sequence the document reads that has none, such as one typed into a File, once.
-    fn scan_unscanned(&mut self) {
-        let version = Some(self.session.version());
-        if version == self.scans_followed {
-            return;
-        }
-        self.scans_followed = version;
-        for sequence in self.session.unscanned() {
-            if !self.scanning.contains_key(sequence.path())
-                && !self.unscannable.contains(sequence.path())
-            {
-                self.scan(sequence);
-            }
-        }
     }
 
     /// Records a finished scan, says how many frames it found changed or why it failed, and
     /// decides the files chosen that waited for it.
     fn scanned(&mut self, sequence: Pattern, scan: io::Result<Scan>) -> Vec<Request> {
-        let again = self.scanning.remove(sequence.path()).unwrap_or(false);
+        let again = self.scanner.returned(&sequence, scan.is_err());
         let mut requests = Vec::new();
         match scan {
             Ok(scan) => {
-                self.unscannable.remove(sequence.path());
                 if let Some(reloaded) = self.session.record_scan(&sequence, scan) {
                     requests.push(Request::Redraw(Pane::Graph));
                     if reloaded > 0 {
@@ -1629,17 +1448,14 @@ impl App {
                     }
                 }
             }
-            Err(error) => {
-                self.unscannable.insert(sequence.path().clone());
-                requests.push(Request::ShowError(format!(
-                    "Cannot scan {}: {error}",
-                    sequence.directory().display()
-                )));
-            }
+            Err(error) => requests.push(Request::ShowError(format!(
+                "Cannot scan {}: {error}",
+                sequence.directory().display()
+            ))),
         }
         requests.extend(self.decide_choices());
         if again {
-            self.scan(sequence);
+            self.scanner.scan(sequence);
         }
         requests
     }
@@ -1656,7 +1472,7 @@ impl App {
             .collect();
         for sequence in files.iter().filter_map(|(_, sequence)| sequence.clone()) {
             if self.session.files().scan(sequence.path()).is_none() {
-                self.scan(sequence);
+                self.scanner.scan(sequence);
             }
         }
         self.choices.push(Choice { intent, files });
@@ -1673,7 +1489,7 @@ impl App {
                 let Some(sequence) = candidate.as_ref() else {
                     continue;
                 };
-                if self.scanning.contains_key(sequence.path()) {
+                if self.scanner.is_scanning(sequence.path()) {
                     continue;
                 }
                 let scan = files.scan(sequence.path());
@@ -1808,8 +1624,8 @@ impl App {
         Some((node, key))
     }
 
-    /// Keeps the viewer on what its slot marks: asks the worker for it, shows nothing if the slot
-    /// marks nothing, and describes the result.
+    /// Keeps the viewer on what its slot marks: asks the worker for it, and shows nothing if the
+    /// slot marks nothing.
     fn follow_viewer(&mut self, requests: &mut Vec<Request>) {
         // Building a key walks the viewed node's whole upstream, so not on every pointer move.
         let followed = Some((self.session.version(), self.session.viewed()));
@@ -1819,11 +1635,6 @@ impl App {
         }
         if self.copy_falls_short() {
             self.resume();
-        }
-        let caption = self.caption();
-        if caption != self.caption {
-            self.caption.clone_from(&caption);
-            requests.push(Request::ShowViewerCaption(caption));
         }
     }
 
@@ -1932,10 +1743,9 @@ impl App {
     }
 
     /// Keeps the readout on the shown image's pixel under the pointer, or the one it left the
-    /// viewer from: asks the GPU to read it, and describes the last read until a newer arrives.
+    /// viewer from: asks the GPU to read it.
     fn follow_readout(&mut self, requests: &mut Vec<Request>) {
-        let pointed = self.pointed();
-        if let Some((_, Some(probe))) = pointed
+        if let Some((_, Some(probe))) = self.pointed()
             && self.probed != Some(probe)
         {
             self.probed = Some(probe);
@@ -1946,7 +1756,11 @@ impl App {
                 requests.extend(self.poll_pixel_read());
             }
         }
-        let readout = match pointed {
+    }
+
+    /// The readout of the pointed pixel's last read, until a newer arrives.
+    fn readout(&self) -> String {
+        match self.pointed() {
             None => String::new(),
             Some(([x, y], None)) => {
                 format!("x {x} y {y} · R 0 G 0 B 0 A 0, outside the data window")
@@ -1957,10 +1771,6 @@ impl App {
                 Some(read) => format!("{} · reading", read.describe()),
                 None => format!("x {} y {}", pixel[0], pixel[1]),
             },
-        };
-        if readout != self.readout {
-            self.readout.clone_from(&readout);
-            requests.push(Request::ShowReadout(readout));
         }
     }
 

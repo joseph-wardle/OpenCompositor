@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::app::{Notice, Waker};
 use crate::document::{Document, NodeId, NodeKind};
 use crate::parameter::{Resolved, resolve};
+use crate::session::Session;
 
 /// A path whose file name writes a frame number as a run of `#`, zero-padded to the run's length
 /// as printf's `%04d` pads it: `plate.####.exr` names `plate.0001.exr` at frame 1, `plate.-001.exr`
@@ -225,6 +227,89 @@ impl Files {
         }
         self.scans.insert(pattern.path().clone(), scan);
         Some(changed.len())
+    }
+}
+
+/// Scans sequences on threads of their own, one scan of each at a time, and hands each result to
+/// the GUI thread as [`Notice::Scanned`].
+#[derive(Debug)]
+pub(crate) struct Scanner {
+    waker: Waker,
+    /// Sequences being scanned, by path, each with whether it is to be scanned again when its
+    /// scan returns, as Reload files asks while one runs.
+    scanning: HashMap<Arc<Path>, bool>,
+    /// Sequences whose scan failed, which are not scanned again until reloaded.
+    unscannable: BTreeSet<Arc<Path>>,
+    /// The session's version when the scanner last looked for sequences to scan.
+    followed: Option<u64>,
+}
+
+impl Scanner {
+    pub(crate) fn new(waker: Waker) -> Scanner {
+        Scanner {
+            waker,
+            scanning: HashMap::new(),
+            unscannable: BTreeSet::new(),
+            followed: None,
+        }
+    }
+
+    pub(crate) fn is_scanning(&self, sequence: &Path) -> bool {
+        self.scanning.contains_key(sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.scanning.is_empty()
+    }
+
+    /// Scans a sequence, or again once the scan running returns, whose listing may predate a
+    /// change.
+    pub(crate) fn scan(&mut self, sequence: Pattern) {
+        if let Some(again) = self.scanning.get_mut(sequence.path()) {
+            *again = true;
+            return;
+        }
+        self.scanning.insert(sequence.path().clone(), false);
+        let waker = self.waker.clone();
+        std::thread::Builder::new()
+            .name("scan".to_owned())
+            .spawn(move || {
+                let scan = Scan::of(&sequence);
+                waker.wake(Notice::Scanned { sequence, scan });
+            })
+            .expect("the system starts a thread");
+    }
+
+    /// Scans a sequence again, even one whose scan failed, as Reload files does.
+    pub(crate) fn rescan(&mut self, sequence: Pattern) {
+        self.unscannable.remove(sequence.path());
+        self.scan(sequence);
+    }
+
+    /// Scans each sequence the session reads that has none, such as one typed into a File, once.
+    pub(crate) fn scan_unscanned(&mut self, session: &Session) {
+        let version = Some(session.version());
+        if version == self.followed {
+            return;
+        }
+        self.followed = version;
+        for sequence in session.unscanned() {
+            if !self.is_scanning(sequence.path()) && !self.unscannable.contains(sequence.path()) {
+                self.scan(sequence);
+            }
+        }
+    }
+
+    /// Records that a scan of the sequence returned, and whether it failed. Returns whether it is
+    /// to be scanned again.
+    pub(crate) fn returned(&mut self, sequence: &Pattern, failed: bool) -> bool {
+        if failed {
+            self.unscannable.insert(sequence.path().clone());
+        } else {
+            self.unscannable.remove(sequence.path());
+        }
+        self.scanning.remove(sequence.path()).unwrap_or(false)
     }
 }
 

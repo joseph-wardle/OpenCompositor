@@ -107,6 +107,11 @@ impl Viewing {
         }
     }
 
+    /// Whether the viewer shows the result of what it last asked for, as the frame's.
+    pub(super) fn shows_asked_at(&self, frame: f64) -> bool {
+        self.shows_asked() && (self.shown.job()).is_some_and(|shown| shown.frame == frame)
+    }
+
     pub(super) fn displayed(&self) -> Option<Displayed> {
         let job = self.shown.job()?;
         Some(Displayed {

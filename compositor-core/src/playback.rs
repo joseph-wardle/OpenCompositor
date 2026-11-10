@@ -4,6 +4,10 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::app::Request;
+use crate::files::input_range;
+use crate::session::Session;
+
 /// Which way playback steps through the timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -150,6 +154,184 @@ pub fn parse_timecode(text: &str, rate: f64) -> Result<f64, TimecodeError> {
     } else {
         count as f64
     })
+}
+
+/// How the artist chose playback to play, and playback in progress.
+#[derive(Debug)]
+pub(crate) struct Playback {
+    clock: Option<Clock>,
+    mode: PlaybackMode,
+    pub(crate) looping: bool,
+    pub(crate) range_source: RangeSource,
+    /// Whether a [`Request::Advance`] is waiting to be dispatched.
+    advance_requested: bool,
+}
+
+/// The first and last frames the timebar spans and playback plays through.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Range {
+    pub(crate) first: f64,
+    pub(crate) last: f64,
+    /// With [`RangeSource::Input`], whether the viewed node's range was found.
+    pub(crate) input_found: bool,
+}
+
+impl Range {
+    pub(crate) fn frames(self) -> Frames {
+        Frames::between(self.first, self.last)
+    }
+}
+
+impl Default for Playback {
+    fn default() -> Playback {
+        Playback {
+            clock: None,
+            mode: PlaybackMode::default(),
+            looping: true,
+            range_source: RangeSource::default(),
+            advance_requested: false,
+        }
+    }
+}
+
+impl Playback {
+    pub(crate) fn playing(&self) -> Option<(Direction, PlaybackMode)> {
+        let clock = self.clock.as_ref()?;
+        Some((clock.direction(), clock.mode()))
+    }
+
+    pub(crate) fn direction(&self) -> Option<Direction> {
+        self.clock.as_ref().map(Clock::direction)
+    }
+
+    /// Starts playing that way in the mode chosen, from the next advance, asked for at once.
+    pub(crate) fn play(&mut self, direction: Direction) -> Option<Request> {
+        self.clock = Some(Clock::new(direction, self.mode));
+        self.request_advance(Duration::ZERO)
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.clock = None;
+    }
+
+    /// Plays in the mode from now on, starting again at once if playing in another.
+    pub(crate) fn set_mode(&mut self, mode: PlaybackMode) -> Option<Request> {
+        self.mode = mode;
+        match &self.clock {
+            Some(clock) if clock.mode() != mode => self.play(clock.direction()),
+            _ => None,
+        }
+    }
+
+    /// The range chosen as the session stands: the timeline's, unless the viewed node's
+    /// sequences are chosen and found.
+    pub(crate) fn range(&self, session: &Session) -> Range {
+        let timeline = session.document().timeline();
+        let input = match (self.range_source, session.viewed()) {
+            (RangeSource::Input, Some(node)) => {
+                input_range(session.document(), session.files(), node, session.frame())
+            }
+            _ => None,
+        };
+        match input {
+            Some((first, last)) => Range {
+                first,
+                last,
+                input_found: true,
+            },
+            None => Range {
+                first: timeline.first(),
+                last: timeline.last(),
+                input_found: false,
+            },
+        }
+    }
+
+    pub(crate) fn frames(&self, session: &Session) -> Frames {
+        self.range(session).frames()
+    }
+
+    /// The frame one step that way from the session's: round to the range's other end when
+    /// looping, and from a frame outside the range or between frames the next whole frame.
+    pub(crate) fn step(&self, session: &Session, direction: Direction) -> f64 {
+        let frame = session.frame();
+        let frames = self.frames(session);
+        match frames.index(frame) {
+            Some(index) => match frames.step(index, 1, direction, self.looping) {
+                Ok(index) | Err(index) => frames.frame(index),
+            },
+            None => match direction {
+                Direction::Forward => frame.floor() + 1.0,
+                Direction::Backward => frame.ceil() - 1.0,
+            },
+        }
+    }
+
+    /// Moves the clock to `now`. Returns the frame to go to, if it stepped, and the next advance
+    /// when the clock knows when; in every-frame mode, [`Playback::follow_shown`] asks once the
+    /// frame is shown.
+    pub(crate) fn advance(
+        &mut self,
+        now: Instant,
+        session: &Session,
+    ) -> (Option<f64>, Option<Request>) {
+        self.advance_requested = false;
+        let frames = self.frames(session);
+        let Some(clock) = &mut self.clock else {
+            return (None, None);
+        };
+        let rate = session.document().timeline().rate();
+        let tick = clock.advance(now, session.frame(), frames, rate, self.looping);
+        if tick.stopped {
+            self.clock = None;
+        }
+        let next = (tick.next)
+            .and_then(|next| self.request_advance(next.saturating_duration_since(Instant::now())));
+        (tick.frame, next)
+    }
+
+    /// Tells the clock whether its frame is shown, and in every-frame mode asks for the advance
+    /// that steps once it is due.
+    pub(crate) fn follow_shown(&mut self, shown: bool) -> Option<Request> {
+        let clock = self.clock.as_mut()?;
+        if shown {
+            clock.frame_shown(Instant::now());
+        }
+        if clock.mode() == PlaybackMode::EveryFrame && clock.is_shown() {
+            self.request_advance(Duration::ZERO)
+        } else {
+            None
+        }
+    }
+
+    /// Asks for an advance after the delay, unless one is waiting already.
+    fn request_advance(&mut self, after: Duration) -> Option<Request> {
+        if self.advance_requested {
+            return None;
+        }
+        self.advance_requested = true;
+        Some(Request::Advance { after })
+    }
+
+    pub(crate) fn timebar(&self, session: &Session, marks: &[FrameMark]) -> Timebar {
+        let range = self.range(session);
+        let clock = self.clock.as_ref();
+        Timebar {
+            first: range.first,
+            last: range.last,
+            source: self.range_source,
+            input_found: range.input_found,
+            rate: session.document().timeline().rate(),
+            frame: session.frame(),
+            playing: clock.map(Clock::direction),
+            mode: self.mode,
+            looping: self.looping,
+            achieved: (clock.and_then(Clock::achieved_rate))
+                .map(|rate| (rate * 10.0).round() / 10.0),
+            drops: clock.map_or(0, Clock::drops),
+            marks: marks.to_vec(),
+        }
+    }
 }
 
 /// How long before the latest frame shown the achieved rate counts frames over.
