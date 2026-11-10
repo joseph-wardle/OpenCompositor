@@ -49,7 +49,7 @@ pub use parameter::{
 };
 pub use playback::{
     Direction, FrameMark, MAX_MARKED_FRAMES, PlaybackMode, RangeSource, Timebar, TimecodeError,
-    parse_timecode, timecode,
+    ntsc_rate, parse_timecode, timecode,
 };
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{EditError, Reload, Session};

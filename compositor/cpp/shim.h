@@ -105,23 +105,14 @@ class Timebar : public QWidget {
     // A field that sends what is typed into it as the gesture, if the artist changed it.
     QLineEdit *field(TimebarGestureKind kind, const QString &tooltip);
     QToolButton *button(TimebarGestureKind kind, const QIcon &icon, const QString &tooltip);
-    // Shows the frame, first and last as numbers or timecode, sizing their fields to fit.
-    void show_frames();
-    void send(TimebarGestureKind kind, double frame = 0, const QString &text = QString(),
-              bool on = false);
+    void send(TimebarGestureKind kind, double frame = 0, const QString &text = QString());
 
     rust::Fn<void(TimebarGesture)> gestures;
     bool refreshing = false;
-    bool timecode = false;
-    // As last shown, which the buttons send the other of.
-    bool looping_on = false;
-    bool real_time = false;
-    // The frame, first and last as last shown: as numbers, then as timecode.
-    QString texts[3][2];
     FrameBar *bar;
     QComboBox *rate;
     QLabel *status;
-    QToolButton *timecode_button;
+    QToolButton *timecode;
     QToolButton *play_backward;
     QToolButton *play_forward;
     QLineEdit *frame;

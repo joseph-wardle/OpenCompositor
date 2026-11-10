@@ -10,7 +10,7 @@ use crate::panel::number;
 use crate::qt::ffi::{self, TimebarGestureKind};
 
 /// The rates the timebar offers, as it writes them. NTSC's are exact fractions, which a rate
-/// typed near one becomes.
+/// typed near one becomes in the app.
 const RATES: [(&str, f64); 9] = [
     ("23.976", 24_000.0 / 1001.0),
     ("24", 24.0),
@@ -37,13 +37,6 @@ fn rate_text(rate: f64) -> String {
     }
 }
 
-/// A typed rate: the listed one it reads as, such as 23.976 for 24000/1001, or itself.
-fn typed_rate(typed: f64) -> f64 {
-    (RATES.iter())
-        .find(|(_, listed)| (typed - listed).abs() < 0.0005)
-        .map_or(typed, |(_, listed)| *listed)
-}
-
 pub fn frame_label(frame: f64, rate: f64, timecode: bool) -> String {
     if timecode {
         self::timecode(frame, rate)
@@ -61,25 +54,28 @@ pub fn show(timebar: &Timebar) {
         (Some(_), Some(achieved)) => format!("{achieved:.1} fps"),
     };
     let marks = (timebar.marks.iter())
-        .map(|mark| u8::from(mark.cached) | u8::from(mark.missing) << 1 | u8::from(mark.held) << 2)
+        .map(|mark| ffi::FrameMark {
+            cached: mark.cached,
+            missing: mark.missing,
+            held: mark.held,
+        })
         .collect();
-    let rate = timebar.rate;
+    let (rate, timecode) = (timebar.rate, timebar.timecode);
+    let text = |frame| QString::from(&frame_label(frame, rate, timecode));
     let data = ffi::TimebarData {
         first: timebar.first,
         last: timebar.last,
         frame: timebar.frame,
         rate,
-        frame_text: QString::from(&number(timebar.frame)),
-        frame_timecode: QString::from(&timecode(timebar.frame, rate)),
-        first_text: QString::from(&number(timebar.first)),
-        first_timecode: QString::from(&timecode(timebar.first, rate)),
-        last_text: QString::from(&number(timebar.last)),
-        last_timecode: QString::from(&timecode(timebar.last, rate)),
+        timecode,
+        frame_text: text(timebar.frame),
+        first_text: text(timebar.first),
+        last_text: text(timebar.last),
         rate_text: QString::from(&rate_text(rate)),
         playing: match timebar.playing {
-            Some(Direction::Forward) => 1,
-            Some(Direction::Backward) => -1,
-            None => 0,
+            Some(Direction::Forward) => ffi::Playing::Forward,
+            Some(Direction::Backward) => ffi::Playing::Backward,
+            None => ffi::Playing::Stopped,
         },
         real_time: timebar.mode == PlaybackMode::RealTime,
         looping: timebar.looping,
@@ -112,7 +108,15 @@ fn typed_frame(text: &str, rate: f64) -> Result<f64, String> {
 
 pub fn gesture(gesture: ffi::TimebarGesture) {
     let text = String::from(&gesture.text);
-    let timeline = crate::read_app(|app| app.session().document().timeline());
+    let (timeline, shown) = crate::read_app(|app| {
+        let timeline = app.session().document().timeline();
+        let shown = (app.timebar()).map(|shown| (shown.looping, shown.mode, shown.timecode));
+        (timeline, shown)
+    });
+    // The timebar is shown before the window takes gestures.
+    let Some((looping, mode, timecode)) = shown else {
+        return;
+    };
     let typed = || typed_frame(&text, timeline.rate());
     let event = match gesture.kind {
         TimebarGestureKind::Scrubbed => Ok(Event::FrameSet(gesture.frame)),
@@ -125,9 +129,9 @@ pub fn gesture(gesture: ffi::TimebarGesture) {
             first: timeline.first(),
             last,
         }),
-        TimebarGestureKind::RateTyped => Ok(Event::FrameRateSet(typed_rate(
-            text.trim().parse().unwrap_or(f64::NAN),
-        ))),
+        TimebarGestureKind::RateTyped => {
+            Ok(Event::FrameRateSet(text.trim().parse().unwrap_or(f64::NAN)))
+        }
         TimebarGestureKind::Restore => return refresh(),
         TimebarGestureKind::FirstFrame => Ok(Event::Command(Command::FirstFrame)),
         TimebarGestureKind::StepBackward => Ok(Event::Command(Command::Step(Direction::Backward))),
@@ -135,17 +139,14 @@ pub fn gesture(gesture: ffi::TimebarGesture) {
         TimebarGestureKind::PlayForward => Ok(Event::Command(Command::Play(Direction::Forward))),
         TimebarGestureKind::StepForward => Ok(Event::Command(Command::Step(Direction::Forward))),
         TimebarGestureKind::LastFrame => Ok(Event::Command(Command::LastFrame)),
-        TimebarGestureKind::Looping => Ok(Event::LoopingSet(gesture.on)),
-        TimebarGestureKind::RealTime => Ok(Event::PlaybackModeSet(if gesture.on {
-            PlaybackMode::RealTime
-        } else {
-            PlaybackMode::EveryFrame
+        TimebarGestureKind::ToggleLooping => Ok(Event::LoopingSet(!looping)),
+        TimebarGestureKind::ToggleRealTime => Ok(Event::PlaybackModeSet(match mode {
+            PlaybackMode::EveryFrame => PlaybackMode::RealTime,
+            PlaybackMode::RealTime => PlaybackMode::EveryFrame,
         })),
-        TimebarGestureKind::InputRange => Ok(Event::RangeSourceChosen(if gesture.on {
-            RangeSource::Input
-        } else {
-            RangeSource::Timeline
-        })),
+        TimebarGestureKind::ToggleTimecode => Ok(Event::TimecodeSet(!timecode)),
+        TimebarGestureKind::GlobalRange => Ok(Event::RangeSourceChosen(RangeSource::Timeline)),
+        TimebarGestureKind::InputRange => Ok(Event::RangeSourceChosen(RangeSource::Input)),
         _ => return,
     };
     let typing = matches!(
@@ -176,10 +177,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_typed_rate_near_a_listed_one_becomes_it_and_is_written_as_listed() {
-        assert_eq!(typed_rate(23.976), 24_000.0 / 1001.0);
-        assert_eq!(rate_text(typed_rate(29.97)), "29.97");
-        assert_eq!(typed_rate(23.9), 23.9);
+    fn a_listed_rate_is_written_as_listed() {
+        assert_eq!(rate_text(opencompositor_core::ntsc_rate(29.97)), "29.97");
         assert_eq!(rate_text(12.5), "12.5");
     }
 

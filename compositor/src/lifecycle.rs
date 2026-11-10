@@ -29,6 +29,7 @@ use opencompositor_core::{
     Anchor, Event, FileIntent, FrameCheck, Input, Key, NodeId, NodeKind, Pane, Request, Slot, Value,
 };
 
+use crate::check::Seen;
 use crate::keys::qt_key;
 use crate::qt::ffi;
 
@@ -109,14 +110,13 @@ pub fn start(image: PathBuf) {
     ffi::single_shot(STEPS[0].0, step, 0);
 }
 
-/// Records how long an attempt to make a GPU device blocked the GUI thread.
-pub fn attempt_took(duration: Duration) {
-    LONGEST_ATTEMPT.with(|cell| cell.set(cell.get().max(Some(duration))));
-}
-
-/// Records how long retiring a lost device blocked the GUI thread.
-pub fn retirement_took(duration: Duration) {
-    RETIREMENT.with(|cell| cell.set(Some(duration)));
+/// Records how long making a device and retiring one blocked the GUI thread.
+pub fn observe(seen: &Seen) {
+    match *seen {
+        Seen::Attempted(took) => LONGEST_ATTEMPT.with(|cell| cell.set(cell.get().max(Some(took)))),
+        Seen::Retired(took) => RETIREMENT.with(|cell| cell.set(Some(took))),
+        _ => {}
+    }
 }
 
 fn step(index: usize) {
@@ -268,11 +268,7 @@ fn step(index: usize) {
                 0 => {}
                 errors => fail(format!("the GPU reported {errors} uncaptured errors")),
             }
-            let failures = FAILURES.with(|cell| cell.take());
-            for failure in &failures {
-                eprintln!("lifecycle check failed: {failure}");
-            }
-            ffi::exit(i32::from(!failures.is_empty()));
+            crate::check::finish("lifecycle check", &FAILURES.with(|cell| cell.take()));
         }
     }
 }

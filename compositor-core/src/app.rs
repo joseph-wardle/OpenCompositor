@@ -21,6 +21,7 @@ use crate::panel::Panel;
 use crate::parameter::Value;
 use crate::playback::{
     Direction, FrameMark, Frames, MAX_MARKED_FRAMES, Playback, PlaybackMode, RangeSource, Timebar,
+    ntsc_rate,
 };
 use crate::session::Session;
 use crate::viewer::{EXPOSURE_STEP, Zoom};
@@ -133,12 +134,15 @@ pub enum Event {
         first: f64,
         last: f64,
     },
-    /// The artist set the rate the timeline plays at, in frames per second, as one step.
+    /// The artist set the rate the timeline plays at, in frames per second, as one step. A rate
+    /// near an NTSC rate becomes it, as [`ntsc_rate`](crate::ntsc_rate) does.
     FrameRateSet(f64),
     /// The artist chose the mode playback plays in, from now on and at once if playing.
     PlaybackModeSet(PlaybackMode),
     /// The artist chose whether playback wraps round at the range's end.
     LoopingSet(bool),
+    /// The artist chose whether frames read as timecode rather than as numbers.
+    TimecodeSet(bool),
     /// The artist chose which frames the timebar spans and playback plays through.
     RangeSourceChosen(RangeSource),
 }
@@ -724,7 +728,7 @@ impl App {
                     ))],
                 }
             }
-            Event::FrameRateSet(rate) => match self.session.set_frame_rate(rate) {
+            Event::FrameRateSet(rate) => match self.session.set_frame_rate(ntsc_rate(rate)) {
                 Ok(_) => Vec::new(),
                 Err(error) => vec![Request::ShowStatus(format!(
                     "Cannot set the frame rate: {error}"
@@ -733,6 +737,10 @@ impl App {
             Event::PlaybackModeSet(mode) => self.playback.set_mode(mode).into_iter().collect(),
             Event::LoopingSet(looping) => {
                 self.playback.looping = looping;
+                Vec::new()
+            }
+            Event::TimecodeSet(timecode) => {
+                self.playback.timecode = timecode;
                 Vec::new()
             }
             Event::RangeSourceChosen(source) => {

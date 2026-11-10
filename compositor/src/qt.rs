@@ -217,16 +217,13 @@ pub mod ffi {
         last: f64,
         frame: f64,
         rate: f64,
-        /// The frame, first and last as frame numbers, and as timecode.
+        /// Whether the texts and the ticks read as timecode rather than as numbers.
+        timecode: bool,
         frame_text: QString,
-        frame_timecode: QString,
         first_text: QString,
-        first_timecode: QString,
         last_text: QString,
-        last_timecode: QString,
         rate_text: QString,
-        /// 1 playing forwards, -1 backwards, 0 stopped.
-        playing: i32,
+        playing: Playing,
         real_time: bool,
         looping: bool,
         /// Whether the range is the viewed node's input range rather than the timeline's.
@@ -235,8 +232,24 @@ pub mod ffi {
         input_found: bool,
         /// How playback keeps up, or nothing.
         status: QString,
-        /// Each whole frame's from the first: 1 cached, 2 missing, 4 held, or'd.
-        marks: Vec<u8>,
+        /// Each whole frame's from the first.
+        marks: Vec<FrameMark>,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum Playing {
+        Stopped,
+        Forward,
+        Backward,
+    }
+
+    /// [`opencompositor_core::FrameMark`], for the bar.
+    #[derive(Debug)]
+    struct FrameMark {
+        cached: bool,
+        missing: bool,
+        held: bool,
     }
 
     /// What the artist did to the timebar.
@@ -247,8 +260,6 @@ pub mod ffi {
         frame: f64,
         /// What was typed.
         text: QString,
-        /// Whether looping, real time or the input range was chosen.
-        on: bool,
     }
 
     #[derive(Debug)]
@@ -269,8 +280,11 @@ pub mod ffi {
         PlayForward,
         StepForward,
         LastFrame,
-        Looping,
-        RealTime,
+        /// Each of these three turns its choice to the other of what the timebar shows.
+        ToggleLooping,
+        ToggleRealTime,
+        ToggleTimecode,
+        GlobalRange,
         InputRange,
     }
 

@@ -1,6 +1,7 @@
 //! OpenCompositor's Qt shell. Qt owns the windows, docks, dialogs and event loop; the core's
 //! [`App`] owns everything else. Everything here runs on Qt's GUI thread.
 
+mod check;
 mod creation;
 mod drag;
 mod keys;
@@ -26,6 +27,7 @@ use opencompositor_core::{
     FrameTiming, MAX_EXPOSURE, Notice, Pane, Request, Session, Slot,
 };
 
+use crate::check::Seen;
 use crate::qt::ffi;
 
 /// A `Qt::DockWidgetArea` value.
@@ -324,9 +326,10 @@ pub fn dispatch(event: Event) {
     else {
         return;
     };
-    if let Some(pane) = drawn {
-        drag::frame_drawn(pane);
-        playback_check::frame_drawn(pane);
+    if let Some(pane) = drawn
+        && let Some(frame) = frame_timing(pane)
+    {
+        check::observe(Seen::Frame(pane, frame));
     }
     for request in requests {
         perform(request);
@@ -454,27 +457,30 @@ pub fn perform(request: Request) {
 fn advance(_: usize) {
     let started = Instant::now();
     dispatch(Event::Advance(started));
-    playback_check::advanced(started.elapsed());
+    check::observe(Seen::Advanced(started.elapsed()));
 }
 
-/// Dispatches a notice from another thread. Retiring a lost device blocks the GUI thread, so
-/// the lifecycle check reports how long; the drag check records each result's arrival.
+/// Dispatches a notice from another thread, telling the checks of each result and of how long
+/// retiring a lost device blocked the GUI thread.
 fn receive(notice: Notice) {
     let lost = matches!(notice, Notice::DeviceLost { .. });
-    let evaluated = match &notice {
-        Notice::Evaluated(evaluated) => {
-            playback_check::delivered(evaluated.frame(), evaluated.timing.started);
-            Some((evaluated.job(), evaluated.timing, evaluated.data_window()))
-        }
+    let received = Instant::now();
+    let delivered = match &notice {
+        Notice::Evaluated(evaluated) => Some(Seen::Delivered {
+            job: evaluated.job(),
+            frame: evaluated.frame(),
+            timing: evaluated.timing,
+            window: evaluated.data_window(),
+            received,
+        }),
         Notice::DeviceLost { .. } | Notice::Scanned { .. } | Notice::Copied(_) => None,
     };
-    let started = Instant::now();
     dispatch(Event::from(notice));
     if lost {
-        lifecycle::retirement_took(started.elapsed());
+        check::observe(Seen::Retired(received.elapsed()));
     }
-    if let Some((request, timing, window)) = evaluated {
-        drag::delivered(request, timing, window, started);
+    if let Some(delivered) = delivered {
+        check::observe(delivered);
     }
 }
 
@@ -483,7 +489,7 @@ fn receive(notice: Notice) {
 fn retry_device_creation(attempt: usize) {
     let started = Instant::now();
     dispatch(Event::RetryDeviceCreation(attempt as u64));
-    lifecycle::attempt_took(started.elapsed());
+    check::observe(Seen::Attempted(started.elapsed()));
 }
 
 /// One whose timer fires after the app has dropped dispatches to nothing.

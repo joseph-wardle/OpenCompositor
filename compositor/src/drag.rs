@@ -42,6 +42,7 @@ use opencompositor_core::{
     Window,
 };
 
+use crate::check::{Durations, Seen, finish, gui_frames, resident_memory};
 use crate::qt::ffi;
 
 /// `QEvent::Type` values.
@@ -57,12 +58,6 @@ const LONGEST_WAIT: Duration = Duration::from_secs(60);
 /// The Blur's Sizes shown in turn before the drag, the last its starting value: the first is
 /// summed directly on the GPU and the second by blocks, either side of `DIRECT_T`.
 const BLUR_SIZES: [f64; 2] = [3.0, 30.0];
-
-/// The GUI's frame budget in a GPU session: from acquiring a frame to submitting it, p99 and
-/// at most, but for one frame per drag: the driver alone occasionally takes milliseconds to
-/// submit.
-pub const FRAME_GUI_P99: Duration = Duration::from_millis(1);
-pub const FRAME_GUI_MAX: Duration = Duration::from_millis(4);
 
 /// A chain the check drags a slider on, from its Reader to the node whose panel has the slider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,18 +258,27 @@ fn poll_gpu(_: usize) {
     ffi::single_shot(1, poll_gpu, 0);
 }
 
-/// Records a result's arrival on the GUI thread, if the drag check is running and an edit asked
-/// for it.
-pub fn delivered(request: u64, timing: Timing, window: Option<Window>, at: Instant) {
-    with_edit(request, |edit| edit.delivered = Some((at, timing, window)));
+/// Records, if the drag check is running, a result's arrival for the edit that asked for it, and
+/// each frame.
+pub fn observe(seen: &Seen) {
+    match seen {
+        Seen::Frame(pane, frame) => frame_drawn(*pane, frame),
+        Seen::Delivered {
+            job,
+            timing,
+            window,
+            received,
+            ..
+        } => with_edit(*job, |edit| {
+            edit.delivered = Some((*received, *timing, *window))
+        }),
+        _ => {}
+    }
 }
 
-/// Records the pane's frame, if the drag check is running and the draw made one. A viewer frame
-/// is the first for every edit its result answers, which is each edit it is from or supersedes.
-pub fn frame_drawn(pane: Pane) {
-    let Some(frame) = crate::frame_timing(pane) else {
-        return;
-    };
+/// A viewer frame is the first for every edit its result answers, which is each edit it is from
+/// or supersedes.
+fn frame_drawn(pane: Pane, frame: &FrameTiming) {
     let shown = crate::presented_job();
     CHECK.with(|cell| {
         let mut check = cell.borrow_mut();
@@ -298,7 +302,7 @@ pub fn frame_drawn(pane: Pane) {
             }
         }
         if check.dragging {
-            check.frames.push(frame);
+            check.frames.push(frame.clone());
         }
     });
 }
@@ -588,17 +592,14 @@ fn report(mut failures: Vec<String>) {
     let edits = &check.edits;
     let latency = |edit: &Edit| check.latency(edit);
     // Every edit once the final one is framed, since that frame answers them all.
-    let mut latencies: Vec<Duration> = edits.iter().filter_map(latency).collect();
-    latencies.sort();
+    let latencies: Durations = edits.iter().filter_map(latency).collect();
     let final_latency = edits.last().and_then(latency);
     let shown = edits.iter().filter(|edit| edit.shown()).count();
-    let mut spacing: Vec<Duration> = edits
+    let spacing: Durations = edits
         .windows(2)
         .map(|pair| pair[1].at - pair[0].at)
         .collect();
-    spacing.sort();
-    let mut dispatches = check.dispatches.clone();
-    dispatches.sort();
+    let dispatches: Durations = check.dispatches.iter().copied().collect();
     eprintln!("{name}: {}", caption());
     let end = if gpu {
         "the GPU completes"
@@ -624,24 +625,18 @@ fn report(mut failures: Vec<String>) {
         eprintln!(
             "{name}: {} edits {:.1?} apart (asked {} ms) over {:.1?}",
             edits.len(),
-            percentile(&spacing, 0.5),
+            spacing.p(0.5),
             check.period,
             last.at - first.at
         );
     }
     eprintln!(
-        "{name}: {} mouse events over {} pixels took the GUI thread p50 {:.1?}, p95 {:.1?}, max {:.1?}",
+        "{name}: {} mouse events over {} pixels took the GUI thread {dispatches}",
         dispatches.len(),
         check.span,
-        percentile(&dispatches, 0.5),
-        percentile(&dispatches, 0.95),
-        percentile(&dispatches, 1.0),
     );
     eprintln!(
-        "{name}: edit → frame p50 {:.1?}, p95 {:.1?}, max {:.1?}; the final edit {}; {} of {} edits' own values were shown",
-        percentile(&latencies, 0.5),
-        percentile(&latencies, 0.95),
-        percentile(&latencies, 1.0),
+        "{name}: edit → frame {latencies}; the final edit {}; {} of {} edits' own values were shown",
         final_latency.map_or_else(|| "never".to_owned(), |latency| format!("{latency:.1?}")),
         shown,
         edits.len(),
@@ -698,16 +693,15 @@ fn report(mut failures: Vec<String>) {
         let medians: Vec<String> = stages
             .iter()
             .filter_map(|(name, stage)| {
-                let mut values: Vec<Duration> = delivered
+                let values: Durations = delivered
                     .iter()
                     .enumerate()
                     .filter(|(index, _)| selected(*index))
                     .filter_map(|(_, (edit, received, timing, _))| stage(edit, timing, *received))
                     .collect();
-                values.sort();
                 // A stage the evaluation does not pass through, such as staging on the GPU, has
                 // no values.
-                (!values.is_empty()).then(|| format!("{name} {:.1?}", percentile(&values, 0.5)))
+                (!values.is_empty()).then(|| format!("{name} {:.1?}", values.p(0.5)))
             })
             .collect();
         medians.join(", ")
@@ -734,8 +728,8 @@ fn report(mut failures: Vec<String>) {
     );
     // The edits that set the latencies the budget is checked against, each with every stage of
     // the result that answered it, which for a superseded edit is a later edit's.
-    let p95 = percentile(&latencies, 0.95);
-    let longest_latency = percentile(&latencies, 1.0);
+    let p95 = latencies.p(0.95);
+    let longest_latency = latencies.max();
     let mut attributed: Vec<(Vec<&str>, &Edit)> = Vec::new();
     for (role, edit) in [
         ("p95", edits.iter().find(|edit| latency(edit) == Some(p95))),
@@ -791,44 +785,20 @@ fn report(mut failures: Vec<String>) {
             latency(edit).expect("filtered"),
         );
     }
-    let mut gui: Vec<Duration> = (check.frames.iter())
-        .map(|frame| frame.submitted - frame.acquired)
-        .collect();
-    gui.sort();
-    eprintln!(
-        "{name}: {} frames of either pane during the drag, acquired → submitted p50 {:.2?}, p99 \
-         {:.2?}, max {:.2?}",
-        gui.len(),
-        percentile(&gui, 0.5),
-        percentile(&gui, 0.99),
-        percentile(&gui, 1.0),
-    );
+    let gui = gui_frames(&check.frames, gpu, &mut failures);
+    eprintln!("{name}: during the drag, of either pane, {gui}");
     if gpu {
-        let mut to_completion: Vec<Duration> = (check.frames.iter())
+        let to_completion: Durations = (check.frames.iter())
             .filter_map(|frame| Some(*frame.completed.get()? - frame.acquired))
             .collect();
-        to_completion.sort();
-        let longest = percentile(&to_completion, 1.0);
+        let longest = to_completion.max();
         eprintln!(
             "{name}: {} of them completed, acquired → completed p50 {:.1?}, p99 {:.1?}, max \
              {longest:.1?}",
             to_completion.len(),
-            percentile(&to_completion, 0.5),
-            percentile(&to_completion, 0.99),
+            to_completion.p(0.5),
+            to_completion.p(0.99),
         );
-        let p99 = percentile(&gui, 0.99);
-        if p99 > FRAME_GUI_P99 {
-            failures.push(format!(
-                "frames acquired → submitted p99 {p99:.2?}, over {FRAME_GUI_P99:?}"
-            ));
-        }
-        let over: Vec<&Duration> = gui.iter().filter(|&&time| time > FRAME_GUI_MAX).collect();
-        if over.len() > 1 {
-            failures.push(format!(
-                "{} frames acquired → submitted over {FRAME_GUI_MAX:?}: {over:.2?}",
-                over.len()
-            ));
-        }
         if longest > check.refresh * 2 {
             failures.push(format!(
                 "a frame acquired → completed {longest:.1?}, over two refreshes, {:.1?}",
@@ -849,25 +819,5 @@ fn report(mut failures: Vec<String>) {
             ));
         }
     }
-    for failure in &failures {
-        eprintln!("{name} failed: {failure}");
-    }
-    ffi::exit(i32::from(!failures.is_empty()));
-}
-
-/// The value at the quantile of sorted durations, or zero of none.
-pub fn percentile(sorted: &[Duration], quantile: f64) -> Duration {
-    match sorted.len() {
-        0 => Duration::ZERO,
-        len => sorted[((len - 1) as f64 * quantile).round() as usize],
-    }
-}
-
-/// The process's resident set from /proc, as Linux reports it.
-pub fn resident_memory() -> String {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))
-        .map_or_else(|| "unknown".to_owned(), |rss| rss.trim().to_owned())
+    finish(&name, &failures);
 }

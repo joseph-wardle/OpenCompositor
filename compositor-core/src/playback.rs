@@ -60,6 +60,8 @@ pub struct Timebar {
     pub mode: PlaybackMode,
     /// Whether playback wraps round at the timeline's end, rather than stopping there.
     pub looping: bool,
+    /// Whether frames read as [`timecode`] rather than as numbers.
+    pub timecode: bool,
     /// While playing, the frames shown per second over the last second, to a tenth, once
     /// measured.
     pub achieved: Option<f64>,
@@ -103,6 +105,15 @@ pub fn timecode(frame: f64, rate: f64) -> String {
     let (frames, seconds) = (count % base, count / base);
     let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
     format!("{sign}{hours:02}:{minutes:02}:{seconds:02}:{frames:02}")
+}
+
+/// A rate within 0.0005 of an NTSC rate, such as 23.976, as that rate's exact fraction, such as
+/// 24000/1001; any other rate as it is.
+pub fn ntsc_rate(rate: f64) -> f64 {
+    ([24_000.0, 30_000.0, 60_000.0].map(|numerator| numerator / 1001.0))
+        .into_iter()
+        .find(|ntsc| (rate - ntsc).abs() < 0.0005)
+        .unwrap_or(rate)
 }
 
 /// Why typed timecode is not a frame.
@@ -156,12 +167,13 @@ pub fn parse_timecode(text: &str, rate: f64) -> Result<f64, TimecodeError> {
     })
 }
 
-/// How the artist chose playback to play, and playback in progress.
+/// How the artist chose playback to play and the timebar to read, and playback in progress.
 #[derive(Debug)]
 pub(crate) struct Playback {
     clock: Option<Clock>,
     mode: PlaybackMode,
     pub(crate) looping: bool,
+    pub(crate) timecode: bool,
     pub(crate) range_source: RangeSource,
     /// Whether a [`Request::Advance`] is waiting to be dispatched.
     advance_requested: bool,
@@ -188,6 +200,7 @@ impl Default for Playback {
             clock: None,
             mode: PlaybackMode::default(),
             looping: true,
+            timecode: false,
             range_source: RangeSource::default(),
             advance_requested: false,
         }
@@ -326,6 +339,7 @@ impl Playback {
             playing: clock.map(Clock::direction),
             mode: self.mode,
             looping: self.looping,
+            timecode: self.timecode,
             achieved: (clock.and_then(Clock::achieved_rate))
                 .map(|rate| (rate * 10.0).round() / 10.0),
             drops: clock.map_or(0, Clock::drops),

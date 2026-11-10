@@ -133,3 +133,11 @@ fn timecode_counts_whole_seconds_at_the_nearest_whole_rate_and_reads_back() {
     assert_eq!(parse_timecode("1001", 24.0), Err(TimecodeError::Unreadable));
     assert_eq!(parse_timecode("a:b", 24.0), Err(TimecodeError::Unreadable));
 }
+
+#[test]
+fn a_rate_near_an_ntsc_rate_becomes_its_exact_fraction() {
+    assert_eq!(ntsc_rate(23.976), 24_000.0 / 1001.0);
+    assert_eq!(ntsc_rate(29.97), 30_000.0 / 1001.0);
+    assert_eq!(ntsc_rate(23.9), 23.9);
+    assert_eq!(ntsc_rate(24.0), 24.0);
+}

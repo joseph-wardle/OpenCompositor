@@ -127,11 +127,6 @@ class ExposureBox : public QDoubleSpinBox {
 };
 } // namespace
 
-// The bits of a frame's mark in `TimebarData::marks`.
-constexpr uint8_t CACHED = 1;
-constexpr uint8_t MISSING = 2;
-constexpr uint8_t HELD = 4;
-
 namespace {
 // The timebar's buttons' pictures, drawn rather than taken from the icon theme, which differs
 // between desktops and lacks some.
@@ -250,7 +245,7 @@ class FrameBar : public QWidget {
             "wheel scrolls. Green below: in the viewer cache. Red: a missing file. Shaded: "
             "outside a sequence's frames, holding its nearest."));
     }
-    void show_frames(const TimebarData &data, bool timecode) {
+    void show_frames(const TimebarData &data) {
         if (data.first != first || data.last != last) {
             first = data.first;
             last = data.last;
@@ -261,12 +256,8 @@ class FrameBar : public QWidget {
             follow();
         }
         rate = data.rate;
-        this->timecode = timecode;
+        timecode = data.timecode;
         marks.assign(data.marks.begin(), data.marks.end());
-        update();
-    }
-    void show_timecode(bool timecode) {
-        this->timecode = timecode;
         update();
     }
     QSize sizeHint() const override { return {200, fontMetrics().height() + 14}; }
@@ -279,12 +270,12 @@ class FrameBar : public QWidget {
         const auto [from, to] = visible();
         for (int64_t index = from; index <= to && index < int64_t(marks.size()); ++index) {
             const double left = x_of(index), right = std::max(x_of(index + 1), left + 1);
-            const uint8_t mark = marks[size_t(index)];
-            if (mark & HELD)
+            const FrameMark &mark = marks[size_t(index)];
+            if (mark.held)
                 painter.fillRect(QRectF(left, 0, right - left, h), palette().alternateBase());
-            if (mark & MISSING)
+            if (mark.missing)
                 painter.fillRect(QRectF(left, 0, right - left, h), QColor(190, 60, 60, 150));
-            if (mark & CACHED)
+            if (mark.cached)
                 painter.fillRect(QRectF(left, h - 3, right - left, 3), QColor(80, 170, 90));
         }
         paint_ticks(painter);
@@ -452,7 +443,7 @@ class FrameBar : public QWidget {
     // The view: the frames from the first at its left edge, and across it.
     double offset = 0, span = 1;
     bool timecode = false;
-    std::vector<uint8_t> marks;
+    std::vector<FrameMark> marks;
     std::optional<double> sent;
     // Where a middle drag began, and the view's offset then.
     std::optional<std::pair<double, double>> dragged_from;
@@ -510,20 +501,12 @@ Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rat
     });
     left->addWidget(rate);
     left->addWidget(new QLabel(QStringLiteral("fps")));
-    timecode_button = new QToolButton;
-    timecode_button->setText(QStringLiteral("TC"));
-    timecode_button->setCheckable(true);
-    timecode_button->setAutoRaise(true);
-    timecode_button->setFocusPolicy(Qt::NoFocus);
-    timecode_button->setToolTip(
-        QStringLiteral("Frames as timecode, counted from frame 0 at the rate, rather than as "
-                       "numbers. Either can be typed."));
-    connect(timecode_button, &QToolButton::toggled, this, [this](bool on) {
-        timecode = on;
-        bar->show_timecode(on);
-        show_frames();
-    });
-    left->addWidget(timecode_button);
+    timecode = button(TimebarGestureKind::ToggleTimecode, QIcon(),
+                      QStringLiteral("Frames as timecode, counted from frame 0 at the rate, "
+                                     "rather than as numbers. Either can be typed."));
+    timecode->setText(QStringLiteral("TC"));
+    timecode->setCheckable(true);
+    left->addWidget(timecode);
     status = new QLabel;
     status->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     status->setToolTip(QStringLiteral("Frames shown per second while playing, and in real time "
@@ -559,17 +542,17 @@ Timebar::Timebar(rust::Fn<void(TimebarGesture)> gestures, const QStringList &rat
 
     auto *right = new QHBoxLayout;
     right->addStretch(1);
-    looping = button(TimebarGestureKind::Looping, loop_icon, QString());
+    looping = button(TimebarGestureKind::ToggleLooping, loop_icon, QString());
     right->addWidget(looping);
     // Lit when on, as Houdini's.
-    mode = button(TimebarGestureKind::RealTime, glyph_icon(Glyph::RealTime, color), QString());
+    mode = button(TimebarGestureKind::ToggleRealTime, glyph_icon(Glyph::RealTime, color), QString());
     mode->setCheckable(true);
     right->addWidget(mode);
     range = new QComboBox;
     range->addItems({QStringLiteral("Global"), QStringLiteral("Input")});
     range->setFocusPolicy(Qt::NoFocus);
     connect(range, &QComboBox::currentIndexChanged, this, [this](int index) {
-        send(TimebarGestureKind::InputRange, 0, QString(), index == 1);
+        send(index == 1 ? TimebarGestureKind::InputRange : TimebarGestureKind::GlobalRange);
     });
     right->addWidget(range);
     controls->addLayout(right, 0, 2);
@@ -598,53 +581,40 @@ QToolButton *Timebar::button(TimebarGestureKind kind, const QIcon &icon, const Q
     button->setToolTip(tooltip);
     button->setAutoRaise(true);
     button->setFocusPolicy(Qt::NoFocus);
-    connect(button, &QToolButton::clicked, this, [=, this] {
-        // The toggles send the other of what Rust last showed.
-        const bool on = kind == TimebarGestureKind::Looping     ? !looping_on
-                        : kind == TimebarGestureKind::RealTime ? !real_time
-                                                               : false;
-        send(kind, 0, QString(), on);
-    });
+    connect(button, &QToolButton::clicked, this, [=, this] { send(kind); });
     return button;
-}
-
-void Timebar::show_frames() {
-    QLineEdit *const fields[] = {frame, first, last};
-    const QFontMetrics metrics = frame->fontMetrics();
-    const QString widest = timecode ? QStringLiteral("-00:00:00:00") : QStringLiteral("-000000");
-    for (int index = 0; index < 3; ++index) {
-        QLineEdit *field = fields[index];
-        field->setFixedWidth(metrics.horizontalAdvance(widest) + 12);
-        // What the artist is typing stays.
-        if (!field->hasFocus()) field->setText(texts[index][timecode ? 1 : 0]);
-    }
 }
 
 void Timebar::show_timebar(const TimebarData &data) {
     refreshing = true;
-    bar->show_frames(data, timecode);
-    const QString shown[3][2] = {{data.frame_text, data.frame_timecode},
-                                 {data.first_text, data.first_timecode},
-                                 {data.last_text, data.last_timecode}};
-    for (int index = 0; index < 3; ++index)
-        for (int form = 0; form < 2; ++form) texts[index][form] = shown[index][form];
-    show_frames();
+    bar->show_frames(data);
+    const QFontMetrics metrics = frame->fontMetrics();
+    const QString widest =
+        data.timecode ? QStringLiteral("-00:00:00:00") : QStringLiteral("-000000");
+    const std::pair<QLineEdit *, const QString &> fields[] = {
+        {frame, data.frame_text}, {first, data.first_text}, {last, data.last_text}};
+    for (const auto &[field, text] : fields) {
+        field->setFixedWidth(metrics.horizontalAdvance(widest) + 12);
+        // What the artist is typing stays.
+        if (!field->hasFocus()) field->setText(text);
+    }
+    timecode->setChecked(data.timecode);
     if (!rate->hasFocus()) rate->setEditText(data.rate_text);
 
-    play_backward->setIcon(data.playing < 0 ? stop_icon : play_backward_icon);
-    play_backward->setToolTip(data.playing < 0 ? QStringLiteral("Stop (K or J over the viewer)")
-                                               : QStringLiteral("Play backwards (J over the viewer)"));
-    play_forward->setIcon(data.playing > 0 ? stop_icon : play_forward_icon);
-    play_forward->setToolTip(data.playing > 0 ? QStringLiteral("Stop (K or L over the viewer)")
-                                              : QStringLiteral("Play forwards (L over the viewer)"));
+    const bool backward = data.playing == Playing::Backward;
+    const bool forward = data.playing == Playing::Forward;
+    play_backward->setIcon(backward ? stop_icon : play_backward_icon);
+    play_backward->setToolTip(backward ? QStringLiteral("Stop (K or J over the viewer)")
+                                       : QStringLiteral("Play backwards (J over the viewer)"));
+    play_forward->setIcon(forward ? stop_icon : play_forward_icon);
+    play_forward->setToolTip(forward ? QStringLiteral("Stop (K or L over the viewer)")
+                                     : QStringLiteral("Play forwards (L over the viewer)"));
 
-    looping_on = data.looping;
     looping->setIcon(data.looping ? loop_icon : once_icon);
     looping->setToolTip(data.looping
                             ? QStringLiteral("Loop: playing round from the other end at the "
                                              "range's end. Click to stop there instead.")
                             : QStringLiteral("Once: stopping at the range's end. Click to loop."));
-    real_time = data.real_time;
     mode->setChecked(data.real_time);
     mode->setToolTip(
         data.real_time
@@ -682,9 +652,9 @@ bool Timebar::eventFilter(QObject *watched, QEvent *event) {
     return QWidget::eventFilter(watched, event);
 }
 
-void Timebar::send(TimebarGestureKind kind, double frame, const QString &text, bool on) {
+void Timebar::send(TimebarGestureKind kind, double frame, const QString &text) {
     if (refreshing) return;
-    gestures(TimebarGesture{kind, frame, text, on});
+    gestures(TimebarGesture{kind, frame, text});
 }
 
 ViewerStrip::ViewerStrip(double limit, double step, rust::Fn<void(double)> exposure_set,
