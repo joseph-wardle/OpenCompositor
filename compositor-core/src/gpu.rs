@@ -1492,7 +1492,6 @@ mod tests {
     fn an_image_staged_for_an_earlier_device_is_not_shown() {
         use std::sync::mpsc;
 
-        use crate::evaluate::result_key;
         use crate::fixtures;
         use crate::session::Session;
         use crate::worker::{EvaluationDevice, Job, Worker};
@@ -1505,8 +1504,7 @@ mod tests {
         let mut session = Session::new();
         let changes = session.create_readers(vec![path], open_ng::Point::default(), None);
         let node = *changes.nodes.first().expect("one Reader");
-        let key =
-            result_key(session.document(), session.files(), node, session.frame()).expect("a key");
+        let key = session.result_key(node).expect("a key");
         let (delivered, deliveries) = mpsc::channel();
         let worker = Worker::start(
             EvaluationDevice::Cpu,

@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use open_ng::Point;
 
 use super::*;
-use crate::evaluate::result_key;
 use crate::fixtures::fitted;
 use crate::kernels::headless;
 use crate::session::Session;
@@ -14,7 +13,7 @@ fn key(name: &str) -> ResultKey {
     let path = PathBuf::from(format!("/nonexistent/{name}.exr"));
     let changes = session.create_readers(vec![path], Point::default(), None);
     let id = *changes.nodes.first().unwrap();
-    result_key(session.document(), session.files(), id, session.frame()).unwrap()
+    session.result_key(id).unwrap()
 }
 
 fn window(x: i32, y: i32, width: u32, height: u32) -> Window {

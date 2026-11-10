@@ -600,9 +600,12 @@ impl App {
     /// [`advance`](App::advance) on. A frame outside the timeline plays from the end it plays
     /// from.
     pub fn play(&mut self, direction: Direction, mode: PlaybackMode) -> Vec<Request> {
-        let restarted = self.playback.set_mode(mode);
-        let requests = restarted.into_iter().chain(self.playback.play(direction));
-        self.after_change(requests.collect())
+        let mut requests = self.dispatch(Event::PlaybackModeSet(mode));
+        // The command stops playback already going that way.
+        if self.playback.direction() != Some(direction) {
+            requests.extend(self.dispatch(Event::Command(Command::Play(direction))));
+        }
+        requests
     }
 
     /// Stops playback, staying on the frame.
@@ -1611,7 +1614,7 @@ impl App {
     fn viewed_key(&self) -> Option<(NodeId, ResultKey)> {
         let node = self.session.viewed()?;
         let session = &self.session;
-        let key = result_key(session.document(), session.files(), node, session.frame())?;
+        let key = session.result_key(node)?;
         Some((node, key))
     }
 

@@ -9,7 +9,6 @@ use open_ng::{
 
 use super::*;
 use crate::document::{ExposureVersion, Timeline};
-use crate::evaluate::result_key;
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
 
@@ -574,9 +573,7 @@ fn reloading_a_reader_reloads_every_reader_of_its_file() {
     let other = create(&mut session, "b.exr", ORIGIN);
     let twin = create(&mut session, "a.exr", ORIGIN);
     let selected = create(&mut session, "a.exr", ORIGIN);
-    let key = |session: &Session, id| {
-        result_key(session.document(), session.files(), id, session.frame())
-    };
+    let key = |session: &Session, id| session.result_key(id);
     let before = [selected, twin, other].map(|id| key(&session, id));
     session.record_failure(before[1].as_ref().unwrap());
     assert!(session.failures.nodes.contains(&twin));
@@ -604,9 +601,7 @@ fn a_node_shows_a_failure_while_its_current_key_failed() {
     let twin = create(&mut session, "a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", reader).unwrap();
-    let key = |session: &Session, id| {
-        result_key(session.document(), session.files(), id, session.frame()).unwrap()
-    };
+    let key = |session: &Session, id| session.result_key(id).unwrap();
     let failing = |session: &Session| session.failures.nodes.iter().copied().collect::<Vec<_>>();
 
     // At the Reader, and at its twin, whose key is equal; not at the Exposure that took it.
@@ -1414,9 +1409,7 @@ fn keys_hold_what_a_frame_resolves_to_not_the_frame() {
     let reader = create(&mut session, "a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", reader).unwrap();
-    let key = |session: &Session, id| {
-        result_key(session.document(), session.files(), id, session.frame()).unwrap()
-    };
+    let key = |session: &Session, id| session.result_key(id).unwrap();
     let at_first = key(&session, exposure);
     session.record_failure(&key(&session, reader));
 

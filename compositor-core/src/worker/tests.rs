@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use open_ng::Point;
 
 use super::*;
-use crate::evaluate::result_key;
 use crate::fixtures::{self, directory};
 use crate::gpu::{noop_device, noop_device_pair};
 use crate::read::{ReadError, read_image};
@@ -18,7 +17,7 @@ fn key(path: impl Into<PathBuf>) -> ResultKey {
     let mut session = Session::new();
     let changes = session.create_readers(vec![path.into()], Point::default(), None);
     let id = *changes.nodes.first().unwrap();
-    result_key(session.document(), session.files(), id, session.frame()).unwrap()
+    session.result_key(id).unwrap()
 }
 
 /// A request for the node with the key, as the worker cares only about which node it is.

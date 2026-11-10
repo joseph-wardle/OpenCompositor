@@ -874,7 +874,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     assert_eq!(app.shell.caption, "Slot 2 · Exposure · updating… · CPU");
     let key = |app: &App, id| {
         let session = app.session();
-        result_key(session.document(), session.files(), id, session.frame()).unwrap()
+        session.result_key(id).unwrap()
     };
     let requests = app.dispatch(Event::Evaluated(Evaluated {
         timing: Timing::now(),

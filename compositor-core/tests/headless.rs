@@ -54,8 +54,7 @@ fn reader(session: &mut Session, path: PathBuf) -> NodeId {
 
 /// The node's image as the session's document and reloads describe it.
 fn evaluate(evaluator: &mut Evaluator, session: &Session, id: NodeId) -> Result<Image, EvalError> {
-    let key = result_key(session.document(), session.files(), id, session.frame())
-        .expect("the node exists");
+    let key = session.result_key(id).expect("the node exists");
     evaluator
         .evaluate(&key, || false)
         .expect("nothing stops it")
@@ -106,17 +105,11 @@ fn evaluation_reports_what_went_wrong_and_where() {
         matches!(&error, EvalError::Read { error: ReadError::Io(io), .. } if io.kind() == std::io::ErrorKind::NotFound),
         "{error:?}"
     );
-    assert_eq!(
-        Some(error.origin()),
-        result_key(session.document(), session.files(), id, session.frame()).as_ref()
-    );
+    assert_eq!(Some(error.origin()), session.result_key(id).as_ref());
     assert!(error.to_string().contains("missing.exr"), "{error}");
 
     session.delete_nodes(&[id]).unwrap();
-    assert_eq!(
-        result_key(session.document(), session.files(), id, session.frame()),
-        None
-    );
+    assert_eq!(session.result_key(id), None);
 }
 
 #[test]

@@ -12,7 +12,7 @@ use crate::document::{
     Assignment, Changes, ConnectionError, Document, InputSlot, Node, NodeId, NodeKind,
     ReaderVersion, Slot, TimelineError, node_types,
 };
-use crate::evaluate::{ResultKey, result_keys};
+use crate::evaluate::{ResultKey, result_key, result_keys};
 use crate::files::{Files, Pattern, Scan};
 use crate::parameter::{Value, ValueError, describe, resolve};
 use crate::presentation::{assignments, judge, present};
@@ -204,6 +204,11 @@ impl Session {
 
     pub fn frame(&self) -> f64 {
         self.frame
+    }
+
+    /// The key of a node's image at the session's frame, or `None` for no such node.
+    pub fn result_key(&self, node: NodeId) -> Option<ResultKey> {
+        result_key(&self.document, &self.files, node, self.frame)
     }
 
     /// Goes to a frame, refused unless it is finite. Any frame is allowed, inside the document's
