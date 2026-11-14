@@ -78,7 +78,10 @@ class ParameterPanel : public QWidget {
     rust::Fn<void(PanelGesture)> gestures;
     bool refreshing = false;
     std::optional<uint64_t> node;
-    QLabel *title;
+    QLineEdit *name;
+    // The name as last shown, which Escape restores.
+    QString shown_name;
+    QLabel *type;
     QToolButton *pin;
     QLabel *empty;
     QScrollArea *scroll;

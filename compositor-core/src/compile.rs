@@ -21,9 +21,9 @@ use crate::parameter::{ParameterKind, Value, describe};
 
 const IN_CYCLE: &str = "takes its own image, through a cycle of wires";
 
-/// The bijection between prim paths and session IDs. A path keeps its ID for the session, so a
-/// node returning through undo or redo is the node it was, and an ID is never given to another
-/// path. A prim renamed is a new node to the session.
+/// Session IDs by prim path. A path keeps its ID for the session, so a node returning through
+/// undo or redo is the node it was, and an ID is never given to another path. A renamed node
+/// keeps its ID at its new path, and its earlier paths name it still.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Ids {
     by_path: HashMap<sdf::Path, NodeId>,
@@ -44,6 +44,23 @@ impl Ids {
 
     pub(crate) fn contains(&self, path: &sdf::Path) -> bool {
         self.by_path.contains_key(path)
+    }
+
+    /// The ID a path has, or had before its node was renamed.
+    pub(crate) fn get(&self, path: &sdf::Path) -> Option<NodeId> {
+        self.by_path.get(path).copied()
+    }
+
+    /// Moves the node to `path`, a path no other node has had. Its earlier paths still name it,
+    /// so that the one an undo restores finds it again.
+    pub(crate) fn rename(&mut self, id: NodeId, path: &sdf::Path) {
+        let previous = self.by_path.insert(path.clone(), id);
+        assert!(
+            previous.is_none_or(|previous| previous == id),
+            "{path} names another node"
+        );
+        let index = usize::try_from(id.0 - 1).expect("an ID from 1");
+        self.paths[index] = path.clone();
     }
 
     pub(crate) fn path(&self, id: NodeId) -> Option<&sdf::Path> {
@@ -136,6 +153,11 @@ impl Compiler {
         self.ids.intern(path)
     }
 
+    /// Moves the node to `path` before an update reads the stage there.
+    pub(crate) fn rename(&mut self, id: NodeId, path: &sdf::Path) {
+        self.ids.rename(id, path);
+    }
+
     /// The project's frames and rate: the root layer's, or the default's where it authors none or
     /// authors a timeline that is refused.
     pub(crate) fn timeline(&self) -> Timeline {
@@ -195,6 +217,10 @@ impl Compiler {
         let mut rewired = false;
         for path in dirty {
             let id = self.ids.intern(&path);
+            // A renamed node's earlier path, which its node is no longer read from.
+            if self.ids.path(id) != Some(&path) {
+                continue;
+            }
             self.forget_reads(id);
             let node = self.define(stage, id, &path).map(Arc::new);
             let before = match &node {

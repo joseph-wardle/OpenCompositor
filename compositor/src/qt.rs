@@ -154,7 +154,10 @@ pub mod ffi {
         /// The shown node's id: rows of another node than last shown are made anew, otherwise
         /// they refresh in place.
         node: u64,
-        title: QString,
+        /// The node's prim name, which the artist can type over to rename it.
+        name: QString,
+        /// The node's type, shown beside a name that does not say it, or empty.
+        type_label: QString,
         pinned: bool,
         rows: Vec<PanelRow>,
     }
@@ -180,14 +183,15 @@ pub mod ffi {
         File,
     }
 
-    /// What the artist did to the panel, on the row of the parameter named.
+    /// What the artist did to the panel, on the row of the parameter named, or to the node's name
+    /// for a rename.
     #[derive(Debug)]
     struct PanelGesture {
         kind: PanelGestureKind,
         parameter: QString,
         /// Where the slider is, for a drag began or dragged.
         tick: i32,
-        /// What was typed, into a field of either kind.
+        /// What was typed, into a field of either kind or the name.
         text: QString,
     }
 
@@ -205,6 +209,8 @@ pub mod ffi {
         Reload,
         Pin,
         Unpin,
+        /// A new name typed for the node.
+        Renamed,
     }
 
     /// The timebar as Rust sends it.

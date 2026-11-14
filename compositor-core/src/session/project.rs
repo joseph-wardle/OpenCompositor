@@ -240,6 +240,7 @@ impl Session {
             self.undo.push(Step {
                 label: "Rewrite Paths",
                 inverse,
+                renamed: None,
             });
             self.redo.clear();
             self.update(Changes::default());

@@ -836,11 +836,17 @@ ParameterPanel::ParameterPanel(rust::Fn<void(PanelGesture)> gestures, QWidget *p
     : QWidget(parent), gestures(gestures) {
     auto *layout = new QVBoxLayout(this);
     auto *header = new QHBoxLayout;
-    title = new QLabel;
-    title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    QFont bold = title->font();
+    name = new QLineEdit;
+    name->setToolTip(QStringLiteral("The node's name: type over it to rename the node"));
+    name->setEnabled(false);
+    QFont bold = name->font();
     bold.setBold(true);
-    title->setFont(bold);
+    name->setFont(bold);
+    name->installEventFilter(this);
+    connect(name, &QLineEdit::editingFinished, this, [this] {
+        if (name->text() != shown_name) send(PanelGestureKind::Renamed, QString(), 0, name->text());
+    });
+    type = new QLabel;
     pin = new QToolButton;
     pin->setText(QStringLiteral("Pin"));
     pin->setCheckable(true);
@@ -849,7 +855,8 @@ ParameterPanel::ParameterPanel(rust::Fn<void(PanelGesture)> gestures, QWidget *p
     connect(pin, &QToolButton::toggled, this, [this](bool pinned) {
         send(pinned ? PanelGestureKind::Pin : PanelGestureKind::Unpin, QString());
     });
-    header->addWidget(title, 1);
+    header->addWidget(name, 1);
+    header->addWidget(type);
     header->addWidget(pin);
     layout->addLayout(header);
     empty = new QLabel(QStringLiteral("No node selected"));
@@ -867,8 +874,12 @@ void ParameterPanel::show_panel(const PanelData &data) {
     Refreshing refreshing(this->refreshing);
     pin->setChecked(data.pinned);
     pin->setEnabled(data.shown);
-    title->setText(data.title);
-    title->setToolTip(data.title);
+    shown_name = data.name;
+    name->setText(data.name);
+    name->setCursorPosition(0);
+    name->setEnabled(data.shown);
+    type->setText(data.type_label);
+    type->setVisible(!data.type_label.isEmpty());
     empty->setVisible(!data.shown);
     scroll->setVisible(data.shown);
     std::optional<uint64_t> shown = data.shown ? std::optional(data.node) : std::nullopt;
@@ -988,6 +999,11 @@ void ParameterPanel::committed(const QString &name) {
 bool ParameterPanel::eventFilter(QObject *watched, QEvent *event) {
     if (event->type() == QEvent::KeyPress &&
         static_cast<QKeyEvent *>(event)->key() == Qt::Key_Escape) {
+        if (watched == name) {
+            name->setText(shown_name);
+            name->clearFocus();
+            return true;
+        }
         for (Row &row : rows) {
             if (row.field != watched) continue;
             row.field->setText(row.shown);

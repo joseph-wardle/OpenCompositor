@@ -27,8 +27,10 @@ use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
 mod project;
+mod rename;
 
 pub use project::{FileError, RelativePaths};
+pub use rename::NameError;
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
 const READER_SPACING: f32 = 70.0;
@@ -51,11 +53,13 @@ def OcComp "Comp"
 /// has the name.
 const ROOT: &str = "Comp";
 
-/// One undo or redo step: every spec it touched, as it stood before.
+/// One undo or redo step: every spec it touched, as it stood before, and the node it renamed,
+/// with the path that node had before.
 #[derive(Debug)]
 struct Step {
     label: &'static str,
     inverse: Inverse,
+    renamed: Option<(NodeId, sdf::Path)>,
 }
 
 /// An edit applied to the stage as it happens, recorded as one step when it finishes: a slider
@@ -86,6 +90,12 @@ pub enum EditError {
     },
     Connection(ConnectionError),
     Timeline(TimelineError),
+    /// A rename refused.
+    Name {
+        node: NodeId,
+        name: String,
+        error: NameError,
+    },
 }
 
 impl fmt::Display for EditError {
@@ -101,6 +111,9 @@ impl fmt::Display for EditError {
             } => write!(f, "node {}, {parameter}: {error}", node.0),
             EditError::Connection(error) => write!(f, "{error}"),
             EditError::Timeline(error) => write!(f, "{error}"),
+            EditError::Name { node, name, error } => {
+                write!(f, "node {}, name {name:?}: {error}", node.0)
+            }
         }
     }
 }
@@ -111,6 +124,7 @@ impl std::error::Error for EditError {
             EditError::InvalidValue { error, .. } => Some(error),
             EditError::Connection(error) => Some(error),
             EditError::Timeline(error) => Some(error),
+            EditError::Name { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -1011,6 +1025,7 @@ impl Session {
             self.undo.push(Step {
                 label: edit.label,
                 inverse: edit.inverse,
+                renamed: None,
             });
             self.redo.clear();
         }
@@ -1047,13 +1062,20 @@ impl Session {
         changes
     }
 
-    /// Writes back the step's specs and returns the step that writes them back again.
-    fn restore(&self, step: Step) -> Step {
+    /// Writes back the step's specs, and moves back the node it renamed, and returns the step that
+    /// writes them back again.
+    fn restore(&mut self, step: Step) -> Step {
         let (restored, inverse) = self.recorder.record(|| step.inverse.restore(&self.stage));
         restored.expect("a recorded state restores");
+        let renamed = step.renamed.map(|(id, path)| {
+            let current = self.path(id).clone();
+            self.compiler.rename(id, &path);
+            (id, current)
+        });
         Step {
             label: step.label,
             inverse,
+            renamed,
         }
     }
 
@@ -1079,7 +1101,11 @@ impl Session {
         self.finish_edit();
         let inverse = self.author(edit);
         if !inverse.changes_nothing(&self.stage) {
-            self.undo.push(Step { label, inverse });
+            self.undo.push(Step {
+                label,
+                inverse,
+                renamed: None,
+            });
             self.redo.clear();
         }
         self.update(changes)

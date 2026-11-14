@@ -1467,4 +1467,5 @@ fn keys_hold_what_a_frame_resolves_to_not_the_frame() {
 }
 
 mod project;
+mod rename;
 mod stage;

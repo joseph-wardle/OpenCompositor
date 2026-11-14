@@ -52,7 +52,7 @@ fn authored_file(session: &Session, id: NodeId) -> Option<PathBuf> {
     }
 }
 
-fn write(path: &Path, text: &str) {
+pub(super) fn write(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
 }

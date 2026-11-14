@@ -24,7 +24,8 @@ pub fn show(panel: Option<&Panel>) {
     let data = ffi::PanelData {
         shown: panel.is_some(),
         node: panel.map_or(0, |panel| open_ng::NodeId::from(panel.node).0),
-        title: QString::from(&panel.map(title).unwrap_or_default()),
+        name: QString::from(panel.map_or("", |panel| &panel.name)),
+        type_label: QString::from(panel.map_or("", type_label)),
         pinned: panel.is_some_and(|panel| panel.pinned),
         rows: panel.map_or_else(Vec::new, |panel| panel.rows.iter().map(row).collect()),
     };
@@ -33,12 +34,12 @@ pub fn show(panel: Option<&Panel>) {
     unsafe { ffi::show_panel(crate::widgets().panel, &data) };
 }
 
-/// The node's name, and its type where the name does not say it.
-fn title(panel: &Panel) -> String {
+/// The node's type, where its name does not say it.
+fn type_label(panel: &Panel) -> &str {
     if panel.name == panel.type_label {
-        panel.name.clone()
+        ""
     } else {
-        format!("{} ({})", panel.name, panel.type_label)
+        panel.type_label
     }
 }
 
@@ -149,6 +150,7 @@ pub fn gesture(gesture: ffi::PanelGesture) {
     match gesture.kind {
         PanelGestureKind::Pin => return crate::dispatch(Event::Command(Command::PinPanel)),
         PanelGestureKind::Unpin => return crate::dispatch(Event::Command(Command::UnpinPanel)),
+        PanelGestureKind::Renamed => return rename(String::from(&gesture.text).trim()),
         _ => {}
     }
     // The gesture is on the panel last shown, since the shim sends none while it refreshes.
@@ -231,6 +233,26 @@ pub fn gesture(gesture: ffi::PanelGesture) {
         gesture.kind,
         PanelGestureKind::Typed | PanelGestureKind::DragEnded | PanelGestureKind::DragCancelled
     ) {
+        refresh();
+    }
+}
+
+/// Renames the shown node, putting its name back in the field if the session refuses.
+fn rename(name: &str) {
+    let Some((node, old)) = crate::read_app(|app| {
+        let panel = app.panel()?;
+        Some((panel.node, panel.name.clone()))
+    }) else {
+        return;
+    };
+    if let Err(error) = crate::edit(|session| session.rename(node, name)) {
+        let why = match &error {
+            EditError::Name { error, .. } => error.to_string(),
+            error => error.to_string(),
+        };
+        crate::perform(Request::ShowStatus(format!(
+            "Cannot rename \"{old}\" to \"{name}\": {why}"
+        )));
         refresh();
     }
 }
