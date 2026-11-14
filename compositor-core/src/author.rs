@@ -66,7 +66,7 @@ impl NumberType {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             NumberType::Double => "double",
             NumberType::Float => "float",

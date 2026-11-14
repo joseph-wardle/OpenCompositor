@@ -904,11 +904,12 @@ impl App {
             return;
         }
         self.panel_followed = followed;
-        let (files, frame) = (self.session.files(), self.session.frame());
+        let session = &self.session;
         let panel = match self.pinned {
-            Some(pinned) => Panel::of(network, files, pinned, true, frame),
-            None => (self.session.selection().last())
-                .and_then(|&current| Panel::of(network, files, current, false, frame)),
+            Some(pinned) => Panel::of(session, pinned, true),
+            None => {
+                (session.selection().last()).and_then(|&current| Panel::of(session, current, false))
+            }
         };
         if panel != self.shell.panel {
             self.shell.panel.clone_from(&panel);

@@ -1,8 +1,9 @@
 //! What the parameter panel shows: one node's parameters, their values, and which were set.
 
-use crate::files::{Files, scanned_end};
-use crate::network::{Network, NodeId};
-use crate::parameter::{Parameter, Value, resolve};
+use crate::files::scanned_end;
+use crate::network::NodeId;
+use crate::parameter::{Parameter, ParameterKind, Value, resolve};
+use crate::session::{Property, Session};
 
 /// One node's parameters as the panel shows them.
 #[derive(Clone, Debug, PartialEq)]
@@ -14,6 +15,8 @@ pub struct Panel {
     pub pinned: bool,
     /// In description order.
     pub rows: Vec<Row>,
+    /// What else the node's prim authors, by name.
+    pub properties: Vec<Property>,
 }
 
 /// One parameter of the panel's node.
@@ -26,6 +29,8 @@ pub struct Row {
     /// cannot decide yet.
     pub value: Option<Value>,
     pub state: ValueState,
+    /// A number's type as authored, if other than `double`: `float`, `half` or `int`.
+    pub number: Option<&'static str>,
 }
 
 /// Whether a value was set, which the panel shows apart from what it resolves to: a value set to
@@ -38,14 +43,9 @@ pub enum ValueState {
 
 impl Panel {
     /// The node's panel at a frame, or `None` if the network has no such node.
-    pub(crate) fn of(
-        network: &Network,
-        files: &Files,
-        node: NodeId,
-        pinned: bool,
-        frame: f64,
-    ) -> Option<Panel> {
-        let shown = network.node(node)?;
+    pub(crate) fn of(session: &Session, node: NodeId, pinned: bool) -> Option<Panel> {
+        let (files, frame) = (session.files(), session.frame());
+        let shown = session.network().node(node)?;
         let resolved = resolve(shown, frame);
         let rows = (shown.kind.parameters().iter())
             .map(|parameter| Row {
@@ -57,6 +57,12 @@ impl Panel {
                     Some(_) => ValueState::Authored,
                     None => ValueState::Absent,
                 },
+                number: match parameter.kind {
+                    ParameterKind::Float(_) | ParameterKind::Frame { .. } => {
+                        session.number_type(node, parameter.name)
+                    }
+                    ParameterKind::File => None,
+                },
             })
             .collect();
         Some(Panel {
@@ -65,6 +71,7 @@ impl Panel {
             type_label: shown.kind.label(),
             pinned,
             rows,
+            properties: session.other_properties(node),
         })
     }
 }

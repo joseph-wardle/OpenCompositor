@@ -324,14 +324,7 @@ def OcComp "Comp"
         Some(Path::new("nowhere.png"))
     );
     // The panel shows what was authored, so that editing it keeps the path relative.
-    let panel = Panel::of(
-        session.network(),
-        session.files(),
-        named("Plate"),
-        false,
-        0.0,
-    )
-    .unwrap();
+    let panel = Panel::of(&session, named("Plate"), false).unwrap();
     let row = (panel.rows.iter()).find(|row| row.parameter.name == "file");
     assert_eq!(
         row.unwrap().value,

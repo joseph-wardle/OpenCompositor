@@ -8,7 +8,7 @@ use std::sync::Arc;
 use cxx_qt_lib::QString;
 use opencompositor_core::{
     Command, EditError, Event, FRAME_LIMIT, FileIntent, FloatParameter, Panel, Parameter,
-    ParameterKind, Request, Row, Session, Value, ValueState,
+    ParameterKind, Property, PropertyError, Request, Row, Session, Value, ValueState,
 };
 
 use crate::qt::ffi::{self, PanelGestureKind, RowKind};
@@ -27,7 +27,16 @@ pub fn show(panel: Option<&Panel>) {
         name: QString::from(panel.map_or("", |panel| &panel.name)),
         type_label: QString::from(panel.map_or("", type_label)),
         pinned: panel.is_some_and(|panel| panel.pinned),
-        rows: panel.map_or_else(Vec::new, |panel| panel.rows.iter().map(row).collect()),
+        rows: panel.map_or_else(Vec::new, |panel| {
+            (panel.rows.iter().map(row))
+                .chain(
+                    panel
+                        .properties
+                        .iter()
+                        .map(|property| property_row(panel, property)),
+                )
+                .collect()
+        }),
     };
     // SAFETY: the dock owns the panel, and lives until the main window is destroyed after the
     // event loop.
@@ -81,15 +90,48 @@ fn row(row: &Row) -> ffi::PanelRow {
         ),
         (ParameterKind::File, _) => (RowKind::File, String::new(), QString::default(), 0, 0),
     };
+    let (label, tooltip) = match row.number {
+        Some(number) => (
+            format!("{} ({number})", parameter.label),
+            format!("{tooltip}\nAuthored as {number}, and set so")
+                .trim()
+                .to_owned(),
+        ),
+        None => (parameter.label.to_owned(), tooltip),
+    };
     ffi::PanelRow {
         name: QString::from(parameter.name),
-        label: QString::from(parameter.label),
+        label: QString::from(&label),
         kind,
         authored: row.state == ValueState::Authored,
         tooltip: QString::from(&tooltip),
         text,
         ticks,
         tick,
+        editable: true,
+        unused: false,
+    }
+}
+
+fn property_row(panel: &Panel, property: &Property) -> ffi::PanelRow {
+    let mut tooltip = format!("{} {}", property.type_name, property.name);
+    if property.unused {
+        tooltip += &format!("\nNot an input of {}, so unused", panel.type_label);
+    }
+    if !property.removable {
+        tooltip += "\nAuthored by another layer";
+    }
+    ffi::PanelRow {
+        name: QString::from(&property.name),
+        label: QString::from(&property.name),
+        kind: RowKind::Property,
+        authored: property.removable,
+        tooltip: QString::from(&tooltip),
+        text: QString::from(&property.text),
+        ticks: 0,
+        tick: 0,
+        editable: property.editor.is_some(),
+        unused: property.unused,
     }
 }
 
@@ -155,6 +197,17 @@ pub fn gesture(gesture: ffi::PanelGesture) {
     }
     // The gesture is on the panel last shown, since the shim sends none while it refreshes.
     let name = String::from(&gesture.parameter);
+    let property = crate::read_app(|app| {
+        let panel = app.panel()?;
+        let property = panel
+            .properties
+            .iter()
+            .find(|property| property.name == name)?;
+        Some((panel.node, property.clone()))
+    });
+    if let Some((node, property)) = property {
+        return property_gesture(&gesture, node, &property);
+    }
     let shown = crate::read_app(|app| {
         let panel = app.panel()?;
         let row = panel.rows.iter().find(|row| row.parameter.name == name)?;
@@ -235,6 +288,50 @@ pub fn gesture(gesture: ffi::PanelGesture) {
     ) {
         refresh();
     }
+}
+
+/// Sets or removes one of the node's other properties, refusing text its type does not read.
+fn property_gesture(
+    gesture: &ffi::PanelGesture,
+    node: opencompositor_core::NodeId,
+    property: &Property,
+) {
+    let edited = match gesture.kind {
+        PanelGestureKind::Reset => {
+            crate::edit(|session| session.remove_property(node, &property.name))
+        }
+        PanelGestureKind::Typed => {
+            let Some(kind) = property.editor else {
+                return refresh();
+            };
+            match kind.parse(&String::from(&gesture.text)) {
+                Some(value) => {
+                    crate::edit(|session| session.set_property(node, &property.name, value))
+                }
+                None => Err(EditError::Property {
+                    node,
+                    property: property.name.clone(),
+                    error: PropertyError::WrongKind(kind),
+                }),
+            }
+        }
+        _ => return,
+    };
+    if let Err(error) = edited {
+        let why = match &error {
+            EditError::Property { error, .. } => error.to_string(),
+            error => error.to_string(),
+        };
+        let verb = match gesture.kind {
+            PanelGestureKind::Reset => "remove",
+            _ => "set",
+        };
+        crate::perform(Request::ShowStatus(format!(
+            "Cannot {verb} {}: {why}",
+            property.name
+        )));
+    }
+    refresh();
 }
 
 /// Renames the shown node, putting its name back in the field if the session refuses.

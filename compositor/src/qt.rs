@@ -173,14 +173,21 @@ pub mod ffi {
         /// Float only: the slider's positions from 0, and where it is.
         ticks: i32,
         tick: i32,
+        /// Property only: whether a value can be typed, and whether evaluation ignores it.
+        editable: bool,
+        unused: bool,
     }
 
     #[derive(Debug)]
+    #[repr(u8)]
     enum RowKind {
         Float,
         /// A whole frame number, in a field alone.
         Frame,
         File,
+        /// One of the node's other properties, under its full name, removed where a parameter
+        /// is reset.
+        Property,
     }
 
     /// What the artist did to the panel, on the row of the parameter named, or to the node's name

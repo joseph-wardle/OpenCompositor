@@ -883,11 +883,20 @@ void ParameterPanel::show_panel(const PanelData &data) {
     empty->setVisible(!data.shown);
     scroll->setVisible(data.shown);
     std::optional<uint64_t> shown = data.shown ? std::optional(data.node) : std::nullopt;
-    if (shown != node) {
+    if (shown != node || !same_rows(data)) {
         node = shown;
         rebuild(data);
     }
     for (size_t i = 0; i < rows.size() && i < data.rows.size(); ++i) refresh(rows[i], data.rows[i]);
+}
+
+bool ParameterPanel::same_rows(const PanelData &data) const {
+    if (rows.size() != data.rows.size()) return false;
+    for (size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].name != data.rows[i].name || rows[i].label->text() != data.rows[i].label ||
+            rows[i].kind != data.rows[i].kind)
+            return false;
+    return true;
 }
 
 QSlider *ParameterPanel::slider(const QString &name) const {
@@ -909,6 +918,14 @@ void ParameterPanel::rebuild(const PanelData &data) {
     int index = 0;
     for (const PanelRow &data : data.rows) {
         QString name = data.name;
+        if (data.kind == RowKind::Property && (rows.empty() || rows.back().kind != RowKind::Property)) {
+            auto *heading = new QLabel(QStringLiteral("Other properties"));
+            QFont bold = heading->font();
+            bold.setBold(true);
+            heading->setFont(bold);
+            heading->setContentsMargins(0, 8, 0, 0);
+            grid->addWidget(heading, index++, 0, 1, 3);
+        }
         auto *label = new QLabel(data.label);
         label->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(label, &QLabel::customContextMenuRequested, this, [=, this](const QPoint &at) {
@@ -944,6 +961,9 @@ void ParameterPanel::rebuild(const PanelData &data) {
                                  12);
             field->setPlaceholderText(QStringLiteral("Unset"));
             grid->addWidget(field, index, 1);
+        } else if (data.kind == RowKind::Property) {
+            if (data.unused) label->setForegroundRole(QPalette::PlaceholderText);
+            grid->addWidget(field, index, 1, 1, 2);
         } else {
             field->setPlaceholderText(QStringLiteral("No file"));
             auto *browse = new QPushButton(QStringLiteral("Browse…"));
@@ -962,7 +982,7 @@ void ParameterPanel::rebuild(const PanelData &data) {
             box->addWidget(reload);
             grid->addLayout(box, index, 1, 1, 2);
         }
-        rows.push_back(Row{name, label, field, row_slider, QString(), false});
+        rows.push_back(Row{name, label, field, row_slider, QString(), false, data.kind});
         ++index;
     }
     grid->setRowStretch(index, 1);
@@ -978,6 +998,7 @@ void ParameterPanel::refresh(Row &row, const PanelRow &data) {
     row.shown = data.text;
     row.field->setText(data.text);
     row.field->setCursorPosition(0);
+    if (row.kind == RowKind::Property) row.field->setReadOnly(!data.editable);
     if (row.slider && !row.slider->isSliderDown()) {
         QSignalBlocker blocker(row.slider);
         row.slider->setValue(data.tick);
@@ -1017,7 +1038,9 @@ bool ParameterPanel::eventFilter(QObject *watched, QEvent *event) {
 void ParameterPanel::popup_reset_menu(const QString &name, QMenu *menu, const QPoint &at) {
     Row *row = this->row(name);
     if (!menu->isEmpty()) menu->addSeparator();
-    QAction *reset = menu->addAction(QStringLiteral("Reset to Default"));
+    bool property = row && row->kind == RowKind::Property;
+    QAction *reset = menu->addAction(property ? QStringLiteral("Remove from This File")
+                                              : QStringLiteral("Reset to Default"));
     reset->setEnabled(row && row->authored);
     connect(reset, &QAction::triggered, this, [=, this] { send(PanelGestureKind::Reset, name); });
     menu->setAttribute(Qt::WA_DeleteOnClose);

@@ -27,6 +27,7 @@ struct PanelData;
 struct PanelRow;
 struct PanelGesture;
 enum class PanelGestureKind : uint8_t;
+enum class RowKind : uint8_t;
 struct TimebarData;
 struct TimebarGesture;
 enum class TimebarGestureKind : uint8_t;
@@ -64,7 +65,10 @@ class ParameterPanel : public QWidget {
         // The field's text as last refreshed, which Escape restores.
         QString shown;
         bool authored;
+        RowKind kind;
     };
+    // Whether the rows shown are those `data` names, with the same labels and kinds.
+    bool same_rows(const PanelData &data) const;
     void rebuild(const PanelData &data);
     void refresh(Row &row, const PanelRow &data);
     Row *row(const QString &name);

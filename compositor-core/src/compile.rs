@@ -169,11 +169,12 @@ impl Compiler {
         self.timeline_error
     }
 
-    /// Brings the network up to date with what the stage reported since the last update.
-    pub(crate) fn update(&mut self, stage: &Stage) {
+    /// Brings the network up to date with what the stage reported since the last update. Returns
+    /// whether it reported anything, which may change no node.
+    pub(crate) fn update(&mut self, stage: &Stage) -> bool {
         let notices = std::mem::take(&mut *self.notices.borrow_mut());
         if notices.resynced.is_empty() && notices.changed.is_empty() {
-            return;
+            return false;
         }
         self.read_timeline(stage);
         let root_resynced = (notices.resynced.iter())
@@ -241,6 +242,7 @@ impl Compiler {
             let node = (self.network.nodes.get_mut(&id)).expect("cycles are of nodes");
             Arc::make_mut(node).refuse(IN_CYCLE);
         }
+        true
     }
 
     fn forget_reads(&mut self, id: NodeId) {
@@ -466,7 +468,7 @@ fn wrong_type(label: &str, attribute: &Attribute, wanted: &str) -> String {
 }
 
 /// The input slot an `inputs:` attribute name is, as the kind declares it.
-fn input_slot(kind: &NodeKind, name: &str) -> Option<InputSlot<'static>> {
+pub(crate) fn input_slot(kind: &NodeKind, name: &str) -> Option<InputSlot<'static>> {
     kind.inputs().iter().find_map(|input| {
         if !input.repeating {
             return (input.name == name).then_some(InputSlot {

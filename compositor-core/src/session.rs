@@ -27,9 +27,11 @@ use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
 mod project;
+mod properties;
 mod rename;
 
 pub use project::{FileError, RelativePaths};
+pub use properties::{Property, PropertyError, Scalar, ScalarKind};
 pub use rename::NameError;
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
@@ -96,6 +98,12 @@ pub enum EditError {
         name: String,
         error: NameError,
     },
+    /// One of a node's other properties refused a value or its removal.
+    Property {
+        node: NodeId,
+        property: String,
+        error: PropertyError,
+    },
 }
 
 impl fmt::Display for EditError {
@@ -114,6 +122,11 @@ impl fmt::Display for EditError {
             EditError::Name { node, name, error } => {
                 write!(f, "node {}, name {name:?}: {error}", node.0)
             }
+            EditError::Property {
+                node,
+                property,
+                error,
+            } => write!(f, "node {}, {property}: {error}", node.0),
         }
     }
 }
@@ -125,6 +138,7 @@ impl std::error::Error for EditError {
             EditError::Connection(error) => Some(error),
             EditError::Timeline(error) => Some(error),
             EditError::Name { error, .. } => Some(error),
+            EditError::Property { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -173,8 +187,8 @@ pub struct Session {
     /// Unsaved and not undoable.
     files: Files,
     failures: Failures,
-    /// Counts changes to the network, the marks, the frame and the files, which every key is made
-    /// from.
+    /// Counts changes to the stage, the network, the marks, the frame and the files, which every
+    /// key is made from.
     version: u64,
     /// Counts the changes of `version` that were to the frame alone.
     frames_set: u64,
@@ -314,8 +328,8 @@ impl Session {
         &mut self.viewer
     }
 
-    /// Changes whenever the network, the marks, the frame or the files do, so that a key built at
-    /// one version is current while the version is.
+    /// Changes whenever the stage, the network, the marks, the frame or the files do, so that a
+    /// key built at one version is current while the version is.
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -1132,7 +1146,7 @@ impl Session {
     fn update(&mut self, mut changes: Changes) -> Changes {
         let before = self.compiler.network().clone();
         let timeline = self.compiler.timeline();
-        self.compiler.update(&self.stage);
+        let staged = self.compiler.update(&self.stage);
         let network = self.compiler.network();
         changes.nodes.extend(before.changes_to(network));
         changes.timeline |= self.compiler.timeline() != timeline;
@@ -1144,8 +1158,11 @@ impl Session {
             changes.selection = true;
         }
         if !changes.is_empty() {
-            self.version += 1;
             self.present(&changes);
+        }
+        // A property no node reads changes no node, but the panel shows it.
+        if staged || !changes.is_empty() {
+            self.version += 1;
         }
         changes
     }
