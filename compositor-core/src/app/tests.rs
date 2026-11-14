@@ -196,7 +196,7 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
     let mut requests = app.dispatch(Event::FilesChosen { intent, paths });
 
     let panel = shown_panel(&requests).expect("the panel follows the selection");
-    assert_eq!(panel.map(|panel| panel.name.as_str()), Some("b.exr"));
+    assert_eq!(panel.map(|panel| panel.name.as_str()), Some("b"));
     requests.retain(|request| !matches!(request, Request::ShowPanel(_)));
     assert_eq!(
         requests,
@@ -435,9 +435,9 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     assert_eq!(app.session().mark(Slot::new(3).unwrap()), Some(id));
     assert_eq!(app.session().viewer().slot().digit(), 3);
     // Only the caption says it is updating, so the node keeps its size.
-    assert_eq!(title(&app, id), "a.exr [3]");
+    assert_eq!(title(&app, id), "a [3]");
     assert!(requests.contains(&Request::ShowViewerCaption(
-        "Slot 3 · a.exr · updating… · CPU".to_owned()
+        "Slot 3 · a · updating… · CPU".to_owned()
     )));
 
     let evaluated = receive(&deliveries);
@@ -450,7 +450,7 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     assert!(
         app.shell
             .caption
-            .starts_with("Slot 3 · a.exr · /nonexistent/a.exr: No such file"),
+            .starts_with("Slot 3 · a · /nonexistent/a.exr: No such file"),
         "{}",
         app.shell.caption
     );
@@ -485,21 +485,21 @@ fn a_result_for_a_node_no_longer_viewed_is_not_shown() {
 
     // The first read finishes after the viewer moved on.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
-    assert_eq!(app.shell.caption, "Slot 2 · b.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · b · updating… · CPU");
 
     app.dispatch(read(&second, 8, 2));
-    assert_eq!(app.shell.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · b · 8 × 2 · CPU");
 
     // Back to slot 1, which is read again, showing slot 2's image until then.
     app.dispatch(slot_key(1, NONE));
     assert_eq!(asked(&app).key, first.key);
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · updating… · CPU");
     assert!(matches!(app.viewing.shown, Shown::Image { .. }));
     // Back to slot 2, which is shown already and asked for again, so that the worker lets slot
     // 1's read go.
     app.dispatch(slot_key(2, NONE));
     assert_eq!(asked(&app).key, second.key);
-    assert_eq!(app.shell.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · b · 8 × 2 · CPU");
 }
 
 #[test]
@@ -516,13 +516,13 @@ fn an_edit_faster_than_evaluation_shows_each_later_result_as_it_finishes() {
     // Superseded, but later than anything shown.
     app.dispatch(read(&second, 8, 2));
     assert!(matches!(&app.viewing.shown, Shown::Image { info, .. } if info.data_window.width == 8));
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · updating… · CPU");
     // Earlier than what is shown.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
     assert!(matches!(&app.viewing.shown, Shown::Image { info, .. } if info.data_window.width == 8));
 
     app.dispatch(read(&third, 5, 1));
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · 5 × 1 · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · 5 × 1 · CPU");
 }
 
 #[test]
@@ -550,7 +550,7 @@ fn a_superseded_failure_leaves_the_viewer_and_the_node_as_they_are() {
     app.dispatch(failed(superseded));
 
     assert!(matches!(app.viewing.shown, Shown::Image { .. }));
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · updating… · CPU");
     assert_eq!(color(&app), unfailed);
     app.dispatch(failed(asked(&app)));
     assert!(matches!(app.viewing.shown, Shown::Failed { .. }));
@@ -748,7 +748,7 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     assert!(matches!(app.viewing.shown, Shown::Failed { .. }));
     assert_eq!(
         app.shell.caption,
-        "Slot 1 · a.exr · /nonexistent/a.exr: not an EXR or PNG file · CPU"
+        "Slot 1 · a · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let failed = app.session().graph().node(id.into()).unwrap().color;
 
@@ -771,12 +771,12 @@ fn undoing_the_marked_nodes_creation_leaves_its_mark_doing_nothing() {
     assert!(matches!(app.viewing.shown, Shown::Nothing));
     assert_eq!(
         app.shell.caption,
-        "Slot 1: Reader1 no longer exists. Ctrl+1 marks the selected node"
+        "Slot 1: a no longer exists. Ctrl+1 marks the selected node"
     );
 
     // Redo brings the node back to its mark, and the file is read again.
     app.dispatch(Event::Command(Command::Redo));
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · updating… · CPU");
 }
 
 #[test]
@@ -834,7 +834,7 @@ fn delete_in_the_graph_deletes_the_selection_and_the_viewer_lets_go() {
     assert!(matches!(app.viewing.asked, Asked::Nothing));
     assert_eq!(
         app.shell.caption,
-        "Slot 1: Reader2 no longer exists. Ctrl+1 marks the selected node"
+        "Slot 1: a no longer exists. Ctrl+1 marks the selected node"
     );
 
     assert!(matches!(
@@ -861,19 +861,19 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     app.dispatch(slot_key(2, CTRL));
     assert_eq!(
         app.shell.caption,
-        "Slot 2 · Exposure · updating…; Source of Exposure is not connected · CPU"
+        "Slot 2 · Exposure1 · updating…; Source of Exposure is not connected · CPU"
     );
     // The empty image, which the viewer does not frame.
     app.dispatch(read(&asked(&app), 0, 0));
     assert_eq!(
         app.shell.caption,
-        "Slot 2 · Exposure · Source of Exposure is not connected · CPU"
+        "Slot 2 · Exposure1 · Source of Exposure is not connected · CPU"
     );
     assert_eq!(app.viewing.shown.display_window(), None);
 
     app.session.connect(first, "source", reader).unwrap();
     app.dispatch(Event::Draw(Pane::Viewer));
-    assert_eq!(app.shell.caption, "Slot 2 · Exposure · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · Exposure1 · updating… · CPU");
     let key = |app: &App, id| {
         let session = app.session();
         session.result_key(id).unwrap()
@@ -890,7 +890,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
     assert_eq!(
         app.shell.caption,
-        "Slot 2 · Exposure · /nonexistent/a.exr: not an EXR or PNG file · CPU"
+        "Slot 2 · Exposure1 · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
     assert_ne!(color(reader), color(second));
@@ -1131,7 +1131,7 @@ fn the_panel_follows_the_current_node_and_whether_its_values_were_set() {
             panel.type_label,
             panel.pinned
         ),
-        (reader, "a.exr", "Reader", false)
+        (reader, "a", "Reader", false)
     );
 
     let requests = choose_in_menu(&mut app, "exposure");
@@ -1243,12 +1243,12 @@ fn out_of_gpu_memory_moves_evaluation_to_the_cpu_until_the_artist_chooses_the_gp
     );
     assert_eq!(
         app.shell.caption,
-        "Slot 1 · a.exr · 4 × 4 · CPU (the GPU ran out of memory)"
+        "Slot 1 · a · 4 × 4 · CPU (the GPU ran out of memory)"
     );
     assert_eq!(receive(&deliveries).job.number, job.number);
     app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
     assert_eq!(app.evaluation_device(), EvaluationDevice::Gpu);
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · 4 × 4 · GPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · 4 × 4 · GPU");
 }
 
 #[test]
@@ -1775,7 +1775,7 @@ fn a_scrub_shows_frames_in_the_order_asked_and_ends_on_the_last() {
     }
 
     assert!(shown.is_sorted(), "{shown:?}");
-    assert_eq!(app.shell.caption, "Slot 1 · plate.####.png · 20 × 1 · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · plate · 20 × 1 · CPU");
 }
 
 /// Views three 64 × 8 frames of a sequence in slot 1, in a 16-pixel-square viewer pane, which
@@ -1820,7 +1820,7 @@ fn a_frame_shown_before_is_shown_again_from_the_viewer_cache_without_the_worker(
     assert_eq!(app.session().frame(), 1.0);
     assert_eq!(
         app.shell.caption,
-        "Slot 1 · plate.####.png · 64 × 8; cached at 1/4 · CPU"
+        "Slot 1 · plate · 64 × 8; cached at 1/4 · CPU"
     );
     assert!(
         deliveries.recv_timeout(Duration::from_millis(200)).is_err(),

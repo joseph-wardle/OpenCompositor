@@ -295,7 +295,11 @@ fn merge_exr(path: &Path, origin: (i32, i32), size: (usize, usize), seed: usize)
 
 /// A Reader with no file, whose image is empty.
 fn reader_without_a_file() -> Node {
-    Node::new(NodeKind::Reader, open_ng::Point { x: 0.0, y: 0.0 })
+    Node::new(
+        NodeKind::Reader,
+        "Reader",
+        open_ng::Point { x: 0.0, y: 0.0 },
+    )
 }
 
 /// Merge on the GPU against the CPU's result over whole images, bit for bit: offset inputs

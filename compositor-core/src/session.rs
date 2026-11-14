@@ -150,9 +150,6 @@ pub struct Session {
     /// nodes the network has.
     selection: Arc<[NodeId]>,
     marks: Marks,
-    /// The number the next default name tries first. Never rewound, so that a name returns only
-    /// with its node.
-    next_name: u64,
     graph: Graph,
     graph_view: View,
     /// The frame evaluated and viewed, one for every pane. Interface state, outside the stage, so
@@ -223,7 +220,6 @@ impl Session {
             editing: None,
             selection: Arc::new([]),
             marks: Marks::default(),
-            next_name: 1,
             graph: Graph::default(),
             graph_view: View::new(Viewport {
                 x: 0,
@@ -523,15 +519,20 @@ impl Session {
         if let Some(root) = self.compiler.root() {
             return (root.clone(), false);
         }
-        let free = (0..)
+        (self.free_path(&sdf::Path::abs_root(), ROOT), true)
+    }
+
+    /// The first of `name`, `name1`, `name2` and on under `parent` that no prim and no node this
+    /// session has known has, so that a name returns only with its node.
+    fn free_path(&self, parent: &sdf::Path, name: &str) -> sdf::Path {
+        (0..)
             .map(|number| match number {
-                0 => ROOT.to_owned(),
-                number => format!("{ROOT}{number}"),
+                0 => name.to_owned(),
+                number => format!("{name}{number}"),
             })
-            .map(|name| (sdf::Path::abs_root().append_path(name)).expect("a prim name"))
+            .map(|name| parent.append_path(name).expect("a prim name"))
             .find(|path| !self.is_taken(path))
-            .expect("some name is free");
-        (free, true)
+            .expect("some name is free")
     }
 
     /// Whether a prim or a node this session has known has the path.
@@ -541,18 +542,10 @@ impl Session {
                 .is_some_and(|prim| prim.is_valid().unwrap_or(true))
     }
 
-    /// A free path for a new node of a kind under the root, interned: the kind's label and the
-    /// lowest number not yet tried this session whose path no prim and no node has had.
-    fn new_node(&mut self, root: &sdf::Path, kind: &NodeKind) -> (NodeId, sdf::Path) {
-        loop {
-            let number = self.next_name;
-            self.next_name += 1;
-            let path = (root.append_path(format!("{}{number}", kind.label())))
-                .expect("a label and a number make a prim name");
-            if !self.is_taken(&path) {
-                return (self.compiler.intern(&path), path);
-            }
-        }
+    /// A free path named `name` for a new node under the root, interned.
+    fn new_node(&mut self, root: &sdf::Path, name: &str) -> (NodeId, sdf::Path) {
+        let path = self.free_path(root, name);
+        (self.compiler.intern(&path), path)
     }
 
     /// Selects the given nodes, in order, if that changes the selection.
@@ -588,7 +581,7 @@ impl Session {
         let mut created = Vec::with_capacity(paths.len());
         let mut readers = Vec::with_capacity(paths.len());
         for (row, file) in paths.into_iter().enumerate() {
-            let (id, path) = self.new_node(&root, &NodeKind::Reader);
+            let (id, path) = self.new_node(&root, &reader_name(&file));
             let position = Point {
                 x: at.x,
                 y: at.y + row as f32 * READER_SPACING,
@@ -640,7 +633,7 @@ impl Session {
             return Err(EditError::MissingNode(current));
         }
         let (root, define_root) = self.root();
-        let (id, path) = self.new_node(&root, &node_type.kind);
+        let (id, path) = self.new_node(&root, node_type.kind.label());
         let mut position = at;
         let mut assignments = Vec::new();
         if let Some(current) = current {
@@ -1175,6 +1168,26 @@ impl Reload {
     /// Whether no node was a Reader with a file.
     pub fn is_empty(&self) -> bool {
         self.stills.is_empty() && self.sequences.is_empty()
+    }
+}
+
+/// What a Reader of `file` is named: its file name up to the first `.` or frame number, `#` or
+/// `%`, without the separator before it, each character a prim name cannot hold as `_`, and `_` first before a
+/// digit. `Reader` if nothing is left.
+fn reader_name(file: &Path) -> String {
+    let name = file.file_name().map(|name| name.to_string_lossy());
+    let name = name.as_deref().unwrap_or_default();
+    let stem = name.split(['.', '#', '%']).next().unwrap_or_default();
+    let stem = stem.trim_end_matches(['_', '-', ' ']);
+    let mut name: String = (stem.chars())
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert(0, '_');
+    }
+    match name.is_empty() {
+        true => NodeKind::Reader.label().to_owned(),
+        false => name,
     }
 }
 

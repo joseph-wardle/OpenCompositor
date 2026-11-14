@@ -7,11 +7,11 @@ use super::*;
 use crate::network::NodeKind;
 
 fn exposure() -> Node {
-    Node::new(NodeKind::Exposure, Point { x: 0.0, y: 0.0 })
+    Node::new(NodeKind::Exposure, "Exposure", Point { x: 0.0, y: 0.0 })
 }
 
 fn reader() -> Node {
-    Node::new(NodeKind::Reader, Point { x: 0.0, y: 0.0 })
+    Node::new(NodeKind::Reader, "Reader", Point { x: 0.0, y: 0.0 })
 }
 
 fn stops(node: &Node) -> Option<Value> {

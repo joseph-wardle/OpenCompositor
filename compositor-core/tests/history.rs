@@ -56,12 +56,12 @@ fn retained_by(edit: impl FnOnce()) -> isize {
     LIVE.with(Cell::get) - before
 }
 
-/// A session of `readers` Readers, each with a path of `path_length` bytes, created as one
-/// step so the history's own vector stays well within its capacity.
+/// A session of `readers` Readers, each in a directory of `path_length` bytes, created as one step
+/// so the history's own vector stays well within its capacity.
 fn session_of(readers: usize, path_length: usize) -> Session {
     let mut session = Session::new();
     let paths = (0..readers)
-        .map(|index| PathBuf::from(format!("{index:0>path_length$}.exr")))
+        .map(|index| PathBuf::from(format!("{:0>path_length$}/{index}.exr", "")))
         .collect();
     session.create_readers(paths, Point { x: 0.0, y: 0.0 }, None);
     session

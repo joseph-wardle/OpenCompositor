@@ -17,14 +17,14 @@ const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 const DEEP_CHAIN: u64 = 10_000;
 
 pub(crate) fn reader(path: impl AsRef<Path>) -> Node {
-    let mut node = Node::new(NodeKind::Reader, ORIGIN);
+    let mut node = Node::new(NodeKind::Reader, "Reader", ORIGIN);
     node.set_value("file", Value::File(path.as_ref().into()))
         .unwrap();
     node
 }
 
 pub(crate) fn exposure(stops: Option<f64>) -> Node {
-    let mut node = Node::new(NodeKind::Exposure, ORIGIN);
+    let mut node = Node::new(NodeKind::Exposure, "Exposure", ORIGIN);
     if let Some(stops) = stops {
         node.set_value("stops", Value::Float(stops)).unwrap();
     }
@@ -52,7 +52,7 @@ fn write(path: &Path, color: png::ColorType, data: &[u8]) {
 }
 
 pub(crate) fn merge(mix: Option<f64>) -> Node {
-    let mut node = Node::new(NodeKind::Merge, ORIGIN);
+    let mut node = Node::new(NodeKind::Merge, "Merge", ORIGIN);
     if let Some(mix) = mix {
         node.set_value("mix", Value::Float(mix)).unwrap();
     }
@@ -60,7 +60,7 @@ pub(crate) fn merge(mix: Option<f64>) -> Node {
 }
 
 pub(crate) fn blur(size: Option<f64>) -> Node {
-    let mut node = Node::new(NodeKind::Blur, ORIGIN);
+    let mut node = Node::new(NodeKind::Blur, "Blur", ORIGIN);
     if let Some(size) = size {
         node.set_value("size", Value::Float(size)).unwrap();
     }
@@ -332,7 +332,7 @@ fn exposure_keeps_a_grey_image_one_plane() {
 
 #[test]
 fn an_unconnected_input_or_a_reader_without_a_file_gives_the_empty_image() {
-    let without_file = Node::new(NodeKind::Reader, ORIGIN);
+    let without_file = Node::new(NodeKind::Reader, "Reader", ORIGIN);
     let networks = [chain([exposure(Some(3.0))]), chain([without_file])];
     let mut evaluator = Evaluator::new();
     for network in networks {

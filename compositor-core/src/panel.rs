@@ -61,7 +61,7 @@ impl Panel {
             .collect();
         Some(Panel {
             node,
-            name: shown.name(),
+            name: shown.name().to_owned(),
             type_label: shown.kind.label(),
             pinned,
             rows,

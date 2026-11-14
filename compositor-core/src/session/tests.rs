@@ -211,8 +211,8 @@ fn the_graph_matches_the_network_after_every_step() {
         assert!(!edit(&mut session).is_empty());
         assert_presented(&session);
     }
-    assert_eq!(session.graph().node(a.into()).unwrap().title, "a.exr");
-    assert_eq!(session.graph().node(c.into()).unwrap().title, "c.exr [1]");
+    assert_eq!(session.graph().node(a.into()).unwrap().title, "a");
+    assert_eq!(session.graph().node(c.into()).unwrap().title, "c [1]");
 
     while !session.undo().is_empty() {
         assert_presented(&session);
@@ -223,8 +223,8 @@ fn the_graph_matches_the_network_after_every_step() {
         assert_presented(&session);
     }
     assert_eq!(session.selection(), []);
-    assert_eq!(session.graph().node(c.into()).unwrap().title, "c.exr [1]");
-    assert_eq!(session.graph().node(b.into()).unwrap().title, "d.exr");
+    assert_eq!(session.graph().node(c.into()).unwrap().title, "c [1]");
+    assert_eq!(session.graph().node(b.into()).unwrap().title, "b");
 }
 
 #[test]
@@ -301,7 +301,8 @@ fn a_new_file_keeps_the_node_its_position_and_its_marks() {
     assert_eq!(session.mark(slot(4)), Some(reader));
     assert_eq!(
         session.graph().node(reader.into()).unwrap().title,
-        "b.exr [4]"
+        "a [4]",
+        "a new file keeps the node's name"
     );
 }
 
@@ -341,7 +342,10 @@ fn an_exposure_node_is_created_selected_and_undoable() {
     assert!(changes.selection);
     assert_eq!(session.selection(), [id]);
     let exposure = NodeKind::Exposure;
-    assert_eq!(session.network().node(id), Some(&Node::new(exposure, at)));
+    assert_eq!(
+        session.network().node(id),
+        Some(&Node::new(exposure, "Exposure", at))
+    );
     assert_eq!(session.graph().node(id.into()).unwrap().title, "Exposure");
     assert_eq!(session.undo_label(), Some("Create Exposure"));
     assert_presented(&session);
@@ -553,13 +557,41 @@ fn an_exposure_node_has_no_file() {
 }
 
 #[test]
+fn readers_are_named_after_their_files_once_each() {
+    let mut session = Session::new();
+    let files = [
+        "/shots/plate.####.exr",
+        "/shots/plate.exr",
+        "/shots/bg_v2_%04d.exr",
+        "/shots/A-001 grade.png",
+        "/shots/001.exr",
+        "/shots/####.exr",
+    ];
+    let created = session.create_readers(paths(&files), ORIGIN, None);
+    let names: Vec<_> = (created.nodes.iter())
+        .map(|&id| session.name_of(id).unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["plate", "plate1", "bg_v2", "A_001_grade", "_001", "Reader"]
+    );
+    for &id in &created.nodes {
+        let title = &session.graph().node(id.into()).unwrap().title;
+        assert_eq!(Some(title.as_str()), session.name_of(id));
+    }
+}
+
+#[test]
 fn a_reader_without_a_file_is_named_for_its_kind_and_reloads_nothing() {
     let mut session = Session::new();
     let created = session.create_node("reader", ORIGIN, None).unwrap();
     let empty = create(&mut session, "", ORIGIN);
-    for id in [*created.nodes.first().unwrap(), empty] {
+    for (id, name) in [
+        (*created.nodes.first().unwrap(), "Reader"),
+        (empty, "Reader1"),
+    ] {
         assert_eq!(file(&session, id), None);
-        assert_eq!(session.graph().node(id.into()).unwrap().title, "Reader");
+        assert_eq!(session.graph().node(id.into()).unwrap().title, name);
         assert!(session.reload(&[id]).is_empty());
     }
     assert_eq!(

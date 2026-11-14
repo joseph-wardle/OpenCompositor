@@ -352,6 +352,7 @@ const _: () = {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub kind: NodeKind,
+    name: String,
     /// The node's top-left corner in graph units, y down, as OpenNG places it.
     pub position: Point,
     /// Only the values the stage authors, each valid for its parameter. An absent value reads as
@@ -369,9 +370,10 @@ pub struct Node {
 }
 
 impl Node {
-    pub(crate) fn new(kind: NodeKind, position: Point) -> Node {
+    pub(crate) fn new(kind: NodeKind, name: impl Into<String>, position: Point) -> Node {
         Node {
             kind,
+            name: name.into(),
             position,
             authored: BTreeMap::new(),
             anchored: BTreeMap::new(),
@@ -380,18 +382,9 @@ impl Node {
         }
     }
 
-    /// What the artist calls the node: a Reader's file name, or the node's kind.
-    pub fn name(&self) -> String {
-        match &self.kind {
-            // A file is never a default, so the authored value is the one every frame reads.
-            NodeKind::Reader => match self.authored_value("file") {
-                Some(Value::File(path)) => (path.file_name().unwrap_or(path.as_os_str()))
-                    .to_string_lossy()
-                    .into_owned(),
-                Some(Value::Float(_)) | None => self.kind.label().to_owned(),
-            },
-            NodeKind::Exposure | NodeKind::Merge | NodeKind::Blur => self.kind.label().to_owned(),
-        }
+    /// The node's prim name, unique in its comp.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// The node an input takes its image from, if the input is connected.

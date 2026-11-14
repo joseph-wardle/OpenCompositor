@@ -274,7 +274,7 @@ impl Compiler {
                 _ => None,
             })
             .unwrap_or(Point { x: 0.0, y: 0.0 });
-        let mut node = Node::new(kind.clone(), position);
+        let mut node = Node::new(kind.clone(), path.name().unwrap_or_default(), position);
         let mut reads = Vec::new();
         for property in prim.property_names().unwrap_or_default() {
             let Some(name) = property.as_str().strip_prefix("inputs:") else {

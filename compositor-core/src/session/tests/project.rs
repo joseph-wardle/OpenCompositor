@@ -86,7 +86,7 @@ fn save_as_keeps_every_id_the_history_the_selection_and_the_marks() {
 
     assert_eq!(session.selection(), selection);
     assert_eq!(session.mark(super::slot(1)), Some(exposure));
-    assert_eq!(session.name_of(reader), Some("Reader1"));
+    assert_eq!(session.name_of(reader), Some("a"));
     assert_eq!(session.undo_label(), Some("Stops"));
     // Undo restores the saved layer, under its new name, and marks the project modified.
     session.undo();
@@ -109,13 +109,9 @@ fn save_as_keeps_every_id_the_history_the_selection_and_the_marks() {
         Some(&Value::Float(1.5))
     );
     // A new node never takes a name a node had before the save.
-    let blur = *session
-        .create_node("blur", ORIGIN, None)
-        .unwrap()
-        .nodes
-        .first()
-        .unwrap();
-    assert_eq!(session.name_of(blur), Some("Blur3"));
+    session.delete_nodes(&[exposure]).unwrap();
+    let again = create_exposure(&mut session, ORIGIN);
+    assert_eq!(session.name_of(again), Some("Exposure1"));
 }
 
 #[test]
@@ -447,7 +443,7 @@ def Xform "Comp"
 
     let id = create_exposure(&mut session, ORIGIN);
 
-    assert_eq!(session.name_of(id), Some("Exposure1"));
+    assert_eq!(session.name_of(id), Some("Exposure"));
     let text = session.root_layer_text();
     assert!(text.contains("defaultPrim = \"World\""), "{text}");
     assert!(text.contains("def Xform \"Comp\""), "{text}");

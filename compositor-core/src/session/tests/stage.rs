@@ -56,16 +56,16 @@ fn edits_author_typed_prims_with_shade_style_inputs() {
 
 def OcComp "Comp"
 {
-    def OcReader "Reader1"
+    def OcReader "a"
     {
         asset inputs:file = @/shots/a.exr@
         opaque outputs:image
         uniform float2 ui:nodegraph:node:pos = (0, 0)
     }
 
-    def OcExposure "Exposure2"
+    def OcExposure "Exposure"
     {
-        opaque inputs:source.connect = </Comp/Reader1.outputs:image>
+        opaque inputs:source.connect = </Comp/a.outputs:image>
         double inputs:stops = 1.5
         opaque outputs:image
         uniform float2 ui:nodegraph:node:pos = (120, 80)
@@ -197,13 +197,13 @@ fn a_returning_path_keeps_its_id_and_a_new_node_gets_a_new_name_and_id() {
     assert!(session.network().node(exposure).is_none());
     session.redo();
     assert!(session.network().node(exposure).is_some());
-    assert_eq!(session.name_of(exposure), Some("Exposure2"));
+    assert_eq!(session.name_of(exposure), Some("Exposure"));
 
     session.undo();
     let another = create_exposure(&mut session, ORIGIN);
     assert_ne!(another, exposure);
     assert_ne!(session.name_of(another), session.name_of(exposure));
-    assert_eq!(session.name_of(exposure), Some("Exposure2"));
+    assert_eq!(session.name_of(exposure), Some("Exposure"));
 }
 
 #[test]
@@ -553,7 +553,7 @@ fn deleting_removes_the_nodes_specs_and_every_connection_to_them() {
     assert_eq!(session.mark(slot(1)), Some(reader));
     assert_eq!(session.mark(slot(2)), Some(third));
     let text = session.root_layer_text();
-    for gone in ["Reader1", "Exposure3", "inputs:source"] {
+    for gone in ["OcReader", "\"Exposure1\"", "inputs:source"] {
         assert!(!text.contains(gone), "{gone} in {text}");
     }
     super::assert_presented(&session);

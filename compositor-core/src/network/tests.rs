@@ -7,7 +7,7 @@ const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 
 /// A network of one Reader, with ID 0, and `exposures` Exposures, with IDs from 1.
 fn network_of(exposures: u64) -> Network {
-    let mut reader = Node::new(NodeKind::Reader, ORIGIN);
+    let mut reader = Node::new(NodeKind::Reader, "Reader", ORIGIN);
     reader
         .set_value("file", Value::File(Path::new("a.exr").into()))
         .unwrap();
@@ -15,9 +15,10 @@ fn network_of(exposures: u64) -> Network {
     let mut network = Network::default();
     network.nodes.insert(NodeId(0), Arc::new(reader));
     for id in 1..=exposures {
-        network
-            .nodes
-            .insert(NodeId(id), Arc::new(Node::new(exposure.clone(), ORIGIN)));
+        network.nodes.insert(
+            NodeId(id),
+            Arc::new(Node::new(exposure.clone(), "Exposure", ORIGIN)),
+        );
     }
     network
 }
@@ -150,7 +151,7 @@ fn what_is_missing_is_found_up_the_chain() {
 /// A network of two Readers, with IDs 0 and 1, and a Merge with ID 2.
 fn network_with_merge() -> Network {
     let mut network = network_of(0);
-    let mut reader = Node::new(NodeKind::Reader, ORIGIN);
+    let mut reader = Node::new(NodeKind::Reader, "Reader", ORIGIN);
     reader
         .set_value("file", Value::File(Path::new("b.exr").into()))
         .unwrap();
@@ -158,7 +159,7 @@ fn network_with_merge() -> Network {
     let merge = NodeKind::Merge;
     network
         .nodes
-        .insert(NodeId(2), Arc::new(Node::new(merge, ORIGIN)));
+        .insert(NodeId(2), Arc::new(Node::new(merge, "Merge", ORIGIN)));
     network
 }
 

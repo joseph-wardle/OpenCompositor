@@ -132,7 +132,7 @@ pub(crate) fn record(
     id: NodeId,
     node: &Node,
 ) -> NodeRecord {
-    let mut title = shorten(&node.name());
+    let mut title = shorten(node.name());
     let color = match node.kind {
         NodeKind::Reader => READER_COLOR,
         NodeKind::Exposure => EXPOSURE_COLOR,
