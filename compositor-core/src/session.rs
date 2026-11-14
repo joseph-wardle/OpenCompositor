@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
@@ -22,7 +22,7 @@ use crate::network::{
     Assignment, Changes, ConnectionError, InputSlot, Marks, Network, NodeId, NodeKind, Slot,
     Timeline, TimelineError, node_types,
 };
-use crate::parameter::{Value, ValueError, describe, resolve, validate};
+use crate::parameter::{ParameterKind, Value, ValueError, describe, resolve, validate};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
@@ -561,7 +561,8 @@ impl Session {
     }
 
     /// Creates a Reader for each path, stacked downwards, and selects them all. A Reader of a path
-    /// the file parameter refuses, such as an empty one, has no file.
+    /// the file parameter refuses, such as an empty one or a relative one in an untitled
+    /// project, has no file.
     ///
     /// The stack starts below the current node, as [`create_node`](Session::create_node) places
     /// a type without inputs, or at `at` without one, or if it no longer exists.
@@ -586,11 +587,9 @@ impl Session {
                 x: at.x,
                 y: at.y + row as f32 * READER_SPACING,
             };
-            let file = validate(
-                NodeKind::Reader.parameters(),
-                "file",
-                Value::File(file.into()),
-            );
+            let file = self
+                .as_set(Value::File(file.into()))
+                .and_then(|file| validate(NodeKind::Reader.parameters(), "file", file));
             created.push(id);
             readers.push((path, position, file.ok().map(|(_, file)| file)));
         }
@@ -965,6 +964,9 @@ impl Session {
         let described = describe(node.kind.parameters(), parameter).map_err(invalid)?;
         let mut edited = node.clone();
         match value {
+            Some(value) if matches!(described.kind, ParameterKind::File) => self
+                .as_set(value)
+                .and_then(|value| edited.set_value(parameter, value)),
             Some(value) => edited.set_value(parameter, value),
             None => edited.reset(parameter),
         }
@@ -979,6 +981,25 @@ impl Session {
             value: edited.authored_value(described.name).cloned(),
         };
         Ok((edit, described.label))
+    }
+
+    /// A file as the artist sets it. A bare relative path gains `./`, which USD anchors to the
+    /// project file alone, never searching for it elsewhere; with no project file to anchor it, a
+    /// relative path is refused.
+    fn as_set(&self, value: Value) -> Result<Value, ValueError> {
+        let Value::File(path) = &value else {
+            return Ok(value);
+        };
+        if path.as_os_str().is_empty() || path.is_absolute() {
+            return Ok(value);
+        }
+        if self.file().is_none() {
+            return Err(ValueError::Unanchored);
+        }
+        match path.components().next() {
+            Some(Component::Normal(_)) => Ok(Value::File(Path::new(".").join(path).into())),
+            _ => Ok(value),
+        }
     }
 
     /// Records the edit in progress as one step, unless it changed nothing on the whole.

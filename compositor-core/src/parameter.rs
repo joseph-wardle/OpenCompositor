@@ -140,6 +140,8 @@ pub enum ValueError {
     OutOfLimits(RangeInclusive<f64>),
     EmptyPath,
     NotUnicode,
+    /// A relative path set in a project with no file to read it beside.
+    Unanchored,
 }
 
 impl fmt::Display for ValueError {
@@ -157,6 +159,10 @@ impl fmt::Display for ValueError {
             ),
             ValueError::EmptyPath => write!(f, "the path is empty"),
             ValueError::NotUnicode => write!(f, "the path is not Unicode"),
+            ValueError::Unanchored => write!(
+                f,
+                "a relative path needs the project saved, to read beside it"
+            ),
         }
     }
 }

@@ -9,8 +9,8 @@ use super::{ORIGIN, create, create_exposure, file, set_file};
 use crate::fixtures::directory;
 use crate::network::NodeId;
 use crate::panel::Panel;
-use crate::parameter::Value;
-use crate::session::{FileError, RelativePaths, Session};
+use crate::parameter::{Value, ValueError};
+use crate::session::{EditError, FileError, RelativePaths, Session};
 
 /// A project of a Reader of `plate` feeding an Exposure at 1.5 stops.
 fn project(plate: &str) -> (Session, NodeId, NodeId) {
@@ -456,9 +456,55 @@ def Xform "Comp"
 }
 
 #[test]
-fn an_untitled_project_reads_a_relative_file_nowhere() {
+fn an_untitled_project_refuses_relative_files() {
     let mut session = Session::new();
-    let id = create(&mut session, "/shots/a.exr", ORIGIN);
-    set_file(&mut session, id, "./a.exr").unwrap();
-    assert_eq!(file(&session, id).as_deref(), Some(Path::new("./a.exr")));
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
+    for relative in ["a.exr", "./a.exr", "../a.exr"] {
+        assert_eq!(
+            set_file(&mut session, reader, relative),
+            Err(EditError::InvalidValue {
+                node: reader,
+                parameter: "file".to_owned(),
+                error: ValueError::Unanchored,
+            }),
+            "{relative}"
+        );
+    }
+    let created = session.create_readers(vec![PathBuf::from("b.exr")], ORIGIN, None);
+    assert_eq!(
+        authored_file(&session, *created.nodes.first().unwrap()),
+        None
+    );
+    assert_eq!(
+        authored_file(&session, reader).as_deref(),
+        Some(Path::new("/shots/a.exr"))
+    );
+}
+
+#[test]
+fn a_bare_relative_file_set_in_a_saved_project_is_stored_dot_relative() {
+    let directory = directory("projects");
+    let (mut session, reader, _) = project("/shots/a.exr");
+    session
+        .save_as(&directory.join("shot.usda"), RelativePaths::Keep)
+        .unwrap();
+    for (set, stored) in [
+        ("plates/a.####.exr", "./plates/a.####.exr"),
+        ("a.exr", "./a.exr"),
+        ("./a.exr", "./a.exr"),
+        ("../a.exr", "../a.exr"),
+        ("/shots/b.exr", "/shots/b.exr"),
+    ] {
+        set_file(&mut session, reader, set).unwrap();
+        assert_eq!(
+            authored_file(&session, reader).as_deref(),
+            Some(Path::new(stored)),
+            "{set}"
+        );
+    }
+    let created = session.create_readers(vec![PathBuf::from("b.exr")], ORIGIN, None);
+    assert_eq!(
+        authored_file(&session, *created.nodes.first().unwrap()).as_deref(),
+        Some(Path::new("./b.exr"))
+    );
 }

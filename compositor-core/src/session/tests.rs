@@ -77,9 +77,9 @@ fn drive(session: &mut Session, view: &mut View, events: &[InputEvent]) {
 #[test]
 fn a_node_created_after_an_undo_gets_a_new_id() {
     let mut session = Session::new();
-    let first = create(&mut session, "a.exr", ORIGIN);
+    let first = create(&mut session, "/shots/a.exr", ORIGIN);
     session.undo();
-    let second = create(&mut session, "b.exr", ORIGIN);
+    let second = create(&mut session, "/shots/b.exr", ORIGIN);
 
     assert_ne!(first, second);
     assert!(session.network().node(first).is_none());
@@ -90,8 +90,8 @@ fn a_node_created_after_an_undo_gets_a_new_id() {
 #[test]
 fn a_new_edit_clears_redo() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
-    set_file(&mut session, reader, "b.exr").unwrap();
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
+    set_file(&mut session, reader, "/shots/b.exr").unwrap();
     session.undo();
     assert_eq!(session.redo_label(), Some("File"));
     // A mark is no edit, so redo survives it.
@@ -104,15 +104,18 @@ fn a_new_edit_clears_redo() {
 
     assert_eq!(session.redo_label(), None);
     assert!(session.redo().is_empty());
-    assert_eq!(file(&session, reader).as_deref(), Some(Path::new("a.exr")));
+    assert_eq!(
+        file(&session, reader).as_deref(),
+        Some(Path::new("/shots/a.exr"))
+    );
     assert_presented(&session);
 }
 
 #[test]
 fn selecting_and_dragging_a_node_is_one_step() {
     let mut session = Session::new();
-    let dragged = create(&mut session, "a.exr", ORIGIN);
-    let other = create(&mut session, "b.exr", Point { x: 0.0, y: 200.0 });
+    let dragged = create(&mut session, "/shots/a.exr", ORIGIN);
+    let other = create(&mut session, "/shots/b.exr", Point { x: 0.0, y: 200.0 });
     assert_eq!(session.selection(), [other]);
     let steps = session.undo.len();
     // At 100% zoom the graph origin is at the viewport's centre, so the press is on the dragged
@@ -160,8 +163,8 @@ fn selecting_and_dragging_a_node_is_one_step() {
 #[test]
 fn undo_skips_clicks_that_only_select() {
     let mut session = Session::new();
-    let a = create(&mut session, "a.exr", ORIGIN);
-    let b = create(&mut session, "b.exr", Point { x: 0.0, y: 200.0 });
+    let a = create(&mut session, "/shots/a.exr", ORIGIN);
+    let b = create(&mut session, "/shots/b.exr", Point { x: 0.0, y: 200.0 });
     session.set_mark(slot(1), Some(a)).unwrap();
     let steps = session.undo.len();
 
@@ -187,7 +190,11 @@ fn undo_skips_clicks_that_only_select() {
 #[test]
 fn the_graph_matches_the_network_after_every_step() {
     let mut session = Session::new();
-    let readers = session.create_readers(paths(&["a.exr", "b.png", "c.exr"]), ORIGIN, None);
+    let readers = session.create_readers(
+        paths(&["/shots/a.exr", "/shots/b.png", "/shots/c.exr"]),
+        ORIGIN,
+        None,
+    );
     assert_presented(&session);
     let [a, b, c] = [0, 1, 2].map(|i| *readers.nodes.iter().nth(i).unwrap());
     assert_eq!(session.selection(), [a, b, c]);
@@ -195,9 +202,9 @@ fn the_graph_matches_the_network_after_every_step() {
     // Marks are set between the steps, and are not steps themselves.
     let edits: [&dyn Fn(&mut Session) -> Changes; 6] = [
         &|s| s.set_mark(slot(1), Some(a)).unwrap(),
-        &|s| set_file(s, a, "e.exr").unwrap(),
+        &|s| set_file(s, a, "/shots/e.exr").unwrap(),
         &|s| s.set_mark(slot(1), Some(c)).unwrap(),
-        &|s| set_file(s, b, "d.exr").unwrap(),
+        &|s| set_file(s, b, "/shots/d.exr").unwrap(),
         &|s| {
             s.apply_response(&Response {
                 positions: vec![(c.into(), Point { x: 10.0, y: 10.0 })],
@@ -205,7 +212,7 @@ fn the_graph_matches_the_network_after_every_step() {
                 ..Response::default()
             })
         },
-        &|s| set_file(s, a, "a.exr").unwrap(),
+        &|s| set_file(s, a, "/shots/a.exr").unwrap(),
     ];
     for edit in edits {
         assert!(!edit(&mut session).is_empty());
@@ -230,7 +237,7 @@ fn the_graph_matches_the_network_after_every_step() {
 #[test]
 fn edits_that_change_nothing_record_nothing_and_keep_redo() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let connected = create_exposure(&mut session, ORIGIN);
     let unconnected = create_exposure(&mut session, ORIGIN);
     session.connect(connected, "source", reader).unwrap();
@@ -244,7 +251,7 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
             unchanged(s.create_readers(Vec::new(), ORIGIN, None));
         }),
         ("the same file", &|s| {
-            unchanged(set_file(s, reader, "a.exr").unwrap());
+            unchanged(set_file(s, reader, "/shots/a.exr").unwrap());
         }),
         ("the same position", &|s| {
             unchanged(s.apply_response(&Response {
@@ -290,10 +297,10 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
 fn a_new_file_keeps_the_node_its_position_and_its_marks() {
     let mut session = Session::new();
     let at = Point { x: 30.0, y: -40.0 };
-    let reader = create(&mut session, "plates/a.exr", at);
+    let reader = create(&mut session, "/shots/plates/a.exr", at);
     session.set_mark(slot(4), Some(reader)).unwrap();
 
-    let changes = set_file(&mut session, reader, "plates/b.exr").unwrap();
+    let changes = set_file(&mut session, reader, "/shots/plates/b.exr").unwrap();
 
     assert_eq!(changes.nodes.iter().copied().collect::<Vec<_>>(), [reader]);
     assert!(!changes.selection);
@@ -309,11 +316,11 @@ fn a_new_file_keeps_the_node_its_position_and_its_marks() {
 #[test]
 fn edits_to_a_node_an_undo_removed_are_refused() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     session.undo();
 
     let missing = Err(EditError::MissingNode(reader));
-    assert_eq!(set_file(&mut session, reader, "b.exr"), missing);
+    assert_eq!(set_file(&mut session, reader, "/shots/b.exr"), missing);
     assert_eq!(session.set_mark(slot(0), Some(reader)), missing);
     assert_eq!(
         session.set_value(reader, "stops", Value::Float(1.0)),
@@ -333,7 +340,7 @@ fn edits_to_a_node_an_undo_removed_are_refused() {
 #[test]
 fn an_exposure_node_is_created_selected_and_undoable() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let at = Point { x: 0.0, y: 100.0 };
 
     let changes = session.create_node("exposure", at, None).unwrap();
@@ -361,7 +368,7 @@ fn an_exposure_node_is_created_selected_and_undoable() {
 #[test]
 fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let consumers = [0.0, 200.0].map(|x| {
         let id = create_exposure(&mut session, Point { x, y: 300.0 });
         session.connect(id, "source", reader).unwrap();
@@ -406,7 +413,7 @@ fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
 #[test]
 fn an_inserted_node_pushes_what_it_feeds_right_when_it_lands_on_it() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let outline = session.graph().node_rect(reader.into()).unwrap();
     let first = create_exposure(
         &mut session,
@@ -447,7 +454,7 @@ fn an_inserted_node_pushes_what_it_feeds_right_when_it_lands_on_it() {
 #[test]
 fn a_node_without_inputs_is_created_below_the_current_node_unconnected() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, Point { x: 0.0, y: 100.0 });
     session.connect(exposure, "source", reader).unwrap();
 
@@ -481,7 +488,8 @@ fn readers_stack_below_the_current_node_or_at_the_point_once_it_is_gone() {
     let outline = session.graph().node_rect(exposure.into()).unwrap();
     let at = Point { x: 500.0, y: 500.0 };
 
-    let changes = session.create_readers(paths(&["a.exr", "b.exr"]), at, Some(exposure));
+    let changes =
+        session.create_readers(paths(&["/shots/a.exr", "/shots/b.exr"]), at, Some(exposure));
 
     let below = Point {
         x: outline.min.x,
@@ -503,7 +511,7 @@ fn readers_stack_below_the_current_node_or_at_the_point_once_it_is_gone() {
     );
 
     session.delete_nodes(&[exposure]).unwrap();
-    let changes = session.create_readers(paths(&["c.exr"]), at, Some(exposure));
+    let changes = session.create_readers(paths(&["/shots/c.exr"]), at, Some(exposure));
     let id = *changes.nodes.first().unwrap();
     assert_eq!(session.network().node(id).unwrap().position, at);
 }
@@ -511,7 +519,7 @@ fn readers_stack_below_the_current_node_or_at_the_point_once_it_is_gone() {
 #[test]
 fn creating_by_an_unknown_type_or_after_a_missing_node_changes_nothing() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     session.delete_nodes(&[reader]).unwrap();
     let steps = session.undo.len();
 
@@ -546,7 +554,7 @@ fn an_exposure_node_has_no_file() {
 
     assert_eq!(session.viewed(), Some(id));
     assert_eq!(
-        set_file(&mut session, id, "a.exr"),
+        set_file(&mut session, id, "/shots/a.exr"),
         Err(EditError::InvalidValue {
             node: id,
             parameter: "file".to_owned(),
@@ -607,9 +615,9 @@ fn a_reader_without_a_file_is_named_for_its_kind_and_reloads_nothing() {
 #[test]
 fn reloading_a_reader_reloads_every_reader_of_its_file() {
     let mut session = Session::new();
-    let other = create(&mut session, "b.exr", ORIGIN);
-    let twin = create(&mut session, "a.exr", ORIGIN);
-    let selected = create(&mut session, "a.exr", ORIGIN);
+    let other = create(&mut session, "/shots/b.exr", ORIGIN);
+    let twin = create(&mut session, "/shots/a.exr", ORIGIN);
+    let selected = create(&mut session, "/shots/a.exr", ORIGIN);
     let key = |session: &Session, id| session.result_key(id);
     let before = [selected, twin, other].map(|id| key(&session, id));
     session.record_failure(before[1].as_ref().unwrap());
@@ -617,7 +625,7 @@ fn reloading_a_reader_reloads_every_reader_of_its_file() {
 
     assert_eq!(
         session.reload(&[selected]).stills,
-        [Path::new("a.exr").into()]
+        [Path::new("/shots/a.exr").into()]
     );
 
     let after = [selected, twin, other].map(|id| key(&session, id));
@@ -634,8 +642,8 @@ fn reloading_a_reader_reloads_every_reader_of_its_file() {
 #[test]
 fn a_node_shows_a_failure_while_its_current_key_failed() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
-    let twin = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
+    let twin = create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", reader).unwrap();
     let key = |session: &Session, id| session.result_key(id).unwrap();
@@ -742,7 +750,7 @@ fn cancelling_restores_the_stage_from_the_beginning() {
 #[test]
 fn undo_during_an_edit_cancels_it_then_undoes() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, Point { x: 0.0, y: 100.0 });
     session.begin_edit(exposure, "Set Stops").unwrap();
     session.edit_value("stops", Value::Float(1.0)).unwrap();
@@ -764,7 +772,7 @@ fn undo_during_an_edit_cancels_it_then_undoes() {
 fn another_edit_finishes_the_edit_in_progress_as_its_own_step() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
-    let reader = create(&mut session, "a.exr", Point { x: 0.0, y: 100.0 });
+    let reader = create(&mut session, "/shots/a.exr", Point { x: 0.0, y: 100.0 });
     session.begin_edit(exposure, "Set Stops").unwrap();
     session.edit_value("stops", Value::Float(1.0)).unwrap();
 
@@ -800,7 +808,7 @@ fn another_edit_finishes_the_edit_in_progress_as_its_own_step() {
 fn selecting_leaves_the_edit_in_progress_running() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
-    let reader = create(&mut session, "a.exr", Point { x: 0.0, y: 100.0 });
+    let reader = create(&mut session, "/shots/a.exr", Point { x: 0.0, y: 100.0 });
     let steps = session.undo.len();
     session.begin_edit(exposure, "Set Stops").unwrap();
 
@@ -849,7 +857,7 @@ fn refused_values_leave_the_edit_and_network_unchanged() {
 #[test]
 fn a_reader_has_no_values_to_edit() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let before = session.network().clone();
     let steps = session.undo.len();
 
@@ -954,8 +962,8 @@ fn source_of(session: &Session, consumer: NodeId) -> Option<NodeId> {
 #[test]
 fn replacing_a_wire_is_one_step_and_undo_restores_it() {
     let mut session = Session::new();
-    let first = create(&mut session, "a.exr", ORIGIN);
-    let second = create(&mut session, "b.exr", ORIGIN);
+    let first = create(&mut session, "/shots/a.exr", ORIGIN);
+    let second = create(&mut session, "/shots/b.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", first).unwrap();
     let steps = session.undo.len();
@@ -981,7 +989,7 @@ fn a_refused_connection_leaves_the_network_and_history_unchanged() {
     let upstream = create_exposure(&mut session, ORIGIN);
     let downstream = create_exposure(&mut session, ORIGIN);
     session.connect(downstream, "source", upstream).unwrap();
-    create(&mut session, "a.exr", ORIGIN);
+    create(&mut session, "/shots/a.exr", ORIGIN);
     session.undo();
     let before = session.network().clone();
     let steps = session.undo.len();
@@ -998,7 +1006,7 @@ fn a_refused_connection_leaves_the_network_and_history_unchanged() {
 #[test]
 fn deleting_is_one_step_that_undo_restores_whole() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", reader).unwrap();
     session.set_mark(slot(1), Some(reader)).unwrap();
@@ -1033,8 +1041,8 @@ fn deleting_is_one_step_that_undo_restores_whole() {
 #[test]
 fn deleting_is_refused_whole_if_a_node_is_gone() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
-    let gone = create(&mut session, "b.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
+    let gone = create(&mut session, "/shots/b.exr", ORIGIN);
     session.undo();
     let steps = session.undo.len();
 
@@ -1091,10 +1099,10 @@ fn wiring(remove: &[Connection], add: &[Connection]) -> Response {
 #[test]
 fn a_wire_dragged_in_the_graph_connects_as_connect_does() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, Point { x: 200.0, y: 0.0 });
     let mut headless = Session::new();
-    create(&mut headless, "a.exr", ORIGIN);
+    create(&mut headless, "/shots/a.exr", ORIGIN);
     create_exposure(&mut headless, Point { x: 200.0, y: 0.0 });
     headless.connect(exposure, "source", reader).unwrap();
     let steps = session.undo.len();
@@ -1153,8 +1161,8 @@ fn a_wire_dragged_in_the_graph_connects_as_connect_does() {
 #[test]
 fn a_wire_onto_a_taken_input_displaces_the_old_one_in_one_step() {
     let mut session = Session::new();
-    let first = create(&mut session, "a.exr", ORIGIN);
-    let second = create(&mut session, "b.exr", ORIGIN);
+    let first = create(&mut session, "/shots/a.exr", ORIGIN);
+    let second = create(&mut session, "/shots/b.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", first).unwrap();
     let steps = session.undo.len();
@@ -1182,7 +1190,7 @@ fn a_wire_onto_a_taken_input_displaces_the_old_one_in_one_step() {
 #[test]
 fn a_gesture_is_judged_on_its_result_and_applied_as_one_step() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let upstream = create_exposure(&mut session, ORIGIN);
     let downstream = create_exposure(&mut session, ORIGIN);
     session.connect(downstream, "source", upstream).unwrap();
@@ -1227,7 +1235,7 @@ fn a_gesture_is_judged_on_its_result_and_applied_as_one_step() {
 fn a_gesture_is_decided_again_when_applied() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let proposal = wiring(&[], &[wire(reader, exposure)]);
     assert!(matches!(
         judge(session.network(), proposal.connections.as_ref().unwrap()),
@@ -1242,8 +1250,8 @@ fn a_gesture_is_decided_again_when_applied() {
     assert_presented(&session);
 
     // Two wires into one input are refused whole.
-    let reader = create(&mut session, "b.exr", ORIGIN);
-    let other = create(&mut session, "c.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/b.exr", ORIGIN);
+    let other = create(&mut session, "/shots/c.exr", ORIGIN);
     let steps = session.undo.len();
     let both = wiring(&[], &[wire(reader, exposure), wire(other, exposure)]);
     assert!(session.apply_response(&both).is_empty());
@@ -1265,8 +1273,8 @@ fn pin_labels(session: &Session, id: NodeId) -> Vec<String> {
 #[test]
 fn a_merge_shows_one_free_layer_slot_after_its_last_connected_one() {
     let mut session = Session::new();
-    let a = create(&mut session, "a.exr", ORIGIN);
-    let b = create(&mut session, "b.exr", ORIGIN);
+    let a = create(&mut session, "/shots/a.exr", ORIGIN);
+    let b = create(&mut session, "/shots/b.exr", ORIGIN);
     let merge = create_merge(&mut session, ORIGIN);
     assert_eq!(
         pin_labels(&session, merge),
@@ -1309,7 +1317,7 @@ fn a_merge_shows_one_free_layer_slot_after_its_last_connected_one() {
 #[test]
 fn a_wire_dragged_to_a_free_slot_connects_that_slot() {
     let mut session = Session::new();
-    let a = create(&mut session, "a.exr", ORIGIN);
+    let a = create(&mut session, "/shots/a.exr", ORIGIN);
     let merge = create_merge(&mut session, ORIGIN);
     // The layer input is the second declared, and its slot is the pin's high half.
     let to_slot = |slot: u32| Connection {
@@ -1359,7 +1367,7 @@ fn a_wire_dragged_to_a_free_slot_connects_that_slot() {
 #[test]
 fn a_merge_inserted_after_the_current_node_takes_it_as_its_background() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, Point { x: 200.0, y: 0.0 });
     session.connect(exposure, "source", reader).unwrap();
 
@@ -1445,7 +1453,7 @@ fn invalid_frames_ranges_and_rates_are_refused() {
 #[test]
 fn keys_hold_what_a_frame_resolves_to_not_the_frame() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", reader).unwrap();
     let key = |session: &Session, id| session.result_key(id).unwrap();

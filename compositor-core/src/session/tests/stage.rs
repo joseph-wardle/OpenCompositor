@@ -113,7 +113,7 @@ fn a_new_project_holds_only_the_template_and_the_default_timeline() {
 #[test]
 fn undo_restores_the_root_layer_exactly_and_redo_reapplies() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     let merge = session
         .create_node("merge", ORIGIN, None)
@@ -181,7 +181,7 @@ fn undo_restores_the_root_layer_exactly_and_redo_reapplies() {
 #[test]
 fn a_returning_path_keeps_its_id_and_a_new_node_gets_a_new_name_and_id() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     session.connect(exposure, "source", reader).unwrap();
 
@@ -493,7 +493,7 @@ def OcComp "Comp"
 #[test]
 fn marks_and_selection_stay_out_of_undo() {
     let mut session = Session::new();
-    create(&mut session, "a.exr", ORIGIN);
+    create(&mut session, "/shots/a.exr", ORIGIN);
     let exposure = create_exposure(&mut session, ORIGIN);
     let steps = session.undo.len();
     let label = session.undo_label();
@@ -526,7 +526,7 @@ fn marks_and_selection_stay_out_of_undo() {
 #[test]
 fn deleting_removes_the_nodes_specs_and_every_connection_to_them() {
     let mut session = Session::new();
-    let reader = create(&mut session, "a.exr", ORIGIN);
+    let reader = create(&mut session, "/shots/a.exr", ORIGIN);
     let [first, second, third] = [0; 3].map(|_| create_exposure(&mut session, ORIGIN));
     // The first and second take the Reader, and the third takes the second.
     session.connect(first, "source", reader).unwrap();
