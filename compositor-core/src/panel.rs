@@ -1,7 +1,7 @@
 //! What the parameter panel shows: one node's parameters, their values, and which were set.
 
-use crate::document::{Document, NodeId};
 use crate::files::{Files, scanned_end};
+use crate::network::{Network, NodeId};
 use crate::parameter::{Parameter, Value, resolve};
 
 /// One node's parameters as the panel shows them.
@@ -36,15 +36,15 @@ pub enum ValueState {
 }
 
 impl Panel {
-    /// The node's panel at a frame, or `None` if the document has no such node.
+    /// The node's panel at a frame, or `None` if the network has no such node.
     pub(crate) fn of(
-        document: &Document,
+        network: &Network,
         files: &Files,
         node: NodeId,
         pinned: bool,
         frame: f64,
     ) -> Option<Panel> {
-        let shown = document.node(node)?;
+        let shown = network.node(node)?;
         let resolved = resolve(shown, frame);
         let rows = (shown.kind.parameters().iter())
             .map(|parameter| Row {

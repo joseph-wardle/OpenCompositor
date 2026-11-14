@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{EvalError, ResultKey, result_key};
 use crate::files::{Pattern, Scan, Scanner, readings};
 use crate::gpu::{
@@ -17,8 +16,9 @@ use crate::gpu::{
     ViewerFrame,
 };
 use crate::image::Window;
+use crate::network::{Missing, NodeId, Slot, missing};
 use crate::panel::Panel;
-use crate::parameter::Value;
+use crate::parameter::{Value, ValueError};
 use crate::playback::{
     Direction, FrameMark, Frames, MAX_MARKED_FRAMES, Playback, PlaybackMode, RangeSource, Timebar,
     ntsc_rate,
@@ -826,10 +826,10 @@ impl App {
     /// Keeps the panel on the pinned node, or the current node: shows it when it changed. A pin
     /// on a deleted node is dropped, so undoing the delete does not pin it again.
     fn follow_panel(&mut self, shows: &mut Vec<Request>) {
-        let document = self.session.document();
+        let network = self.session.network();
         if self
             .pinned
-            .is_some_and(|pinned| document.node(pinned).is_none())
+            .is_some_and(|pinned| network.node(pinned).is_none())
         {
             self.pinned = None;
         }
@@ -841,9 +841,9 @@ impl App {
         self.panel_followed = followed;
         let (files, frame) = (self.session.files(), self.session.frame());
         let panel = match self.pinned {
-            Some(pinned) => Panel::of(document, files, pinned, true, frame),
-            None => (document.selection().last())
-                .and_then(|&current| Panel::of(document, files, current, false, frame)),
+            Some(pinned) => Panel::of(network, files, pinned, true, frame),
+            None => (self.session.selection().last())
+                .and_then(|&current| Panel::of(network, files, current, false, frame)),
         };
         if panel != self.shell.panel {
             self.shell.panel.clone_from(&panel);
@@ -1125,7 +1125,7 @@ impl App {
     }
 
     fn delete_selected(&mut self) -> Vec<Request> {
-        let selection = self.session.document().selection().to_vec();
+        let selection = self.session.selection().to_vec();
         if selection.is_empty() {
             return vec![Request::ShowStatus(
                 "Select nodes to delete them".to_owned(),
@@ -1197,7 +1197,7 @@ impl App {
                 Vec::new()
             }
             Command::Reload => {
-                let selection = self.session.document().selection().to_vec();
+                let selection = self.session.selection().to_vec();
                 self.reload(&selection)
             }
             Command::Undo => redraw_if(Pane::Graph, !self.session.undo().is_empty()),
@@ -1206,7 +1206,7 @@ impl App {
                 self.session.viewer_mut().show_slot(slot);
                 vec![Request::Redraw(Pane::Viewer)]
             }
-            Command::MarkSlot(slot) => match self.session.document().selection() {
+            Command::MarkSlot(slot) => match self.session.selection() {
                 &[id] => {
                     let changes = self.session.set_mark(slot, Some(id));
                     debug_assert!(changes.is_ok(), "a selected node exists");
@@ -1303,11 +1303,11 @@ impl App {
             if let Some(node) = viewed
                 && frames.count() <= MAX_MARKED_FRAMES
             {
-                let (document, files) = (session.document(), session.files());
+                let (network, files) = (session.network(), session.files());
                 for index in 0..frames.count() {
                     let frame = frames.frame(index);
-                    marks.keys.push(result_key(document, files, node, frame));
-                    let readings = readings(document, files, node, frame);
+                    marks.keys.push(result_key(network, files, node, frame));
+                    let readings = readings(network, files, node, frame);
                     marks.marks.push(FrameMark {
                         cached: false,
                         missing: (readings.iter()).any(|(_, read)| read.missing().is_some()),
@@ -1369,7 +1369,7 @@ impl App {
             let frame = frames.frame(index);
             let key = match marked.and_then(|keys| keys.get(index as usize)) {
                 Some(key) => key.clone(),
-                None => result_key(session.document(), session.files(), node, frame),
+                None => result_key(session.network(), session.files(), node, frame),
             };
             let Some(key) = key else {
                 continue;
@@ -1398,7 +1398,7 @@ impl App {
         });
         Anchor {
             at: view.to_graph(pointer),
-            current: self.session.document().selection().last().copied(),
+            current: self.session.selection().last().copied(),
         }
     }
 
@@ -1523,7 +1523,18 @@ impl App {
         };
         match intent {
             FileIntent::CreateReaders(Anchor { at, current }) => {
+                let refused = paths.iter().find(|path| path.to_str().is_none()).cloned();
                 self.session.create_readers(paths, at, current);
+                if let Some(path) = refused {
+                    return vec![
+                        Request::Redraw(Pane::Graph),
+                        Request::ShowStatus(format!(
+                            "Cannot read {}: {}",
+                            path.display(),
+                            ValueError::NotUnicode
+                        )),
+                    ];
+                }
             }
             FileIntent::SetFile { node, parameter } => {
                 let file = Value::File(first.into());
@@ -1803,18 +1814,21 @@ impl App {
     /// asked for.
     fn caption(&self) -> String {
         let slot = self.session.viewer().slot().digit();
-        let document = self.session.document();
+        let network = self.session.network();
         let Some(viewed) = self.session.viewed() else {
+            let marked = self.session.mark(self.session.viewer().slot());
             // The next step, for an artist who has not found the menus yet.
-            return if document.nodes().next().is_none() {
-                format!(
+            return match marked.and_then(|absent| self.session.name_of(absent)) {
+                Some(absent) => format!(
+                    "Slot {slot}: {absent} no longer exists. Ctrl+{slot} marks the selected node"
+                ),
+                None if network.nodes().next().is_none() => format!(
                     "Slot {slot}: nothing marked. Read files with R, then mark one with Ctrl+{slot}"
-                )
-            } else {
-                format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node")
+                ),
+                None => format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node"),
             };
         };
-        let node = document.node(viewed).expect("marks name existing nodes");
+        let node = network.node(viewed).expect("the viewed node exists");
         let current = self.viewing.shows_asked();
         let mut details = Vec::new();
         match &self.viewing.shown {
@@ -1847,11 +1861,19 @@ impl App {
             _ => details.push("updating…".to_owned()),
         }
         let (files, frame) = (self.session.files(), self.session.frame());
-        let name = |id| document.node(id).expect("upstream nodes exist").name();
-        for (id, what) in missing(document, viewed, frame) {
+        let name = |id| network.node(id).expect("upstream nodes exist").name();
+        for (id, what) in missing(network, viewed, frame) {
             let (label, lack) = match what {
                 Missing::Input(input) => (input.label, "is not connected"),
                 Missing::File(parameter) => (parameter.label, "is not set"),
+                Missing::Refused(problem) => {
+                    details.push(if id == viewed {
+                        problem.to_string()
+                    } else {
+                        format!("{}: {problem}", name(id))
+                    });
+                    continue;
+                }
             };
             details.push(if id == viewed {
                 format!("{label} {lack}")
@@ -1859,7 +1881,7 @@ impl App {
                 format!("{label} of {} {lack}", name(id))
             });
         }
-        for (id, reading) in readings(document, files, viewed, frame) {
+        for (id, reading) in readings(network, files, viewed, frame) {
             let Some(read) = reading.held() else {
                 continue;
             };

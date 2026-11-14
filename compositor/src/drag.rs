@@ -358,7 +358,7 @@ fn wait_for_image(tries: usize) {
         }
         let (parameter, _) = chain.parameter();
         let before = crate::read_app(|app| {
-            let node = app.session().document().node(node);
+            let node = app.session().network().node(node);
             node.and_then(|node| node.authored_value(parameter).cloned())
         });
         with(|check| check.before = before);
@@ -489,7 +489,7 @@ fn check_steps() -> Vec<String> {
     let state = || {
         crate::read_app(|app| {
             let session = app.session();
-            let value = (session.document().node(node))
+            let value = (session.network().node(node))
                 .and_then(|node| node.authored_value(parameter).cloned());
             (value, session.undo_label(), session.editing().is_some())
         })

@@ -6,8 +6,8 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::document::Node;
 use crate::files::with_hashes;
+use crate::network::Node;
 
 /// One parameter of a node type. OpenFX properties beyond these stay in the plugin adapter.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +104,10 @@ pub(crate) fn validate(
         (ParameterKind::File, Value::File(path)) if path.as_os_str().is_empty() => {
             return Err(ValueError::EmptyPath);
         }
+        // USD holds asset paths as strings.
+        (ParameterKind::File, Value::File(path)) if path.to_str().is_none() => {
+            return Err(ValueError::NotUnicode);
+        }
         (ParameterKind::File, Value::File(path)) => Value::File(with_hashes(path)),
         (ParameterKind::Float(_) | ParameterKind::Frame { .. } | ParameterKind::File, _) => {
             return Err(ValueError::WrongKind);
@@ -135,6 +139,7 @@ pub enum ValueError {
     NotWhole,
     OutOfLimits(RangeInclusive<f64>),
     EmptyPath,
+    NotUnicode,
 }
 
 impl fmt::Display for ValueError {
@@ -151,6 +156,7 @@ impl fmt::Display for ValueError {
                 limits.end()
             ),
             ValueError::EmptyPath => write!(f, "the path is empty"),
+            ValueError::NotUnicode => write!(f, "the path is not Unicode"),
         }
     }
 }

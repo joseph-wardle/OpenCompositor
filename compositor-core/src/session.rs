@@ -1,5 +1,5 @@
-//! One open document with its history, its presentation in OpenNG, the current frame, and the
-//! viewer's state.
+//! One open project: its stage and the network compiled from it, its history, its presentation
+//! in OpenNG, the selection and marks, the current frame, and the viewer's state.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -7,14 +7,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
+use openusd::sdf::{self, Layer, LayerEdit};
+use openusd::usd::Stage;
 
-use crate::document::{
-    Assignment, Changes, ConnectionError, Document, InputSlot, Node, NodeId, NodeKind,
-    ReaderVersion, Slot, TimelineError, node_types,
+use crate::author::{
+    NumberType, ValueEdit, Wire, author_moves, author_node, author_range, author_rate, author_root,
+    author_value, author_wires, input_attribute,
 };
+use crate::compile::Compiler;
 use crate::evaluate::{ResultKey, result_key, result_keys};
 use crate::files::{Files, Pattern, Scan};
-use crate::parameter::{Value, ValueError, describe, resolve};
+use crate::history::{Inverse, Recorder};
+use crate::network::{
+    Assignment, Changes, ConnectionError, InputSlot, Marks, Network, NodeId, NodeKind, Slot,
+    Timeline, TimelineError, node_types,
+};
+use crate::parameter::{Value, ValueError, describe, resolve, validate};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
@@ -24,23 +32,36 @@ const READER_SPACING: f32 = 70.0;
 /// Between a node and one created after or below it.
 const PLACEMENT_GAP: f32 = 40.0;
 
-/// One undo or redo step: the whole document from before it. Unlike an inverse record, a
-/// snapshot cannot forget to restore a field.
+/// What a new project's root layer holds.
+const TEMPLATE: &str = r#"#usda 1.0
+(
+    defaultPrim = "Comp"
+)
+
+def OcComp "Comp"
+{
+}
+"#;
+
+/// Where a project without a comp root puts the one its first node creates.
+const ROOT: &str = "/Comp";
+
+/// One undo or redo step: every spec it touched, as it stood before.
 #[derive(Debug)]
 struct Step {
     label: &'static str,
-    document: Document,
+    inverse: Inverse,
 }
 
-/// An edit applied to the live document as it happens, recorded as one step when it finishes:
-/// a slider drag, or a script setting several values.
+/// An edit applied to the stage as it happens, recorded as one step when it finishes: a slider
+/// drag, or a script setting several values.
 #[derive(Debug)]
 struct EditInProgress {
     label: &'static str,
     /// The edit belongs to this node, not to the selection.
     node: NodeId,
-    /// The document from when the edit began, which finishing records and cancelling restores.
-    before: Document,
+    /// What the edit touched so far, which finishing records and cancelling restores.
+    inverse: Inverse,
 }
 
 /// An edit refused before applying.
@@ -99,39 +120,60 @@ struct Failures {
     nodes: BTreeSet<NodeId>,
 }
 
-/// A document with its undo history, its OpenNG graph and the view of it, the current frame, the
-/// viewer, what is known of its files on disk, and which evaluations failed.
+/// A stage with its compiled network, its undo history, its OpenNG graph and the view of it, the
+/// selection and marks, the current frame, the viewer, what is known of its files on disk, and
+/// which evaluations failed.
 ///
-/// Every applied change, whether an edit, an undo or a redo, updates the graph and the view
-/// before returning the [`Changes`] it made. An edit that changes nothing records no step.
+/// Every edit reaches the stage through a session call, as one transaction on the root layer.
+/// Every applied change, whether an edit, an undo or a redo, updates the network, the graph and
+/// the view before returning the [`Changes`] it made. An edit that changes nothing records no
+/// step.
 ///
 /// A parameter value changes in one step through [`set_value`](Session::set_value) or
 /// [`reset_value`](Session::reset_value), or continuously through an edit in progress:
 /// [`begin_edit`](Session::begin_edit), any number of [`edit_value`](Session::edit_value) and
 /// [`edit_reset`](Session::edit_reset), then [`finish_edit`](Session::finish_edit) to record them
-/// as one step or [`cancel_edit`](Session::cancel_edit) to restore the document from the
-/// beginning.
-#[derive(Debug)]
+/// as one step or [`cancel_edit`](Session::cancel_edit) to restore the stage from the beginning.
 pub struct Session {
-    document: Document,
+    stage: Stage,
+    compiler: Compiler,
+    recorder: Recorder,
     undo: Vec<Step>,
     redo: Vec<Step>,
     editing: Option<EditInProgress>,
-    /// Outside every snapshot, so undo never rewinds it.
-    next_id: u64,
+    /// In selection order, as OpenNG keeps it: the last node is the most recently selected. Only
+    /// nodes the network has.
+    selection: Arc<[NodeId]>,
+    marks: Marks,
+    /// The number the next default name tries first. Never rewound, so that a name returns only
+    /// with its node.
+    next_name: u64,
     graph: Graph,
     graph_view: View,
-    /// The frame evaluated and viewed, one for every pane. Interface state, outside the document,
-    /// so undo never moves it.
+    /// The frame evaluated and viewed, one for every pane. Interface state, outside the stage, so
+    /// undo never moves it.
     frame: f64,
     viewer: Viewer,
     /// Unsaved and not undoable.
     files: Files,
     failures: Failures,
-    /// Counts changes to the document, the frame and the files, which every key is made from.
+    /// Counts changes to the network, the marks, the frame and the files, which every key is made
+    /// from.
     version: u64,
     /// Counts the changes of `version` that were to the frame alone.
     frames_set: u64,
+}
+
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("network", self.network())
+            .field("selection", &self.selection)
+            .field("marks", &self.marks)
+            .field("frame", &self.frame)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Session {
@@ -141,13 +183,38 @@ impl Default for Session {
 }
 
 impl Session {
+    /// A new project: a comp root and nothing in it.
     pub fn new() -> Session {
-        Session {
-            document: Document::default(),
+        let layer = Layer::from_bytes("untitled.usda", TEMPLATE.as_bytes().to_vec())
+            .expect("the template is valid usda");
+        Session::with_root_layer(layer)
+    }
+
+    /// A project whose root layer is the given text, as a file from another tool would be.
+    #[cfg(test)]
+    pub(crate) fn from_usda(text: &str) -> Session {
+        let layer = Layer::from_bytes("test.usda", text.as_bytes().to_vec()).expect("valid usda");
+        Session::with_root_layer(layer)
+    }
+
+    fn with_root_layer(layer: Layer) -> Session {
+        let stage = Stage::builder()
+            .open_layer(layer)
+            .expect("a layer read from memory opens");
+        let recorder = Recorder::default();
+        recorder.install(&stage);
+        let compiler = Compiler::new(&stage);
+        let frame = compiler.timeline().first();
+        let mut session = Session {
+            stage,
+            compiler,
+            recorder,
             undo: Vec::new(),
             redo: Vec::new(),
             editing: None,
-            next_id: 1,
+            selection: Arc::new([]),
+            marks: Marks::default(),
+            next_name: 1,
             graph: Graph::default(),
             graph_view: View::new(Viewport {
                 x: 0,
@@ -156,17 +223,53 @@ impl Session {
                 height: 0,
                 scale_factor: 1.0,
             }),
-            frame: Document::default().timeline().first(),
+            frame,
             viewer: Viewer::new(),
             files: Files::default(),
             failures: Failures::default(),
             version: 0,
             frames_set: 0,
-        }
+        };
+        let everything = Changes {
+            nodes: session.network().nodes().map(|(id, _)| id).collect(),
+            ..Changes::default()
+        };
+        session.present(&everything);
+        session
     }
 
-    pub fn document(&self) -> &Document {
-        &self.document
+    pub fn network(&self) -> &Network {
+        self.compiler.network()
+    }
+
+    pub fn selection(&self) -> &[NodeId] {
+        &self.selection
+    }
+
+    /// The node a slot marks, which the network may lack while an undo has removed it.
+    pub fn mark(&self, slot: Slot) -> Option<NodeId> {
+        self.marks.get(slot)
+    }
+
+    /// The project's frames and rate.
+    pub fn timeline(&self) -> Timeline {
+        self.compiler.timeline()
+    }
+
+    /// Why the timeline the stage authors was refused for the default, if it was.
+    pub fn timeline_error(&self) -> Option<TimelineError> {
+        self.compiler.timeline_error()
+    }
+
+    /// The prim name of a node this session has known, whether or not the network has it now.
+    pub fn name_of(&self, id: NodeId) -> Option<&str> {
+        self.compiler.ids().path(id)?.name()
+    }
+
+    /// The root layer as text, in its format.
+    #[cfg(test)]
+    pub(crate) fn root_layer_text(&self) -> String {
+        (self.stage.root_layer().export_to_string()).expect("the root layer exports")
     }
 
     pub fn graph(&self) -> &Graph {
@@ -185,21 +288,25 @@ impl Session {
         &mut self.viewer
     }
 
-    /// Changes whenever the document, the frame or the files do, so that a key built at one
-    /// version is current while the version is.
+    /// Changes whenever the network, the marks, the frame or the files do, so that a key built at
+    /// one version is current while the version is.
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    /// Changes whenever the document or the files do, but not the frame: what is known of every
-    /// frame at once, such as which are missing, is current while this is.
+    /// Changes whenever the network, the marks or the files do, but not the frame: what is known
+    /// of every frame at once, such as which are missing, is current while this is.
     pub fn content_version(&self) -> u64 {
         self.version - self.frames_set
     }
 
-    /// The node the viewer's slot marks.
+    /// The node the viewer's slot marks, while the network has it.
     pub fn viewed(&self) -> Option<NodeId> {
-        self.document.mark(self.viewer.slot())
+        self.live_mark(self.viewer.slot())
+    }
+
+    fn live_mark(&self, slot: Slot) -> Option<NodeId> {
+        (self.marks.get(slot)).filter(|&id| self.network().node(id).is_some())
     }
 
     pub fn frame(&self) -> f64 {
@@ -208,10 +315,10 @@ impl Session {
 
     /// The key of a node's image at the session's frame, or `None` for no such node.
     pub fn result_key(&self, node: NodeId) -> Option<ResultKey> {
-        result_key(&self.document, &self.files, node, self.frame)
+        result_key(self.network(), &self.files, node, self.frame)
     }
 
-    /// Goes to a frame, refused unless it is finite. Any frame is allowed, inside the document's
+    /// Goes to a frame, refused unless it is finite. Any frame is allowed, inside the timeline's
     /// range or not; what a source gives outside its own frames is the source's to say.
     pub fn set_frame(&mut self, frame: f64) -> Result<(), TimelineError> {
         if !frame.is_finite() {
@@ -228,19 +335,18 @@ impl Session {
         Ok(())
     }
 
-    /// Sets the frames the document spans as one step.
+    /// Sets the frames the project spans as one step, authored even where they are the default's:
+    /// unauthored, other tools read no range at all.
     pub fn set_frame_range(&mut self, first: f64, last: f64) -> Result<Changes, EditError> {
-        let mut document = self.document.clone();
-        document.timeline =
-            (document.timeline.with_range(first, last)).map_err(EditError::Timeline)?;
-        Ok(self.commit("Frame Range", document))
+        let timeline = (self.timeline().with_range(first, last)).map_err(EditError::Timeline)?;
+        Ok(self.commit("Frame Range", |layer| author_range(layer, timeline)))
     }
 
-    /// Sets the rate the document plays at, in frames per second, as one step.
+    /// Sets the rate the project plays at, in frames per second, as one step, authored even where
+    /// it is the default's.
     pub fn set_frame_rate(&mut self, rate: f64) -> Result<Changes, EditError> {
-        let mut document = self.document.clone();
-        document.timeline = (document.timeline.with_rate(rate)).map_err(EditError::Timeline)?;
-        Ok(self.commit("Frame Rate", document))
+        let timeline = (self.timeline().with_rate(rate)).map_err(EditError::Timeline)?;
+        Ok(self.commit("Frame Rate", |layer| author_rate(layer, timeline)))
     }
 
     /// Records that a key was evaluated, which clears the failures of it and of every key
@@ -262,7 +368,7 @@ impl Session {
         self.failures
             .keys
             .retain(|failed| !inside.contains(&failed));
-        let keys = result_keys(&self.document, &self.files, self.frame);
+        let keys = result_keys(self.compiler.network(), &self.files, self.frame);
         if keys.values().any(|key| key == origin) {
             self.failures.keys.push(origin.clone());
         }
@@ -311,8 +417,8 @@ impl Session {
 
     /// The file a node reads, a sequence's pattern: `None` unless it is a Reader with a file.
     fn file_of(&self, node: NodeId) -> Option<Arc<Path>> {
-        let reader = self.document.node(node)?;
-        if !matches!(reader.kind, NodeKind::Reader { .. }) {
+        let reader = self.network().node(node)?;
+        if !matches!(reader.kind, NodeKind::Reader) {
             return None;
         }
         resolve(reader, self.frame).file("file").cloned()
@@ -331,12 +437,12 @@ impl Session {
         reloaded
     }
 
-    /// The sequences the document's Readers read that have not been scanned, each once, in the
+    /// The sequences the network's Readers read that have not been scanned, each once, in the
     /// order of the nodes reading them. Until scanned, a sequence holds nothing and misses
     /// nothing.
     pub fn unscanned(&self) -> Vec<Pattern> {
         let mut unscanned: Vec<Pattern> = Vec::new();
-        for (id, _) in self.document.nodes() {
+        for (id, _) in self.network().nodes() {
             if let Some(sequence) = self.file_of(id).as_ref().and_then(Pattern::parse)
                 && self.files.scan(sequence.path()).is_none()
                 && !unscanned.contains(&sequence)
@@ -347,9 +453,10 @@ impl Session {
         unscanned
     }
 
-    /// Centres the node a slot marks in the graph view. Returns whether the slot marks one.
+    /// Centres the node a slot marks in the graph view. Returns whether the slot marks a node the
+    /// network has.
     pub fn frame_mark(&mut self, slot: Slot) -> bool {
-        let Some(id) = self.document.mark(slot) else {
+        let Some(id) = self.live_mark(slot) else {
             return false;
         };
         self.graph_view.frame(&self.graph, [id.into()]);
@@ -359,10 +466,10 @@ impl Session {
     /// Passes an event to the graph view and applies what it asks for. Returns whether the view
     /// needs drawing again.
     pub fn graph_input(&mut self, event: InputEvent) -> bool {
-        let document = &self.document;
+        let network = self.compiler.network();
         let response = self
             .graph_view
-            .handle_input(&self.graph, event, |edit| judge(document, edit));
+            .handle_input(&self.graph, event, |edit| judge(network, edit));
         let asks = response.selection.is_some()
             || !response.positions.is_empty()
             || response.connections.is_some();
@@ -388,8 +495,50 @@ impl Session {
         self.redo.last().map(|step| step.label)
     }
 
-    /// Creates a Reader for each path, stacked downwards, and selects them all. A Reader of an
-    /// empty path has no file.
+    /// The prim path of a node the session has known.
+    fn path(&self, id: NodeId) -> &sdf::Path {
+        (self.compiler.ids().path(id)).expect("every ID the session hands out has a path")
+    }
+
+    /// The comp root new nodes go under, and whether the edit creating the first must define it.
+    fn root(&self) -> (sdf::Path, bool) {
+        match self.compiler.root() {
+            Some(root) => (root.clone(), false),
+            None => (sdf::Path::new(ROOT).expect("a valid path"), true),
+        }
+    }
+
+    /// A free path for a new node of a kind under the root, interned: the kind's label and the
+    /// lowest number not yet tried this session whose path no prim and no node has had.
+    fn new_node(&mut self, root: &sdf::Path, kind: &NodeKind) -> (NodeId, sdf::Path) {
+        loop {
+            let number = self.next_name;
+            self.next_name += 1;
+            let path = (root.append_path(format!("{}{number}", kind.label())))
+                .expect("a label and a number make a prim name");
+            let taken = self.compiler.ids().contains(&path)
+                || (self.stage.prim(path.clone()).ok())
+                    .is_some_and(|prim| prim.is_valid().unwrap_or(true));
+            if !taken {
+                return (self.compiler.intern(&path), path);
+            }
+        }
+    }
+
+    /// Selects the given nodes, in order, if that changes the selection.
+    fn select(&mut self, selection: Arc<[NodeId]>) -> Changes {
+        let changed = selection != self.selection;
+        if changed {
+            self.selection = selection;
+        }
+        Changes {
+            selection: changed,
+            ..Changes::default()
+        }
+    }
+
+    /// Creates a Reader for each path, stacked downwards, and selects them all. A Reader of a path
+    /// the file parameter refuses, such as an empty one, has no file.
     ///
     /// The stack starts below the current node, as [`create_node`](Session::create_node) places
     /// a type without inputs, or at `at` without one, or if it no longer exists.
@@ -399,32 +548,42 @@ impl Session {
         at: Point,
         current: Option<NodeId>,
     ) -> Changes {
+        if paths.is_empty() {
+            return Changes::default();
+        }
         let at = current
             .and_then(|current| self.below(current))
             .unwrap_or(at);
-        let mut document = self.document.clone();
+        let (root, define_root) = self.root();
         let mut created = Vec::with_capacity(paths.len());
-        for (row, path) in paths.into_iter().enumerate() {
-            let id = NodeId(self.next_id);
-            self.next_id += 1;
-            let mut node = Node::new(
-                NodeKind::Reader {
-                    version: ReaderVersion::CURRENT,
-                },
-                Point {
-                    x: at.x,
-                    y: at.y + row as f32 * READER_SPACING,
-                },
+        let mut readers = Vec::with_capacity(paths.len());
+        for (row, file) in paths.into_iter().enumerate() {
+            let (id, path) = self.new_node(&root, &NodeKind::Reader);
+            let position = Point {
+                x: at.x,
+                y: at.y + row as f32 * READER_SPACING,
+            };
+            let file = validate(
+                NodeKind::Reader.parameters(),
+                "file",
+                Value::File(file.into()),
             );
-            // Refused only for an empty path, which leaves the file absent.
-            node.set_value("file", Value::File(path.into())).ok();
-            document.nodes.insert(id, Arc::new(node));
             created.push(id);
+            readers.push((path, position, file.ok().map(|(_, file)| file)));
         }
-        if !created.is_empty() {
-            document.selection = created.into();
-        }
-        self.commit("Create Reader", document)
+        let selected = self.select(created.into());
+        self.commit_with("Create Reader", selected, |layer| {
+            if define_root {
+                author_root(layer, &root)?;
+            }
+            for (path, position, file) in &readers {
+                author_node(layer, path, &NodeKind::Reader, *position)?;
+                if let Some(file) = file {
+                    author_value(layer, path, "file", file, None)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Creates a node of the type named `type_name`, one of [`node_types`], as one step, and
@@ -445,17 +604,20 @@ impl Session {
             .iter()
             .find(|node_type| node_type.name == type_name)
             .ok_or_else(|| EditError::UnknownType(type_name.to_owned()))?;
-        let id = NodeId(self.next_id);
+        if let Some(current) = current
+            && self.network().node(current).is_none()
+        {
+            return Err(EditError::MissingNode(current));
+        }
+        let (root, define_root) = self.root();
+        let (id, path) = self.new_node(&root, &node_type.kind);
         let mut position = at;
         let mut assignments = Vec::new();
         if let Some(current) = current {
-            if self.document.node(current).is_none() {
-                return Err(EditError::MissingNode(current));
-            }
             if let Some(input) = node_type.kind.inputs().first() {
                 position =
-                    (self.after(current)).expect("the graph presents every node the document has");
-                for (consumer, node) in self.document.nodes() {
+                    (self.after(current)).expect("the graph presents every node the network has");
+                for (consumer, node) in self.network().nodes() {
                     for (input, source) in node.inputs() {
                         if source == current {
                             assignments.push(Assignment {
@@ -473,17 +635,18 @@ impl Session {
                 });
             } else {
                 position =
-                    (self.below(current)).expect("the graph presents every node the document has");
+                    (self.below(current)).expect("the graph presents every node the network has");
             }
         }
-        let mut document = self.document.clone();
-        let node = Node::new(node_type.kind.clone(), position);
-        document.nodes.insert(id, Arc::new(node));
-        let mut document = (document.assign_inputs(&assignments))
-            .expect("a new node takes over existing wires without a cycle");
-        document.selection = [id].into();
-        self.next_id += 1;
-        let mut changes = self.commit(node_type.step, document);
+        let wires = self.wires(&assignments);
+        let selected = self.select([id].into());
+        let mut changes = self.commit_with(node_type.step, selected, |layer| {
+            if define_root {
+                author_root(layer, &root)?;
+            }
+            author_node(layer, &path, &node_type.kind, position)?;
+            author_wires(layer, &wires)
+        });
         if !assignments.is_empty() {
             changes.extend(self.make_room_after(id));
         }
@@ -495,8 +658,9 @@ impl Session {
     /// must be the last one: its width is known only once the graph presents it.
     fn make_room_after(&mut self, node: NodeId) -> Changes {
         let outline = (self.graph.node_rect(node.into()))
-            .expect("the graph presents every node the document has");
-        let overlap = (self.document.nodes())
+            .expect("the graph presents every node the network has");
+        let network = self.network();
+        let overlap = (network.nodes())
             .filter(|(_, consumer)| consumer.inputs().any(|(_, source)| source == node))
             .filter_map(|(consumer, _)| self.graph.node_rect(consumer.into()))
             .filter(|consumer| consumer.intersects(&outline))
@@ -505,12 +669,21 @@ impl Session {
         if overlap <= 0.0 {
             return Changes::default();
         }
-        let mut document = self.document.clone();
-        for id in self.document.downstream_of(node) {
-            let moved = document.nodes.get_mut(&id).expect("downstream nodes exist");
-            Arc::make_mut(moved).position.x += overlap;
+        let moves: Vec<(sdf::Path, Point)> = (network.downstream_of(node).into_iter())
+            .map(|id| {
+                let position = network.node(id).expect("downstream nodes exist").position;
+                let moved = Point {
+                    x: position.x + overlap,
+                    y: position.y,
+                };
+                (self.path(id).clone(), moved)
+            })
+            .collect();
+        let inverse = self.author(|layer| author_moves(layer, &moves));
+        if let Some(step) = self.undo.last_mut() {
+            step.inverse.merge(inverse);
         }
-        self.swap_in(document)
+        self.update(Changes::default())
     }
 
     /// Where a node taking another on its input goes: to its right, as the graph reads left to
@@ -533,35 +706,66 @@ impl Session {
         })
     }
 
-    /// Marks a node in a slot, replacing what the slot marked, or clears the slot.
+    /// Marks a node in a slot, replacing what the slot marked, or clears the slot. Marks are
+    /// outside undo, so this records no step.
     pub fn set_mark(&mut self, slot: Slot, node: Option<NodeId>) -> Result<Changes, EditError> {
         if let Some(id) = node
-            && self.document.node(id).is_none()
+            && self.network().node(id).is_none()
         {
             return Err(EditError::MissingNode(id));
         }
-        let mut document = self.document.clone();
-        document.marks[usize::from(slot.digit())] = node;
-        let label = if node.is_some() { "Mark" } else { "Clear Mark" };
-        Ok(self.commit(label, document))
+        let before = self.marks.get(slot);
+        if before == node {
+            return Ok(Changes::default());
+        }
+        self.marks.set(slot, node);
+        let changes = Changes {
+            nodes: before.into_iter().chain(node).collect(),
+            ..Changes::default()
+        };
+        self.version += 1;
+        self.present(&changes);
+        Ok(changes)
     }
 
-    /// Deletes nodes as one step, disconnecting every input that took one and clearing their
-    /// marks and selection. Refused whole if any of them is already gone.
+    /// Deletes nodes as one step, disconnecting every input that took one. Refused whole if any
+    /// of them is already gone. Their marks stay, doing nothing until an undo brings the nodes
+    /// back.
     ///
     /// A gesture in the graph view ends unapplied, since it may hold a deleted node. Reads of a
-    /// deleted node are left alone: IDs are never reused, so nothing can mistake them.
+    /// deleted node are left alone: its ID returns only with its path, so nothing can mistake
+    /// them.
     pub fn delete_nodes(&mut self, ids: &[NodeId]) -> Result<Changes, EditError> {
-        if let Some(&missing) = ids.iter().find(|&&id| self.document.node(id).is_none()) {
+        if let Some(&missing) = ids.iter().find(|&&id| self.network().node(id).is_none()) {
             return Err(EditError::MissingNode(missing));
         }
         if ids.is_empty() {
             return Ok(Changes::default());
         }
         self.graph_view.cancel_gesture();
-        let document = self.document.without_nodes(ids);
+        let deleted: BTreeSet<NodeId> = ids.iter().copied().collect();
+        let disconnected: Vec<Assignment> = (self.network().nodes())
+            .filter(|(id, _)| !deleted.contains(id))
+            .flat_map(|(consumer, node)| {
+                (node.inputs())
+                    .filter(|(_, source)| deleted.contains(source))
+                    .map(move |(input, _)| Assignment {
+                        consumer,
+                        input,
+                        source: None,
+                    })
+            })
+            .collect();
+        let wires = self.wires(&disconnected);
+        let prims: Vec<sdf::Path> = deleted.iter().map(|&id| self.path(id).clone()).collect();
         // Committing finishes an edit in progress, which may belong to a deleted node.
-        Ok(self.commit("Delete", document))
+        Ok(self.commit("Delete", |layer| {
+            author_wires(layer, &wires)?;
+            for prim in &prims {
+                layer.remove_spec(prim)?;
+            }
+            Ok(())
+        }))
     }
 
     /// Connects a node's input, named or with its slot, to the output of `source`, replacing
@@ -594,65 +798,84 @@ impl Session {
 
     /// Applies connection assignments as one step, or none of them.
     fn assign_inputs(&mut self, assignments: &[Assignment]) -> Result<Changes, EditError> {
-        let document = self
-            .document
-            .assign_inputs(assignments)
-            .map_err(EditError::Connection)?;
-        Ok(self.commit(connection_label(assignments), document))
+        (self.network().assign_inputs(assignments)).map_err(EditError::Connection)?;
+        let wires = self.wires(assignments);
+        Ok(self.commit(connection_label(assignments), |layer| {
+            author_wires(layer, &wires)
+        }))
     }
 
-    /// Applies a view's response. A move is one step, selection included, so that a press that
-    /// selects a node and drags it undoes at once. Selecting alone records no step, as in Nuke and
-    /// Houdini: undo goes back to the last edit, not the last click, and redo survives a click.
+    /// The wires assignments the network accepted author, each consumer's input attribute with
+    /// the source's path or none: only those that change what an input takes.
+    fn wires(&self, assignments: &[Assignment]) -> Vec<Wire> {
+        let network = self.network();
+        (assignments.iter())
+            .filter(|assignment| {
+                let current = network.node(assignment.consumer);
+                current.and_then(|node| node.input(assignment.input)) != assignment.source
+            })
+            .map(|assignment| Wire {
+                consumer: self.path(assignment.consumer).clone(),
+                attribute: input_attribute(assignment.input),
+                source: assignment.source.map(|source| self.path(source).clone()),
+            })
+            .collect()
+    }
+
+    /// Applies a view's response. Selecting records no step, as in Nuke and Houdini: undo goes
+    /// back to the last edit, not the last click, and redo survives a click. A move is one step.
     ///
-    /// A connection edit is decided again against the document as it is now, and applied whole,
+    /// A connection edit is decided again against the network as it is now, and applied whole,
     /// with any move, as one step, or not at all.
     ///
-    /// Nodes the document no longer has are left out: a window-wide undo can remove a node during
+    /// Nodes the network no longer has are left out: a window-wide undo can remove a node during
     /// a gesture. No node has groups yet, so a response never folds.
     pub fn apply_response(&mut self, response: &Response) -> Changes {
-        let mut document = self.document.clone();
+        let mut changes = Changes::default();
         if let Some(selection) = &response.selection {
-            document.selection = selection
-                .iter()
+            let network = self.network();
+            let selection: Arc<[NodeId]> = (selection.iter())
                 .map(|&id| NodeId::from(id))
-                .filter(|id| document.nodes.contains_key(id))
+                .filter(|&id| network.node(id).is_some())
                 .collect();
+            changes = self.select(selection);
         }
-        let mut moved = false;
-        for &(id, position) in &response.positions {
-            if let Some(node) = document.nodes.get_mut(&NodeId::from(id))
-                && node.position != position
-            {
-                Arc::make_mut(node).position = position;
-                moved = true;
-            }
-        }
+        let network = self.network();
+        let moves: Vec<(sdf::Path, Point)> = (response.positions.iter())
+            .filter_map(|&(id, position)| {
+                let id = NodeId::from(id);
+                let moved = network.node(id)?.position != position;
+                moved.then(|| (self.path(id).clone(), position))
+            })
+            .collect();
         let connected = response.connections.as_ref().and_then(|edit| {
-            let assignments = assignments(&document, edit).ok()?;
-            let connected = document.assign_inputs(&assignments).ok()?;
-            let changed = !document.changes_to(&connected).is_empty();
-            changed.then(|| (connection_label(&assignments), connected))
+            let assignments = assignments(network, edit).ok()?;
+            network.assign_inputs(&assignments).ok()?;
+            let wires = self.wires(&assignments);
+            (!wires.is_empty()).then(|| (connection_label(&assignments), wires))
         });
-        if let Some((label, connected)) = connected {
-            self.commit(label, connected)
-        } else if moved {
-            self.commit("Move", document)
-        } else {
-            self.swap_in(document)
+        match connected {
+            Some((label, wires)) => self.commit_with(label, changes, |layer| {
+                author_moves(layer, &moves)?;
+                author_wires(layer, &wires)
+            }),
+            None if !moves.is_empty() => {
+                self.commit_with("Move", changes, |layer| author_moves(layer, &moves))
+            }
+            None => self.update(changes),
         }
     }
 
     /// Begins an edit of a node's values, finishing any edit in progress first.
     pub fn begin_edit(&mut self, node: NodeId, label: &'static str) -> Result<(), EditError> {
-        if self.document.node(node).is_none() {
+        if self.network().node(node).is_none() {
             return Err(EditError::MissingNode(node));
         }
         self.finish_edit();
         self.editing = Some(EditInProgress {
             label,
             node,
-            before: self.document.clone(),
+            inverse: Inverse::default(),
         });
         Ok(())
     }
@@ -662,20 +885,26 @@ impl Session {
         self.editing.as_ref().map(|edit| edit.node)
     }
 
-    /// Sets a value of the edited node in the live document, recording no step yet. A value equal
-    /// to the default stays set.
+    /// Sets a value of the edited node on the stage, recording no step yet. A value equal to the
+    /// default stays set.
     pub fn edit_value(&mut self, parameter: &str, value: Value) -> Result<Changes, EditError> {
         let id = self.editing().ok_or(EditError::NoEditInProgress)?;
-        let (document, _) =
-            self.with_value(id, parameter, |node| node.set_value(parameter, value))?;
-        Ok(self.swap_in(document))
+        let (edit, _) = self.value_edit(id, parameter, Some(value))?;
+        Ok(self.join_edit(edit))
     }
 
-    /// Removes a value of the edited node in the live document, so it reads as its default.
+    /// Removes a value of the edited node from the stage, so it reads as its default.
     pub fn edit_reset(&mut self, parameter: &str) -> Result<Changes, EditError> {
         let id = self.editing().ok_or(EditError::NoEditInProgress)?;
-        let (document, _) = self.with_value(id, parameter, |node| node.reset(parameter))?;
-        Ok(self.swap_in(document))
+        let (edit, _) = self.value_edit(id, parameter, None)?;
+        Ok(self.join_edit(edit))
+    }
+
+    fn join_edit(&mut self, edit: ValueEdit) -> Changes {
+        let inverse = self.author(|layer| edit.author(layer));
+        let editing = self.editing.as_mut().expect("an edit is in progress");
+        editing.inverse.merge(inverse);
+        self.update(Changes::default())
     }
 
     /// Sets a node's value as one step named after the parameter, as a typed value does. A value
@@ -686,74 +915,79 @@ impl Session {
         parameter: &str,
         value: Value,
     ) -> Result<Changes, EditError> {
-        let (document, label) =
-            self.with_value(node, parameter, |edited| edited.set_value(parameter, value))?;
-        Ok(self.commit(label, document))
+        let (edit, label) = self.value_edit(node, parameter, Some(value))?;
+        Ok(self.commit(label, |layer| edit.author(layer)))
     }
 
     /// Removes a node's value as one step, so it reads as its default.
     pub fn reset_value(&mut self, node: NodeId, parameter: &str) -> Result<Changes, EditError> {
-        let (document, _) = self.with_value(node, parameter, |edited| edited.reset(parameter))?;
-        Ok(self.commit("Reset", document))
+        let (edit, _) = self.value_edit(node, parameter, None)?;
+        Ok(self.commit("Reset", |layer| edit.author(layer)))
     }
 
-    /// The document with one node's values edited, and the edited parameter's label.
-    fn with_value(
+    /// The edit that sets a node's value, or removes it for `None`, checked against the
+    /// parameter's description, and the parameter's label.
+    fn value_edit(
         &self,
         id: NodeId,
         parameter: &str,
-        edit: impl FnOnce(&mut Node) -> Result<(), ValueError>,
-    ) -> Result<(Document, &'static str), EditError> {
+        value: Option<Value>,
+    ) -> Result<(ValueEdit, &'static str), EditError> {
         let invalid = |error| EditError::InvalidValue {
             node: id,
             parameter: parameter.to_owned(),
             error,
         };
-        let mut document = self.document.clone();
-        let node = document
-            .nodes
-            .get_mut(&id)
-            .ok_or(EditError::MissingNode(id))?;
-        let label = describe(node.kind.parameters(), parameter)
-            .map_err(invalid)?
-            .label;
-        let mut edited = Node::clone(node);
-        edit(&mut edited).map_err(invalid)?;
-        if edited != **node {
-            *node = Arc::new(edited);
+        let node = self.network().node(id).ok_or(EditError::MissingNode(id))?;
+        let described = describe(node.kind.parameters(), parameter).map_err(invalid)?;
+        let mut edited = node.clone();
+        match value {
+            Some(value) => edited.set_value(parameter, value),
+            None => edited.reset(parameter),
         }
-        Ok((document, label))
+        .map_err(invalid)?;
+        let path = self.path(id).clone();
+        let attribute = (path.append_property(format!("inputs:{}", described.name)))
+            .expect("a parameter's name is a property name");
+        let edit = ValueEdit {
+            number: NumberType::of(&self.stage, &attribute),
+            node: path,
+            parameter: described.name,
+            value: edited.authored_value(described.name).cloned(),
+        };
+        Ok((edit, described.label))
     }
 
-    /// Records the edit in progress as one step, unless it changed nothing.
+    /// Records the edit in progress as one step, unless it changed nothing on the whole.
     pub fn finish_edit(&mut self) {
         let Some(edit) = self.editing.take() else {
             return;
         };
-        if !edit.before.changes_to(&self.document).is_empty() {
+        if !edit.inverse.changes_nothing(&self.stage) {
             self.undo.push(Step {
                 label: edit.label,
-                document: edit.before,
+                inverse: edit.inverse,
             });
             self.redo.clear();
         }
     }
 
-    /// Ends the edit in progress, restoring the document from when it began.
+    /// Ends the edit in progress, restoring the stage from when it began.
     pub fn cancel_edit(&mut self) -> Changes {
-        match self.editing.take() {
-            Some(edit) => self.swap_in(edit.before),
-            None => Changes::default(),
-        }
+        let Some(edit) = self.editing.take() else {
+            return Changes::default();
+        };
+        (edit.inverse.restore(&self.stage)).expect("a recorded state restores");
+        self.update(Changes::default())
     }
 
-    /// Restores the document from before the last step, cancelling any edit in progress first.
+    /// Restores the stage from before the last step, cancelling any edit in progress first.
     pub fn undo(&mut self) -> Changes {
         let mut changes = self.cancel_edit();
         if let Some(step) = self.undo.pop() {
-            let (redo, undone) = self.restore(step);
+            let redo = self.restore(step);
             self.redo.push(redo);
-            changes.extend(undone);
+            changes.extend(self.update(Changes::default()));
         }
         changes
     }
@@ -762,58 +996,84 @@ impl Session {
     pub fn redo(&mut self) -> Changes {
         let mut changes = self.cancel_edit();
         if let Some(step) = self.redo.pop() {
-            let (undo, redone) = self.restore(step);
+            let undo = self.restore(step);
             self.undo.push(undo);
-            changes.extend(redone);
+            changes.extend(self.update(Changes::default()));
         }
         changes
     }
 
-    /// Swaps in the step's document and returns the step that swaps back.
-    fn restore(&mut self, step: Step) -> (Step, Changes) {
-        let changes = self.document.changes_to(&step.document);
-        let current = std::mem::replace(&mut self.document, step.document);
-        self.version += 1;
-        self.present(&changes);
-        let reverse = Step {
+    /// Writes back the step's specs and returns the step that writes them back again.
+    fn restore(&self, step: Step) -> Step {
+        let (restored, inverse) = self.recorder.record(|| step.inverse.restore(&self.stage));
+        restored.expect("a recorded state restores");
+        Step {
             label: step.label,
-            document: current,
-        };
-        (reverse, changes)
-    }
-
-    /// Records an edit as one step, unless it changed nothing. A new step clears redo.
-    ///
-    /// An edit in progress is finished first as its own step: steps are whole documents, so
-    /// otherwise undoing one would undo or half-restore the other.
-    ///
-    /// Every change to which nodes exist comes through here, or through undo and redo, which
-    /// cancel the edit first; `swap_in` carries only the selection and the edit in progress. So
-    /// an edit in progress never outlives its node. A new way to replace the document must keep
-    /// that.
-    fn commit(&mut self, label: &'static str, after: Document) -> Changes {
-        let changes = self.document.changes_to(&after);
-        if changes.is_empty() {
-            return changes;
+            inverse,
         }
-        self.finish_edit();
-        let before = std::mem::replace(&mut self.document, after);
-        self.version += 1;
-        self.undo.push(Step {
-            label,
-            document: before,
-        });
-        self.redo.clear();
-        self.present(&changes);
-        changes
     }
 
-    /// Swaps in a document without recording a step: a change of selection, of the edit in
-    /// progress, or one that joins the step just recorded.
-    fn swap_in(&mut self, after: Document) -> Changes {
-        let changes = self.document.changes_to(&after);
+    /// Authors one transaction on the root layer as a step, unless it changes nothing.
+    fn commit(
+        &mut self,
+        label: &'static str,
+        edit: impl FnOnce(&mut LayerEdit<'_>) -> Result<(), sdf::AuthoringError>,
+    ) -> Changes {
+        self.commit_with(label, Changes::default(), edit)
+    }
+
+    /// As [`commit`](Session::commit), presenting what the session changed beside the stage.
+    ///
+    /// An edit in progress is finished first as its own step, so that undoing one never undoes or
+    /// half-restores the other.
+    fn commit_with(
+        &mut self,
+        label: &'static str,
+        changes: Changes,
+        edit: impl FnOnce(&mut LayerEdit<'_>) -> Result<(), sdf::AuthoringError>,
+    ) -> Changes {
+        self.finish_edit();
+        let inverse = self.author(edit);
+        if !inverse.changes_nothing(&self.stage) {
+            self.undo.push(Step { label, inverse });
+            self.redo.clear();
+        }
+        self.update(changes)
+    }
+
+    /// Authors one transaction on the root layer, and returns what it touched.
+    fn author(
+        &self,
+        edit: impl FnOnce(&mut LayerEdit<'_>) -> Result<(), sdf::AuthoringError>,
+    ) -> Inverse {
+        let root = self.stage.root_layer();
+        let (authored, inverse) = self.recorder.record(|| {
+            (self.stage).batch_edit(&[root.identifier()], |edits| {
+                edit(&mut edits[0]).map_err(Into::into)
+            })
+        });
+        // Every edit is checked against the network before it is authored.
+        authored.expect("the root layer takes the session's edits");
+        inverse
+    }
+
+    /// Compiles what the stage reported, drops selected nodes the network lost, and presents what
+    /// changed, with `changes` the session made beside the stage.
+    fn update(&mut self, mut changes: Changes) -> Changes {
+        let before = self.compiler.network().clone();
+        let timeline = self.compiler.timeline();
+        self.compiler.update(&self.stage);
+        let network = self.compiler.network();
+        changes.nodes.extend(before.changes_to(network));
+        changes.timeline |= self.compiler.timeline() != timeline;
+        if self.selection.iter().any(|&id| network.node(id).is_none()) {
+            self.selection = (self.selection.iter())
+                .copied()
+                .filter(|&id| network.node(id).is_some())
+                .collect();
+            changes.selection = true;
+        }
         if !changes.is_empty() {
-            self.document = after;
             self.version += 1;
             self.present(&changes);
         }
@@ -835,15 +1095,17 @@ impl Session {
             selection: changes.selection,
             timeline: changes.timeline,
         };
+        let network = self.compiler.network();
         let changed = present(
             &mut self.graph,
-            &self.document,
+            network,
+            &self.selection,
+            &self.marks,
             &self.failures.nodes,
             &changes,
         );
-        let document = &self.document;
         self.graph_view
-            .refresh(&self.graph, |edit| judge(document, edit));
+            .refresh(&self.graph, |edit| judge(network, edit));
         changed
     }
 
@@ -852,15 +1114,21 @@ impl Session {
         self.present(&Changes::default())
     }
 
-    /// The nodes whose key at the current frame failed.
+    /// The nodes the stage defines wrongly, and those whose key at the current frame failed.
     fn failing_nodes(&self) -> BTreeSet<NodeId> {
-        if self.failures.keys.is_empty() {
-            return BTreeSet::new();
-        }
-        (result_keys(&self.document, &self.files, self.frame).into_iter())
-            .filter(|(_, key)| self.failures.keys.contains(key))
+        let network = self.network();
+        let mut failing: BTreeSet<NodeId> = (network.nodes())
+            .filter(|(_, node)| node.problem().is_some())
             .map(|(id, _)| id)
-            .collect()
+            .collect();
+        if !self.failures.keys.is_empty() {
+            failing.extend(
+                (result_keys(network, &self.files, self.frame).into_iter())
+                    .filter(|(_, key)| self.failures.keys.contains(key))
+                    .map(|(id, _)| id),
+            );
+        }
+        failing
     }
 }
 

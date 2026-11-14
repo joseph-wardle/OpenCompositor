@@ -1,6 +1,6 @@
-//! What one undo step keeps alive. A step is the whole document from before it, sharing every
-//! node the edit left alone, so it retains only the nodes the edit replaced and the path of the
-//! persistent map down to them. Cloning a node must cost in proportion to its parameter count,
+//! What one edit keeps alive. Its step is the specs it touched, each as it stood before it, and
+//! the network replaces only the nodes it changed, so an edit retains in proportion to what it
+//! touched, never to the project. Cloning a node must cost in proportion to its parameter count,
 //! never its payloads: a value that can grow is shared on its own, not cloned with the node.
 //!
 //! Bytes are counted by this binary's allocator, per thread, so tests running alongside on other
@@ -67,15 +67,16 @@ fn session_of(readers: usize, path_length: usize) -> Session {
     session
 }
 
-/// A step retains its node and the map's path to it. The path deepens logarithmically, so a
-/// document a hundred times larger may retain at most this many times more.
-const LARGER_DOCUMENT_FACTOR: isize = 3;
+/// An edit retains its specs, and in the network its node and the map's path to it. The path
+/// deepens logarithmically, so a project a hundred times larger may retain at most this many
+/// times more.
+const LARGER_PROJECT_FACTOR: isize = 3;
 
 /// What a single-node step may retain at most, against a payload cloned with its node.
 const STEP_CEILING: isize = 16 * 1024;
 
-/// What `edit` retains in a document of 100 Readers and in one of 10,000, each with an Exposure
-/// connected to its first Reader. It must grow with the map's depth, not the document's size.
+/// What `edit` retains in a project of 100 Readers and in one of 10,000, each with an Exposure
+/// connected to its first Reader. It must grow with the map's depth, not the project's size.
 fn assert_retains_its_node_and_map_path(what: &str, edit: impl Fn(&mut Session, Edited)) {
     let [small, large] = [100, 10_000].map(|readers| {
         let mut session = session_of(readers, 16);
@@ -83,7 +84,7 @@ fn assert_retains_its_node_and_map_path(what: &str, edit: impl Fn(&mut Session, 
             .create_node("exposure", Point { x: 0.0, y: 0.0 }, None)
             .unwrap();
         let exposure = *changes.nodes.first().expect("one node created");
-        let readers: Vec<_> = (session.document().nodes())
+        let readers: Vec<_> = (session.network().nodes())
             .map(|(id, _)| id)
             .take(2)
             .collect();
@@ -94,7 +95,7 @@ fn assert_retains_its_node_and_map_path(what: &str, edit: impl Fn(&mut Session, 
         retained_by(|| edit(&mut session, Edited { exposure, second }))
     });
     assert!(
-        large <= LARGER_DOCUMENT_FACTOR * small,
+        large <= LARGER_PROJECT_FACTOR * small,
         "{what} retained {small} bytes at 100 nodes but {large} at 10,000"
     );
     assert!(large <= STEP_CEILING, "{what} retained {large} bytes");
@@ -132,7 +133,7 @@ fn connecting_retains_its_node_and_map_path_alone() {
 fn moving_a_reader_retains_no_copy_of_its_path() {
     let retained = [16, 32 * 1024].map(|path_length| {
         let mut session = session_of(100, path_length);
-        let reader = session.document().selection()[0];
+        let reader = session.selection()[0];
         retained_by(|| {
             session.apply_response(&Response {
                 positions: vec![(reader.into(), Point { x: 5.0, y: 5.0 })],
@@ -140,7 +141,10 @@ fn moving_a_reader_retains_no_copy_of_its_path() {
             });
         })
     });
-    assert_eq!(retained[0], retained[1], "a longer path retained more");
+    // State the process shares with tests on other threads may differ by a byte; a copy of the
+    // path would be 32 KiB.
+    let longer = retained[1] - retained[0];
+    assert!(longer < 64, "a longer path retained {longer} bytes more");
     assert!(
         retained[0] <= STEP_CEILING,
         "a move retained {} bytes",

@@ -492,7 +492,7 @@ fn after_uncached_scrub() {
 }
 
 fn range() -> (f64, f64) {
-    let timeline = crate::read_app(|app| app.session().document().timeline());
+    let timeline = crate::read_app(|app| app.session().timeline());
     (timeline.first(), timeline.last())
 }
 

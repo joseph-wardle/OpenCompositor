@@ -8,7 +8,7 @@ use open_ng::{
 };
 
 use super::*;
-use crate::document::{ExposureVersion, Timeline};
+use crate::network::{Node, Timeline};
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
 
@@ -29,7 +29,7 @@ fn set_file(session: &mut Session, id: NodeId, name: &str) -> Result<Changes, Ed
 
 fn file(session: &Session, id: NodeId) -> Option<Arc<Path>> {
     resolve(
-        session.document().node(id).expect("the node exists"),
+        session.network().node(id).expect("the node exists"),
         session.frame(),
     )
     .file("file")
@@ -40,27 +40,27 @@ fn slot(digit: u8) -> Slot {
     Slot::new(digit).expect("a digit")
 }
 
-/// The graph shows exactly the document: its nodes as they would be presented from scratch, its
-/// wires, and its selection in order.
+/// The graph shows exactly the network: its nodes as they would be presented from scratch, its
+/// wires, and the selection in order.
 fn assert_presented(session: &Session) {
-    let document = session.document();
+    let network = session.network();
     let graph = session.graph();
-    assert_eq!(graph.nodes().count(), document.nodes().count());
-    for (id, node) in document.nodes() {
+    assert_eq!(graph.nodes().count(), network.nodes().count());
+    for (id, node) in network.nodes() {
         assert_eq!(
             graph.node(id.into()),
-            Some(&record(document, &session.failures.nodes, id, node)),
+            Some(&record(&session.marks, &session.failures.nodes, id, node)),
             "{id:?}"
         );
     }
-    let wires: HashSet<Connection> = document
+    let wires: HashSet<Connection> = network
         .nodes()
         .flat_map(|(id, node)| wires_into(id, node))
         .collect();
     let shown: HashSet<Connection> = graph.connections().iter().copied().collect();
     assert_eq!(shown, wires);
     let selection: Vec<NodeId> = graph.selection().iter().map(|&id| id.into()).collect();
-    assert_eq!(selection, document.selection());
+    assert_eq!(selection, session.selection());
 }
 
 /// Sends events to a view as a host does, applying each response before the next event.
@@ -82,7 +82,7 @@ fn a_node_created_after_an_undo_gets_a_new_id() {
     let second = create(&mut session, "b.exr", ORIGIN);
 
     assert_ne!(first, second);
-    assert!(session.document().node(first).is_none());
+    assert!(session.network().node(first).is_none());
     assert!(session.graph().node(first.into()).is_none());
     assert_presented(&session);
 }
@@ -94,8 +94,13 @@ fn a_new_edit_clears_redo() {
     set_file(&mut session, reader, "b.exr").unwrap();
     session.undo();
     assert_eq!(session.redo_label(), Some("File"));
-
+    // A mark is no edit, so redo survives it.
     session.set_mark(slot(1), Some(reader)).unwrap();
+    assert_eq!(session.redo_label(), Some("File"));
+
+    session
+        .set_value(reader, "offset", Value::Float(1.0))
+        .unwrap();
 
     assert_eq!(session.redo_label(), None);
     assert!(session.redo().is_empty());
@@ -108,6 +113,7 @@ fn selecting_and_dragging_a_node_is_one_step() {
     let mut session = Session::new();
     let dragged = create(&mut session, "a.exr", ORIGIN);
     let other = create(&mut session, "b.exr", Point { x: 0.0, y: 200.0 });
+    assert_eq!(session.selection(), [other]);
     let steps = session.undo.len();
     // At 100% zoom the graph origin is at the viewport's centre, so the press is on the dragged
     // node's title and the release 50 units right and 20 down.
@@ -140,13 +146,14 @@ fn selecting_and_dragging_a_node_is_one_step() {
 
     assert_eq!(session.undo.len(), steps + 1);
     assert_eq!(session.undo_label(), Some("Move"));
-    assert_eq!(session.document().selection(), [dragged]);
+    assert_eq!(session.selection(), [dragged]);
     let moved = Point { x: 50.0, y: 20.0 };
-    assert_eq!(session.document().node(dragged).unwrap().position, moved);
+    assert_eq!(session.network().node(dragged).unwrap().position, moved);
 
+    // Selection is outside undo, so the dragged node stays selected.
     session.undo();
-    assert_eq!(session.document().selection(), [other]);
-    assert_eq!(session.document().node(dragged).unwrap().position, ORIGIN);
+    assert_eq!(session.selection(), [dragged]);
+    assert_eq!(session.network().node(dragged).unwrap().position, ORIGIN);
     assert_presented(&session);
 }
 
@@ -168,25 +175,27 @@ fn undo_skips_clicks_that_only_select() {
         assert_presented(&session);
     }
     assert_eq!(session.undo.len(), steps);
-    assert_eq!(session.undo_label(), Some("Mark"));
+    assert_eq!(session.undo_label(), Some("Create Reader"));
 
     session.undo();
-    assert_eq!(session.document().mark(slot(1)), None);
-    assert_eq!(session.document().selection(), [b]);
+    assert!(session.network().node(b).is_none());
+    assert_eq!(session.mark(slot(1)), Some(a));
+    assert_eq!(session.selection(), []);
     assert_presented(&session);
 }
 
 #[test]
-fn the_graph_matches_the_document_after_every_step() {
+fn the_graph_matches_the_network_after_every_step() {
     let mut session = Session::new();
     let readers = session.create_readers(paths(&["a.exr", "b.png", "c.exr"]), ORIGIN, None);
     assert_presented(&session);
     let [a, b, c] = [0, 1, 2].map(|i| *readers.nodes.iter().nth(i).unwrap());
-    assert_eq!(session.document().selection(), [a, b, c]);
+    assert_eq!(session.selection(), [a, b, c]);
 
+    // Marks are set between the steps, and are not steps themselves.
     let edits: [&dyn Fn(&mut Session) -> Changes; 6] = [
         &|s| s.set_mark(slot(1), Some(a)).unwrap(),
-        &|s| s.set_mark(slot(2), Some(a)).unwrap(),
+        &|s| set_file(s, a, "e.exr").unwrap(),
         &|s| s.set_mark(slot(1), Some(c)).unwrap(),
         &|s| set_file(s, b, "d.exr").unwrap(),
         &|s| {
@@ -196,7 +205,7 @@ fn the_graph_matches_the_document_after_every_step() {
                 ..Response::default()
             })
         },
-        &|s| s.set_mark(slot(2), None).unwrap(),
+        &|s| set_file(s, a, "a.exr").unwrap(),
     ];
     for edit in edits {
         assert!(!edit(&mut session).is_empty());
@@ -209,10 +218,12 @@ fn the_graph_matches_the_document_after_every_step() {
         assert_presented(&session);
     }
     assert_eq!(session.graph().nodes().count(), 0);
+    assert_eq!(session.selection(), []);
     while !session.redo().is_empty() {
         assert_presented(&session);
     }
-    assert_eq!(session.document().selection(), [c, a]);
+    assert_eq!(session.selection(), []);
+    assert_eq!(session.graph().node(c.into()).unwrap().title, "c.exr [1]");
     assert_eq!(session.graph().node(b.into()).unwrap().title, "d.exr");
 }
 
@@ -223,22 +234,17 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
     let connected = create_exposure(&mut session, ORIGIN);
     let unconnected = create_exposure(&mut session, ORIGIN);
     session.connect(connected, "source", reader).unwrap();
-    session.set_mark(slot(3), Some(reader)).unwrap();
-    session.set_mark(slot(1), Some(connected)).unwrap();
     session.undo();
     let steps = session.undo.len();
 
     let unchanged = |changes: Changes| assert!(changes.is_empty());
     type Edit<'a> = (&'a str, &'a dyn Fn(&mut Session));
-    let edits: [Edit; 9] = [
+    let edits: [Edit; 8] = [
         ("an empty create", &|s| {
             unchanged(s.create_readers(Vec::new(), ORIGIN, None));
         }),
         ("the same file", &|s| {
             unchanged(set_file(s, reader, "a.exr").unwrap());
-        }),
-        ("the same mark", &|s| {
-            unchanged(s.set_mark(slot(3), Some(reader)).unwrap());
         }),
         ("the same position", &|s| {
             unchanged(s.apply_response(&Response {
@@ -246,11 +252,11 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
                 ..Response::default()
             }));
         }),
-        ("the same connection", &|s| {
-            unchanged(s.connect(connected, "source", reader).unwrap());
-        }),
         ("a disconnect of nothing", &|s| {
             unchanged(s.disconnect(unconnected, "source").unwrap());
+        }),
+        ("a disconnect of what the undo disconnected", &|s| {
+            unchanged(s.disconnect(connected, "source").unwrap());
         }),
         ("a value set then reset", &|s| {
             s.begin_edit(connected, "Set Stops").unwrap();
@@ -261,7 +267,6 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
         ("a reset of an unset value", &|s| {
             unchanged(s.reset_value(unconnected, "stops").unwrap());
         }),
-        // Selection changes the document, but is not a step.
         ("a deselection", &|s| {
             let deselect = Response {
                 selection: Some(Vec::new()),
@@ -273,12 +278,12 @@ fn edits_that_change_nothing_record_nothing_and_keep_redo() {
     for (edit, apply) in edits {
         apply(&mut session);
         assert_eq!(session.undo.len(), steps, "{edit}");
-        assert_eq!(session.redo_label(), Some("Mark"), "{edit}");
+        assert_eq!(session.redo_label(), Some("Connect"), "{edit}");
         assert_presented(&session);
     }
 
     assert!(!session.redo().is_empty());
-    assert_eq!(session.document().mark(slot(1)), Some(connected));
+    assert_eq!(source_of(&session, connected), Some(reader));
 }
 
 #[test]
@@ -292,8 +297,8 @@ fn a_new_file_keeps_the_node_its_position_and_its_marks() {
 
     assert_eq!(changes.nodes.iter().copied().collect::<Vec<_>>(), [reader]);
     assert!(!changes.selection);
-    assert_eq!(session.document().node(reader).unwrap().position, at);
-    assert_eq!(session.document().mark(slot(4)), Some(reader));
+    assert_eq!(session.network().node(reader).unwrap().position, at);
+    assert_eq!(session.mark(slot(4)), Some(reader));
     assert_eq!(
         session.graph().node(reader.into()).unwrap().title,
         "b.exr [4]"
@@ -334,18 +339,18 @@ fn an_exposure_node_is_created_selected_and_undoable() {
 
     let id = *changes.nodes.first().expect("one node created");
     assert!(changes.selection);
-    assert_eq!(session.document().selection(), [id]);
-    let exposure = NodeKind::Exposure {
-        version: ExposureVersion::CURRENT,
-    };
-    assert_eq!(session.document().node(id), Some(&Node::new(exposure, at)));
+    assert_eq!(session.selection(), [id]);
+    let exposure = NodeKind::Exposure;
+    assert_eq!(session.network().node(id), Some(&Node::new(exposure, at)));
     assert_eq!(session.graph().node(id.into()).unwrap().title, "Exposure");
     assert_eq!(session.undo_label(), Some("Create Exposure"));
     assert_presented(&session);
 
+    // Selection is outside undo, so it loses the node and gains nothing back.
     session.undo();
-    assert_eq!(session.document().node(id), None);
-    assert_eq!(session.document().selection(), [reader]);
+    assert_eq!(session.network().node(id), None);
+    assert_eq!(session.selection(), []);
+    assert!(session.network().node(reader).is_some());
     assert_presented(&session);
 }
 
@@ -359,7 +364,7 @@ fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
         id
     });
     session.set_mark(slot(1), Some(reader)).unwrap();
-    let before = session.document().clone();
+    let before = session.network().clone();
     let steps = session.undo.len();
 
     let changes = session.create_node("exposure", ORIGIN, Some(reader));
@@ -369,8 +374,8 @@ fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
         .nodes
         .last()
         .expect("the newest ID is created");
-    let document = session.document();
-    let inserted = document.node(id).unwrap();
+    let network = session.network();
+    let inserted = network.node(id).unwrap();
     let outline = session.graph().node_rect(reader.into()).unwrap();
     assert_eq!(
         inserted.position,
@@ -381,16 +386,16 @@ fn a_node_created_after_the_current_node_is_inserted_in_one_step() {
     );
     assert_eq!(inserted.input("source"), Some(reader));
     for consumer in consumers {
-        assert_eq!(document.node(consumer).unwrap().input("source"), Some(id));
+        assert_eq!(network.node(consumer).unwrap().input("source"), Some(id));
     }
-    assert_eq!(document.selection(), [id]);
-    assert_eq!(document.mark(slot(1)), Some(reader));
+    assert_eq!(session.selection(), [id]);
+    assert_eq!(session.mark(slot(1)), Some(reader));
     assert_eq!(session.undo.len(), steps + 1);
     assert_eq!(session.undo_label(), Some("Create Exposure"));
     assert_presented(&session);
 
     session.undo();
-    assert!(session.document().changes_to(&before).is_empty());
+    assert!(session.network().changes_to(&before).is_empty());
     assert_presented(&session);
 }
 
@@ -410,7 +415,7 @@ fn an_inserted_node_pushes_what_it_feeds_right_when_it_lands_on_it() {
     let unrelated = create_exposure(&mut session, Point { x: 600.0, y: 300.0 });
     session.connect(first, "source", reader).unwrap();
     session.connect(second, "source", first).unwrap();
-    let before = session.document().clone();
+    let before = session.network().clone();
     let steps = session.undo.len();
 
     let changes = session.create_node("exposure", ORIGIN, Some(reader));
@@ -419,7 +424,7 @@ fn an_inserted_node_pushes_what_it_feeds_right_when_it_lands_on_it() {
     let inserted = session.graph().node_rect(id.into()).unwrap();
     let pushed = session.graph().node_rect(first.into()).unwrap();
     assert_eq!(pushed.min.x, inserted.max.x + PLACEMENT_GAP);
-    let position = |id| session.document().node(id).unwrap().position;
+    let position = |id| session.network().node(id).unwrap().position;
     let moved = pushed.min.x - before.node(first).unwrap().position.x;
     assert_eq!(position(second).x, 600.0 + moved);
     assert_eq!(position(unrelated).x, 600.0);
@@ -427,11 +432,11 @@ fn an_inserted_node_pushes_what_it_feeds_right_when_it_lands_on_it() {
     assert_eq!(session.undo.len(), steps + 1);
     assert_presented(&session);
 
-    let after = session.document().clone();
+    let after = session.network().clone();
     session.undo();
-    assert!(session.document().changes_to(&before).is_empty());
+    assert!(session.network().changes_to(&before).is_empty());
     session.redo();
-    assert!(session.document().changes_to(&after).is_empty());
+    assert!(session.network().changes_to(&after).is_empty());
     assert_presented(&session);
 }
 
@@ -451,16 +456,16 @@ fn a_node_without_inputs_is_created_below_the_current_node_unconnected() {
         .expect("the newest ID is created");
     let outline = session.graph().node_rect(exposure.into()).unwrap();
     assert_eq!(
-        session.document().node(id).unwrap().position,
+        session.network().node(id).unwrap().position,
         Point {
             x: outline.min.x,
             y: outline.max.y + PLACEMENT_GAP,
         }
     );
     assert_eq!(file(&session, id), None);
-    let exposure = session.document().node(exposure).unwrap();
+    let exposure = session.network().node(exposure).unwrap();
     assert_eq!(exposure.input("source"), Some(reader));
-    assert_eq!(session.document().selection(), [id]);
+    assert_eq!(session.selection(), [id]);
     assert_eq!(session.undo_label(), Some("Create Reader"));
     assert_presented(&session);
 }
@@ -481,7 +486,7 @@ fn readers_stack_below_the_current_node_or_at_the_point_once_it_is_gone() {
     let positions = changes
         .nodes
         .iter()
-        .map(|&id| session.document().node(id).unwrap().position);
+        .map(|&id| session.network().node(id).unwrap().position);
     assert_eq!(
         positions.collect::<Vec<_>>(),
         [
@@ -496,7 +501,7 @@ fn readers_stack_below_the_current_node_or_at_the_point_once_it_is_gone() {
     session.delete_nodes(&[exposure]).unwrap();
     let changes = session.create_readers(paths(&["c.exr"]), at, Some(exposure));
     let id = *changes.nodes.first().unwrap();
-    assert_eq!(session.document().node(id).unwrap().position, at);
+    assert_eq!(session.network().node(id).unwrap().position, at);
 }
 
 #[test]
@@ -514,7 +519,7 @@ fn creating_by_an_unknown_type_or_after_a_missing_node_changes_nothing() {
         session.create_node("exposure", ORIGIN, Some(reader)),
         Err(EditError::MissingNode(reader))
     );
-    assert_eq!(session.document().nodes().count(), 0);
+    assert_eq!(session.network().nodes().count(), 0);
     assert_eq!(session.undo.len(), steps);
 }
 
@@ -524,7 +529,7 @@ fn every_node_type_is_created_by_its_name() {
     for node_type in node_types() {
         let changes = session.create_node(node_type.name, ORIGIN, None).unwrap();
         let id = *changes.nodes.first().expect("one node created");
-        assert_eq!(session.document().node(id).unwrap().kind, node_type.kind);
+        assert_eq!(session.network().node(id).unwrap().kind, node_type.kind);
         assert_eq!(session.undo_label(), Some(node_type.step));
     }
 }
@@ -544,7 +549,7 @@ fn an_exposure_node_has_no_file() {
             error: ValueError::UnknownParameter,
         })
     );
-    assert_eq!(session.undo_label(), Some("Mark"));
+    assert_eq!(session.undo_label(), Some("Create Exposure"));
 }
 
 #[test]
@@ -640,7 +645,7 @@ fn create_exposure(session: &mut Session, at: Point) -> NodeId {
 
 fn stops(session: &Session, id: NodeId) -> Option<Value> {
     resolve(
-        session.document().node(id).expect("the node exists"),
+        session.network().node(id).expect("the node exists"),
         session.frame(),
     )
     .get("stops")
@@ -671,7 +676,7 @@ fn a_drag_shows_each_value_and_records_one_step() {
     session.undo();
     assert_eq!(
         session
-            .document()
+            .network()
             .node(exposure)
             .unwrap()
             .authored_value("stops"),
@@ -683,7 +688,7 @@ fn a_drag_shows_each_value_and_records_one_step() {
 }
 
 #[test]
-fn cancelling_restores_the_document_from_the_beginning() {
+fn cancelling_restores_the_stage_from_the_beginning() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     session.begin_edit(exposure, "Set Stops").unwrap();
@@ -714,8 +719,9 @@ fn undo_during_an_edit_cancels_it_then_undoes() {
 
     assert_eq!(session.editing(), None);
     assert!(changes.nodes.contains(&exposure));
-    assert_eq!(session.document().node(exposure), None);
-    assert_eq!(session.document().selection(), [reader]);
+    assert_eq!(session.network().node(exposure), None);
+    assert_eq!(session.selection(), []);
+    assert!(session.network().node(reader).is_some());
     assert_eq!(session.redo_label(), Some("Create Exposure"));
     session.redo();
     assert_eq!(stops(&session, exposure), Some(Value::Float(0.0)));
@@ -745,14 +751,14 @@ fn another_edit_finishes_the_edit_in_progress_as_its_own_step() {
     session.undo();
     assert_eq!(
         session
-            .document()
+            .network()
             .node(exposure)
             .unwrap()
             .authored_value("stops"),
         None
     );
     assert_eq!(
-        session.document().node(reader).unwrap().position,
+        session.network().node(reader).unwrap().position,
         Point { x: 0.0, y: 100.0 }
     );
     assert_presented(&session);
@@ -774,13 +780,13 @@ fn selecting_leaves_the_edit_in_progress_running() {
     session.edit_value("stops", Value::Float(-1.0)).unwrap();
     session.finish_edit();
 
-    assert_eq!(session.document().selection(), [reader]);
+    assert_eq!(session.selection(), [reader]);
     assert_eq!(stops(&session, exposure), Some(Value::Float(-1.0)));
     assert_eq!(session.undo.len(), steps + 1);
 }
 
 #[test]
-fn refused_values_leave_the_edit_and_document_unchanged() {
+fn refused_values_leave_the_edit_and_network_unchanged() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     assert_eq!(
@@ -812,7 +818,7 @@ fn refused_values_leave_the_edit_and_document_unchanged() {
 fn a_reader_has_no_values_to_edit() {
     let mut session = Session::new();
     let reader = create(&mut session, "a.exr", ORIGIN);
-    let before = session.document().clone();
+    let before = session.network().clone();
     let steps = session.undo.len();
 
     session.begin_edit(reader, "Set Stops").unwrap();
@@ -825,7 +831,7 @@ fn a_reader_has_no_values_to_edit() {
     assert_eq!(session.edit_reset("stops"), unknown);
     session.finish_edit();
 
-    assert!(before.changes_to(session.document()).is_empty());
+    assert!(before.changes_to(session.network()).is_empty());
     assert_eq!(session.undo.len(), steps);
 }
 
@@ -885,7 +891,7 @@ fn a_set_finishes_the_edit_in_progress_as_its_own_step() {
 }
 
 #[test]
-fn a_refused_set_leaves_the_document_and_history_unchanged() {
+fn a_refused_set_leaves_the_network_and_history_unchanged() {
     let mut session = Session::new();
     let exposure = create_exposure(&mut session, ORIGIN);
     let steps = session.undo.len();
@@ -910,7 +916,7 @@ fn a_refused_set_leaves_the_document_and_history_unchanged() {
 }
 
 fn source_of(session: &Session, consumer: NodeId) -> Option<NodeId> {
-    session.document().node(consumer).unwrap().input("source")
+    session.network().node(consumer).unwrap().input("source")
 }
 
 #[test]
@@ -938,22 +944,21 @@ fn replacing_a_wire_is_one_step_and_undo_restores_it() {
 }
 
 #[test]
-fn a_refused_connection_leaves_the_document_and_history_unchanged() {
+fn a_refused_connection_leaves_the_network_and_history_unchanged() {
     let mut session = Session::new();
     let upstream = create_exposure(&mut session, ORIGIN);
     let downstream = create_exposure(&mut session, ORIGIN);
     session.connect(downstream, "source", upstream).unwrap();
     create(&mut session, "a.exr", ORIGIN);
     session.undo();
-    let before = session.document().clone();
+    let before = session.network().clone();
     let steps = session.undo.len();
 
-    // Why each connection is refused is the document's to test.
     assert_eq!(
         session.connect(upstream, "source", downstream),
         Err(EditError::Connection(ConnectionError::Cycle))
     );
-    assert!(before.changes_to(session.document()).is_empty());
+    assert!(before.changes_to(session.network()).is_empty());
     assert_eq!(session.undo.len(), steps);
     assert_eq!(session.redo_label(), Some("Create Reader"));
 }
@@ -970,23 +975,26 @@ fn deleting_is_one_step_that_undo_restores_whole() {
         selection: Some(vec![exposure.into(), reader.into()]),
         ..Response::default()
     });
-    let before = session.document().clone();
+    let before = session.network().clone();
     let steps = session.undo.len();
 
     session.delete_nodes(&[reader]).unwrap();
     assert_eq!(session.undo.len(), steps + 1);
     assert_eq!(session.undo_label(), Some("Delete"));
-    assert_eq!(session.document().node(reader), None);
+    assert_eq!(session.network().node(reader), None);
     assert_eq!(source_of(&session, exposure), None);
-    assert_eq!(session.document().mark(slot(1)), None);
-    assert_eq!(session.document().selection(), [exposure]);
+    // The mark stays, doing nothing while its node is gone.
+    assert_eq!(session.mark(slot(1)), Some(reader));
+    assert_eq!(session.selection(), [exposure]);
+    session.viewer_mut().show_slot(slot(1));
     assert_eq!(session.viewed(), None);
     assert_presented(&session);
 
     session.undo();
-    assert!(before.changes_to(session.document()).is_empty());
+    assert!(before.changes_to(session.network()).is_empty());
     assert_eq!(source_of(&session, exposure), Some(reader));
-    assert_eq!(session.document().selection(), [exposure, reader]);
+    assert_eq!(session.viewed(), Some(reader));
+    assert_eq!(session.selection(), [exposure]);
     assert_presented(&session);
 }
 
@@ -1003,7 +1011,7 @@ fn deleting_is_refused_whole_if_a_node_is_gone() {
         Err(EditError::MissingNode(gone))
     );
     assert!(session.delete_nodes(&[]).unwrap().is_empty());
-    assert!(session.document().node(reader).is_some());
+    assert!(session.network().node(reader).is_some());
     assert_eq!(session.undo.len(), steps);
     assert_eq!(session.redo_label(), Some("Create Reader"));
 }
@@ -1088,12 +1096,7 @@ fn a_wire_dragged_in_the_graph_connects_as_connect_does() {
     }
 
     assert_eq!(source_of(&session, exposure), Some(reader));
-    assert!(
-        headless
-            .document()
-            .changes_to(session.document())
-            .is_empty()
-    );
+    assert!(headless.network().changes_to(session.network()).is_empty());
     assert_eq!(session.undo.len(), steps + 1);
     assert_eq!(session.undo_label(), Some("Connect"));
     assert_presented(&session);
@@ -1108,7 +1111,7 @@ fn a_wire_dragged_in_the_graph_connects_as_connect_does() {
     let refused = session.connect(exposure, "source", downstream);
     assert_eq!(refused, Err(EditError::Connection(ConnectionError::Cycle)));
     assert_eq!(
-        judge(session.document(), &cycle),
+        judge(session.network(), &cycle),
         Verdict::Refuse {
             reason: Some(ConnectionError::Cycle.to_string())
         }
@@ -1129,7 +1132,7 @@ fn a_wire_onto_a_taken_input_displaces_the_old_one_in_one_step() {
         add: vec![wire(second, exposure)],
     };
     assert_eq!(
-        judge(session.document(), &replacement),
+        judge(session.network(), &replacement),
         Verdict::Accept {
             displaced: vec![wire(first, exposure)]
         }
@@ -1159,7 +1162,7 @@ fn a_gesture_is_judged_on_its_result_and_applied_as_one_step() {
     let dropped = [wire(reader, downstream)];
     assert_eq!(
         judge(
-            session.document(),
+            session.network(),
             &wiring(&lifted, &dropped).connections.unwrap()
         ),
         Verdict::Accept {
@@ -1178,7 +1181,7 @@ fn a_gesture_is_judged_on_its_result_and_applied_as_one_step() {
     // edit also removes it.
     let turn = wiring(&[wire(upstream, downstream)], &[wire(downstream, upstream)]);
     assert!(matches!(
-        judge(session.document(), turn.connections.as_ref().unwrap()),
+        judge(session.network(), turn.connections.as_ref().unwrap()),
         Verdict::Accept { .. }
     ));
     session.apply_response(&turn);
@@ -1195,7 +1198,7 @@ fn a_gesture_is_decided_again_when_applied() {
     let reader = create(&mut session, "a.exr", ORIGIN);
     let proposal = wiring(&[], &[wire(reader, exposure)]);
     assert!(matches!(
-        judge(session.document(), proposal.connections.as_ref().unwrap()),
+        judge(session.network(), proposal.connections.as_ref().unwrap()),
         Verdict::Accept { .. }
     ));
 
@@ -1293,14 +1296,14 @@ fn a_wire_dragged_to_a_free_slot_connects_that_slot() {
     };
 
     assert_eq!(
-        judge(session.document(), &edit(1)),
+        judge(session.network(), &edit(1)),
         Verdict::Accept {
             displaced: Vec::new()
         }
     );
     session.apply_response(&wiring(&[], &[to_slot(1)]));
     assert_eq!(
-        session.document().node(merge).unwrap().input(("layer", 1)),
+        session.network().node(merge).unwrap().input(("layer", 1)),
         Some(a)
     );
     assert_eq!(session.undo_label(), Some("Connect"));
@@ -1308,7 +1311,7 @@ fn a_wire_dragged_to_a_free_slot_connects_that_slot() {
 
     // A slot the input does not have is refused as connect refuses it.
     assert_eq!(
-        judge(session.document(), &edit(0)),
+        judge(session.network(), &edit(0)),
         Verdict::Refuse {
             reason: Some(
                 ConnectionError::UnknownSlot {
@@ -1330,12 +1333,12 @@ fn a_merge_inserted_after_the_current_node_takes_it_as_its_background() {
 
     let changes = session.create_node("merge", ORIGIN, Some(reader)).unwrap();
 
-    let document = session.document();
+    let network = session.network();
     let merge = (changes.nodes.iter().copied())
-        .find(|&id| matches!(document.node(id).unwrap().kind, NodeKind::Merge { .. }))
+        .find(|&id| network.node(id).unwrap().kind == NodeKind::Merge)
         .unwrap();
     assert_eq!(
-        document.node(merge).unwrap().input("background"),
+        network.node(merge).unwrap().input("background"),
         Some(reader)
     );
     assert_eq!(source_of(&session, exposure), Some(merge));
@@ -1353,7 +1356,7 @@ fn the_frame_is_outside_undo_and_the_timeline_is_inside() {
     session.set_frame(-12.0).unwrap();
     assert_eq!(session.frame(), -12.0);
     assert!(session.version() > version);
-    // Undo restores the document, and leaves the frame where it is.
+    // Undo restores the stage, and leaves the frame where it is.
     session.undo();
     assert_eq!(session.frame(), -12.0);
     session.redo();
@@ -1362,18 +1365,22 @@ fn the_frame_is_outside_undo_and_the_timeline_is_inside() {
     assert!(changes.timeline && changes.nodes.is_empty());
     session.set_frame_rate(25.0).unwrap();
     assert_eq!(session.undo_label(), Some("Frame Rate"));
-    let timeline = session.document().timeline();
+    let timeline = session.timeline();
     assert_eq!(
         (timeline.first(), timeline.last(), timeline.rate()),
         (-10.0, 250.0, 25.0)
     );
     session.undo();
     session.undo();
-    assert_eq!(session.document().timeline(), Timeline::default());
-    assert!(session.document().node(exposure).is_some());
+    assert_eq!(session.timeline(), Timeline::default());
+    assert!(session.network().node(exposure).is_some());
 
-    // The same range again changes nothing and records nothing.
+    // The default range is authored when set, since other tools read none where it is unauthored;
+    // the range the root layer authors records nothing.
     assert!(session.set_frame_range(1.0, 100.0).unwrap().is_empty());
+    assert_eq!(session.undo_label(), Some("Frame Range"));
+    session.set_frame_range(1.0, 100.0).unwrap();
+    session.undo();
     assert_eq!(session.undo_label(), Some("Create Exposure"));
 }
 
@@ -1418,3 +1425,5 @@ fn keys_hold_what_a_frame_resolves_to_not_the_frame() {
     // The failure is of the key, which every frame shares.
     assert_eq!(session.failures.nodes, BTreeSet::from([reader]));
 }
+
+mod stage;

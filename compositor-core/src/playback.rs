@@ -26,10 +26,10 @@ pub enum PlaybackMode {
 }
 
 /// Where the frames the timebar spans and playback plays through come from. The viewer's choice,
-/// not the document's; the shell calls the timeline's Global, as Nuke does.
+/// not the project's; the shell calls the timeline's Global, as Nuke does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RangeSource {
-    /// The timeline's, which the document holds.
+    /// The timeline's, which the stage holds.
     #[default]
     Timeline,
     /// The viewed node's sequences', as [`input_range`](crate::input_range) finds them, following
@@ -77,7 +77,7 @@ pub struct FrameMark {
 }
 
 /// The longest timeline whose frames the timebar marks: each frame costs a key and an upstream
-/// walk whenever the document or the files change.
+/// walk whenever the network or the files change.
 pub const MAX_MARKED_FRAMES: i64 = 2_000;
 
 /// The frames per second a timecode counts at a rate: the whole number nearest it, so that
@@ -230,10 +230,10 @@ impl Playback {
     /// The range chosen as the session stands: the timeline's, unless the viewed node's
     /// sequences are chosen and found.
     pub(crate) fn range(&self, session: &Session) -> Range {
-        let timeline = session.document().timeline();
+        let timeline = session.timeline();
         let input = match (self.range_source, session.viewed()) {
             (RangeSource::Input, Some(node)) => {
-                input_range(session.document(), session.files(), node, session.frame())
+                input_range(session.network(), session.files(), node, session.frame())
             }
             _ => None,
         };
@@ -284,7 +284,7 @@ impl Playback {
         let Some(clock) = &mut self.clock else {
             return (None, None);
         };
-        let rate = session.document().timeline().rate();
+        let rate = session.timeline().rate();
         let tick = clock.advance(now, session.frame(), frames, rate, self.looping);
         if tick.stopped {
             self.clock = None;
@@ -324,7 +324,7 @@ impl Playback {
             last: range.last,
             source: self.range_source,
             input_found: range.input_found,
-            rate: session.document().timeline().rate(),
+            rate: session.timeline().rate(),
             frame: session.frame(),
             playing: clock.map(Clock::direction),
             mode: self.mode,

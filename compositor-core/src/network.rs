@@ -1,4 +1,4 @@
-//! The document: everything undo restores, and nothing else.
+//! The network the stage compiles to, and the catalog of node types that defines how.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,8 +12,9 @@ use crate::parameter::{
     FloatParameter, Parameter, ParameterKind, Value, ValueError, describe, resolve, validate,
 };
 
-/// A node's identity. A session never gives two nodes the same ID, even after undoing the
-/// creation of one, so caches, loads in flight and OpenNG gestures cannot confuse them.
+/// A node's identity: its prim's path, numbered for the session. An ID is never given to another
+/// path, so caches, loads in flight and OpenNG gestures cannot confuse two nodes, and a node an
+/// undo brings back has the ID it had.
 ///
 /// OpenNG receives the same number. Its `NodeId` has no `Ord`, which ordered maps need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -47,77 +48,101 @@ impl Slot {
     }
 }
 
+/// What each of the viewer's slots marks, by session ID. Interface state, outside undo: a mark
+/// on a node the network lacks does nothing until undo or redo brings the node back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Marks([Option<NodeId>; Slot::COUNT]);
+
+impl Marks {
+    pub fn get(&self, slot: Slot) -> Option<NodeId> {
+        self.0[usize::from(slot.0)]
+    }
+
+    pub(crate) fn set(&mut self, slot: Slot, node: Option<NodeId>) {
+        self.0[usize::from(slot.0)] = node;
+    }
+
+    /// The slots that mark a node, in slot order.
+    pub fn slots_marking(&self, id: NodeId) -> impl Iterator<Item = Slot> {
+        (0..Slot::COUNT as u8)
+            .map(Slot)
+            .filter(move |&slot| self.get(slot) == Some(id))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     /// Reads the image file its File names, or for a sequence the file numbered the frame less its
     /// Offset, holding the nearest end of its range, from First to Last, outside it. Without a
     /// file it gives the empty image.
-    Reader { version: ReaderVersion },
+    Reader,
     /// Multiplies R, G and B by two to the power of its Stops and leaves A. On premultiplied
     /// pixels that equals unpremultiplying, scaling and premultiplying again.
-    Exposure { version: ExposureVersion },
+    Exposure,
     /// Composes its layers over its background, each layer in slot order over the result so far,
     /// then dissolves that stack by its Mix against the base, the lowest connected input.
-    Merge { version: MergeVersion },
+    Merge,
     /// Blurs its source by its Size, a radius in pixels, every channel as it is, so that
     /// premultiplied edges fade without an unpremultiply; the data window grows by the reach.
-    Blur { version: BlurVersion },
+    Blur,
 }
 
 impl NodeKind {
-    /// What the node offers to be set, as its version describes it.
+    /// What the node offers to be set.
     pub fn parameters(&self) -> &'static [Parameter] {
         match self {
-            NodeKind::Reader {
-                version: ReaderVersion::V1,
-            } => READER_V1,
-            NodeKind::Exposure {
-                version: ExposureVersion::V1,
-            } => EXPOSURE_V1,
-            NodeKind::Merge {
-                version: MergeVersion::V1,
-            } => MERGE_V1,
-            NodeKind::Blur {
-                version: BlurVersion::V1,
-            } => BLUR_V1,
+            NodeKind::Reader => READER_PARAMETERS,
+            NodeKind::Exposure => EXPOSURE_PARAMETERS,
+            NodeKind::Merge => MERGE_PARAMETERS,
+            NodeKind::Blur => BLUR_PARAMETERS,
         }
     }
 
     /// What the artist calls the node's type.
     pub fn label(&self) -> &'static str {
         match self {
-            NodeKind::Reader { .. } => "Reader",
-            NodeKind::Exposure { .. } => "Exposure",
-            NodeKind::Merge { .. } => "Merge",
-            NodeKind::Blur { .. } => "Blur",
+            NodeKind::Reader => "Reader",
+            NodeKind::Exposure => "Exposure",
+            NodeKind::Merge => "Merge",
+            NodeKind::Blur => "Blur",
         }
     }
 
-    /// The images the node takes, as its version declares them.
+    /// The images the node takes.
     pub fn inputs(&self) -> &'static [NodeInput] {
         match self {
-            NodeKind::Reader { .. } => &[],
-            NodeKind::Exposure {
-                version: ExposureVersion::V1,
-            } => EXPOSURE_V1_INPUTS,
-            NodeKind::Merge {
-                version: MergeVersion::V1,
-            } => MERGE_V1_INPUTS,
-            NodeKind::Blur {
-                version: BlurVersion::V1,
-            } => BLUR_V1_INPUTS,
+            NodeKind::Reader => &[],
+            NodeKind::Exposure => EXPOSURE_INPUTS,
+            NodeKind::Merge => MERGE_INPUTS,
+            NodeKind::Blur => BLUR_INPUTS,
         }
+    }
+
+    /// The prim type a node of this kind is authored as. Types, parameters and defaults change in
+    /// place until 1.0; after it, a breaking change takes USD's suffix, as `OcExposure_1`.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            NodeKind::Reader => "OcReader",
+            NodeKind::Exposure => "OcExposure",
+            NodeKind::Merge => "OcMerge",
+            NodeKind::Blur => "OcBlur",
+        }
+    }
+
+    pub(crate) fn of_type(type_name: &str) -> Option<NodeKind> {
+        (NODE_TYPES.iter())
+            .map(|node_type| node_type.kind.clone())
+            .find(|kind| kind.type_name() == type_name)
     }
 }
 
 /// A node type the artist and scripts can create.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeType {
-    /// Unchanged across labels and versions: scripts create nodes by it.
+    /// Unchanged across labels: scripts create nodes by it.
     pub name: &'static str,
     /// What creating one names in the undo history.
     pub(crate) step: &'static str,
-    /// What a new node of the type is: its current version.
     pub(crate) kind: NodeKind,
 }
 
@@ -125,30 +150,22 @@ const NODE_TYPES: &[NodeType] = &[
     NodeType {
         name: "reader",
         step: "Create Reader",
-        kind: NodeKind::Reader {
-            version: ReaderVersion::CURRENT,
-        },
+        kind: NodeKind::Reader,
     },
     NodeType {
         name: "exposure",
         step: "Create Exposure",
-        kind: NodeKind::Exposure {
-            version: ExposureVersion::CURRENT,
-        },
+        kind: NodeKind::Exposure,
     },
     NodeType {
         name: "merge",
         step: "Create Merge",
-        kind: NodeKind::Merge {
-            version: MergeVersion::CURRENT,
-        },
+        kind: NodeKind::Merge,
     },
     NodeType {
         name: "blur",
         step: "Create Blur",
-        kind: NodeKind::Blur {
-            version: BlurVersion::CURRENT,
-        },
+        kind: NodeKind::Blur,
     },
 ];
 
@@ -167,8 +184,8 @@ pub fn node_types() -> &'static [NodeType] {
 /// series of them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeInput {
-    /// Unchanged across labels: connections and scripts address it. Renaming or removing an
-    /// input, or changing what it means, makes a new version of its node type.
+    /// Unchanged across labels: connections and scripts address it, and it names the input's
+    /// attribute, `inputs:` and the name, or for a repeating input's slot the name and its number.
     pub name: &'static str,
     pub label: &'static str,
     /// Whether the input is a series of slots, each taking an image, rather than one image.
@@ -225,18 +242,7 @@ impl fmt::Display for InputSlot<'_> {
     }
 }
 
-/// The parameter descriptions a Reader node was created with, as [`ExposureVersion`] is for
-/// Exposure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ReaderVersion {
-    V1,
-}
-
-impl ReaderVersion {
-    pub const CURRENT: ReaderVersion = ReaderVersion::V1;
-}
-
-const READER_V1: &[Parameter] = &[
+const READER_PARAMETERS: &[Parameter] = &[
     Parameter {
         name: "file",
         label: "File",
@@ -262,18 +268,7 @@ const READER_V1: &[Parameter] = &[
     },
 ];
 
-/// The parameter and input descriptions an Exposure node was created with. A changed default is
-/// a new version, so a node keeps the defaults its values were authored against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ExposureVersion {
-    V1,
-}
-
-impl ExposureVersion {
-    pub const CURRENT: ExposureVersion = ExposureVersion::V1;
-}
-
-const EXPOSURE_V1: &[Parameter] = &[Parameter {
+const EXPOSURE_PARAMETERS: &[Parameter] = &[Parameter {
     name: "stops",
     label: "Stops",
     kind: ParameterKind::Float(FloatParameter {
@@ -284,24 +279,14 @@ const EXPOSURE_V1: &[Parameter] = &[Parameter {
     }),
 }];
 
-const EXPOSURE_V1_INPUTS: &[NodeInput] = &[NodeInput {
+const EXPOSURE_INPUTS: &[NodeInput] = &[NodeInput {
     name: "source",
     label: "Source",
     repeating: false,
     required: true,
 }];
 
-/// The parameter and input descriptions a Merge node was created with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MergeVersion {
-    V1,
-}
-
-impl MergeVersion {
-    pub const CURRENT: MergeVersion = MergeVersion::V1;
-}
-
-const MERGE_V1: &[Parameter] = &[Parameter {
+const MERGE_PARAMETERS: &[Parameter] = &[Parameter {
     name: "mix",
     label: "Mix",
     kind: ParameterKind::Float(FloatParameter {
@@ -313,7 +298,7 @@ const MERGE_V1: &[Parameter] = &[Parameter {
 
 // Neither is required: the base is the lowest connected input, whichever that is, and nothing
 // connected gives the empty image.
-const MERGE_V1_INPUTS: &[NodeInput] = &[
+const MERGE_INPUTS: &[NodeInput] = &[
     NodeInput {
         name: "background",
         label: "Background",
@@ -328,17 +313,7 @@ const MERGE_V1_INPUTS: &[NodeInput] = &[
     },
 ];
 
-/// The parameter and input descriptions a Blur node was created with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BlurVersion {
-    V1,
-}
-
-impl BlurVersion {
-    pub const CURRENT: BlurVersion = BlurVersion::V1;
-}
-
-const BLUR_V1: &[Parameter] = &[Parameter {
+const BLUR_PARAMETERS: &[Parameter] = &[Parameter {
     name: "size",
     label: "Size",
     kind: ParameterKind::Float(FloatParameter {
@@ -349,7 +324,7 @@ const BLUR_V1: &[Parameter] = &[Parameter {
     }),
 }];
 
-const BLUR_V1_INPUTS: &[NodeInput] = &[NodeInput {
+const BLUR_INPUTS: &[NodeInput] = &[NodeInput {
     name: "source",
     label: "Source",
     repeating: false,
@@ -357,7 +332,7 @@ const BLUR_V1_INPUTS: &[NodeInput] = &[NodeInput {
 }];
 
 const _: () = {
-    let tables = [EXPOSURE_V1_INPUTS, MERGE_V1_INPUTS, BLUR_V1_INPUTS];
+    let tables = [EXPOSURE_INPUTS, MERGE_INPUTS, BLUR_INPUTS];
     let mut table = 0;
     while table < tables.len() {
         let mut index = 0;
@@ -378,12 +353,15 @@ pub struct Node {
     pub kind: NodeKind,
     /// The node's top-left corner in graph units, y down, as OpenNG places it.
     pub position: Point,
-    /// Only the values the artist set, each valid for its parameter. An absent value reads as its
-    /// version's default, so a changed default never alters what was authored.
+    /// Only the values the stage authors, each valid for its parameter. An absent value reads as
+    /// its parameter's default.
     authored: BTreeMap<&'static str, Value>,
     /// Only the connected inputs, each naming the node whose output it takes, in input order and
     /// then slot order. An unconnected input is legal and reports itself when evaluated.
     inputs: BTreeMap<InputSlot<'static>, NodeId>,
+    /// Why the stage's definition of the node was refused, which makes it evaluate to the empty
+    /// image and take nothing from its inputs.
+    problem: Option<Arc<str>>,
 }
 
 impl Node {
@@ -393,6 +371,7 @@ impl Node {
             position,
             authored: BTreeMap::new(),
             inputs: BTreeMap::new(),
+            problem: None,
         }
     }
 
@@ -400,15 +379,13 @@ impl Node {
     pub fn name(&self) -> String {
         match &self.kind {
             // A file is never a default, so the authored value is the one every frame reads.
-            NodeKind::Reader { .. } => match self.authored_value("file") {
+            NodeKind::Reader => match self.authored_value("file") {
                 Some(Value::File(path)) => (path.file_name().unwrap_or(path.as_os_str()))
                     .to_string_lossy()
                     .into_owned(),
                 Some(Value::Float(_)) | None => self.kind.label().to_owned(),
             },
-            NodeKind::Exposure { .. } | NodeKind::Merge { .. } | NodeKind::Blur { .. } => {
-                self.kind.label().to_owned()
-            }
+            NodeKind::Exposure | NodeKind::Merge | NodeKind::Blur => self.kind.label().to_owned(),
         }
     }
 
@@ -456,28 +433,48 @@ impl Node {
         self.authored.remove(parameter.name);
         Ok(())
     }
+
+    pub(crate) fn connect(&mut self, input: InputSlot<'static>, source: NodeId) {
+        self.inputs.insert(input, source);
+    }
+
+    /// Why the stage's definition of the node was refused, if it was.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
+    }
+
+    /// Refuses the node's definition, keeping the first reason given.
+    pub(crate) fn refuse(&mut self, problem: impl Into<Arc<str>>) {
+        self.problem.get_or_insert_with(|| problem.into());
+    }
 }
 
 /// Something a node needs to make its image and lacks.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Missing {
     /// An input that takes no image.
     Input(&'static NodeInput),
     /// A file parameter with no file.
     File(&'static Parameter),
+    /// The node itself, which the stage defines wrongly, for the reason given.
+    Refused(Arc<str>),
 }
 
 /// Everything missing on the node and upstream of it at a frame: the node's own first, its files
 /// before its inputs, each in declaration order, and each upstream node once, without recursion.
-/// Empty if the document has no such node.
+/// A refused node reports that alone. Empty if the network has no such node.
 ///
 /// What is missing gives the empty image, so this, not the image, says what is incomplete. An
 /// input a node makes do without, such as a Merge's slots, is never missing. A sequence's missing
 /// frame is no such gap: reading it fails, as [`Reading::missing`](crate::Reading::missing) says.
-pub fn missing(document: &Document, node: NodeId, frame: f64) -> Vec<(NodeId, Missing)> {
+pub fn missing(network: &Network, node: NodeId, frame: f64) -> Vec<(NodeId, Missing)> {
     let mut missing = Vec::new();
-    for id in document.upstream(node) {
-        let current = document.node(id).expect("upstream nodes exist");
+    for id in network.upstream(node) {
+        let current = network.node(id).expect("upstream nodes exist");
+        if let Some(problem) = &current.problem {
+            missing.push((id, Missing::Refused(problem.clone())));
+            continue;
+        }
         let resolved = resolve(current, frame);
         for parameter in current.kind.parameters() {
             if matches!(parameter.kind, ParameterKind::File)
@@ -581,23 +578,16 @@ impl fmt::Display for TimelineError {
 
 impl std::error::Error for TimelineError {}
 
-/// Everything undo restores, and nothing else. Decoded images, GPU resources, Qt objects, the ID
-/// counter, the current frame and viewer state stay out of it.
+/// The nodes the stage defines, as evaluation and the graph read them, by session ID.
 ///
-/// Persistent maps of shared nodes make a copy one pointer copy, and an edit copies only the
+/// Persistent maps of shared nodes make a copy one pointer copy, and a change copies only the
 /// nodes it changes.
 #[derive(Clone, Debug, Default)]
-pub struct Document {
+pub struct Network {
     pub(crate) nodes: OrdMap<NodeId, Arc<Node>>,
-    /// In selection order, as OpenNG keeps it: the last node is the most recently selected. A
-    /// per-node flag or a set would lose the order on undo.
-    pub(crate) selection: Arc<[NodeId]>,
-    /// Each names a node the document has: deleting a node clears its marks.
-    pub(crate) marks: [Option<NodeId>; Slot::COUNT],
-    pub(crate) timeline: Timeline,
 }
 
-impl Document {
+impl Network {
     pub fn node(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(&id).map(|node| &**node)
     }
@@ -607,35 +597,15 @@ impl Document {
         self.nodes.iter().map(|(&id, node)| (id, &**node))
     }
 
-    pub fn selection(&self) -> &[NodeId] {
-        &self.selection
-    }
-
-    pub fn timeline(&self) -> Timeline {
-        self.timeline
-    }
-
-    /// The node marked in a slot.
-    pub fn mark(&self, slot: Slot) -> Option<NodeId> {
-        self.marks[usize::from(slot.0)]
-    }
-
-    /// The slots that mark a node, in slot order.
-    pub fn slots_marking(&self, id: NodeId) -> impl Iterator<Item = Slot> {
-        (0..Slot::COUNT as u8)
-            .map(Slot)
-            .filter(move |&slot| self.mark(slot) == Some(id))
-    }
-
-    /// This document with every assignment applied, refused whole if any assignment names a
+    /// This network with every assignment applied, refused whole if any assignment names a
     /// missing node or an input or slot its node does not have, or if the result connects a node
     /// to itself or has a cycle.
     ///
     /// Only the result is judged, so a batch can move a wire that would form a cycle while the
     /// wire it replaces is still in place. An assignment that changes nothing keeps its node
     /// shared, so a batch of them yields no changes.
-    pub fn assign_inputs(&self, assignments: &[Assignment]) -> Result<Document, ConnectionError> {
-        let mut document = self.clone();
+    pub fn assign_inputs(&self, assignments: &[Assignment]) -> Result<Network, ConnectionError> {
+        let mut network = self.clone();
         let mut assigned = BTreeSet::new();
         for assignment in assignments {
             let consumer = self
@@ -656,7 +626,7 @@ impl Document {
             if consumer.input(input) == assignment.source {
                 continue;
             }
-            let node = document
+            let node = network
                 .nodes
                 .get_mut(&assignment.consumer)
                 .expect("the consumer was found above");
@@ -668,54 +638,17 @@ impl Document {
         }
         for assignment in assignments {
             if let Some(source) = assignment.source
-                && document.is_upstream_of(assignment.consumer, source)
+                && network.is_upstream_of(assignment.consumer, source)
             {
                 return Err(ConnectionError::Cycle);
             }
         }
-        Ok(document)
+        Ok(network)
     }
 
-    /// This document without the given nodes, and without every input, mark and selection entry
-    /// that named one.
-    pub(crate) fn without_nodes(&self, ids: &[NodeId]) -> Document {
-        let deleted: BTreeSet<NodeId> = ids.iter().copied().collect();
-        let mut document = self.clone();
-        for id in &deleted {
-            document.nodes.remove(id);
-        }
-        let consumers: Vec<NodeId> = document
-            .nodes()
-            .filter(|(_, node)| node.inputs.values().any(|source| deleted.contains(source)))
-            .map(|(id, _)| id)
-            .collect();
-        for id in consumers {
-            let node = document
-                .nodes
-                .get_mut(&id)
-                .expect("the consumer was found above");
-            Arc::make_mut(node)
-                .inputs
-                .retain(|_, source| !deleted.contains(source));
-        }
-        if self.selection.iter().any(|id| deleted.contains(id)) {
-            document.selection = self
-                .selection
-                .iter()
-                .copied()
-                .filter(|id| !deleted.contains(id))
-                .collect();
-        }
-        for mark in &mut document.marks {
-            if mark.is_some_and(|id| deleted.contains(&id)) {
-                *mark = None;
-            }
-        }
-        document
-    }
-
-    /// The node and every node upstream of it, each once, depth first with each node's inputs in
-    /// order, without recursion. Empty if the document has no such node.
+    /// The node and every node upstream of it that it takes an image from, each once, depth first
+    /// with each node's inputs in order, without recursion: a refused node takes none. Empty if
+    /// the network has no such node.
     pub(crate) fn upstream(&self, node: NodeId) -> Vec<NodeId> {
         let mut upstream = Vec::new();
         let mut visited = BTreeSet::new();
@@ -725,6 +658,9 @@ impl Document {
                 continue;
             };
             upstream.push(id);
+            if current.problem.is_some() {
+                continue;
+            }
             // Reversed, so that the first input's chain is visited first.
             let sources: Vec<NodeId> = current.inputs().map(|(_, source)| source).collect();
             pending.extend(sources.into_iter().rev());
@@ -763,29 +699,15 @@ impl Document {
         downstream
     }
 
-    /// What differs from this document to `after`. Subtrees and nodes the two share are skipped
-    /// without comparing them.
-    pub(crate) fn changes_to(&self, after: &Document) -> Changes {
-        let mut nodes: BTreeSet<NodeId> = self
-            .nodes
-            .diff(&after.nodes)
+    /// The nodes that differ from this network to `after`: added, removed or changed. Subtrees
+    /// and nodes the two share are skipped without comparing them.
+    pub(crate) fn changes_to(&self, after: &Network) -> BTreeSet<NodeId> {
+        (self.nodes.diff(&after.nodes))
             .map(|item| match item {
                 DiffItem::Add(&id, _) | DiffItem::Remove(&id, _) => id,
                 DiffItem::Update { new: (&id, _), .. } => id,
             })
-            .collect();
-        for (before, after) in self.marks.iter().zip(&after.marks) {
-            if before != after {
-                // A node's marks are part of how it is presented.
-                nodes.extend(before.iter().chain(after));
-            }
-        }
-        Changes {
-            nodes,
-            selection: !Arc::ptr_eq(&self.selection, &after.selection)
-                && self.selection != after.selection,
-            timeline: self.timeline != after.timeline,
-        }
+            .collect()
     }
 }
 
@@ -859,9 +781,8 @@ impl std::error::Error for ConnectionError {}
 
 /// What one applied change touched: an edit, an undo or a redo.
 ///
-/// Presentation updates from this alone. How the document is stored and compared stays behind
-/// it, so replacing snapshots with inverse edits, or with a store's change notices, changes what
-/// fills it and nothing that reads it.
+/// Presentation updates from this alone, whatever filled it: the compiler's network, or the
+/// session's selection and marks.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Changes {
     /// Nodes added, removed, or changed in content, position or marks.

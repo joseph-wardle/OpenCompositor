@@ -3,9 +3,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use super::*;
-use crate::document::NodeKind;
 use crate::evaluate::EvalError;
 use crate::image::ImageInfo;
+use crate::network::NodeKind;
 use crate::panel::ValueState;
 use crate::parameter::{Value, resolve};
 use crate::read::ReadError;
@@ -100,7 +100,7 @@ fn input(pane: Pane, input: Input) -> Event {
 }
 
 fn file(app: &App, id: NodeId) -> Option<Arc<Path>> {
-    let node = app.session().document().node(id)?;
+    let node = app.session().network().node(id)?;
     resolve(node, 1.0).file("file").cloned()
 }
 
@@ -113,7 +113,7 @@ fn create(app: &mut App, path: &str) -> NodeId {
         }),
         paths: vec![PathBuf::from(path)],
     });
-    app.session().document().selection()[0]
+    app.session().selection()[0]
 }
 
 fn slot_key(digit: u8, modifiers: Modifiers) -> Event {
@@ -211,10 +211,10 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
             Request::Redraw(Pane::Graph)
         ]
     );
-    let document = app.session().document();
-    assert_eq!(document.nodes().count(), 2);
-    let first = document.selection()[0];
-    assert_eq!(document.node(first).unwrap().position, at);
+    let network = app.session().network();
+    assert_eq!(network.nodes().count(), 2);
+    let first = app.session().selection()[0];
+    assert_eq!(network.node(first).unwrap().position, at);
     assert!(
         deliveries.recv_timeout(Duration::from_millis(100)).is_err(),
         "a Reader no slot marks was read"
@@ -274,7 +274,7 @@ fn changing_a_readers_file_fails_if_it_went_while_the_dialog_was_open() {
         intent: create,
         paths,
     });
-    let id = app.session().document().selection()[0];
+    let id = app.session().selection()[0];
 
     // As the panel's Browse… asks.
     let intent = FileIntent::SetFile {
@@ -387,7 +387,7 @@ fn only_the_graph_losing_the_keyboard_cancels_its_gesture() {
             }),
             paths: vec![PathBuf::from("/nonexistent/a.exr")],
         });
-        let id = app.session().document().selection()[0];
+        let id = app.session().selection()[0];
         // Just inside the Reader's top-left corner, at the graph origin.
         let press = PhysicalPoint { x: 204.0, y: 154.0 };
         app.dispatch(input(Pane::Graph, Input::PointerEntered));
@@ -413,7 +413,7 @@ fn only_the_graph_losing_the_keyboard_cancels_its_gesture() {
                 button: Button::Left,
             },
         ));
-        app.session().document().node(id).unwrap().position
+        app.session().network().node(id).unwrap().position
     };
 
     assert_eq!(drag(Pane::Viewer), Point { x: 50.0, y: 0.0 });
@@ -428,10 +428,7 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
 
     let requests = app.dispatch(slot_key(3, CTRL));
 
-    assert_eq!(
-        app.session().document().mark(Slot::new(3).unwrap()),
-        Some(id)
-    );
+    assert_eq!(app.session().mark(Slot::new(3).unwrap()), Some(id));
     assert_eq!(app.session().viewer().slot().digit(), 3);
     // Only the caption says it is updating, so the node keeps its size.
     assert_eq!(title(&app, id), "a.exr [3]");
@@ -468,7 +465,7 @@ fn shift_and_a_digit_frames_the_node_the_slot_marks() {
     );
     let after = app.session().graph_view().to_graph(middle);
     assert_ne!(after, before);
-    assert_eq!(app.session().document().selection(), [id]);
+    assert_eq!(app.session().selection(), [id]);
 }
 
 #[test]
@@ -757,22 +754,23 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
 }
 
 #[test]
-fn undoing_a_mark_leaves_the_viewer_showing_nothing() {
+fn undoing_the_marked_nodes_creation_leaves_its_mark_doing_nothing() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
     app.dispatch(read(&asked(&app), 4, 4));
 
+    // The mark is no step, so undo undoes the creation, and the mark names a node that is gone.
     let requests = app.dispatch(Event::Command(Command::Undo));
 
     assert!(requests.contains(&Request::Redraw(Pane::Viewer)));
     assert!(matches!(app.viewing.shown, Shown::Nothing));
     assert_eq!(
         app.shell.caption,
-        "Slot 1: nothing marked. Ctrl+1 marks the selected node"
+        "Slot 1: Reader1 no longer exists. Ctrl+1 marks the selected node"
     );
 
-    // Redo marks it again, and the file is read again.
+    // Redo brings the node back to its mark, and the file is read again.
     app.dispatch(Event::Command(Command::Redo));
     assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
 }
@@ -820,19 +818,19 @@ fn delete_in_the_graph_deletes_the_selection_and_the_viewer_lets_go() {
     // Over the viewer, Delete does nothing.
     app.dispatch(input(Pane::Viewer, Input::PointerEntered));
     assert!(app.dispatch(delete()).is_empty());
-    assert!(app.session().document().node(id).is_some());
+    assert!(app.session().network().node(id).is_some());
 
     app.dispatch(input(Pane::Viewer, Input::PointerLeft));
     app.dispatch(input(Pane::Graph, Input::PointerEntered));
     let requests = app.dispatch(delete());
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
-    assert_eq!(app.session().document().node(id), None);
-    assert!(app.session().document().node(kept).is_some());
+    assert_eq!(app.session().network().node(id), None);
+    assert!(app.session().network().node(kept).is_some());
     assert_eq!(app.session().undo_label(), Some("Delete"));
     assert!(matches!(app.viewing.asked, Asked::Nothing));
     assert_eq!(
         app.shell.caption,
-        "Slot 1: nothing marked. Ctrl+1 marks the selected node"
+        "Slot 1: Reader2 no longer exists. Ctrl+1 marks the selected node"
     );
 
     assert!(matches!(
@@ -974,12 +972,12 @@ fn a_type_chosen_without_a_current_node_goes_where_the_pointer_was() {
     });
 
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
-    let document = app.session().document();
-    let &[id] = document.selection() else {
+    let network = app.session().network();
+    let &[id] = app.session().selection() else {
         panic!("one node selected")
     };
-    let node = document.node(id).unwrap();
-    assert!(matches!(node.kind, NodeKind::Exposure { .. }));
+    let node = network.node(id).unwrap();
+    assert!(matches!(node.kind, NodeKind::Exposure));
     assert_eq!(node.position, at);
     assert_eq!(app.session().undo_label(), Some("Create Exposure"));
 }
@@ -1005,23 +1003,23 @@ fn a_reader_chosen_in_the_menu_asks_for_its_files_and_goes_below_the_current_nod
         intent,
         paths: Vec::new(),
     });
-    assert_eq!(app.session().document().nodes().count(), 1);
+    assert_eq!(app.session().network().nodes().count(), 1);
     assert_eq!(app.session().undo_label(), Some("Create Exposure"));
 
     app.dispatch(Event::FilesChosen {
         intent,
         paths: vec!["/nonexistent/a.exr".into(), "/nonexistent/b.exr".into()],
     });
-    let document = app.session().document();
-    let &[first, _] = document.selection() else {
+    let network = app.session().network();
+    let &[first, _] = app.session().selection() else {
         panic!("both Readers selected")
     };
     let outline = app.session().graph().node_rect(exposure.into()).unwrap();
-    assert_eq!(document.node(first).unwrap().position.x, outline.min.x);
-    assert!(document.node(first).unwrap().position.y > outline.max.y);
+    assert_eq!(network.node(first).unwrap().position.x, outline.min.x);
+    assert!(network.node(first).unwrap().position.y > outline.max.y);
     assert_eq!(app.session().undo_label(), Some("Create Reader"));
     app.dispatch(Event::Command(Command::Undo));
-    assert_eq!(app.session().document().nodes().count(), 1);
+    assert_eq!(app.session().network().nodes().count(), 1);
 }
 
 #[test]
@@ -1133,7 +1131,7 @@ fn the_panel_follows_the_current_node_and_whether_its_values_were_set() {
     );
 
     let requests = choose_in_menu(&mut app, "exposure");
-    let exposure = app.session().document().selection()[0];
+    let exposure = app.session().selection()[0];
     assert_eq!(app.shell.panel.as_ref().unwrap().node, exposure);
     let default = (Some(Value::Float(0.0)), ValueState::Absent);
     assert_eq!(only_row(&requests), default);
@@ -1183,13 +1181,13 @@ fn a_pinned_panel_stays_on_its_node_until_unpinned_or_the_node_is_deleted() {
 
     let requests = choose_in_menu(&mut app, "exposure");
     assert_eq!(shown_panel(&requests), None);
-    let exposure = app.session().document().selection()[0];
+    let exposure = app.session().selection()[0];
 
     let requests = app.dispatch(Event::Command(Command::UnpinPanel));
     let panel = shown_panel(&requests).flatten().unwrap();
     assert_eq!((panel.node, panel.pinned), (exposure, false));
 
-    // Undoing the delete brings the node back, not the pin.
+    // Undoing the delete brings the node back, not the pin, nor the selection the panel follows.
     app.dispatch(Event::Command(Command::PinPanel));
     app.dispatch(input(Pane::Graph, Input::PointerEntered));
     app.dispatch(Event::KeyPressed {
@@ -1198,8 +1196,8 @@ fn a_pinned_panel_stays_on_its_node_until_unpinned_or_the_node_is_deleted() {
     });
     assert_eq!(app.shell.panel, None);
     app.dispatch(Event::Command(Command::Undo));
-    let panel = app.shell.panel.as_ref().unwrap();
-    assert_eq!((panel.node, panel.pinned), (exposure, false));
+    assert!(app.session().network().node(exposure).is_some());
+    assert_eq!(app.shell.panel, None);
 }
 
 #[test]
@@ -1488,7 +1486,7 @@ fn a_device_loss_drops_the_read_of_its_copy_of_the_image() {
 }
 
 #[test]
-fn e_steps_the_viewers_exposure_and_its_control_follows_without_editing_the_document() {
+fn e_steps_the_viewers_exposure_and_its_control_follows_without_an_edit() {
     let (mut app, _deliveries) = viewing_a_cropped_image();
     app.dispatch(input(Pane::Viewer, Input::PointerEntered));
     let version = app.session().version();
@@ -1636,14 +1634,14 @@ fn a_frame_chosen_in_the_dialog_reads_its_sequence_once_a_scan_finds_other_frame
         }),
         paths: chosen,
     });
-    assert_eq!(app.session().document().nodes().count(), 0);
+    assert_eq!(app.session().network().nodes().count(), 0);
     let first = next_scan(&scans);
     app.dispatch(first);
-    assert_eq!(app.session().document().nodes().count(), 0);
+    assert_eq!(app.session().network().nodes().count(), 0);
     let requests = app.dispatch(next_scan(&scans));
 
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
-    let created = app.session().document().selection().to_vec();
+    let created = app.session().selection().to_vec();
     assert_eq!(
         files_of(&app, &created),
         [
@@ -2161,9 +2159,9 @@ fn the_input_range_spans_the_viewed_sequence_moved_by_its_offset_and_playback_ke
     });
     assert_eq!(span(&app), (11.0, 14.0, true));
     assert_eq!(
-        app.session().document().timeline().last(),
+        app.session().timeline().last(),
         9.0,
-        "the document's range is left alone"
+        "the project's range is left alone"
     );
 
     let still = pattern.with_file_name("still.png");

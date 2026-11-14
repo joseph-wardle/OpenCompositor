@@ -1,4 +1,4 @@
-//! How the document appears in OpenNG, and what OpenNG's connection edits mean to it.
+//! How the network appears in OpenNG, and what OpenNG's connection edits mean to it.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -7,14 +7,15 @@ use open_ng::{
     Verdict,
 };
 
-use crate::document::{
-    Assignment, Changes, ConnectionError, Document, InputSlot, MAX_SLOTS, Node, NodeId, NodeKind,
+use crate::network::{
+    Assignment, Changes, ConnectionError, InputSlot, MAX_SLOTS, Marks, Network, Node, NodeId,
+    NodeKind,
 };
 
 /// Every node's one output. An input's pin is derived from its declaration index and, for a
 /// repeating input, its slot, so pins are never stored and a slot's pin is its own for the
-/// node's life: a version that reorders or removes inputs would need pins of its own that are
-/// never reused.
+/// node's life: a change to a type that reorders or removes inputs would need pins of its own
+/// that are never reused.
 const OUTPUT_PIN: PinId = PinId(0);
 
 const READER_COLOR: Color = Color {
@@ -46,18 +47,20 @@ const FAILED_COLOR: Color = Color {
 /// elides titles itself.
 const MAX_NAME_CHARS: usize = 32;
 
-/// Brings the graph in line with the document and the nodes shown failed, for the nodes and
-/// selection `changes` names only. Returns whether the graph changed.
+/// Brings the graph in line with the network, the selection, the marks and the nodes shown failed,
+/// for the nodes and selection `changes` names only. Returns whether the graph changed.
 pub(crate) fn present(
     graph: &mut Graph,
-    document: &Document,
+    network: &Network,
+    selection: &[NodeId],
+    marks: &Marks,
     failing: &BTreeSet<NodeId>,
     changes: &Changes,
 ) -> bool {
     let mut changed = false;
     let mut moved = Vec::new();
     for &id in &changes.nodes {
-        match (document.node(id), graph.node(id.into())) {
+        match (network.node(id), graph.node(id.into())) {
             (None, Some(_)) => {
                 graph.remove_node(id.into()).expect("the node is shown");
                 changed = true;
@@ -65,12 +68,12 @@ pub(crate) fn present(
             (None, None) => {}
             (Some(node), None) => {
                 graph
-                    .add_node(id.into(), record(document, failing, id, node))
+                    .add_node(id.into(), record(marks, failing, id, node))
                     .expect("the node is not shown");
                 changed = true;
             }
             (Some(node), Some(shown)) => {
-                let record = record(document, failing, id, node);
+                let record = record(marks, failing, id, node);
                 // Updating a record lays the node out again; moving it does not.
                 if record.title == shown.title
                     && record.color == shown.color
@@ -95,7 +98,7 @@ pub(crate) fn present(
     let wanted: HashSet<Connection> = changes
         .nodes
         .iter()
-        .filter_map(|&id| Some((id, document.node(id)?)))
+        .filter_map(|&id| Some((id, network.node(id)?)))
         .flat_map(|(id, node)| wires_into(id, node))
         .collect();
     let unwanted: Vec<Connection> = graph
@@ -115,7 +118,7 @@ pub(crate) fn present(
         }
     }
     if changes.selection {
-        let selection: Vec<_> = document.selection().iter().map(|&id| id.into()).collect();
+        let selection: Vec<_> = selection.iter().map(|&id| id.into()).collect();
         graph
             .set_selection(&selection)
             .expect("selected nodes are shown, once each");
@@ -124,22 +127,22 @@ pub(crate) fn present(
 }
 
 pub(crate) fn record(
-    document: &Document,
+    marks: &Marks,
     failing: &BTreeSet<NodeId>,
     id: NodeId,
     node: &Node,
 ) -> NodeRecord {
     let mut title = shorten(&node.name());
     let color = match node.kind {
-        NodeKind::Reader { .. } => READER_COLOR,
-        NodeKind::Exposure { .. } => EXPOSURE_COLOR,
-        NodeKind::Merge { .. } => MERGE_COLOR,
-        NodeKind::Blur { .. } => BLUR_COLOR,
+        NodeKind::Reader => READER_COLOR,
+        NodeKind::Exposure => EXPOSURE_COLOR,
+        NodeKind::Merge => MERGE_COLOR,
+        NodeKind::Blur => BLUR_COLOR,
     };
     // Slot numbers go in the title, and a failure in the colour, until OpenNG has badges.
     // Nothing shows an evaluation in progress: the title would widen the node while it lasted, and the
     // viewer's caption says it.
-    let slots: Vec<_> = document
+    let slots: Vec<_> = marks
         .slots_marking(id)
         .map(|slot| slot.digit().to_string())
         .collect();
@@ -192,7 +195,7 @@ fn input_pin(index: usize, slot: u32) -> PinId {
 }
 
 /// The input and slot a pin shows on a node of this kind, named as the kind declares the input.
-/// Whether the input has the slot is the document's to say.
+/// Whether the input has the slot is the network's to say.
 fn input_at(kind: &NodeKind, pin: PinId) -> Option<InputSlot<'static>> {
     let index = usize::try_from((pin.0 & u64::from(u32::MAX)).checked_sub(1)?).ok()?;
     Some(InputSlot {
@@ -229,12 +232,12 @@ fn wire(consumer: NodeId, kind: &NodeKind, input: InputSlot<'_>, source: NodeId)
 /// edit also wires that input, and each added wire's input connected. Refused if a pin names no
 /// input, or if two added wires enter one input.
 pub(crate) fn assignments(
-    document: &Document,
+    network: &Network,
     edit: &ConnectionEdit,
 ) -> Result<Vec<Assignment<'static>>, ConnectionError> {
     let input = |pin: PinRef| {
         let consumer = NodeId::from(pin.node);
-        let node = document
+        let node = network
             .node(consumer)
             .ok_or(ConnectionError::MissingNode(consumer))?;
         let input = input_at(&node.kind, pin.pin)
@@ -262,20 +265,20 @@ pub(crate) fn assignments(
         .collect())
 }
 
-/// Whether the document would take a proposed connection edit, and which wires it would replace.
-pub(crate) fn judge(document: &Document, edit: &ConnectionEdit) -> Verdict {
-    let assignments = match assignments(document, edit) {
+/// Whether the network would take a proposed connection edit, and which wires it would replace.
+pub(crate) fn judge(network: &Network, edit: &ConnectionEdit) -> Verdict {
+    let assignments = match assignments(network, edit) {
         Ok(assignments) => assignments,
         Err(error) => return refuse(error),
     };
-    if let Err(error) = document.assign_inputs(&assignments) {
+    if let Err(error) = network.assign_inputs(&assignments) {
         return refuse(error);
     }
     let displaced = assignments
         .iter()
         .filter(|assignment| assignment.source.is_some())
         .filter_map(|assignment| {
-            let node = document.node(assignment.consumer)?;
+            let node = network.node(assignment.consumer)?;
             let current = node.input(assignment.input)?;
             let wire = wire(assignment.consumer, &node.kind, assignment.input, current);
             (Some(current) != assignment.source && !edit.remove.contains(&wire)).then_some(wire)

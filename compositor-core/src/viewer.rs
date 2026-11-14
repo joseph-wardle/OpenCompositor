@@ -3,9 +3,9 @@
 
 use open_ng::{Button, PhysicalPoint};
 
-use crate::document::Slot;
 use crate::gpu::PaneSize;
 use crate::image::Window;
+use crate::network::Slot;
 
 /// The zoom factor for one wheel notch, as in the graph.
 const ZOOM_STEP: f32 = 1.2;

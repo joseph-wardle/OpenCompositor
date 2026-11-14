@@ -225,8 +225,8 @@ pub fn gesture(gesture: ffi::PanelGesture) {
         Err(error) => crate::perform(Request::ShowStatus(refusal(parameter, &error))),
     }
     // A field keeps what was typed or dragged into it until shown again, which only a change to
-    // the document does; after an edit the session refused, or a drag an undo or a script cut
-    // short, the panel must catch up with the document.
+    // the network does; after an edit the session refused, or a drag an undo or a script cut
+    // short, the panel must catch up with the network.
     if matches!(
         gesture.kind,
         PanelGestureKind::Typed | PanelGestureKind::DragEnded | PanelGestureKind::DragCancelled
