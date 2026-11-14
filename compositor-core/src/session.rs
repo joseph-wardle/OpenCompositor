@@ -14,7 +14,7 @@ use crate::author::{
     NumberType, ValueEdit, Wire, author_moves, author_node, author_range, author_rate, author_root,
     author_value, author_wires, input_attribute,
 };
-use crate::compile::Compiler;
+use crate::compile::{Compiler, Ids};
 use crate::evaluate::{ResultKey, result_key, result_keys};
 use crate::files::{Files, Pattern, Scan};
 use crate::history::{Inverse, Recorder};
@@ -25,6 +25,10 @@ use crate::network::{
 use crate::parameter::{Value, ValueError, describe, resolve, validate};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
+
+mod project;
+
+pub use project::{FileError, RelativePaths};
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
 const READER_SPACING: f32 = 70.0;
@@ -43,8 +47,9 @@ def OcComp "Comp"
 }
 "#;
 
-/// Where a project without a comp root puts the one its first node creates.
-const ROOT: &str = "/Comp";
+/// What the comp root a project's first node creates is named, numbered after the first if a prim
+/// has the name.
+const ROOT: &str = "Comp";
 
 /// One undo or redo step: every spec it touched, as it stood before.
 #[derive(Debug)]
@@ -183,7 +188,7 @@ impl Default for Session {
 }
 
 impl Session {
-    /// A new project: a comp root and nothing in it.
+    /// A new project, untitled: a comp root and nothing in it.
     pub fn new() -> Session {
         let layer = Layer::from_bytes("untitled.usda", TEMPLATE.as_bytes().to_vec())
             .expect("the template is valid usda");
@@ -201,9 +206,13 @@ impl Session {
         let stage = Stage::builder()
             .open_layer(layer)
             .expect("a layer read from memory opens");
+        Session::with_stage(stage)
+    }
+
+    fn with_stage(stage: Stage) -> Session {
         let recorder = Recorder::default();
         recorder.install(&stage);
-        let compiler = Compiler::new(&stage);
+        let compiler = Compiler::new(&stage, Ids::default());
         let frame = compiler.timeline().first();
         let mut session = Session {
             stage,
@@ -259,6 +268,13 @@ impl Session {
     /// Why the timeline the stage authors was refused for the default, if it was.
     pub fn timeline_error(&self) -> Option<TimelineError> {
         self.compiler.timeline_error()
+    }
+
+    /// What composing the stage failed to compose, such as a sublayer that cannot be read.
+    pub fn composition_errors(&self) -> Vec<String> {
+        (self.stage.composition_errors().iter())
+            .map(ToString::to_string)
+            .collect()
     }
 
     /// The prim name of a node this session has known, whether or not the network has it now.
@@ -500,12 +516,29 @@ impl Session {
         (self.compiler.ids().path(id)).expect("every ID the session hands out has a path")
     }
 
-    /// The comp root new nodes go under, and whether the edit creating the first must define it.
+    /// The comp root new nodes go under, and whether the edit creating the first must define it:
+    /// `Comp`, or the first of `Comp1` and on that no prim has, so that another tool's prim is
+    /// never retyped.
     fn root(&self) -> (sdf::Path, bool) {
-        match self.compiler.root() {
-            Some(root) => (root.clone(), false),
-            None => (sdf::Path::new(ROOT).expect("a valid path"), true),
+        if let Some(root) = self.compiler.root() {
+            return (root.clone(), false);
         }
+        let free = (0..)
+            .map(|number| match number {
+                0 => ROOT.to_owned(),
+                number => format!("{ROOT}{number}"),
+            })
+            .map(|name| (sdf::Path::abs_root().append_path(name)).expect("a prim name"))
+            .find(|path| !self.is_taken(path))
+            .expect("some name is free");
+        (free, true)
+    }
+
+    /// Whether a prim or a node this session has known has the path.
+    fn is_taken(&self, path: &sdf::Path) -> bool {
+        self.compiler.ids().contains(path)
+            || (self.stage.prim(path.clone()).ok())
+                .is_some_and(|prim| prim.is_valid().unwrap_or(true))
     }
 
     /// A free path for a new node of a kind under the root, interned: the kind's label and the
@@ -516,10 +549,7 @@ impl Session {
             self.next_name += 1;
             let path = (root.append_path(format!("{}{number}", kind.label())))
                 .expect("a label and a number make a prim name");
-            let taken = self.compiler.ids().contains(&path)
-                || (self.stage.prim(path.clone()).ok())
-                    .is_some_and(|prim| prim.is_valid().unwrap_or(true));
-            if !taken {
+            if !self.is_taken(&path) {
                 return (self.compiler.intern(&path), path);
             }
         }

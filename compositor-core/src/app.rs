@@ -28,8 +28,11 @@ use crate::viewer::{EXPOSURE_STEP, Zoom};
 use crate::viewer_cache::{ViewerCache, ViewerCopy};
 use crate::worker::{Evaluated, EvaluationDevice, Job, ViewerError, Worker};
 
+mod project;
 mod viewing;
 
+use project::project_name;
+pub use project::{Answer, Leave, Question};
 pub use viewing::Displayed;
 use viewing::{Asked, Shown, Viewing};
 
@@ -145,6 +148,17 @@ pub enum Event {
     TimecodeSet(bool),
     /// The artist chose which frames the timebar spans and playback plays through.
     RangeSourceChosen(RangeSource),
+    /// The project file chosen in the dialog a [`Request::ChooseProject`] opened, or the shell was
+    /// started with, or `None` if the dialog was cancelled.
+    ProjectChosen(Option<PathBuf>),
+    /// The file chosen in the dialog a [`Request::ChooseSaveAs`] opened, or `None` if it was
+    /// cancelled, with what then waits for the save.
+    SaveAsChosen {
+        file: Option<PathBuf>,
+        then: Option<Leave>,
+    },
+    /// The answer chosen for a [`Request::Ask`]'s question.
+    Answered(Answer),
 }
 
 /// What another thread, or wgpu inside a call, tells the GUI thread through the waker
@@ -250,11 +264,36 @@ pub enum Request {
     Advance { after: Duration },
     /// Show the timebar under the viewer as given. It starts empty.
     ShowTimebar(Timebar),
+    /// Name the project in the window's title, marked if modified. It starts untitled and
+    /// unmodified.
+    ShowProject { name: String, modified: bool },
+    /// Open a dialog choosing a USD file to open, then dispatch [`Event::ProjectChosen`].
+    ChooseProject,
+    /// Open a dialog choosing where to save the project, starting at `suggested`, offering
+    /// `.usda`, `.usdc` and `.usd`, then dispatch [`Event::SaveAsChosen`] with `then`.
+    ChooseSaveAs {
+        suggested: PathBuf,
+        then: Option<Leave>,
+    },
+    /// Ask the question in a dialog, then dispatch [`Event::Answered`] with the answer chosen.
+    Ask(Question),
+    /// Close the window and end the application.
+    Quit,
 }
 
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Replaces the project with a new, untitled one, asking first to save a modified one.
+    New,
+    /// Replaces the project with a file chosen, asking first to save a modified one.
+    Open,
+    /// Saves the project to its file, or asks where for one without a file it can save to.
+    Save,
+    /// Saves the project to a file chosen, which becomes its file.
+    SaveAs,
+    /// Ends the application, asking first to save a modified project.
+    Quit,
     /// A Reader for each file chosen, placed where the pointer is over the graph, or below the
     /// current node.
     ReadFiles,
@@ -511,6 +550,8 @@ pub struct App {
 /// What the shell was last asked to show, which it is asked again only once changed.
 #[derive(Debug, Default)]
 struct Shell {
+    /// The project's name and whether it was modified.
+    project: Option<(String, bool)>,
     gpu_label: Option<String>,
     undo_labels: [Option<&'static str>; 2],
     panel: Option<Panel>,
@@ -575,7 +616,10 @@ impl App {
             playback: Playback::default(),
             ahead_sent: Vec::new(),
             marks: Marks::default(),
-            shell: Shell::default(),
+            shell: Shell {
+                project: Some((project_name(None), false)),
+                ..Shell::default()
+            },
         }
     }
 
@@ -746,6 +790,13 @@ impl App {
                 self.playback.range_source = source;
                 Vec::new()
             }
+            Event::ProjectChosen(None) | Event::SaveAsChosen { file: None, .. } => Vec::new(),
+            Event::ProjectChosen(Some(file)) => self.open(&file),
+            Event::SaveAsChosen {
+                file: Some(file),
+                then,
+            } => self.save_as_chosen(file, then),
+            Event::Answered(answer) => self.answered(answer),
         };
         self.after_change(requests)
     }
@@ -787,6 +838,7 @@ impl App {
         self.follow_look_ahead();
         self.follow_readout(&mut requests);
         let mut shows = Vec::new();
+        self.follow_project(&mut shows);
         let gpu_label = self.gpu_label();
         if gpu_label != self.shell.gpu_label {
             self.shell.gpu_label.clone_from(&gpu_label);
@@ -821,6 +873,19 @@ impl App {
         }
         shows.extend(requests);
         shows
+    }
+
+    /// Names the project in the title, marked if modified.
+    fn follow_project(&mut self, shows: &mut Vec<Request>) {
+        let name = project_name(self.session.file().as_deref());
+        let project = (name, self.session.is_modified());
+        if self.shell.project.as_ref() != Some(&project) {
+            shows.push(Request::ShowProject {
+                name: project.0.clone(),
+                modified: project.1,
+            });
+            self.shell.project = Some(project);
+        }
     }
 
     /// Keeps the panel on the pinned node, or the current node: shows it when it changed. A pin
@@ -1182,6 +1247,11 @@ impl App {
 
     fn command(&mut self, command: Command) -> Vec<Request> {
         match command {
+            Command::New => self.leave(Leave::New),
+            Command::Open => self.leave(Leave::Open),
+            Command::Quit => self.leave(Leave::Quit),
+            Command::Save => self.save(None),
+            Command::SaveAs => self.choose_save_as(None),
             Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders(
                 self.anchor(),
             ))],

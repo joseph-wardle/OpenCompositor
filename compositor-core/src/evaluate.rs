@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use opencompositor_kernels::Exposure;
 use rayon::prelude::*;
 
-use crate::files::{Files, reading};
+use crate::files::{Files, reading, unanchored};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::{self, Level};
 use crate::network::{InputSlot, Network, Node, NodeId, NodeKind};
@@ -664,6 +664,12 @@ fn read_file(
     let Some(path) = path else {
         return Ok(Some(Image::empty()));
     };
+    if path.is_relative() {
+        return Err(EvalError::Read {
+            origin: key.clone(),
+            error: ReadError::Io(unanchored()),
+        });
+    }
     let read = || {
         read_image_until(path, stop).map_err(|error| EvalError::Read {
             origin: key.clone(),

@@ -63,8 +63,8 @@ pub enum Value {
     /// A number, for a float or a frame.
     Float(f64),
     /// Kept as the artist chose it, never empty. Shared, so cloning a node to move it does not
-    /// copy the path. Resolving relative paths, variables or assets belongs between the value and
-    /// the read.
+    /// copy the path. A relative path is read as the layer authoring it anchors it, which
+    /// [`resolve`] gives; one no layer anchors is read nowhere.
     File(Arc<Path>),
 }
 
@@ -196,7 +196,7 @@ impl Resolved {
 }
 
 /// The boundary between what was authored and what executes: the node's authored values over its
-/// version's defaults. Inherited opinions would join here if layered composition arrives.
+/// version's defaults, each relative file anchored to the layer that authored it.
 ///
 /// Setting a value equal to its default and resetting it resolve alike, though only the first
 /// keeps the value authored.
@@ -209,8 +209,11 @@ pub fn resolve(node: &Node, _frame: f64) -> Resolved {
         .parameters()
         .iter()
         .filter_map(|parameter| {
-            let value = (node.authored_value(parameter.name).cloned())
-                .or_else(|| parameter.kind.default_value())?;
+            let value = match node.anchored(parameter.name) {
+                Some(path) => Value::File(path.clone()),
+                None => (node.authored_value(parameter.name).cloned())
+                    .or_else(|| parameter.kind.default_value())?,
+            };
             Some((parameter.name, value))
         })
         .collect();

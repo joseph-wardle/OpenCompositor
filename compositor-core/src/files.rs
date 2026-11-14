@@ -123,6 +123,15 @@ pub(crate) fn with_hashes(path: Arc<Path>) -> Arc<Path> {
     path
 }
 
+/// Why a relative path no layer anchors is read nowhere: USD would not read it from the working
+/// directory either.
+pub(crate) fn unanchored() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "not found: no saved layer anchors the relative path",
+    )
+}
+
 /// A file's size and modification time, which a scan compares to tell a changed file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
@@ -140,6 +149,9 @@ impl Scan {
     /// Lists the pattern's directory and stats each of its files there. It waits on the
     /// filesystem, which on NFS may be for many seconds, so never on the GUI thread.
     pub fn of(pattern: &Pattern) -> io::Result<Scan> {
+        if pattern.path().is_relative() {
+            return Err(unanchored());
+        }
         let mut frames = BTreeMap::new();
         for entry in std::fs::read_dir(pattern.directory())? {
             let path = entry?.path();

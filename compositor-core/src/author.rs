@@ -101,13 +101,19 @@ pub(crate) fn author_node(
     Ok(())
 }
 
-/// Defines the comp root a project's first node goes under, the layer's default prim.
+/// Defines the comp root a project's first node goes under, and makes it the layer's default prim
+/// if the layer has none: another tool's default prim decides what references to its file bring
+/// in.
 pub(crate) fn author_root(
     layer: &mut LayerEdit<'_>,
     root: &sdf::Path,
 ) -> Result<(), sdf::AuthoringError> {
     PrimSpecMut::new(layer.data_mut(), root.clone(), Specifier::Def, COMP_TYPE)?;
-    layer.set_default_prim(root.as_str())
+    if layer.default_prim().is_some() {
+        return Ok(());
+    }
+    let name = root.name().expect("the comp root is a prim at the top");
+    layer.set_default_prim(name)
 }
 
 fn author_position(

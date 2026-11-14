@@ -33,7 +33,8 @@ pub mod bench {
 }
 
 pub use app::{
-    Anchor, App, Command, Displayed, Event, FileIntent, Input, Key, Notice, Pane, Request,
+    Anchor, Answer, App, Command, Displayed, Event, FileIntent, Input, Key, Leave, Notice, Pane,
+    Question, Request,
 };
 pub use evaluate::{
     DeviceLost, EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, ResultKey, result_key,
@@ -54,7 +55,7 @@ pub use playback::{
     ntsc_rate, parse_timecode, timecode,
 };
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
-pub use session::{EditError, Reload, Session};
+pub use session::{EditError, FileError, RelativePaths, Reload, Session};
 pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};
 pub use viewer_cache::{DEFAULT_BUDGET, ViewerCache, ViewerCopy};
 pub use worker::{

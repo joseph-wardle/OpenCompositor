@@ -20,9 +20,10 @@ pub struct Panel {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub parameter: &'static Parameter,
-    /// What evaluation reads at the frame: the authored value or the default, or what the node
-    /// decides for an unset value without a default, such as a sequence's first frame found. None
-    /// for a file not set, or for what the node cannot decide yet.
+    /// The authored value as written, a relative file unanchored; otherwise what evaluation reads
+    /// at the frame: the default, or what the node decides for an unset value without a default,
+    /// such as a sequence's first frame found. None for a file not set, or for what the node
+    /// cannot decide yet.
     pub value: Option<Value>,
     pub state: ValueState,
 }
@@ -49,7 +50,8 @@ impl Panel {
         let rows = (shown.kind.parameters().iter())
             .map(|parameter| Row {
                 parameter,
-                value: (resolved.get(parameter.name).cloned())
+                value: (shown.authored_value(parameter.name).cloned())
+                    .or_else(|| resolved.get(parameter.name).cloned())
                     .or_else(|| scanned_end(&resolved, files, parameter.name).map(Value::Float)),
                 state: match shown.authored_value(parameter.name) {
                     Some(_) => ValueState::Authored,

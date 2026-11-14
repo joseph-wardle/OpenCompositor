@@ -3,6 +3,9 @@
 //! A transaction's overlay names exactly the specs it changes, its parents' child lists among
 //! them, so recording their earlier states at the commit seam costs what the edit touched, and
 //! restoring them writes only what differs.
+//!
+//! Not the crate's `UndoStage`, which has no redo, makes a gesture of several commits several
+//! steps, and replays diffs that do not name their layer.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -41,6 +44,14 @@ impl Inverse {
             for (path, state) in specs {
                 recorded.entry(path).or_insert(state);
             }
+        }
+    }
+
+    /// Has what was recorded of the layer `from` restore the layer `to`, as when the root layer
+    /// is saved under another name.
+    pub(crate) fn rename_layer(&mut self, from: &str, to: &str) {
+        if let Some(specs) = self.0.remove(from) {
+            self.0.insert(to.to_owned(), specs);
         }
     }
 

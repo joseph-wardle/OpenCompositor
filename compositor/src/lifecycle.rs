@@ -214,7 +214,7 @@ fn step(index: usize) {
             if ffi::popup_open() {
                 fail("Escape left the creation menu open".to_owned());
             }
-            check_undo_label("Mark", "after the menu was dismissed");
+            check_undo_label("Create Reader", "after the menu was dismissed");
             choose_in_menu("exp");
         }
         14 => {

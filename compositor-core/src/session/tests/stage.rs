@@ -30,7 +30,7 @@ fn problem(session: &Session, id: NodeId) -> Option<String> {
 }
 
 /// The node at a prim name, from a project read from text.
-fn named(session: &Session, name: &str) -> NodeId {
+pub(super) fn named(session: &Session, name: &str) -> NodeId {
     (session.network().nodes())
         .map(|(id, _)| id)
         .find(|&id| session.name_of(id) == Some(name))

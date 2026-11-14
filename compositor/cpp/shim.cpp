@@ -4,6 +4,7 @@
 #include <QtCore/QFile>
 #include <QtCore/QSignalBlocker>
 #include <QtCore/QTimer>
+#include <QtGui/QCloseEvent>
 #include <QtGui/QCursor>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QInputMethodQueryEvent>
@@ -23,6 +24,7 @@
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLineEdit>
 #include <QtWidgets/QListWidget>
+#include <QtWidgets/QMessageBox>
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QProxyStyle>
 #include <QtWidgets/QPushButton>
@@ -50,10 +52,20 @@ void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t argument) {
     QTimer::singleShot(ms, qApp, [=] { callback(argument); });
 }
 
-std::unique_ptr<QMainWindow> new_main_window() {
-    auto window = std::make_unique<QMainWindow>();
+MainWindow::MainWindow(rust::Fn<void()> close_requested) : close_requested(close_requested) {}
+void MainWindow::closeEvent(QCloseEvent *event) {
+    event->ignore();
+    close_requested();
+}
+
+std::unique_ptr<QMainWindow> new_main_window(rust::Fn<void()> close_requested) {
+    auto window = std::make_unique<MainWindow>(close_requested);
     window->statusBar();
     return window;
+}
+void show_project(QMainWindow *window, const QString &name, bool modified) {
+    window->setWindowTitle(name + QStringLiteral("[*] — OpenCompositor"));
+    window->setWindowModified(modified);
 }
 QMenu *new_menu(QMainWindow *window, const QString &title) {
     return window->menuBar()->addMenu(title);
@@ -1171,6 +1183,51 @@ QStringList choose_files(QMainWindow *window, const QString &title, bool several
     if (several) return QFileDialog::getOpenFileNames(window, title);
     QString file = QFileDialog::getOpenFileName(window, title);
     return file.isEmpty() ? QStringList() : QStringList(file);
+}
+QString choose_project(QMainWindow *window) {
+    return QFileDialog::getOpenFileName(window, QStringLiteral("Open"), QString(),
+                                        QStringLiteral("USD (*.usd *.usda *.usdc *.usdz)"));
+}
+QString choose_save_as(QMainWindow *window, const QString &suggested) {
+    QFileDialog dialog(window, QStringLiteral("Save As"));
+    dialog.setAcceptMode(QFileDialog::AcceptSave);
+    dialog.setNameFilters({QStringLiteral("USD text (*.usda)"), QStringLiteral("USD binary (*.usdc)"),
+                           QStringLiteral("USD (*.usd)")});
+    dialog.setDefaultSuffix(QStringLiteral("usda"));
+    // A name typed without an extension takes the filter's.
+    QObject::connect(&dialog, &QFileDialog::filterSelected, &dialog, [&](const QString &filter) {
+        dialog.setDefaultSuffix(filter.section(QStringLiteral("*."), 1).chopped(1));
+    });
+    dialog.selectFile(suggested);
+    if (dialog.exec() != QDialog::Accepted) return QString();
+    QStringList files = dialog.selectedFiles();
+    return files.isEmpty() ? QString() : files.first();
+}
+size_t ask(QMainWindow *window, const QString &text, const QString &detail,
+           const QStringList &answers) {
+    QMessageBox box(window);
+    box.setIcon(QMessageBox::Question);
+    box.setText(text);
+    box.setInformativeText(detail);
+    std::vector<QPushButton *> buttons;
+    for (qsizetype i = 0; i < answers.size(); ++i) {
+        auto role = i == 0                    ? QMessageBox::AcceptRole
+                    : i == answers.size() - 1 ? QMessageBox::RejectRole
+                                              : QMessageBox::DestructiveRole;
+        buttons.push_back(box.addButton(answers[i], role));
+    }
+    box.setDefaultButton(buttons.front());
+    box.setEscapeButton(buttons.back());
+    box.exec();
+    auto clicked = std::find(buttons.begin(), buttons.end(), box.clickedButton());
+    if (clicked == buttons.end()) return answers.size() - 1;
+    return clicked - buttons.begin();
+}
+// Ends the edit in a focused text field, so that what was typed is applied first.
+void commit_focused_field() {
+    QWidget *focus = QApplication::focusWidget();
+    if (qobject_cast<QLineEdit *>(focus) || qobject_cast<QAbstractSpinBox *>(focus))
+        focus->clearFocus();
 }
 QByteArray encode_name(const QString &path) { return QFile::encodeName(path); }
 QString decode_name(rust::Slice<const uint8_t> name) {

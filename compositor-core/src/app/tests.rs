@@ -201,6 +201,10 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
     assert_eq!(
         requests,
         [
+            Request::ShowProject {
+                name: "Untitled".to_owned(),
+                modified: true
+            },
             Request::ShowUndoLabels {
                 undo: Some("Create Reader"),
                 redo: None
@@ -2174,3 +2178,5 @@ fn the_input_range_spans_the_viewed_sequence_moved_by_its_offset_and_playback_ke
         "a still has no range of its own"
     );
 }
+
+mod project;

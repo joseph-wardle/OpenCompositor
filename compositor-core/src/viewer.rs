@@ -108,6 +108,10 @@ impl Viewer {
         self.size = size;
     }
 
+    pub(crate) fn size(&self) -> PaneSize {
+        self.size
+    }
+
     /// Where an image with this display window appears.
     pub fn placement(&self, display: Window) -> Placement {
         let (centre, zoom) = self.placed(display);

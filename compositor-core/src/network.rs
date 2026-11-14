@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 use imbl::OrdMap;
@@ -356,6 +357,9 @@ pub struct Node {
     /// Only the values the stage authors, each valid for its parameter. An absent value reads as
     /// its parameter's default.
     authored: BTreeMap<&'static str, Value>,
+    /// Each authored file that the layer authoring it anchors, as that layer anchors it: what
+    /// is read in place of the authored path.
+    anchored: BTreeMap<&'static str, Arc<Path>>,
     /// Only the connected inputs, each naming the node whose output it takes, in input order and
     /// then slot order. An unconnected input is legal and reports itself when evaluated.
     inputs: BTreeMap<InputSlot<'static>, NodeId>,
@@ -370,6 +374,7 @@ impl Node {
             kind,
             position,
             authored: BTreeMap::new(),
+            anchored: BTreeMap::new(),
             inputs: BTreeMap::new(),
             problem: None,
         }
@@ -423,13 +428,25 @@ impl Node {
     /// the default stays set.
     pub(crate) fn set_value(&mut self, name: &str, value: Value) -> Result<(), ValueError> {
         let (name, value) = validate(self.kind.parameters(), name, value)?;
+        self.anchored.remove(name);
         self.authored.insert(name, value);
         Ok(())
+    }
+
+    /// The path a file parameter's authored value is read at, if its layer anchors it.
+    pub(crate) fn anchored(&self, name: &str) -> Option<&Arc<Path>> {
+        self.anchored.get(name)
+    }
+
+    /// Reads a file parameter's authored value at `path`, as the layer authoring it anchors it.
+    pub(crate) fn anchor(&mut self, name: &'static str, path: Arc<Path>) {
+        self.anchored.insert(name, path);
     }
 
     /// Removes a parameter's authored value, so it reads as its default again.
     pub(crate) fn reset(&mut self, name: &str) -> Result<(), ValueError> {
         let parameter = describe(self.kind.parameters(), name)?;
+        self.anchored.remove(parameter.name);
         self.authored.remove(parameter.name);
         Ok(())
     }

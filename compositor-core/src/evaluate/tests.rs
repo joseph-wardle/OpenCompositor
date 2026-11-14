@@ -509,6 +509,19 @@ fn a_failure_carries_the_key_of_the_node_it_happened_at() {
 }
 
 #[test]
+fn a_relative_file_no_layer_anchors_is_read_nowhere() {
+    // Tests run in the package's directory, which has this file.
+    let network = chain([reader("Cargo.toml")]);
+
+    let error = run(&mut Evaluator::new(), &key(&network, 1)).unwrap_err();
+
+    assert!(
+        matches!(&error, EvalError::Read { error: ReadError::Io(io), .. } if io.kind() == std::io::ErrorKind::NotFound),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn a_panicking_operation_fails_its_node() {
     // An Exposure whose key says it is connected, given no image, panics.
     let exposure = key(&chain([reader("a.png"), exposure(None)]), 2);

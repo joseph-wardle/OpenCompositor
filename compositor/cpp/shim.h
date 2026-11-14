@@ -85,6 +85,19 @@ class ParameterPanel : public QWidget {
     std::vector<Row> rows;
 };
 
+// The application's window. Closing it any way asks Rust to quit, which may ask first to save, and
+// ends the application with `exit`.
+class MainWindow : public QMainWindow {
+  public:
+    explicit MainWindow(rust::Fn<void()> close_requested);
+
+  protected:
+    void closeEvent(QCloseEvent *event) override;
+
+  private:
+    rust::Fn<void()> close_requested;
+};
+
 class FrameBar;
 
 // The timeline under the viewer, shown as Rust sends it. Each gesture is sent back; nothing is sent
@@ -164,7 +177,8 @@ QString qt_compiled_version();
 QString qt_runtime_version();
 void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t argument);
 
-std::unique_ptr<QMainWindow> new_main_window();
+std::unique_ptr<QMainWindow> new_main_window(rust::Fn<void()> close_requested);
+void show_project(QMainWindow *window, const QString &name, bool modified);
 QMenu *new_menu(QMainWindow *window, const QString &title);
 QMenu *new_submenu(QMenu *menu, const QString &title);
 void add_separator(QMenu *menu);
@@ -202,6 +216,11 @@ void show_error(QMainWindow *window, const QString &text);
 QLabel *new_permanent_status(QMainWindow *window);
 void set_permanent_status(QLabel *label, const QString &text);
 QStringList choose_files(QMainWindow *window, const QString &title, bool several);
+QString choose_project(QMainWindow *window);
+QString choose_save_as(QMainWindow *window, const QString &suggested);
+size_t ask(QMainWindow *window, const QString &text, const QString &detail,
+           const QStringList &answers);
+void commit_focused_field();
 QByteArray encode_name(const QString &path);
 QString decode_name(rust::Slice<const uint8_t> name);
 void close_modal_dialog();

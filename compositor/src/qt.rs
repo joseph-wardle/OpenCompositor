@@ -310,7 +310,10 @@ pub mod ffi {
         fn qt_runtime_version() -> QString;
         fn single_shot(ms: i32, callback: fn(usize), argument: usize);
 
-        fn new_main_window() -> UniquePtr<QMainWindow>;
+        /// The window, which calls `close_requested` instead of closing.
+        fn new_main_window(close_requested: fn()) -> UniquePtr<QMainWindow>;
+        /// Names the project in the title, marked if modified.
+        unsafe fn show_project(window: *mut QMainWindow, name: &QString, modified: bool);
         /// A menu at the end of the window's menu bar, which owns it.
         unsafe fn new_menu(window: *mut QMainWindow, title: &QString) -> *mut QMenu;
         /// A menu at the end of `menu`, which owns it.
@@ -413,6 +416,22 @@ pub mod ffi {
             title: &QString,
             several: bool,
         ) -> QStringList;
+        /// Runs a modal dialog choosing a USD file to open, as `choose_files` does. Empty if
+        /// cancelled.
+        unsafe fn choose_project(window: *mut QMainWindow) -> QString;
+        /// Runs a modal dialog choosing where to save, starting at `suggested`. Empty if
+        /// cancelled.
+        unsafe fn choose_save_as(window: *mut QMainWindow, suggested: &QString) -> QString;
+        /// Runs a modal message box with a button per answer, the first the default and the last
+        /// the escape. Returns the index of the answer chosen.
+        unsafe fn ask(
+            window: *mut QMainWindow,
+            text: &QString,
+            detail: &QString,
+            answers: &QStringList,
+        ) -> usize;
+        /// Takes the keyboard from a focused text field, which applies what was typed in it.
+        fn commit_focused_field();
         /// A path as the file system names it.
         fn encode_name(path: &QString) -> QByteArray;
         /// A file system name as a path.

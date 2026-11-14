@@ -10,7 +10,7 @@ use std::sync::Arc;
 use imbl::OrdMap;
 use open_ng::Point;
 use openusd::sdf;
-use openusd::usd::{CommittedChange, Stage};
+use openusd::usd::{Attribute, CommittedChange, Stage};
 use openusd::vt;
 
 use crate::author::{COMP_TYPE, OUTPUT, POSITION};
@@ -24,7 +24,7 @@ const IN_CYCLE: &str = "takes its own image, through a cycle of wires";
 /// The bijection between prim paths and session IDs. A path keeps its ID for the session, so a
 /// node returning through undo or redo is the node it was, and an ID is never given to another
 /// path. A prim renamed is a new node to the session.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Ids {
     by_path: HashMap<sdf::Path, NodeId>,
     /// By ID, from 1.
@@ -86,8 +86,9 @@ pub(crate) struct Compiler {
 }
 
 impl Compiler {
-    /// Compiles the whole stage and watches it for changes.
-    pub(crate) fn new(stage: &Stage) -> Compiler {
+    /// Compiles the whole stage and watches it for changes, continuing the IDs given: a path one
+    /// names keeps its ID.
+    pub(crate) fn new(stage: &Stage, ids: Ids) -> Compiler {
         let notices = Rc::new(RefCell::new(Notices::default()));
         let sink = notices.clone();
         stage
@@ -100,7 +101,7 @@ impl Compiler {
             .expect("a new stage is not being edited");
         let mut compiler = Compiler {
             root: None,
-            ids: Ids::default(),
+            ids,
             defined: OrdMap::new(),
             readers: BTreeMap::new(),
             reads: BTreeMap::new(),
@@ -306,8 +307,13 @@ impl Compiler {
                         continue;
                     }
                 };
-                if let Err(error) = node.set_value(parameter.name, value) {
-                    node.refuse(format!("{}: {error}", parameter.label));
+                match node.set_value(parameter.name, value) {
+                    Ok(()) => {
+                        if let Some(anchored) = anchored(&node, parameter.name, &attribute) {
+                            node.anchor(parameter.name, anchored);
+                        }
+                    }
+                    Err(error) => node.refuse(format!("{}: {error}", parameter.label)),
                 }
                 continue;
             }
@@ -357,6 +363,31 @@ impl Compiler {
     }
 }
 
+/// A relative file the node authors, anchored to the layer whose opinion won, as USD anchors
+/// it: a path opening with `.` beside that layer, and a search path there only if it names a
+/// file there. `None` for an absolute path, and for one no layer anchors: an anonymous layer's,
+/// or a search path naming nothing beside its layer.
+fn anchored(node: &Node, parameter: &str, attribute: &Attribute) -> Option<Arc<Path>> {
+    let Some(Value::File(file)) = node.authored_value(parameter) else {
+        return None;
+    };
+    if file.is_absolute() {
+        return None;
+    }
+    let authored = file
+        .to_str()
+        .expect("validation refuses a path that is not Unicode");
+    let info = attribute.resolve_info().ok()?;
+    let layer = &info.spec_site()?.layer;
+    // USD would read it from the working directory.
+    if layer.is_anonymous() {
+        return None;
+    }
+    let anchored = layer.absolute_path(authored).ok()?;
+    let anchored = Path::new(&anchored);
+    anchored.is_absolute().then(|| anchored.into())
+}
+
 /// The comp root the graph shows: the default prim if it is a comp, else the first comp at the
 /// top of the stage.
 fn discover_root(stage: &Stage) -> Option<sdf::Path> {
@@ -400,7 +431,7 @@ fn number(value: &vt::Value) -> Option<f64> {
     }
 }
 
-fn wrong_type(label: &str, attribute: &openusd::usd::Attribute, wanted: &str) -> String {
+fn wrong_type(label: &str, attribute: &Attribute, wanted: &str) -> String {
     let found = (attribute.type_name().ok().flatten()).map_or_else(
         || "nothing".to_owned(),
         |type_name| type_name.as_str().to_owned(),

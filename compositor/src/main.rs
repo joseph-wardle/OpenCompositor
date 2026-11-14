@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::time::Instant;
 
 use cxx_qt::{QMetaObjectConnectionGuard, Threading};
-use cxx_qt_lib::{QList, QString};
+use cxx_qt_lib::{QList, QString, QStringList};
 use opencompositor_core::{
     App, Command, Direction, EXPOSURE_STEP, EvaluationDevice, Event, FileIntent, FrameCheck,
     FrameTiming, MAX_EXPOSURE, Notice, Pane, Request, Session, Slot,
@@ -64,6 +64,7 @@ pub struct Widgets {
     pub redo: *mut ffi::QAction,
 }
 
+/// What the shell was started to do besides showing the window.
 enum Check {
     Lifecycle(PathBuf),
     Drag(PathBuf, drag::Chain),
@@ -72,7 +73,7 @@ enum Check {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--cpu] [--lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur] | --playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]]"
+        "usage: opencompositor [--cpu] [FILE | --lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur] | --playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]]"
     );
     std::process::exit(2)
 }
@@ -85,13 +86,18 @@ fn main() {
     } else {
         EvaluationDevice::Gpu
     };
+    let mut project = None;
     let check = match &arguments[..] {
         [] => None,
-        [flag, image] if flag == "--lifecycle-check" => Some(Check::Lifecycle(image.into())),
-        [flag, image] if flag == "--drag-check" => drag::run_chains(image.as_ref(), device),
+        [file] if !file.to_string_lossy().starts_with("--") => {
+            project = Some(absolute(file));
+            None
+        }
+        [flag, image] if flag == "--lifecycle-check" => Some(Check::Lifecycle(absolute(image))),
+        [flag, image] if flag == "--drag-check" => drag::run_chains(&absolute(image), device),
         [flag, image, name] if flag == "--drag-check" => {
             match name.to_str().and_then(drag::Chain::from_name) {
-                Some(chain) => Some(Check::Drag(image.into(), chain)),
+                Some(chain) => Some(Check::Drag(absolute(image), chain)),
                 None => usage(),
             }
         }
@@ -128,10 +134,7 @@ fn main() {
     }
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
-    let mut window = ffi::new_main_window();
-    window
-        .pin_mut()
-        .set_window_title(&QString::from("OpenCompositor"));
+    let mut window = ffi::new_main_window(close_requested);
     window.pin_mut().set_dock_nesting_enabled(true);
     window.pin_mut().resize(1400, 900);
     let window_ptr = window.as_mut_ptr();
@@ -148,6 +151,12 @@ fn main() {
         commands.push(command);
         action
     };
+    add(file_menu, "&New", "Ctrl+N", Command::New);
+    add(file_menu, "&Open…", "Ctrl+O", Command::Open);
+    add(file_menu, "&Save", "Ctrl+S", Command::Save);
+    add(file_menu, "Save &As…", "Ctrl+Shift+S", Command::SaveAs);
+    // SAFETY: the file menu is live.
+    unsafe { ffi::add_separator(file_menu) };
     add(file_menu, "&Read Files…", "R", Command::ReadFiles);
     add(
         file_menu,
@@ -155,6 +164,9 @@ fn main() {
         "",
         Command::Reload,
     );
+    // SAFETY: the file menu is live.
+    unsafe { ffi::add_separator(file_menu) };
+    add(file_menu, "&Quit", "Ctrl+Q", Command::Quit);
     let undo = add(edit_menu, "&Undo", "Ctrl+Z", Command::Undo);
     let redo = add(edit_menu, "&Redo", "Ctrl+Shift+Z", Command::Redo);
     // SAFETY: the node menu is live; it owns the note.
@@ -294,8 +306,13 @@ fn main() {
         .expect("widgets are made once")
     });
     show_undo_labels([None, None]);
+    // SAFETY: the window is live.
+    unsafe { ffi::show_project(window_ptr, &QString::from("Untitled"), false) };
     keys::start();
     window.pin_mut().show();
+    if let Some(file) = project {
+        dispatch(Event::ProjectChosen(Some(file)));
+    }
     match check {
         Some(Check::Lifecycle(image)) => lifecycle::start(image),
         Some(Check::Drag(image, chain)) => drag::start(image, chain),
@@ -312,6 +329,12 @@ fn main() {
     unsafe { ffi::delete_waker(waker) };
     drop(window);
     std::process::exit(status);
+}
+
+/// A path from the command line as an absolute one: a Reader reads a relative path nowhere, since
+/// no saved layer anchors it.
+pub fn absolute(path: &OsString) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.into())
 }
 
 /// Hands an event to the app, then does what it asks.
@@ -376,7 +399,18 @@ fn exposure_set(stops: f64) {
 fn run_command(index: usize) {
     let command =
         COMMANDS.with(|cell| cell.get().expect("menus are made before the event loop")[index]);
+    if matches!(
+        command,
+        Command::New | Command::Open | Command::Save | Command::SaveAs | Command::Quit
+    ) {
+        ffi::commit_focused_field();
+    }
     dispatch(Event::Command(command));
+}
+
+fn close_requested() {
+    ffi::commit_focused_field();
+    dispatch(Event::Command(Command::Quit));
 }
 
 pub fn perform(request: Request) {
@@ -448,6 +482,37 @@ pub fn perform(request: Request) {
             ffi::single_shot(milliseconds, advance, 0);
         }
         Request::ShowTimebar(shown) => timebar::show(&shown),
+        // SAFETY: the window is live.
+        Request::ShowProject { name, modified } => unsafe {
+            ffi::show_project(widgets.window, &QString::from(&name), modified)
+        },
+        Request::ChooseProject => {
+            // SAFETY: the window is live.
+            let chosen = unsafe { ffi::choose_project(widgets.window) };
+            let file = (!chosen.is_empty()).then(|| path(&chosen));
+            dispatch(Event::ProjectChosen(file));
+        }
+        Request::ChooseSaveAs { suggested, then } => {
+            let suggested = QString::from(&*suggested.to_string_lossy());
+            // SAFETY: the window is live.
+            let chosen = unsafe { ffi::choose_save_as(widgets.window, &suggested) };
+            let file = (!chosen.is_empty()).then(|| path(&chosen));
+            dispatch(Event::SaveAsChosen { file, then });
+        }
+        Request::Ask(question) => {
+            let mut labels = QList::<QString>::default();
+            for (label, _) in &question.answers {
+                labels.append(QString::from(label));
+            }
+            let [text, detail] = [&question.text, &question.detail].map(QString::from);
+            let labels = QStringList::from(&labels);
+            // SAFETY: the window is live.
+            let chosen = unsafe { ffi::ask(widgets.window, &text, &detail, &labels) };
+            let mut answers = question.answers;
+            let (_, answer) = answers.swap_remove(chosen.min(answers.len() - 1));
+            dispatch(Event::Answered(answer));
+        }
+        Request::Quit => ffi::exit(0),
     }
 }
 
