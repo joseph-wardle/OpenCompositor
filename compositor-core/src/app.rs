@@ -23,7 +23,7 @@ use crate::playback::{
     Direction, FrameMark, Frames, MAX_MARKED_FRAMES, Playback, PlaybackMode, RangeSource, Timebar,
     ntsc_rate,
 };
-use crate::session::Session;
+use crate::session::{EditError, Session};
 use crate::viewer::{EXPOSURE_STEP, Zoom};
 use crate::viewer_cache::{ViewerCache, ViewerCopy};
 use crate::worker::{Evaluated, EvaluationDevice, Job, ViewerError, Worker};
@@ -304,6 +304,8 @@ pub enum Command {
     UnpinPanel,
     /// Reload files on each selected Reader.
     Reload,
+    /// Activates the selected nodes if the first is inactive, and deactivates them otherwise.
+    ToggleActive,
     Undo,
     Redo,
     /// Views what the slot marks.
@@ -347,6 +349,8 @@ pub enum Key {
     Y,
     /// Delete or Backspace: deletes the selected nodes while the pointer is over the graph.
     Delete,
+    /// Activates or deactivates the selected nodes while the pointer is over the graph.
+    D,
     /// Opens the node creation menu while the pointer is over the graph.
     Tab,
     /// Over the viewer, the arrows step a frame, and J, K and L play backwards, stop and play
@@ -372,6 +376,7 @@ impl Key {
             Key::Y => open_ng::Key::Y,
             Key::E
             | Key::Delete
+            | Key::D
             | Key::Tab
             | Key::Left
             | Key::Right
@@ -1178,6 +1183,7 @@ impl App {
         }
         match (self.hovered, key.in_graph()) {
             (Some(Pane::Graph), _) if key == Key::Delete => self.delete_selected(),
+            (Some(Pane::Graph), _) if key == Key::D => self.toggle_active_selected(),
             (Some(Pane::Graph), _) if key == Key::Tab => {
                 vec![Request::ShowCreationMenu(self.anchor())]
             }
@@ -1197,8 +1203,27 @@ impl App {
                 "Select nodes to delete them".to_owned(),
             )];
         }
-        let deleted = self.session.delete_nodes(&selection);
-        debug_assert!(deleted.is_ok(), "selected nodes exist");
+        match self.session.delete_nodes(&selection) {
+            Ok(_) => vec![Request::Redraw(Pane::Graph)],
+            Err(error @ EditError::Delete { node, .. }) => {
+                let name = (self.session.network().node(node)).map_or("", |node| node.name());
+                vec![Request::ShowStatus(format!(
+                    "Cannot delete {name}: {error}"
+                ))]
+            }
+            Err(error) => vec![Request::ShowStatus(format!("Cannot delete: {error}"))],
+        }
+    }
+
+    fn toggle_active_selected(&mut self) -> Vec<Request> {
+        let selection = self.session.selection().to_vec();
+        if selection.is_empty() {
+            return vec![Request::ShowStatus(
+                "Select nodes to activate or deactivate them".to_owned(),
+            )];
+        }
+        let toggled = self.session.toggle_active(&selection);
+        debug_assert!(toggled.is_ok(), "selected nodes exist");
         vec![Request::Redraw(Pane::Graph)]
     }
 
@@ -1271,6 +1296,7 @@ impl App {
                 let selection = self.session.selection().to_vec();
                 self.reload(&selection)
             }
+            Command::ToggleActive => self.toggle_active_selected(),
             Command::Undo => redraw_if(Pane::Graph, !self.session.undo().is_empty()),
             Command::Redo => redraw_if(Pane::Graph, !self.session.redo().is_empty()),
             Command::ViewSlot(slot) => {

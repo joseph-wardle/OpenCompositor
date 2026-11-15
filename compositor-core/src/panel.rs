@@ -3,7 +3,7 @@
 use crate::files::scanned_end;
 use crate::network::NodeId;
 use crate::parameter::{Parameter, ParameterKind, Value, resolve};
-use crate::session::{Property, Session};
+use crate::session::{Property, RefusedConnection, Session};
 
 /// One node's parameters as the panel shows them.
 #[derive(Clone, Debug, PartialEq)]
@@ -13,8 +13,12 @@ pub struct Panel {
     pub type_label: &'static str,
     /// Whether the panel stays on this node whatever is selected.
     pub pinned: bool,
+    /// Why the stage's definition of the node was refused, if it was.
+    pub problem: Option<String>,
     /// In description order.
     pub rows: Vec<Row>,
+    /// The declared inputs whose connections were refused.
+    pub refused: Vec<RefusedConnection>,
     /// What else the node's prim authors, by name.
     pub properties: Vec<Property>,
 }
@@ -70,7 +74,9 @@ impl Panel {
             name: shown.name().to_owned(),
             type_label: shown.kind.label(),
             pinned,
+            problem: shown.problem().map(str::to_owned),
             rows,
+            refused: session.refused_connections(node),
             properties: session.other_properties(node),
         })
     }

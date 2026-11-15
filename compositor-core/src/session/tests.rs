@@ -1466,6 +1466,8 @@ fn keys_hold_what_a_frame_resolves_to_not_the_frame() {
     assert_eq!(session.failures.nodes, BTreeSet::from([reader]));
 }
 
+mod active;
+mod connections;
 mod project;
 mod properties;
 mod rename;

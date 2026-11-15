@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -303,6 +304,9 @@ impl Compiler {
             })
             .unwrap_or(Point { x: 0.0, y: 0.0 });
         let mut node = Node::new(kind.clone(), path.name().unwrap_or_default(), position);
+        if !prim.is_active().unwrap_or(false) {
+            node.deactivate();
+        }
         let mut reads = Vec::new();
         for property in prim.property_names().unwrap_or_default() {
             let Some(name) = property.as_str().strip_prefix("inputs:") else {
@@ -358,28 +362,22 @@ impl Compiler {
             };
             let label = slot_label(&kind, slot);
             let targets = attribute.connections().unwrap_or_default();
-            match targets.as_slice() {
-                [] => {}
-                [target] => {
-                    let source = target.prim_path();
-                    reads.push(source.clone());
-                    let is_image = (target.split_property())
-                        .is_some_and(|(_, property)| property == OUTPUT)
-                        && self.root.as_ref() == source.parent().as_ref()
-                        && (stage.prim(source.clone()).ok())
-                            .is_some_and(|prim| node_kind(&prim).is_some());
-                    if is_image {
-                        node.connect(slot, self.ids.intern(&source));
-                    } else {
-                        node.refuse(format!(
-                            "{label} is connected to {}, which is no node's image",
-                            target.as_str()
-                        ));
-                    }
+            let [target] = targets.as_slice() else {
+                if !targets.is_empty() {
+                    node.refuse(format!(
+                        "{label} has {} connections, and an input takes one",
+                        targets.len()
+                    ));
                 }
-                targets => node.refuse(format!(
-                    "{label} has {} connections, and an input takes one",
-                    targets.len()
+                continue;
+            };
+            let source = target.prim_path();
+            reads.push(source.clone());
+            match invalid_connection(stage, self.root.as_ref(), &targets) {
+                None => node.connect(slot, self.ids.intern(&source)),
+                Some(invalid) => node.refuse(format!(
+                    "{label} is connected to {}, but {invalid}",
+                    target.as_str()
                 )),
             }
         }
@@ -388,6 +386,66 @@ impl Compiler {
         }
         self.reads.insert(id, reads);
         Some(node)
+    }
+}
+
+/// Why an input's connections give it no node's image. As UsdShade reports a connection to no
+/// valid source, it is the path the input names, never a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvalidConnection {
+    /// An input takes one connection.
+    Several(usize),
+    NoPrim,
+    /// A prim of no node type, or one beneath a node.
+    NotANode,
+    /// A node's property other than its image.
+    NotAnImage,
+    OutsideComp,
+}
+
+impl fmt::Display for InvalidConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InvalidConnection::Several(count) => {
+                write!(f, "it has {count} connections, and an input takes one")
+            }
+            InvalidConnection::NoPrim => write!(f, "no prim is there"),
+            InvalidConnection::NotANode => write!(f, "the prim is no node"),
+            InvalidConnection::NotAnImage => write!(f, "it is not the node's image"),
+            InvalidConnection::OutsideComp => write!(f, "it is outside the comp"),
+        }
+    }
+}
+
+impl std::error::Error for InvalidConnection {}
+
+/// Why connections to `targets` give an input of a node under `root` no image, or `None` if
+/// they give it one, or there are none.
+pub(crate) fn invalid_connection(
+    stage: &Stage,
+    root: Option<&sdf::Path>,
+    targets: &[sdf::Path],
+) -> Option<InvalidConnection> {
+    let target = match targets {
+        [] => return None,
+        [target] => target,
+        targets => return Some(InvalidConnection::Several(targets.len())),
+    };
+    let source = target.prim_path();
+    let Some(root) = root.filter(|root| source.has_prefix(root) && source != **root) else {
+        return Some(InvalidConnection::OutsideComp);
+    };
+    let prim = (stage.prim(source.clone()).ok()).filter(|prim| prim.is_valid().unwrap_or(false));
+    let Some(prim) = prim else {
+        return Some(InvalidConnection::NoPrim);
+    };
+    let kind = (prim.type_name().ok().flatten()).and_then(|name| NodeKind::of_type(name.as_str()));
+    if source.parent().as_ref() != Some(root) || kind.is_none() {
+        return Some(InvalidConnection::NotANode);
+    }
+    match target.split_property() {
+        Some((_, property)) if property == OUTPUT => None,
+        _ => Some(InvalidConnection::NotAnImage),
     }
 }
 
@@ -440,9 +498,9 @@ fn node_ancestor(root: &sdf::Path, prim: &sdf::Path) -> Option<sdf::Path> {
     (prim.ancestors()).find(|ancestor| ancestor.parent().as_ref() == Some(root))
 }
 
-/// The kind of node a prim is, if it is an active prim of a known type.
+/// The kind of node a prim is, if it is a prim of a known type, active or not.
 fn node_kind(prim: &openusd::usd::Prim) -> Option<NodeKind> {
-    if !prim.is_valid().unwrap_or(false) || !prim.is_active().unwrap_or(false) {
+    if !prim.is_valid().unwrap_or(false) {
         return None;
     }
     NodeKind::of_type(prim.type_name().ok()??.as_str())
@@ -486,7 +544,7 @@ pub(crate) fn input_slot(kind: &NodeKind, name: &str) -> Option<InputSlot<'stati
     })
 }
 
-fn slot_label(kind: &NodeKind, slot: InputSlot<'_>) -> String {
+pub(crate) fn slot_label(kind: &NodeKind, slot: InputSlot<'_>) -> String {
     let label = (kind.inputs().iter())
         .find(|input| input.name == slot.input)
         .map_or(slot.input, |input| input.label);

@@ -116,7 +116,7 @@ impl Session {
 
     /// The first layer of the root's stack, other than the root, with a spec at or beneath `path`
     /// or a path into it, which the namespace editor would change too.
-    fn held_elsewhere(&self, path: &sdf::Path) -> Option<String> {
+    pub(super) fn held_elsewhere(&self, path: &sdf::Path) -> Option<String> {
         let root = self.stage.root_layer().identifier().to_owned();
         (self.stage.layer_stack().into_iter())
             .filter(|identifier| *identifier != root)

@@ -87,6 +87,7 @@ class ParameterPanel : public QWidget {
     QString shown_name;
     QLabel *type;
     QToolButton *pin;
+    QLabel *problem;
     QLabel *empty;
     QScrollArea *scroll;
     std::vector<Row> rows;

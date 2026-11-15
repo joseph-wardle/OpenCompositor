@@ -152,7 +152,9 @@ pub(crate) fn record(
     NodeRecord {
         position: node.position,
         title,
-        color: if failing.contains(&id) {
+        color: if !node.is_active() {
+            dimmed(color)
+        } else if failing.contains(&id) {
             FAILED_COLOR
         } else {
             color
@@ -165,6 +167,16 @@ pub(crate) fn record(
         .chain(input_pins(node))
         .map(Row::Pin)
         .collect(),
+    }
+}
+
+/// An inactive node's colour: its kind's, halfway to a dark grey.
+fn dimmed(color: Color) -> Color {
+    let dim = |channel: u8| channel / 2 + 25;
+    Color {
+        r: dim(color.r),
+        g: dim(color.g),
+        b: dim(color.b),
     }
 }
 

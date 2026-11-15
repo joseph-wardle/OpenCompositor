@@ -367,6 +367,7 @@ pub struct Node {
     /// Why the stage's definition of the node was refused, which makes it evaluate to the empty
     /// image and take nothing from its inputs.
     problem: Option<Arc<str>>,
+    active: bool,
 }
 
 impl Node {
@@ -379,6 +380,7 @@ impl Node {
             anchored: BTreeMap::new(),
             inputs: BTreeMap::new(),
             problem: None,
+            active: true,
         }
     }
 
@@ -456,6 +458,16 @@ impl Node {
     /// Refuses the node's definition, keeping the first reason given.
     pub(crate) fn refuse(&mut self, problem: impl Into<Arc<str>>) {
         self.problem.get_or_insert_with(|| problem.into());
+    }
+
+    /// Whether the stage has the node's prim active. An inactive node is refused.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub(crate) fn deactivate(&mut self) {
+        self.active = false;
+        self.refuse("the node is inactive");
     }
 }
 

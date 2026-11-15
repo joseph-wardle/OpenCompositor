@@ -186,21 +186,22 @@ fn remove_property(
     Ok(())
 }
 
-/// Connects an input's attribute to a node's image, or disconnects it by removing its spec.
+/// Connects an input's attribute to a node's image, or disconnects it: by removing its spec, or,
+/// where a weaker layer connects it, by an empty list, as UsdShade's `DisconnectSource` blocks.
 fn author_connection(
     layer: &mut LayerEdit<'_>,
     node: &sdf::Path,
-    attribute: &str,
-    source: Option<&sdf::Path>,
+    wire: &Wire,
 ) -> Result<(), sdf::AuthoringError> {
-    let Some(source) = source else {
-        return remove_property(layer, node, attribute);
+    let path = node.append_property(&wire.attribute)?;
+    let targets = match &wire.source {
+        Some(source) => vec![source.append_property(OUTPUT)?],
+        None if wire.block => Vec::new(),
+        None => return remove_property(layer, node, &wire.attribute),
     };
-    let path = node.append_property(attribute)?;
-    let target = source.append_property(OUTPUT)?;
     attribute_spec(layer, &path, "opaque", Variability::Varying)?
         .edit_connections()
-        .set([target])
+        .set(targets)
 }
 
 pub(crate) fn author_range(
@@ -244,6 +245,19 @@ fn attribute_spec<'a>(
         .expect("the spec was found or declared"))
 }
 
+/// Authors a node's `active` opinion, or with `None` removes it.
+pub(crate) fn author_active(
+    layer: &mut LayerEdit<'_>,
+    node: &sdf::Path,
+    active: Option<bool>,
+) -> Result<(), sdf::AuthoringError> {
+    match active {
+        Some(active) => PrimSpecMut::over(layer.data_mut(), node.clone())?.set_active(active),
+        None => (layer.data_mut()).erase_field(node, sdf::FieldKey::Active.as_str()),
+    }
+    Ok(())
+}
+
 /// One input's connection as a session edit authors it.
 #[derive(Debug)]
 pub(crate) struct Wire {
@@ -251,6 +265,9 @@ pub(crate) struct Wire {
     pub(crate) attribute: String,
     /// `None` disconnects.
     pub(crate) source: Option<sdf::Path>,
+    /// Whether a layer other than the edited one connects the input, which a disconnect must
+    /// block.
+    pub(crate) block: bool,
 }
 
 pub(crate) fn author_wires(
@@ -258,7 +275,7 @@ pub(crate) fn author_wires(
     wires: &[Wire],
 ) -> Result<(), sdf::AuthoringError> {
     for wire in wires {
-        author_connection(layer, &wire.consumer, &wire.attribute, wire.source.as_ref())?;
+        author_connection(layer, &wire.consumer, wire)?;
     }
     Ok(())
 }

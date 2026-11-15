@@ -304,7 +304,7 @@ def OcComp "Comp"
         ),
         (
             "Nowhere",
-            "Source is connected to /Comp/Missing.outputs:image, which is no node's image",
+            "Source is connected to /Comp/Missing.outputs:image, but no prim is there",
         ),
     ] {
         assert_eq!(failed(name).as_deref(), Some(expected), "{name}");

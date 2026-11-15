@@ -171,6 +171,7 @@ fn main() {
     let redo = add(edit_menu, "&Redo", "Ctrl+Shift+Z", Command::Redo);
     // SAFETY: the node menu is live; it owns the note.
     unsafe { ffi::add_note(node_menu, &QString::from("Create a Node\tTab")) };
+    add(node_menu, "Toggle &Active\tD", "", Command::ToggleActive);
     // The key filter takes the digit row by position and H for the pane under the pointer, so
     // these items only name their keys, after a tab, rather than binding shortcuts.
     let slot_menus = [

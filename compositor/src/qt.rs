@@ -159,6 +159,8 @@ pub mod ffi {
         /// The node's type, shown beside a name that does not say it, or empty.
         type_label: QString,
         pinned: bool,
+        /// Why the stage's definition of the node was refused, or empty.
+        problem: QString,
         rows: Vec<PanelRow>,
     }
 
@@ -173,7 +175,8 @@ pub mod ffi {
         /// Float only: the slider's positions from 0, and where it is.
         ticks: i32,
         tick: i32,
-        /// Property only: whether a value can be typed, and whether evaluation ignores it.
+        /// Property only: whether a value can be typed, and whether evaluation ignores it. A
+        /// connection is never typed into.
         editable: bool,
         unused: bool,
     }
@@ -188,6 +191,9 @@ pub mod ffi {
         /// One of the node's other properties, under its full name, removed where a parameter
         /// is reset.
         Property,
+        /// A declared input whose connections were refused, read-only, disconnected where a
+        /// parameter is reset.
+        Connection,
     }
 
     /// What the artist did to the panel, on the row of the parameter named, or to the node's name

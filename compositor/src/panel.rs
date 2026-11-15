@@ -8,7 +8,8 @@ use std::sync::Arc;
 use cxx_qt_lib::QString;
 use opencompositor_core::{
     Command, EditError, Event, FRAME_LIMIT, FileIntent, FloatParameter, Panel, Parameter,
-    ParameterKind, Property, PropertyError, Request, Row, Session, Value, ValueState,
+    ParameterKind, Property, PropertyError, RefusedConnection, Request, Row, Session, Value,
+    ValueState,
 };
 
 use crate::qt::ffi::{self, PanelGestureKind, RowKind};
@@ -27,8 +28,14 @@ pub fn show(panel: Option<&Panel>) {
         name: QString::from(panel.map_or("", |panel| &panel.name)),
         type_label: QString::from(panel.map_or("", type_label)),
         pinned: panel.is_some_and(|panel| panel.pinned),
+        problem: QString::from(
+            panel
+                .and_then(|panel| panel.problem.as_deref())
+                .unwrap_or(""),
+        ),
         rows: panel.map_or_else(Vec::new, |panel| {
             (panel.rows.iter().map(row))
+                .chain(panel.refused.iter().map(connection_row))
                 .chain(
                     panel
                         .properties
@@ -135,6 +142,33 @@ fn property_row(panel: &Panel, property: &Property) -> ffi::PanelRow {
     }
 }
 
+/// The row's name, which no parameter or other property has.
+fn connection_name(refused: &RefusedConnection) -> String {
+    format!("inputs:{}", refused.input)
+}
+
+fn connection_row(refused: &RefusedConnection) -> ffi::PanelRow {
+    let targets: Vec<String> = (refused.targets.iter())
+        .map(|target| format!("<{target}>"))
+        .collect();
+    ffi::PanelRow {
+        name: QString::from(&connection_name(refused)),
+        label: QString::from(&refused.label),
+        kind: RowKind::Connection,
+        authored: true,
+        tooltip: QString::from(&format!(
+            "Connected to {}, but {}, so unconnected",
+            targets.join(", "),
+            refused.why
+        )),
+        text: QString::from(&format!("→ {}: {}", targets.join(", "), refused.why)),
+        ticks: 0,
+        tick: 0,
+        editable: false,
+        unused: false,
+    }
+}
+
 /// A number as the panel shows it: up to four decimals, without trailing zeros.
 pub fn number(value: f64) -> String {
     let text = format!("{value:.4}");
@@ -207,6 +241,22 @@ pub fn gesture(gesture: ffi::PanelGesture) {
     });
     if let Some((node, property)) = property {
         return property_gesture(&gesture, node, &property);
+    }
+    let refused = crate::read_app(|app| {
+        let panel = app.panel()?;
+        let refused = (panel.refused.iter()).find(|refused| connection_name(refused) == name)?;
+        Some((panel.node, refused.clone()))
+    });
+    if let Some((node, refused)) = refused {
+        if gesture.kind == PanelGestureKind::Reset
+            && let Err(error) = crate::edit(|session| session.disconnect(node, refused.input))
+        {
+            crate::perform(Request::ShowStatus(format!(
+                "Cannot disconnect {}: {error}",
+                refused.label
+            )));
+        }
+        return refresh();
     }
     let shown = crate::read_app(|app| {
         let panel = app.panel()?;

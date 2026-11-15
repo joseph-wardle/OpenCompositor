@@ -26,10 +26,13 @@ use crate::parameter::{ParameterKind, Value, ValueError, describe, resolve, vali
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
+mod active;
+mod connections;
 mod project;
 mod properties;
 mod rename;
 
+pub use connections::RefusedConnection;
 pub use project::{FileError, RelativePaths};
 pub use properties::{Property, PropertyError, Scalar, ScalarKind};
 pub use rename::NameError;
@@ -104,6 +107,12 @@ pub enum EditError {
         property: String,
         error: PropertyError,
     },
+    /// A delete refused: a layer other than the root, by its identifier, defines the node or
+    /// connects to it. Save writes the root layer alone, so the delete would not last.
+    Delete {
+        node: NodeId,
+        layer: String,
+    },
 }
 
 impl fmt::Display for EditError {
@@ -127,6 +136,12 @@ impl fmt::Display for EditError {
                 property,
                 error,
             } => write!(f, "node {}, {property}: {error}", node.0),
+            EditError::Delete { layer, .. } => {
+                write!(
+                    f,
+                    "{layer} defines or connects to the node; delete it there"
+                )
+            }
         }
     }
 }
@@ -779,8 +794,8 @@ impl Session {
     }
 
     /// Deletes nodes as one step, disconnecting every input that took one. Refused whole if any
-    /// of them is already gone. Their marks stay, doing nothing until an undo brings the nodes
-    /// back.
+    /// of them is already gone, or another layer defines or connects to one. Their marks stay,
+    /// doing nothing until an undo brings the nodes back.
     ///
     /// A gesture in the graph view ends unapplied, since it may hold a deleted node. Reads of a
     /// deleted node are left alone: its ID returns only with its path, so nothing can mistake
@@ -791,6 +806,11 @@ impl Session {
         }
         if ids.is_empty() {
             return Ok(Changes::default());
+        }
+        for &node in ids {
+            if let Some(layer) = self.held_elsewhere(self.path(node)) {
+                return Err(EditError::Delete { node, layer });
+            }
         }
         self.graph_view.cancel_gesture();
         let deleted: BTreeSet<NodeId> = ids.iter().copied().collect();
@@ -856,20 +876,42 @@ impl Session {
     }
 
     /// The wires assignments the network accepted author, each consumer's input attribute with
-    /// the source's path or none: only those that change what an input takes.
+    /// the source's path or none: only those that change what an input takes, or that disconnect
+    /// an input whose connection was refused, which the network has as unconnected.
     fn wires(&self, assignments: &[Assignment]) -> Vec<Wire> {
         let network = self.network();
         (assignments.iter())
-            .filter(|assignment| {
-                let current = network.node(assignment.consumer);
-                current.and_then(|node| node.input(assignment.input)) != assignment.source
-            })
-            .map(|assignment| Wire {
-                consumer: self.path(assignment.consumer).clone(),
-                attribute: input_attribute(assignment.input),
-                source: assignment.source.map(|source| self.path(source).clone()),
+            .filter_map(|assignment| {
+                let consumer = self.path(assignment.consumer).clone();
+                let attribute = input_attribute(assignment.input);
+                let authored = (consumer.append_property(&attribute).ok())
+                    .and_then(|path| self.stage.attribute(path).ok());
+                let connected = (authored.as_ref())
+                    .is_some_and(|authored| !authored.connections().unwrap_or_default().is_empty());
+                let current = (network.node(assignment.consumer))
+                    .and_then(|node| node.input(assignment.input));
+                if current == assignment.source && !(assignment.source.is_none() && connected) {
+                    return None;
+                }
+                Some(Wire {
+                    block: assignment.source.is_none()
+                        && authored.is_some_and(|authored| self.connected_elsewhere(&authored)),
+                    consumer,
+                    attribute,
+                    source: assignment.source.map(|source| self.path(source).clone()),
+                })
             })
             .collect()
+    }
+
+    /// Whether a layer other than the root authors the attribute's connections.
+    fn connected_elsewhere(&self, attribute: &openusd::usd::Attribute) -> bool {
+        let root = self.stage.root_layer().identifier().to_owned();
+        (attribute.property_stack().unwrap_or_default().iter()).any(|site| {
+            site.layer.identifier() != root
+                && (site.layer.borrow().data())
+                    .has_field(&site.path, sdf::FieldKey::ConnectionPaths.as_str())
+        })
     }
 
     /// Applies a view's response. Selecting records no step, as in Nuke and Houdini: undo goes
