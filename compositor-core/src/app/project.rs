@@ -1,9 +1,14 @@
 //! Leaving, opening and saving the project, and the questions they ask the artist.
 
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::{App, Pane, Request};
-use crate::session::{FileError, RelativePaths, Session};
+use crate::session::{FileError, RelativePaths, Session, newer_autosave, untitled_autosave};
+
+/// How long the project is left alone before it autosaves.
+const AUTOSAVE_IDLE: Duration = Duration::from_secs(5);
 
 /// What replaces or closes the project, once it is saved or discarded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,8 +37,19 @@ pub enum Answer {
     Save(Option<Leave>),
     /// Chooses where to save, then leaves as asked, if asked.
     SaveAs(Option<Leave>),
-    /// Leaves without saving.
+    /// Leaves without saving, removing the autosave.
     Discard(Leave),
+    /// Opens the file, if one, and recovers the autosave into its project, or into this untitled
+    /// one without a file.
+    Recover {
+        file: Option<PathBuf>,
+        autosave: PathBuf,
+    },
+    /// Deletes the autosave, then opens the file, if one.
+    DiscardAutosave {
+        file: Option<PathBuf>,
+        autosave: PathBuf,
+    },
     /// Saves as the file, then leaves as asked, if asked.
     SaveTo {
         file: PathBuf,
@@ -43,7 +59,88 @@ pub enum Answer {
     Cancel,
 }
 
+/// When the stage last changed, and what the autosave holds.
+#[derive(Debug, Default)]
+pub(super) struct Autosave {
+    /// The session's edits when last followed.
+    edits: u64,
+    /// When they last changed.
+    changed: Option<Instant>,
+    /// The session's edits the autosave holds.
+    written: Option<u64>,
+    /// Whether an [`Event::Autosave`](super::Event::Autosave) is on its way.
+    scheduled: bool,
+}
+
 impl App {
+    /// Notes a change to the stage, and asks for an autosave once the project is left alone.
+    pub(super) fn follow_edits(&mut self) -> Option<Request> {
+        let edits = self.session.edits();
+        if edits == self.autosave.edits {
+            return None;
+        }
+        self.autosave.edits = edits;
+        self.autosave.changed = Some(Instant::now());
+        self.schedule_autosave(AUTOSAVE_IDLE)
+    }
+
+    fn schedule_autosave(&mut self, after: Duration) -> Option<Request> {
+        (!std::mem::replace(&mut self.autosave.scheduled, true))
+            .then_some(Request::Autosave { after })
+    }
+
+    /// Autosaves once the stage is left alone for the idle delay with no edit or gesture in
+    /// progress, or waits on. A write that fails, as in a directory the user may not write, is
+    /// ignored for now.
+    pub(super) fn autosave_if_idle(&mut self) -> Vec<Request> {
+        self.autosave.scheduled = false;
+        let idle = (self.autosave.changed).map_or(AUTOSAVE_IDLE, |changed| changed.elapsed());
+        if idle < AUTOSAVE_IDLE {
+            return self
+                .schedule_autosave(AUTOSAVE_IDLE - idle)
+                .into_iter()
+                .collect();
+        }
+        if self.session.refuse_while_editing().is_err() {
+            return self.schedule_autosave(AUTOSAVE_IDLE).into_iter().collect();
+        }
+        let edits = self.session.edits();
+        if self.autosave.written != Some(edits) && matches!(self.session.autosave(), Ok(true)) {
+            self.autosave.written = Some(edits);
+        }
+        Vec::new()
+    }
+
+    /// Offers to recover the untitled project's autosave.
+    pub(super) fn offer_untitled_autosave(&self) -> Vec<Request> {
+        let Some(autosave) = (self.session.recovery()).and_then(untitled_autosave) else {
+            return Vec::new();
+        };
+        vec![Request::Ask(Question {
+            text: "An untitled project left autosaved changes.".to_owned(),
+            detail: "Recover brings them back, as changes you can undo. Discard deletes them. \
+                     Not Now keeps them for the next start."
+                .to_owned(),
+            answers: vec![
+                (
+                    "Recover".to_owned(),
+                    Answer::Recover {
+                        file: None,
+                        autosave: autosave.clone(),
+                    },
+                ),
+                (
+                    "Discard".to_owned(),
+                    Answer::DiscardAutosave {
+                        file: None,
+                        autosave,
+                    },
+                ),
+                ("Not Now".to_owned(), Answer::Cancel),
+            ],
+        })]
+    }
+
     /// Leaves the project as asked, first asking whether to save it if it is modified.
     pub(super) fn leave(&mut self, leave: Leave) -> Vec<Request> {
         if !self.session.is_modified() {
@@ -79,32 +176,88 @@ impl App {
         match answer {
             Answer::Save(then) => self.save(then),
             Answer::SaveAs(then) => self.choose_save_as(then),
-            Answer::Discard(leave) => self.proceed(leave),
+            Answer::Discard(leave) => {
+                self.session.remove_autosave();
+                self.proceed(leave)
+            }
+            Answer::Recover { file, autosave } => self.recover(file.as_deref(), &autosave),
+            Answer::DiscardAutosave { file, autosave } => {
+                // Already gone is as good.
+                let _ = fs::remove_file(&autosave);
+                match file.map(|file| self.open_now(&file)) {
+                    Some(Ok(requests)) => requests,
+                    Some(Err(error)) => vec![Request::ShowError(error)],
+                    None => Vec::new(),
+                }
+            }
             Answer::SaveTo { file, paths, then } => self.save_to(&file, paths, then),
             Answer::Cancel => Vec::new(),
         }
     }
 
-    /// Opens a project in place of this one, which was saved or discarded already. What the new
-    /// one shares with this one is the files on disk and the panes.
+    /// Opens a project in place of this one, which was saved or discarded already, first asking
+    /// whether to recover an autosave newer than its file.
     pub(super) fn open(&mut self, file: &Path) -> Vec<Request> {
-        let session = match Session::open(file) {
-            Ok(session) => session,
-            Err(error) => {
-                return vec![Request::ShowError(format!(
-                    "Cannot open {}: {error}",
-                    file.display()
-                ))];
+        let Some(autosave) = newer_autosave(file) else {
+            return self
+                .open_now(file)
+                .unwrap_or_else(|error| vec![Request::ShowError(error)]);
+        };
+        let answer = |recover| {
+            let (file, autosave) = (Some(file.to_owned()), autosave.clone());
+            match recover {
+                true => Answer::Recover { file, autosave },
+                false => Answer::DiscardAutosave { file, autosave },
             }
         };
+        vec![Request::Ask(Question {
+            text: format!(
+                "{} has autosaved changes newer than the file.",
+                project_name(Some(file))
+            ),
+            detail: "Recover opens it with them, as changes you can undo. Discard deletes them \
+                     and opens the file."
+                .to_owned(),
+            answers: vec![
+                ("Recover".to_owned(), answer(true)),
+                ("Discard".to_owned(), answer(false)),
+                ("Cancel".to_owned(), Answer::Cancel),
+            ],
+        })]
+    }
+
+    /// Opens a project in place of this one. What the new one shares with this one is the files
+    /// on disk and the panes.
+    fn open_now(&mut self, file: &Path) -> Result<Vec<Request>, String> {
+        let session = (Session::open(file))
+            .map_err(|error| format!("Cannot open {}: {error}", file.display()))?;
         let mut requests = self.replace_session(session);
         requests.extend(self.composition_errors());
+        Ok(requests)
+    }
+
+    /// Opens the file, if one, then recovers the autosave into the project.
+    fn recover(&mut self, file: Option<&Path>, autosave: &Path) -> Vec<Request> {
+        let mut requests = match file.map(|file| self.open_now(file)) {
+            Some(Ok(requests)) => requests,
+            Some(Err(error)) => return vec![Request::ShowError(error)],
+            None => Vec::new(),
+        };
+        requests.push(match self.session.recover(autosave) {
+            Ok(_) => Request::ShowStatus("Recovered the autosaved changes".to_owned()),
+            Err(error) => {
+                Request::ShowError(format!("Cannot recover {}: {error}", autosave.display()))
+            }
+        });
+        requests.push(Request::Redraw(Pane::Graph));
         requests
     }
 
     fn replace_session(&mut self, mut session: Session) -> Vec<Request> {
         session.succeed(&mut self.session);
         self.session = session;
+        self.autosave.edits = self.session.edits();
+        self.autosave.written = None;
         self.playback.stop();
         self.pinned = None;
         self.choices.clear();

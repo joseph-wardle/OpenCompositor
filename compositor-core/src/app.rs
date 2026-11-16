@@ -31,8 +31,8 @@ use crate::worker::{Evaluated, EvaluationDevice, Job, ViewerError, Worker};
 mod project;
 mod viewing;
 
-use project::project_name;
 pub use project::{Answer, Leave, Question};
+use project::{Autosave, project_name};
 pub use viewing::Displayed;
 use viewing::{Asked, Shown, Viewing};
 
@@ -159,6 +159,10 @@ pub enum Event {
     },
     /// The answer chosen for a [`Request::Ask`]'s question.
     Answered(Answer),
+    /// The window is shown with an untitled project, the shell given no file to open.
+    Started,
+    /// The time to autosave if the project has been left alone, after [`Request::Autosave`].
+    Autosave,
 }
 
 /// What another thread, or wgpu inside a call, tells the GUI thread through the waker
@@ -277,6 +281,8 @@ pub enum Request {
     },
     /// Ask the question in a dialog, then dispatch [`Event::Answered`] with the answer chosen.
     Ask(Question),
+    /// Dispatch [`Event::Autosave`] after the delay. The app asks for one at a time.
+    Autosave { after: Duration },
     /// Close the window and end the application.
     Quit,
 }
@@ -549,6 +555,7 @@ pub struct App {
     ahead_sent: Vec<ResultKey>,
     /// What is known of each frame of the viewed node.
     marks: Marks,
+    autosave: Autosave,
     shell: Shell,
 }
 
@@ -621,6 +628,7 @@ impl App {
             playback: Playback::default(),
             ahead_sent: Vec::new(),
             marks: Marks::default(),
+            autosave: Autosave::default(),
             shell: Shell {
                 project: Some((project_name(None), false)),
                 ..Shell::default()
@@ -802,6 +810,8 @@ impl App {
                 then,
             } => self.save_as_chosen(file, then),
             Event::Answered(answer) => self.answered(answer),
+            Event::Started => self.offer_untitled_autosave(),
+            Event::Autosave => self.autosave_if_idle(),
         };
         self.after_change(requests)
     }
@@ -842,6 +852,7 @@ impl App {
         requests.extend(self.playback.follow_shown(shown));
         self.follow_look_ahead();
         self.follow_readout(&mut requests);
+        requests.extend(self.follow_edits());
         let mut shows = Vec::new();
         self.follow_project(&mut shows);
         let gpu_label = self.gpu_label();

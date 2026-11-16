@@ -2,6 +2,7 @@
 //! dialogs asked for, and what a project opened in place of another keeps.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::{app, create};
 use crate::app::{Answer, Command, Event, Leave, Question, Request};
@@ -243,4 +244,76 @@ fn a_file_that_cannot_be_opened_leaves_the_project_and_says_why() {
         [Request::ShowError(error)] if error.starts_with("Cannot open /nonexistent/shot.usda: ")
     ));
     assert_eq!(app.session().network().nodes().count(), 1);
+}
+
+fn autosaves(requests: &[Request]) -> usize {
+    (requests.iter())
+        .filter(|request| matches!(request, Request::Autosave { .. }))
+        .count()
+}
+
+#[test]
+fn edits_ask_for_one_autosave_which_waits_while_they_go_on() {
+    let (mut app, _deliveries) = app();
+    let requests = app.dispatch(Event::Answered(Answer::Cancel));
+    assert_eq!(autosaves(&requests), 0);
+    let mut asked = 0;
+    for file in ["/nonexistent/a.exr", "/nonexistent/b.exr"] {
+        let requests = app.dispatch(Event::Command(Command::ReadFiles));
+        let Some(Request::ChooseFiles(intent)) = requests.first().cloned() else {
+            panic!("{requests:?}");
+        };
+        let paths = vec![PathBuf::from(file)];
+        asked += autosaves(&app.dispatch(Event::FilesChosen { intent, paths }));
+    }
+    assert_eq!(asked, 1, "one at a time");
+    let requests = app.dispatch(Event::Autosave);
+    let [Request::Autosave { after }] = requests[..] else {
+        panic!("{requests:?}");
+    };
+    assert!(after <= Duration::from_secs(5));
+}
+
+#[test]
+fn open_offers_a_newer_autosave_to_recover_or_discard() {
+    let directory = directory("recover");
+    let shot = directory.join("shot.usda");
+    let autosave = directory.join("shot.usda.autosave");
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(saved_as(&shot, None));
+    create(&mut app, "/nonexistent/b.exr");
+    assert!(app.session().autosave().unwrap());
+
+    let requests = app.dispatch(Event::ProjectChosen(Some(shot.clone())));
+    let question = question(&requests).expect("a newer autosave is offered");
+    let recover = Answer::Recover {
+        file: Some(shot.clone()),
+        autosave: autosave.clone(),
+    };
+    let discard = Answer::DiscardAutosave {
+        file: Some(shot.clone()),
+        autosave: autosave.clone(),
+    };
+    assert_eq!(answers(question), [&recover, &discard, &Answer::Cancel]);
+    app.dispatch(Event::Answered(recover));
+    assert_eq!(app.session().network().nodes().count(), 2);
+    assert!(app.session().is_modified());
+
+    app.dispatch(Event::Answered(discard));
+    assert_eq!(app.session().network().nodes().count(), 1);
+    assert!(!autosave.exists());
+}
+
+#[test]
+fn dont_save_removes_the_autosave() {
+    let directory = directory("discard");
+    let shot = directory.join("shot.usda");
+    let (mut app, _deliveries) = app();
+    create(&mut app, "/nonexistent/a.exr");
+    app.dispatch(saved_as(&shot, None));
+    create(&mut app, "/nonexistent/b.exr");
+    assert!(app.session().autosave().unwrap());
+    app.dispatch(Event::Answered(Answer::Discard(Leave::New)));
+    assert!(!directory.join("shot.usda.autosave").exists());
 }

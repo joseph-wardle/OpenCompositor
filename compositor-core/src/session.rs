@@ -27,11 +27,13 @@ use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
 mod active;
+mod autosave;
 mod connections;
 mod project;
 mod properties;
 mod rename;
 
+pub use autosave::{newer_autosave, recovery_directory, untitled_autosave};
 pub use connections::RefusedConnection;
 pub use project::{FileError, RelativePaths};
 pub use properties::{Property, PropertyError, Scalar, ScalarKind};
@@ -207,6 +209,10 @@ pub struct Session {
     version: u64,
     /// Counts the changes of `version` that were to the frame alone.
     frames_set: u64,
+    /// Counts changes to the stage, which autosave follows.
+    edits: u64,
+    /// Where an untitled project autosaves, if anywhere.
+    recovery: Option<PathBuf>,
 }
 
 impl fmt::Debug for Session {
@@ -277,6 +283,8 @@ impl Session {
             failures: Failures::default(),
             version: 0,
             frames_set: 0,
+            edits: 0,
+            recovery: recovery_directory(),
         };
         let everything = Changes {
             nodes: session.network().nodes().map(|(id, _)| id).collect(),
@@ -345,6 +353,11 @@ impl Session {
 
     /// Changes whenever the stage, the network, the marks, the frame or the files do, so that a
     /// key built at one version is current while the version is.
+    /// Counts changes to the stage: edits, undo and redo.
+    pub fn edits(&self) -> u64 {
+        self.edits
+    }
+
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -1205,6 +1218,9 @@ impl Session {
         // A property no node reads changes no node, but the panel shows it.
         if staged || !changes.is_empty() {
             self.version += 1;
+        }
+        if staged {
+            self.edits += 1;
         }
         changes
     }

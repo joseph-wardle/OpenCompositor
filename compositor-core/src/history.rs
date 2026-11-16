@@ -37,6 +37,22 @@ fn spec_state(data: &dyn AbstractData, path: &sdf::Path) -> SpecState {
 pub(crate) struct Inverse(BTreeMap<String, BTreeMap<sdf::Path, SpecState>>);
 
 impl Inverse {
+    /// What makes the layer `identifier`, now `current`, hold exactly the specs of `wanted`.
+    pub(crate) fn matching(
+        identifier: &str,
+        current: &dyn AbstractData,
+        wanted: &dyn AbstractData,
+    ) -> Inverse {
+        let specs = (current.spec_paths().into_iter())
+            .chain(wanted.spec_paths())
+            .map(|path| {
+                let state = spec_state(wanted, &path);
+                (path, state)
+            })
+            .collect();
+        Inverse(BTreeMap::from([(identifier.to_owned(), specs)]))
+    }
+
     /// Folds in what later transactions touched, keeping each spec's earlier state.
     pub(crate) fn merge(&mut self, later: Inverse) {
         for (layer, specs) in later.0 {

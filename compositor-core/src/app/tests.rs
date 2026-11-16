@@ -212,7 +212,10 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
             Request::ShowViewerCaption(
                 "Slot 1: nothing marked. Ctrl+1 marks the selected node".to_owned()
             ),
-            Request::Redraw(Pane::Graph)
+            Request::Redraw(Pane::Graph),
+            Request::Autosave {
+                after: Duration::from_secs(5)
+            }
         ]
     );
     let network = app.session().network();

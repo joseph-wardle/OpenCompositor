@@ -13,7 +13,7 @@ mod playback_check;
 mod qt;
 mod timebar;
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
@@ -40,6 +40,9 @@ thread_local! {
     static WIDGETS: OnceCell<Widgets> = const { OnceCell::new() };
     /// The menus' commands, by the index each item passes to `run_command`.
     static COMMANDS: OnceCell<Vec<Command>> = const { OnceCell::new() };
+    /// Whether a scripted check runs, whose untitled projects are never autosaved, so that no
+    /// later start offers to recover them.
+    static CHECKING: Cell<bool> = const { Cell::new(false) };
     /// Each pane's connection to Qt Wayland's `surfaceRoleDestroyed`.
     static SURFACE_WATCHES: RefCell<[Option<QMetaObjectConnectionGuard>; Pane::COUNT]> =
         RefCell::new(Default::default());
@@ -311,8 +314,11 @@ fn main() {
     unsafe { ffi::show_project(window_ptr, &QString::from("Untitled"), false) };
     keys::start();
     window.pin_mut().show();
-    if let Some(file) = project {
-        dispatch(Event::ProjectChosen(Some(file)));
+    CHECKING.set(check.is_some());
+    match project {
+        Some(file) => dispatch(Event::ProjectChosen(Some(file))),
+        None if check.is_none() => dispatch(Event::Started),
+        None => {}
     }
     match check {
         Some(Check::Lifecycle(image)) => lifecycle::start(image),
@@ -471,6 +477,11 @@ pub fn perform(request: Request) {
             let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
             ffi::single_shot(milliseconds, retry_device_creation, attempt as usize);
         }
+        Request::Autosave { .. } if CHECKING.get() => {}
+        Request::Autosave { after } => {
+            let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
+            ffi::single_shot(milliseconds, autosave, 0);
+        }
         Request::CollectPixelRead { after } => {
             let milliseconds = i32::try_from(after.as_millis()).unwrap_or(i32::MAX);
             ffi::single_shot(milliseconds, collect_pixel_read, 0);
@@ -553,6 +564,11 @@ fn retry_device_creation(attempt: usize) {
     let started = Instant::now();
     dispatch(Event::RetryDeviceCreation(attempt as u64));
     check::observe(Seen::Attempted(started.elapsed()));
+}
+
+/// One whose timer fires after the app has dropped dispatches to nothing.
+fn autosave(_: usize) {
+    dispatch(Event::Autosave);
 }
 
 /// One whose timer fires after the app has dropped dispatches to nothing.

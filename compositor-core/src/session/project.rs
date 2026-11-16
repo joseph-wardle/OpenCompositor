@@ -101,21 +101,22 @@ impl Session {
         self.stage.root_layer().is_dirty().unwrap_or(false)
     }
 
-    /// Writes the root layer, if modified, to its file in the format it was read in. Refused
-    /// during an edit in progress or a gesture in the graph, and for a project without a file of
-    /// its own to save to again. A file the user may not write is not replaced, though its
-    /// directory would let it be.
+    /// Writes the root layer, if modified, to its file in the format it was read in, and removes
+    /// its autosave. Refused during an edit in progress or a gesture in the graph, and for a
+    /// project without a file of its own to save to again. A file the user may not write is not
+    /// replaced, though its directory would let it be.
     pub fn save(&mut self) -> Result<(), FileError> {
         self.refuse_while_editing()?;
         let file = self.saved_file().ok_or(FileError::NoFile)?;
-        if !self.is_modified() {
-            return Ok(());
+        if self.is_modified() {
+            writable(&file).map_err(|_| FileError::ReadOnly(file.clone()))?;
+            (self.stage.root_layer().save()).map_err(|error| FileError::Write {
+                why: why(&error),
+                file,
+            })?;
         }
-        writable(&file).map_err(|_| FileError::ReadOnly(file.clone()))?;
-        (self.stage.root_layer().save()).map_err(|error| FileError::Write {
-            why: why(&error),
-            file,
-        })
+        self.remove_autosave();
+        Ok(())
     }
 
     /// The file Save writes the root layer back to: `None` for an untitled project or a package.
@@ -219,6 +220,7 @@ impl Session {
             why: why(&error),
             file: file.clone(),
         })?;
+        self.remove_autosave();
         let to = stage.root_layer().identifier().to_owned();
         for step in self.undo.iter_mut().chain(&mut self.redo) {
             step.inverse.rename_layer(root.identifier(), &to);
@@ -285,12 +287,13 @@ impl Session {
         self.viewer.resize(earlier.viewer.size());
         self.version = earlier.version + 1;
         self.frames_set = 0;
+        self.recovery = earlier.recovery.take();
         self.present_failures();
     }
 }
 
 /// An error and the errors it was caused by, as one message.
-fn why(error: &dyn std::error::Error) -> String {
+pub(super) fn why(error: &dyn std::error::Error) -> String {
     let mut why = error.to_string();
     let mut source = error.source();
     while let Some(error) = source {
@@ -301,7 +304,7 @@ fn why(error: &dyn std::error::Error) -> String {
 }
 
 /// An error from the system, which does not name the file.
-fn io_why(file: &Path, error: &io::Error) -> String {
+pub(super) fn io_why(file: &Path, error: &io::Error) -> String {
     format!("{}: {error}", file.display())
 }
 
