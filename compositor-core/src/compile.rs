@@ -18,7 +18,7 @@ use crate::author::{COMP_TYPE, OUTPUT, POSITION};
 use crate::network::{
     InputSlot, MAX_SLOTS, Network, Node, NodeId, NodeKind, Timeline, TimelineError,
 };
-use crate::parameter::{ParameterKind, Value, describe};
+use crate::parameter::{Number, Parameter, ParameterKind, Samples, Value, describe, validate};
 
 const IN_CYCLE: &str = "takes its own image, through a cycle of wires";
 
@@ -329,12 +329,27 @@ impl Compiler {
                 continue;
             };
             if let Ok(parameter) = describe(kind.parameters(), name) {
-                if is_animated(&attribute) {
-                    node.refuse(format!(
-                        "{} is animated, which this version cannot evaluate",
-                        parameter.label
-                    ));
-                    continue;
+                match animation(&attribute) {
+                    Animation::None => {}
+                    Animation::Samples => {
+                        match samples(&kind, parameter, &attribute) {
+                            Ok(Some(samples)) => node.animate(parameter.name, samples),
+                            Ok(None) => {}
+                            Err(problem) => node.refuse(problem),
+                        }
+                        continue;
+                    }
+                    unread @ (Animation::Clips | Animation::Spline) => {
+                        node.refuse(format!(
+                            "{} is animated by {}, which this version cannot evaluate",
+                            parameter.label,
+                            match unread {
+                                Animation::Clips => "value clips",
+                                _ => "a spline",
+                            }
+                        ));
+                        continue;
+                    }
                 }
                 let Ok(Some(authored)) = attribute.get::<vt::Value>() else {
                     continue;
@@ -533,25 +548,87 @@ fn number(value: &vt::Value) -> Option<f64> {
     }
 }
 
-/// Whether an attribute's value varies with time: its strongest value opinion is time samples,
-/// value clips or a spline.
-pub(crate) fn is_animated(attribute: &Attribute) -> bool {
-    let source = attribute.resolve_info().map(|info| info.source());
-    if matches!(
-        source,
-        Ok(ResolveInfoSource::TimeSamples | ResolveInfoSource::ValueClips)
-    ) {
-        return true;
-    }
-    // The crate holds a spline without resolving it. USD reads one before the default beside it.
+/// What makes an attribute's value vary with time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Animation {
+    None,
+    /// Time samples, the strongest value opinion.
+    Samples,
+    Clips,
+    Spline,
+}
+
+/// How an attribute's strongest value opinion varies with time, if it does.
+pub(crate) fn animation(attribute: &Attribute) -> Animation {
+    let sampled = match attribute.resolve_info().map(|info| info.source()) {
+        Ok(ResolveInfoSource::ValueClips) => return Animation::Clips,
+        Ok(ResolveInfoSource::TimeSamples) => true,
+        _ => false,
+    };
+    // The crate holds a spline without resolving it. USD reads one before the default beside it
+    // and after the samples beside it.
     (attribute.property_stack().unwrap_or_default().iter())
         .find_map(|site| {
             let layer = site.layer.borrow();
             let has = |key: sdf::FieldKey| layer.data().has_field(&site.path, key.as_str());
-            let spline = has(sdf::FieldKey::Spline);
-            (spline || has(sdf::FieldKey::Default)).then_some(spline)
+            if sampled && has(sdf::FieldKey::TimeSamples) {
+                Some(Animation::Samples)
+            } else if has(sdf::FieldKey::Spline) {
+                Some(Animation::Spline)
+            } else {
+                has(sdf::FieldKey::Default).then_some(Animation::None)
+            }
         })
-        .unwrap_or(false)
+        .unwrap_or(if sampled {
+            Animation::Samples
+        } else {
+            Animation::None
+        })
+}
+
+/// Whether an attribute's value varies with time: its strongest value opinion is time samples,
+/// value clips or a spline.
+pub(crate) fn is_animated(attribute: &Attribute) -> bool {
+    animation(attribute) != Animation::None
+}
+
+/// An animated parameter's composed samples in stage time, each checked as a value of the
+/// parameter is, or why they are refused. `Ok(None)` if there are none after all.
+fn samples(
+    kind: &NodeKind,
+    parameter: &'static Parameter,
+    attribute: &Attribute,
+) -> Result<Option<Samples>, String> {
+    let label = parameter.label;
+    // A Reader scans its file, and reads its range and whole frames, as constants.
+    if matches!(kind, NodeKind::Reader) || !matches!(parameter.kind, ParameterKind::Float(_)) {
+        return Err(format!(
+            "{label} is animated, which this version cannot evaluate for a {}",
+            kind.label()
+        ));
+    }
+    let composed = (attribute.time_samples().ok().flatten()).unwrap_or_default();
+    let mut samples = Vec::with_capacity(composed.len());
+    for (time, value) in composed {
+        let sample = match value {
+            vt::Value::ValueBlock | vt::Value::None => None,
+            vt::Value::Double(number) => Some(Number::Double(number)),
+            vt::Value::Float(number) => Some(Number::Float(number)),
+            vt::Value::Half(number) => Some(Number::Half(number)),
+            vt::Value::Int(number) => Some(Number::Int(number)),
+            _ => return Err(wrong_type(label, attribute, "a number")),
+        };
+        if let Some(number) = sample {
+            validate(
+                kind.parameters(),
+                parameter.name,
+                Value::Float(number.value()),
+            )
+            .map_err(|error| format!("{label} at frame {time}: {error}"))?;
+        }
+        samples.push((time, sample));
+    }
+    Ok(Samples::new(samples))
 }
 
 fn wrong_type(label: &str, attribute: &Attribute, wanted: &str) -> String {

@@ -718,16 +718,19 @@ fn a_reset_and_a_disconnect_keep_what_else_the_attribute_holds() {
 }
 
 #[test]
-fn an_animated_parameter_refuses_its_node_and_its_edits() {
+fn an_animated_parameter_refuses_its_edits_and_a_splined_one_its_node() {
     let mut session = Session::from_usda(ANOTHER_TOOLS);
     let before = session.root_layer_text();
-    for name in ["Sampled", "SampledOverDefault", "Splined"] {
+    for (name, refused) in [
+        ("Sampled", None),
+        ("SampledOverDefault", None),
+        (
+            "Splined",
+            Some("Stops is animated by a spline, which this version cannot evaluate"),
+        ),
+    ] {
         let id = named(&session, name);
-        assert_eq!(
-            problem(&session, id).as_deref(),
-            Some("Stops is animated, which this version cannot evaluate"),
-            "{name}"
-        );
+        assert_eq!(problem(&session, id).as_deref(), refused, "{name}");
         assert_eq!(stops(&session, id), None, "{name}");
         let animated = EditError::InvalidValue {
             node: id,

@@ -9,6 +9,10 @@ use std::sync::Arc;
 use crate::files::with_hashes;
 use crate::network::Node;
 
+mod samples;
+
+pub(crate) use samples::{Number, Samples};
+
 /// One parameter of a node type. OpenFX properties beyond these stay in the plugin adapter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Parameter {
@@ -208,22 +212,33 @@ impl Resolved {
 }
 
 /// The boundary between what was authored and what executes: the node's authored values over its
-/// version's defaults, each relative file anchored to the layer that authored it.
+/// version's defaults, each relative file anchored to the layer that authored it, and each
+/// animated value as USD reads its time samples at the frame.
 ///
 /// Setting a value equal to its default and resetting it resolve alike, though only the first
-/// keeps the value authored.
-///
-/// Values are resolved at a frame, so that animated values can be sampled there; until a
-/// parameter can be animated, every value is the same at every frame.
-pub fn resolve(node: &Node, _frame: f64) -> Resolved {
+/// keeps the value authored. A frame at which an animated parameter's samples are blocked
+/// resolves as an absent value does.
+pub fn resolve(node: &Node, frame: f64) -> Resolved {
     let values = node
         .kind
         .parameters()
         .iter()
         .filter_map(|parameter| {
+            let sampled = || {
+                let value = node.samples(parameter.name)?.at(frame)?;
+                Some(match &parameter.kind {
+                    // Between two samples inside the limits, rounding can land an ulp outside.
+                    ParameterKind::Float(float) => {
+                        value.clamp(*float.limits.start(), *float.limits.end())
+                    }
+                    ParameterKind::Frame { .. } | ParameterKind::File => value,
+                })
+            };
             let value = match node.anchored(parameter.name) {
                 Some(path) => Value::File(path.clone()),
-                None => (node.authored_value(parameter.name).cloned())
+                // Adding zero stores equal values as equal bits, as validation does.
+                None => (sampled().map(|value| Value::Float(value + 0.0)))
+                    .or_else(|| node.authored_value(parameter.name).cloned())
                     .or_else(|| parameter.kind.default_value())?,
             };
             Some((parameter.name, value))
