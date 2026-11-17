@@ -26,12 +26,12 @@ impl Session {
         let Ok(prim) = self.stage.prim(self.path(id).clone()) else {
             return Vec::new();
         };
-        let root = self.compiler.root();
+        let comp = self.compiler.comp();
         (prim.attributes().unwrap_or_default().iter())
             .filter_map(|attribute| {
                 let input = input_slot(&node.kind, attribute.name().strip_prefix("inputs:")?)?;
                 let targets = attribute.connections().unwrap_or_default();
-                let why = invalid_connection(&self.stage, root, &targets)?;
+                let why = invalid_connection(&self.stage, comp, &targets)?;
                 Some(RefusedConnection {
                     input,
                     label: slot_label(&node.kind, input),

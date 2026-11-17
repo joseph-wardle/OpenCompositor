@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use openusd::sdf::Layer;
 
 use super::project::{io_why, project_format, why};
-use super::{Changes, FileError, Session, Step};
+use super::{Changes, FileError, Session};
 use crate::history::Inverse;
 
 const EXTENSION: &str = "autosave";
@@ -108,14 +108,7 @@ impl Session {
         let matching = Inverse::matching(root.identifier(), root.borrow().data(), recovered.data());
         let (restored, inverse) = self.recorder.record(|| matching.restore(&self.stage));
         restored.map_err(|error| read(why(&error)))?;
-        if !inverse.changes_nothing(&self.stage) {
-            self.undo.push(Step {
-                label: "Recover",
-                inverse,
-                renamed: None,
-            });
-            self.redo.clear();
-        }
+        self.record_step("Recover", inverse, None);
         Ok(self.update(Changes::default()))
     }
 }

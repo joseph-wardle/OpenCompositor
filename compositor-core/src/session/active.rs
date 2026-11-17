@@ -43,13 +43,12 @@ impl Session {
     /// Whether the prim's strongest `active` opinion, apart from the one this session authors on
     /// it in the root layer, deactivates it: one of a sublayer, or across a reference or variant.
     fn inactive_elsewhere(&self, path: &sdf::Path) -> bool {
-        let root = self.stage.root_layer().identifier().to_owned();
         let field = sdf::FieldKey::Active.as_str();
         let Ok(prim) = self.stage.prim(path.clone()) else {
             return false;
         };
         (prim.prim_stack().unwrap_or_default().iter())
-            .filter(|site| site.layer.identifier() != root || site.path != *path)
+            .filter(|site| self.is_foreign(site, path))
             .find_map(|site| {
                 let layer = site.layer.borrow();
                 let data = layer.data();

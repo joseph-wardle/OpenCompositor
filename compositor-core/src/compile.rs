@@ -87,14 +87,15 @@ struct Notices {
 /// node changed.
 #[derive(Debug)]
 pub(crate) struct Compiler {
-    root: Option<sdf::Path>,
+    /// The comp root, the prim whose children are the nodes.
+    comp: Option<sdf::Path>,
     ids: Ids,
     /// Each node as its own prim defines it.
     defined: OrdMap<NodeId, Arc<Node>>,
     /// The nodes whose connections each prim's type and activity decide, by that prim.
-    readers: BTreeMap<sdf::Path, BTreeSet<NodeId>>,
-    /// What each node reads besides itself, to forget it when the node is read again.
-    reads: BTreeMap<NodeId, Vec<sdf::Path>>,
+    dependents: BTreeMap<sdf::Path, BTreeSet<NodeId>>,
+    /// The prims each node depends on besides its own, to forget them when it is read again.
+    dependencies: BTreeMap<NodeId, Vec<sdf::Path>>,
     /// The nodes in a cycle, refused in the network.
     in_cycles: BTreeSet<NodeId>,
     network: Network,
@@ -118,11 +119,11 @@ impl Compiler {
             })
             .expect("a new stage is not being edited");
         let mut compiler = Compiler {
-            root: None,
+            comp: None,
             ids,
             defined: OrdMap::new(),
-            readers: BTreeMap::new(),
-            reads: BTreeMap::new(),
+            dependents: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
             in_cycles: BTreeSet::new(),
             network: Network::default(),
             timeline: Timeline::default(),
@@ -142,8 +143,8 @@ impl Compiler {
         &self.network
     }
 
-    pub(crate) fn root(&self) -> Option<&sdf::Path> {
-        self.root.as_ref()
+    pub(crate) fn comp(&self) -> Option<&sdf::Path> {
+        self.comp.as_ref()
     }
 
     pub(crate) fn ids(&self) -> &Ids {
@@ -178,19 +179,19 @@ impl Compiler {
             return false;
         }
         self.read_timeline(stage);
-        let root_resynced = (notices.resynced.iter())
-            .any(|path| path.is_abs_root() || self.root.as_ref().is_none_or(|root| root == path));
-        let mut everything = root_resynced;
+        let comp_resynced = (notices.resynced.iter())
+            .any(|path| path.is_abs_root() || self.comp.as_ref().is_none_or(|comp| comp == path));
+        let mut everything = comp_resynced;
         // The default prim is a field of `/`, which changes without a resync.
-        if root_resynced || notices.changed.iter().any(sdf::Path::is_abs_root) {
-            let root = discover_root(stage);
-            everything |= root != self.root;
-            self.root = root;
+        if comp_resynced || notices.changed.iter().any(sdf::Path::is_abs_root) {
+            let comp = discover_comp(stage);
+            everything |= comp != self.comp;
+            self.comp = comp;
         }
         let mut dirty: BTreeSet<sdf::Path> = BTreeSet::new();
-        if let Some(root) = &self.root {
+        if let Some(comp) = &self.comp {
             for path in notices.resynced.iter().chain(&notices.changed) {
-                dirty.extend(node_ancestor(root, &path.prim_path()));
+                dirty.extend(node_ancestor(comp, &path.prim_path()));
             }
         }
         if everything {
@@ -199,20 +200,20 @@ impl Compiler {
                     .keys()
                     .filter_map(|&id| self.ids.path(id).cloned()),
             );
-            if let Some(root) = &self.root {
-                let children = (stage.prim(root.clone()).ok())
+            if let Some(comp) = &self.comp {
+                let children = (stage.prim(comp.clone()).ok())
                     .and_then(|prim| prim.children().ok())
                     .unwrap_or_default();
                 dirty.extend(children.iter().map(|child| child.path().clone()));
             }
         }
-        let readers: Vec<NodeId> = (dirty.iter())
-            .filter_map(|path| self.readers.get(path))
+        let dependents: Vec<NodeId> = (dirty.iter())
+            .filter_map(|path| self.dependents.get(path))
             .flatten()
             .copied()
             .collect();
         dirty.extend(
-            readers
+            dependents
                 .into_iter()
                 .filter_map(|id| self.ids.path(id).cloned()),
         );
@@ -223,7 +224,7 @@ impl Compiler {
             if self.ids.path(id) != Some(&path) {
                 continue;
             }
-            self.forget_reads(id);
+            self.forget_dependencies(id);
             let node = self.define(stage, id, &path).map(Arc::new);
             let before = match &node {
                 Some(node) => self.defined.insert(id, node.clone()),
@@ -246,12 +247,12 @@ impl Compiler {
         true
     }
 
-    fn forget_reads(&mut self, id: NodeId) {
-        for read in self.reads.remove(&id).unwrap_or_default() {
-            if let Some(readers) = self.readers.get_mut(&read) {
-                readers.remove(&id);
-                if readers.is_empty() {
-                    self.readers.remove(&read);
+    fn forget_dependencies(&mut self, id: NodeId) {
+        for prim in self.dependencies.remove(&id).unwrap_or_default() {
+            if let Some(dependents) = self.dependents.get_mut(&prim) {
+                dependents.remove(&id);
+                if dependents.is_empty() {
+                    self.dependents.remove(&prim);
                 }
             }
         }
@@ -286,7 +287,7 @@ impl Compiler {
     /// The node a prim defines, refused for any of its own faults, or `None` if the prim is no
     /// node. Records which other prims decide its connections.
     fn define(&mut self, stage: &Stage, id: NodeId, path: &sdf::Path) -> Option<Node> {
-        if path.parent().as_ref() != self.root.as_ref() {
+        if path.parent().as_ref() != self.comp.as_ref() {
             return None;
         }
         let prim = stage.prim(path.clone()).ok()?;
@@ -309,7 +310,7 @@ impl Compiler {
         if !prim.is_active().unwrap_or(false) {
             node.deactivate();
         }
-        let mut reads = Vec::new();
+        let mut dependencies = Vec::new();
         for property in prim.property_names().unwrap_or_default() {
             let Some(name) = property.as_str().strip_prefix("inputs:") else {
                 continue;
@@ -371,18 +372,16 @@ impl Compiler {
             };
             let label = slot_label(&kind, slot);
             let targets = attribute.connections().unwrap_or_default();
+            let invalid = invalid_connection(stage, self.comp.as_ref(), &targets);
             let [target] = targets.as_slice() else {
-                if !targets.is_empty() {
-                    node.refuse(format!(
-                        "{label} has {} connections, and an input takes one",
-                        targets.len()
-                    ));
+                if let Some(invalid) = invalid {
+                    node.refuse(format!("{label}: {invalid}"));
                 }
                 continue;
             };
             let source = target.prim_path();
-            reads.push(source.clone());
-            match invalid_connection(stage, self.root.as_ref(), &targets) {
+            dependencies.push(source.clone());
+            match invalid {
                 None => node.connect(slot, self.ids.intern(&source)),
                 Some(invalid) => node.refuse(format!(
                     "{label} is connected to {}, but {invalid}",
@@ -390,10 +389,10 @@ impl Compiler {
                 )),
             }
         }
-        for read in &reads {
-            self.readers.entry(read.clone()).or_default().insert(id);
+        for prim in &dependencies {
+            self.dependents.entry(prim.clone()).or_default().insert(id);
         }
-        self.reads.insert(id, reads);
+        self.dependencies.insert(id, dependencies);
         Some(node)
     }
 }
@@ -428,11 +427,11 @@ impl fmt::Display for InvalidConnection {
 
 impl std::error::Error for InvalidConnection {}
 
-/// Why connections to `targets` give an input of a node under `root` no image, or `None` if
-/// they give it one, or there are none.
+/// Why connections to `targets` give an input of a node under the comp root `comp` no image, or
+/// `None` if they give it one, or there are none.
 pub(crate) fn invalid_connection(
     stage: &Stage,
-    root: Option<&sdf::Path>,
+    comp: Option<&sdf::Path>,
     targets: &[sdf::Path],
 ) -> Option<InvalidConnection> {
     let target = match targets {
@@ -441,7 +440,7 @@ pub(crate) fn invalid_connection(
         targets => return Some(InvalidConnection::Several(targets.len())),
     };
     let source = target.prim_path();
-    let Some(root) = root.filter(|root| source.has_prefix(root) && source != **root) else {
+    let Some(comp) = comp.filter(|comp| source.has_prefix(comp) && source != **comp) else {
         return Some(InvalidConnection::OutsideComp);
     };
     let prim = (stage.prim(source.clone()).ok()).filter(|prim| prim.is_valid().unwrap_or(false));
@@ -449,7 +448,7 @@ pub(crate) fn invalid_connection(
         return Some(InvalidConnection::NoPrim);
     };
     let kind = (prim.type_name().ok().flatten()).and_then(|name| NodeKind::of_type(name.as_str()));
-    if source.parent().as_ref() != Some(root) || kind.is_none() {
+    if source.parent().as_ref() != Some(comp) || kind.is_none() {
         return Some(InvalidConnection::NotANode);
     }
     match target.split_property() {
@@ -485,7 +484,7 @@ fn anchored(node: &Node, parameter: &str, attribute: &Attribute) -> Option<Arc<P
 
 /// The comp root the graph shows: the default prim if it is a comp, else the first comp at the
 /// top of the stage.
-fn discover_root(stage: &Stage) -> Option<sdf::Path> {
+fn discover_comp(stage: &Stage) -> Option<sdf::Path> {
     let is_comp = |path: &sdf::Path| {
         (stage.prim(path.clone()).ok())
             .and_then(|prim| prim.type_name().ok().flatten())
@@ -502,9 +501,9 @@ fn discover_root(stage: &Stage) -> Option<sdf::Path> {
         .find(is_comp)
 }
 
-/// The child of `root` that `prim` is or lies beneath, if it is beneath `root`.
-fn node_ancestor(root: &sdf::Path, prim: &sdf::Path) -> Option<sdf::Path> {
-    (prim.ancestors()).find(|ancestor| ancestor.parent().as_ref() == Some(root))
+/// The child of `comp` that `prim` is or lies beneath, if it is beneath `comp`.
+fn node_ancestor(comp: &sdf::Path, prim: &sdf::Path) -> Option<sdf::Path> {
+    (prim.ancestors()).find(|ancestor| ancestor.parent().as_ref() == Some(comp))
 }
 
 /// The kind of node a prim is, if it is a prim of a known type, active or not.

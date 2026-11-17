@@ -314,7 +314,10 @@ def OcComp "Comp"
         ("Infinite", "Stops: the value is not a finite number"),
         ("Fractional", "First: the value is not a whole frame"),
         ("Text", "Stops is authored as string, not a number"),
-        ("Twice", "Source has 2 connections, and an input takes one"),
+        (
+            "Twice",
+            "Source: it has 2 connections, and an input takes one",
+        ),
         (
             "Zero",
             "inputs:layer0 is not a slot of Layer: slots are inputs:layer1 to inputs:layer256",

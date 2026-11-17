@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 use openusd::usd::Stage;
 
-use super::{Session, Step};
+use super::Session;
 use crate::compile::Compiler;
 use crate::history::Recorder;
 use crate::network::Changes;
@@ -127,12 +127,12 @@ impl Session {
     /// How many relative paths the root layer authors would read another file if the project were
     /// saved as `file`.
     pub fn moved_paths(&self, file: &Path) -> usize {
-        self.moved(file).map_or(0, |moved| moved.len())
+        self.rewritten_paths(file).map_or(0, |paths| paths.len())
     }
 
     /// Each relative path the root layer authors that its own place anchors, as written to read
     /// the same file from beside `file`: none if `file` is beside it already.
-    fn moved(&self, file: &Path) -> Result<HashMap<String, String>, FileError> {
+    fn rewritten_paths(&self, file: &Path) -> Result<HashMap<String, String>, FileError> {
         let root = self.stage.root_layer();
         let Some(here) = root
             .resolved_path()
@@ -162,7 +162,7 @@ impl Session {
             file: self.file().unwrap_or_default(),
             why: why(&error),
         })?;
-        let mut moved = HashMap::new();
+        let mut rewritten = HashMap::new();
         for path in authored {
             if path.is_empty() || Path::new(&path).is_absolute() {
                 continue;
@@ -171,10 +171,10 @@ impl Session {
                 continue;
             };
             if Path::new(&anchored).is_absolute() {
-                moved.insert(path, relative_path(&there, Path::new(&anchored)));
+                rewritten.insert(path, relative_path(&there, Path::new(&anchored)));
             }
         }
-        Ok(moved)
+        Ok(rewritten)
     }
 
     /// Writes the root layer to `file` and makes it the project's, keeping the history, the
@@ -208,9 +208,9 @@ impl Session {
             return Err(FileError::ComposedLayer(file));
         }
         writable(&file).map_err(|_| FileError::ReadOnly(file.clone()))?;
-        let moved = match paths {
+        let rewrites = match paths {
             RelativePaths::Keep => HashMap::new(),
-            RelativePaths::Rewrite => self.moved(&file)?,
+            RelativePaths::Rewrite => self.rewritten_paths(&file)?,
         };
         root.export(name).map_err(|error| FileError::Write {
             why: why(&error),
@@ -226,27 +226,20 @@ impl Session {
             step.inverse.rename_layer(root.identifier(), &to);
         }
         self.replace_stage(stage);
-        if moved.is_empty() {
+        if rewrites.is_empty() {
             return Ok(());
         }
         let root = self.stage.root_layer();
         let (rewritten, inverse) = self.recorder.record(|| {
-            let rewrite = |path: &str| moved.get(path).cloned().unwrap_or(path.into());
+            let rewrite = |path: &str| rewrites.get(path).cloned().unwrap_or(path.into());
             openusd::usd_utils::modify_asset_paths(&root, rewrite, true)
         });
         rewritten.map_err(|error| FileError::Write {
             why: why(&error),
             file: file.clone(),
         })?;
-        if !inverse.changes_nothing(&self.stage) {
-            self.undo.push(Step {
-                label: "Rewrite Paths",
-                inverse,
-                renamed: None,
-            });
-            self.redo.clear();
-            self.update(Changes::default());
-        }
+        self.record_step("Rewrite Paths", inverse, None);
+        self.update(Changes::default());
         self.save()
     }
 

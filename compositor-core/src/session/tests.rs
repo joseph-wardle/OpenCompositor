@@ -7,8 +7,9 @@ use open_ng::{
     Verdict, View, Viewport,
 };
 
+use super::create::{PLACEMENT_GAP, READER_SPACING};
 use super::*;
-use crate::network::{Node, Timeline};
+use crate::network::{Node, Timeline, node_types};
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
 

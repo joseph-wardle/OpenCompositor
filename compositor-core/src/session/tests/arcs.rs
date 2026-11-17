@@ -68,6 +68,11 @@ def OcComp "Comp" (
             {
             }
 
+            def OcExposure "WiredInVariant"
+            {
+                opaque inputs:source.connect = </Comp/InVariant.outputs:image>
+            }
+
         }
     }
 }
@@ -163,4 +168,26 @@ fn activating_what_a_reference_or_a_variant_deactivates_authors_active_true() {
         session.undo();
     }
     assert_eq!(session.root_layer_text(), before);
+}
+
+#[test]
+fn disconnecting_what_a_reference_or_a_variant_connects_authors_an_empty_connection() {
+    let mut session = open();
+    let before = session.root_layer_text();
+    for consumer in ["Graded", "WiredInVariant"] {
+        assert!(source(&session, consumer).is_some(), "{consumer}");
+        (session.disconnect(named(&session, consumer), "source")).unwrap();
+        assert_eq!(source(&session, consumer), None, "{consumer}");
+    }
+    let text = session.root_layer_text();
+    assert_eq!(
+        text.matches("inputs:source.connect = None").count(),
+        2,
+        "{text}"
+    );
+
+    session.undo();
+    session.undo();
+    assert_eq!(session.root_layer_text(), before);
+    assert!(source(&session, "WiredInVariant").is_some());
 }

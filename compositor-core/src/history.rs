@@ -4,8 +4,8 @@
 //! them, so recording their earlier states at the commit seam costs what the edit touched, and
 //! restoring them writes only what differs.
 //!
-//! Not the crate's `UndoStage`, which has no redo, makes a gesture of several commits several
-//! steps, and replays diffs that do not name their layer.
+//! Not the crate's `UndoStage`, which has no redo, and makes one step of several commits only
+//! inside one call, where a drag's commits arrive over many events.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

@@ -3,47 +3,40 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 use openusd::sdf::{self, Layer, LayerEdit};
-use openusd::usd::{NamespaceEditor, Stage};
+use openusd::usd::{NamespaceEditor, SpecSite, Stage};
 
-use crate::author::{
-    NumberType, ValueEdit, Wire, author_moves, author_node, author_range, author_rate, author_root,
-    author_value, author_wires, input_attribute,
-};
-use crate::compile::{Compiler, Ids, is_animated};
+use crate::author::{Wire, author_moves, author_range, author_rate, author_wires, input_attribute};
+use crate::compile::{Compiler, Ids};
 use crate::evaluate::{ResultKey, result_key, result_keys};
 use crate::files::{Files, Pattern, Scan};
 use crate::history::{Inverse, Recorder};
 use crate::network::{
     Assignment, Changes, ConnectionError, InputSlot, Marks, Network, NodeId, NodeKind, Slot,
-    Timeline, TimelineError, node_types,
+    Timeline, TimelineError,
 };
-use crate::parameter::{ParameterKind, Value, ValueError, describe, resolve, validate};
+use crate::parameter::{ValueError, resolve};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;
 
 mod active;
 mod autosave;
 mod connections;
+mod create;
 mod project;
 mod properties;
 mod rename;
+mod values;
 
 pub use autosave::{newer_autosave, recovery_directory, untitled_autosave};
 pub use connections::RefusedConnection;
 pub use project::{FileError, RelativePaths};
 pub use properties::{Property, PropertyError, Scalar, ScalarKind};
 pub use rename::NameError;
-
-/// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
-const READER_SPACING: f32 = 70.0;
-
-/// Between a node and one created after or below it.
-const PLACEMENT_GAP: f32 = 40.0;
 
 /// What a new project's root layer holds.
 const TEMPLATE: &str = r#"#usda 1.0
@@ -55,10 +48,6 @@ def OcComp "Comp"
 {
 }
 "#;
-
-/// What the comp root a project's first node creates is named, numbered after the first if a prim
-/// has the name.
-const ROOT: &str = "Comp";
 
 /// One undo or redo step: every spec it touched, as it stood before, and the node it renamed,
 /// with the path that node had before.
@@ -177,7 +166,8 @@ struct Failures {
 /// selection and marks, the current frame, the viewer, what is known of its files on disk, and
 /// which evaluations failed.
 ///
-/// Every edit reaches the stage through a session call, as one transaction on the root layer.
+/// Every edit reaches the stage through a session call and authors the root layer alone, the
+/// layer Save writes.
 /// Every applied change, whether an edit, an undo or a redo, updates the network, the graph and
 /// the view before returning the [`Changes`] it made. An edit that changes nothing records no
 /// step.
@@ -354,13 +344,13 @@ impl Session {
         &mut self.viewer
     }
 
-    /// Changes whenever the stage, the network, the marks, the frame or the files do, so that a
-    /// key built at one version is current while the version is.
     /// Counts changes to the stage: edits, undo and redo.
     pub fn edits(&self) -> u64 {
         self.edits
     }
 
+    /// Changes whenever the stage, the network, the marks, the frame or the files do, so that a
+    /// key built at one version is current while the version is.
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -571,47 +561,6 @@ impl Session {
         (self.compiler.ids().path(id)).expect("every ID the session hands out has a path")
     }
 
-    /// The comp root new nodes go under, and whether the edit creating the first must define it:
-    /// `Comp`, or the first of `Comp1` and on that no prim has, so that another tool's prim is
-    /// never retyped.
-    fn root(&self) -> (sdf::Path, bool) {
-        if let Some(root) = self.compiler.root() {
-            return (root.clone(), false);
-        }
-        (self.free_path(&sdf::Path::abs_root(), ROOT), true)
-    }
-
-    /// The first of `name`, `name1`, `name2` and on under `parent` that no prim and no node this
-    /// session has known has, so that a name returns only with its node.
-    fn free_path(&self, parent: &sdf::Path, name: &str) -> sdf::Path {
-        (0..)
-            .map(|number| match number {
-                0 => name.to_owned(),
-                number => format!("{name}{number}"),
-            })
-            .map(|name| parent.append_path(name).expect("a prim name"))
-            .find(|path| !self.is_taken(path))
-            .expect("some name is free")
-    }
-
-    /// Whether a prim or a node this session has known has the path, or a relocate moved or
-    /// deleted the prim a reference brings in there, where USD lets nothing be authored again.
-    fn is_taken(&self, path: &sdf::Path) -> bool {
-        self.compiler.ids().contains(path)
-            || (self.stage.prim(path.clone()).ok())
-                .is_some_and(|prim| prim.is_valid().unwrap_or(true))
-            || (self.stage.layer_stack().iter())
-                .filter_map(|identifier| self.stage.layer(identifier).ok().flatten())
-                .flat_map(|layer| layer.relocates().unwrap_or_default())
-                .any(|(source, _)| source == *path)
-    }
-
-    /// A free path named `name` for a new node under the root, interned.
-    fn new_node(&mut self, root: &sdf::Path, name: &str) -> (NodeId, sdf::Path) {
-        let path = self.free_path(root, name);
-        (self.compiler.intern(&path), path)
-    }
-
     /// Selects the given nodes, in order, if that changes the selection.
     fn select(&mut self, selection: Arc<[NodeId]>) -> Changes {
         let changed = selection != self.selection;
@@ -622,174 +571,6 @@ impl Session {
             selection: changed,
             ..Changes::default()
         }
-    }
-
-    /// Creates a Reader for each path, stacked downwards, and selects them all. A Reader of a path
-    /// the file parameter refuses, such as an empty one or a relative one in an untitled
-    /// project, has no file.
-    ///
-    /// The stack starts below the current node, as [`create_node`](Session::create_node) places
-    /// a type without inputs, or at `at` without one, or if it no longer exists.
-    pub fn create_readers(
-        &mut self,
-        paths: Vec<PathBuf>,
-        at: Point,
-        current: Option<NodeId>,
-    ) -> Changes {
-        if paths.is_empty() {
-            return Changes::default();
-        }
-        let at = current
-            .and_then(|current| self.below(current))
-            .unwrap_or(at);
-        let (root, define_root) = self.root();
-        let mut created = Vec::with_capacity(paths.len());
-        let mut readers = Vec::with_capacity(paths.len());
-        for (row, file) in paths.into_iter().enumerate() {
-            let (id, path) = self.new_node(&root, &reader_name(&file));
-            let position = Point {
-                x: at.x,
-                y: at.y + row as f32 * READER_SPACING,
-            };
-            let file = self
-                .as_set(Value::File(file.into()))
-                .and_then(|file| validate(NodeKind::Reader.parameters(), "file", file));
-            created.push(id);
-            readers.push((path, position, file.ok().map(|(_, file)| file)));
-        }
-        let selected = self.select(created.into());
-        self.commit_with("Create Reader", selected, |layer| {
-            if define_root {
-                author_root(layer, &root)?;
-            }
-            for (path, position, file) in &readers {
-                author_node(layer, path, &NodeKind::Reader, *position)?;
-                if let Some(file) = file {
-                    author_value(layer, path, "file", file, None)?;
-                }
-            }
-            Ok(())
-        })
-    }
-
-    /// Creates a node of the type named `type_name`, one of [`node_types`], as one step, and
-    /// selects it alone.
-    ///
-    /// Without a current node, the node goes at `at`, unconnected. With one, it is inserted after
-    /// it, as Nuke's Tab menu inserts: placed after it in the graph's left-to-right flow, taking it
-    /// on its first input and taking over every input that took it. A type without inputs goes
-    /// below it instead, unconnected, as a second stream beside the first. What the inserted node
-    /// feeds moves right if it would sit underneath it. Marks stay where they are.
-    pub fn create_node(
-        &mut self,
-        type_name: &str,
-        at: Point,
-        current: Option<NodeId>,
-    ) -> Result<Changes, EditError> {
-        let node_type = node_types()
-            .iter()
-            .find(|node_type| node_type.name == type_name)
-            .ok_or_else(|| EditError::UnknownType(type_name.to_owned()))?;
-        if let Some(current) = current
-            && self.network().node(current).is_none()
-        {
-            return Err(EditError::MissingNode(current));
-        }
-        let (root, define_root) = self.root();
-        let (id, path) = self.new_node(&root, node_type.kind.label());
-        let mut position = at;
-        let mut assignments = Vec::new();
-        if let Some(current) = current {
-            if let Some(input) = node_type.kind.inputs().first() {
-                position =
-                    (self.after(current)).expect("the graph presents every node the network has");
-                for (consumer, node) in self.network().nodes() {
-                    for (input, source) in node.inputs() {
-                        if source == current {
-                            assignments.push(Assignment {
-                                consumer,
-                                input,
-                                source: Some(id),
-                            });
-                        }
-                    }
-                }
-                assignments.push(Assignment {
-                    consumer: id,
-                    input: input.first_slot(),
-                    source: Some(current),
-                });
-            } else {
-                position =
-                    (self.below(current)).expect("the graph presents every node the network has");
-            }
-        }
-        let wires = self.wires(&assignments);
-        let selected = self.select([id].into());
-        let mut changes = self.commit_with(node_type.step, selected, |layer| {
-            if define_root {
-                author_root(layer, &root)?;
-            }
-            author_node(layer, &path, &node_type.kind, position)?;
-            author_wires(layer, &wires)
-        });
-        if !assignments.is_empty() {
-            changes.extend(self.make_room_after(id));
-        }
-        Ok(changes)
-    }
-
-    /// Moves everything the node feeds right, keeping its layout, if the node landed on a node it
-    /// feeds, just far enough to clear it. The move joins the step that created the node, which
-    /// must be the last one: its width is known only once the graph presents it.
-    fn make_room_after(&mut self, node: NodeId) -> Changes {
-        let outline = (self.graph.node_rect(node.into()))
-            .expect("the graph presents every node the network has");
-        let network = self.network();
-        let overlap = (network.nodes())
-            .filter(|(_, consumer)| consumer.inputs().any(|(_, source)| source == node))
-            .filter_map(|(consumer, _)| self.graph.node_rect(consumer.into()))
-            .filter(|consumer| consumer.intersects(&outline))
-            .map(|consumer| outline.max.x + PLACEMENT_GAP - consumer.min.x)
-            .fold(0.0, f32::max);
-        if overlap <= 0.0 {
-            return Changes::default();
-        }
-        let moves: Vec<(sdf::Path, Point)> = (network.downstream_of(node).into_iter())
-            .map(|id| {
-                let position = network.node(id).expect("downstream nodes exist").position;
-                let moved = Point {
-                    x: position.x + overlap,
-                    y: position.y,
-                };
-                (self.path(id).clone(), moved)
-            })
-            .collect();
-        let inverse = self.author(|layer| author_moves(layer, &moves));
-        if let Some(step) = self.undo.last_mut() {
-            step.inverse.merge(inverse);
-        }
-        self.update(Changes::default())
-    }
-
-    /// Where a node taking another on its input goes: to its right, as the graph reads left to
-    /// right. `None` if that one does not exist.
-    fn after(&self, node: NodeId) -> Option<Point> {
-        let outline = self.graph.node_rect(node.into())?;
-        Some(Point {
-            x: outline.max.x + PLACEMENT_GAP,
-            y: outline.min.y,
-        })
-    }
-
-    /// Where an unconnected node goes beside another: below it. `None` if that one does not
-    /// exist.
-    fn below(&self, node: NodeId) -> Option<Point> {
-        let outline = self.graph.node_rect(node.into())?;
-        Some(Point {
-            x: outline.min.x,
-            y: outline.max.y + PLACEMENT_GAP,
-        })
     }
 
     /// Marks a node in a slot, replacing what the slot marked, or clears the slot. Marks are
@@ -867,12 +648,7 @@ impl Session {
             (inverse.restore(&self.stage)).expect("a recorded state restores");
             return Err(EditError::DeleteRefused(error.to_string()));
         }
-        self.undo.push(Step {
-            label: "Delete",
-            inverse,
-            renamed: None,
-        });
-        self.redo.clear();
+        self.record_step("Delete", inverse, None);
         Ok(self.update(Changes::default()))
     }
 
@@ -942,14 +718,21 @@ impl Session {
             .collect()
     }
 
-    /// Whether a layer other than the root authors the attribute's connections.
+    /// Whether the attribute's connections are authored anywhere but where this session authors
+    /// them.
     fn connected_elsewhere(&self, attribute: &openusd::usd::Attribute) -> bool {
-        let root = self.stage.root_layer().identifier().to_owned();
         (attribute.property_stack().unwrap_or_default().iter()).any(|site| {
-            site.layer.identifier() != root
+            self.is_foreign(site, attribute.path())
                 && (site.layer.borrow().data())
                     .has_field(&site.path, sdf::FieldKey::ConnectionPaths.as_str())
         })
+    }
+
+    /// Whether an opinion on the prim or property at `path` is not this session's to change: it
+    /// is a sublayer's, or reaches `path` across a reference or a variant. The session authors
+    /// only the root layer's spec at the path itself.
+    fn is_foreign(&self, site: &SpecSite, path: &sdf::Path) -> bool {
+        site.layer.identifier() != self.stage.root_layer().identifier() || site.path != *path
     }
 
     /// Applies a view's response. Selecting records no step, as in Nuke and Houdini: undo goes
@@ -996,147 +779,24 @@ impl Session {
         }
     }
 
-    /// Begins an edit of a node's values, finishing any edit in progress first.
-    pub fn begin_edit(&mut self, node: NodeId, label: &'static str) -> Result<(), EditError> {
-        if self.network().node(node).is_none() {
-            return Err(EditError::MissingNode(node));
-        }
-        self.finish_edit();
-        self.editing = Some(EditInProgress {
-            label,
-            node,
-            inverse: Inverse::default(),
-        });
-        Ok(())
-    }
-
-    /// The node an edit in progress belongs to.
-    pub fn editing(&self) -> Option<NodeId> {
-        self.editing.as_ref().map(|edit| edit.node)
-    }
-
-    /// Sets a value of the edited node on the stage, recording no step yet. A value equal to the
-    /// default stays set.
-    pub fn edit_value(&mut self, parameter: &str, value: Value) -> Result<Changes, EditError> {
-        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
-        let (edit, _) = self.value_edit(id, parameter, Some(value))?;
-        Ok(self.join_edit(edit))
-    }
-
-    /// Removes a value of the edited node from the stage, so it reads as its default.
-    pub fn edit_reset(&mut self, parameter: &str) -> Result<Changes, EditError> {
-        let id = self.editing().ok_or(EditError::NoEditInProgress)?;
-        let (edit, _) = self.value_edit(id, parameter, None)?;
-        Ok(self.join_edit(edit))
-    }
-
-    fn join_edit(&mut self, edit: ValueEdit) -> Changes {
-        let inverse = self.author(|layer| edit.author(layer));
-        let editing = self.editing.as_mut().expect("an edit is in progress");
-        editing.inverse.merge(inverse);
-        self.update(Changes::default())
-    }
-
-    /// Sets a node's value as one step named after the parameter, as a typed value does. A value
-    /// equal to the default stays set.
-    pub fn set_value(
+    /// Records what an edit touched as the step undo restores next, with the node it renamed and
+    /// that node's path before, and drops what redo held. An edit that changed nothing on the
+    /// whole records no step.
+    fn record_step(
         &mut self,
-        node: NodeId,
-        parameter: &str,
-        value: Value,
-    ) -> Result<Changes, EditError> {
-        let (edit, label) = self.value_edit(node, parameter, Some(value))?;
-        Ok(self.commit(label, |layer| edit.author(layer)))
-    }
-
-    /// Removes a node's value as one step, so it reads as its default.
-    pub fn reset_value(&mut self, node: NodeId, parameter: &str) -> Result<Changes, EditError> {
-        let (edit, _) = self.value_edit(node, parameter, None)?;
-        Ok(self.commit("Reset", |layer| edit.author(layer)))
-    }
-
-    /// The edit that sets a node's value, or removes it for `None`, checked against the
-    /// parameter's description, and the parameter's label.
-    fn value_edit(
-        &self,
-        id: NodeId,
-        parameter: &str,
-        value: Option<Value>,
-    ) -> Result<(ValueEdit, &'static str), EditError> {
-        let invalid = |error| EditError::InvalidValue {
-            node: id,
-            parameter: parameter.to_owned(),
-            error,
-        };
-        let node = self.network().node(id).ok_or(EditError::MissingNode(id))?;
-        let described = describe(node.kind.parameters(), parameter).map_err(invalid)?;
-        let mut edited = node.clone();
-        match value {
-            Some(value) if matches!(described.kind, ParameterKind::File) => self
-                .as_set(value)
-                .and_then(|value| edited.set_value(parameter, value)),
-            Some(value) => edited.set_value(parameter, value),
-            None => edited.reset(parameter),
-        }
-        .map_err(invalid)?;
-        let path = self.path(id).clone();
-        let attribute = (path.append_property(format!("inputs:{}", described.name)))
-            .expect("a parameter's name is a property name");
-        // A default set under samples would never be read, and a reset would leave them.
-        if (self.stage.attribute(attribute.clone())).is_ok_and(|attribute| is_animated(&attribute))
-        {
-            return Err(invalid(ValueError::Animated));
-        }
-        let edit = ValueEdit {
-            number: NumberType::of(&self.stage, &attribute),
-            node: path,
-            parameter: described.name,
-            value: edited.authored_value(described.name).cloned(),
-        };
-        Ok((edit, described.label))
-    }
-
-    /// A file as the artist sets it. A bare relative path gains `./`, which USD anchors to the
-    /// project file alone, never searching for it elsewhere; with no project file to anchor it, a
-    /// relative path is refused.
-    fn as_set(&self, value: Value) -> Result<Value, ValueError> {
-        let Value::File(path) = &value else {
-            return Ok(value);
-        };
-        if path.as_os_str().is_empty() || path.is_absolute() {
-            return Ok(value);
-        }
-        if self.file().is_none() {
-            return Err(ValueError::Unanchored);
-        }
-        match path.components().next() {
-            Some(Component::Normal(_)) => Ok(Value::File(Path::new(".").join(path).into())),
-            _ => Ok(value),
-        }
-    }
-
-    /// Records the edit in progress as one step, unless it changed nothing on the whole.
-    pub fn finish_edit(&mut self) {
-        let Some(edit) = self.editing.take() else {
+        label: &'static str,
+        inverse: Inverse,
+        renamed: Option<(NodeId, sdf::Path)>,
+    ) {
+        if inverse.changes_nothing(&self.stage) {
             return;
-        };
-        if !edit.inverse.changes_nothing(&self.stage) {
-            self.undo.push(Step {
-                label: edit.label,
-                inverse: edit.inverse,
-                renamed: None,
-            });
-            self.redo.clear();
         }
-    }
-
-    /// Ends the edit in progress, restoring the stage from when it began.
-    pub fn cancel_edit(&mut self) -> Changes {
-        let Some(edit) = self.editing.take() else {
-            return Changes::default();
-        };
-        (edit.inverse.restore(&self.stage)).expect("a recorded state restores");
-        self.update(Changes::default())
+        self.undo.push(Step {
+            label,
+            inverse,
+            renamed,
+        });
+        self.redo.clear();
     }
 
     /// Restores the stage from before the last step, cancelling any edit in progress first.
@@ -1199,14 +859,7 @@ impl Session {
     ) -> Changes {
         self.finish_edit();
         let inverse = self.author(edit);
-        if !inverse.changes_nothing(&self.stage) {
-            self.undo.push(Step {
-                label,
-                inverse,
-                renamed: None,
-            });
-            self.redo.clear();
-        }
+        self.record_step(label, inverse, None);
         self.update(changes)
     }
 
@@ -1320,26 +973,6 @@ impl Reload {
     /// Whether no node was a Reader with a file.
     pub fn is_empty(&self) -> bool {
         self.stills.is_empty() && self.sequences.is_empty()
-    }
-}
-
-/// What a Reader of `file` is named: its file name up to the first `.` or frame number, `#` or
-/// `%`, without the separator before it, each character a prim name cannot hold as `_`, and `_` first before a
-/// digit. `Reader` if nothing is left.
-fn reader_name(file: &Path) -> String {
-    let name = file.file_name().map(|name| name.to_string_lossy());
-    let name = name.as_deref().unwrap_or_default();
-    let stem = name.split(['.', '#', '%']).next().unwrap_or_default();
-    let stem = stem.trim_end_matches(['_', '-', ' ']);
-    let mut name: String = (stem.chars())
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    if name.starts_with(|c: char| c.is_ascii_digit()) {
-        name.insert(0, '_');
-    }
-    match name.is_empty() {
-        true => NodeKind::Reader.label().to_owned(),
-        false => name,
     }
 }
 

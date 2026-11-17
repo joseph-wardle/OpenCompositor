@@ -7,7 +7,7 @@ use std::fmt;
 use openusd::sdf::{self, AbstractData};
 use openusd::usd::NamespaceEditor;
 
-use super::{Changes, EditError, Session, Step};
+use super::{Changes, EditError, Session};
 use crate::network::NodeId;
 
 /// Why a node cannot take a name.
@@ -101,12 +101,7 @@ impl Session {
         });
         renamed.map_err(|error| refused(NameError::Refused(error.to_string())))?;
         self.compiler.rename(id, &to);
-        self.undo.push(Step {
-            label: "Rename",
-            inverse,
-            renamed: Some((id, from)),
-        });
-        self.redo.clear();
+        self.record_step("Rename", inverse, Some((id, from)));
         Ok(self.update(Changes::default()))
     }
 
