@@ -108,7 +108,7 @@ fn typed_frame(text: &str, rate: f64) -> Result<f64, String> {
 pub fn gesture(gesture: ffi::TimebarGesture) {
     let text = String::from(&gesture.text);
     let (timeline, shown) = crate::read_app(|app| {
-        let timeline = app.session().document().timeline();
+        let timeline = app.session().timeline();
         let shown = (app.timebar()).map(|shown| (shown.looping, shown.mode, shown.timecode));
         (timeline, shown)
     });

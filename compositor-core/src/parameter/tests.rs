@@ -4,24 +4,14 @@ use std::path::Path;
 use open_ng::Point;
 
 use super::*;
-use crate::document::{ExposureVersion, NodeKind, ReaderVersion};
+use crate::network::NodeKind;
 
 fn exposure() -> Node {
-    Node::new(
-        NodeKind::Exposure {
-            version: ExposureVersion::V1,
-        },
-        Point { x: 0.0, y: 0.0 },
-    )
+    Node::new(NodeKind::Exposure, "Exposure", Point { x: 0.0, y: 0.0 })
 }
 
 fn reader() -> Node {
-    Node::new(
-        NodeKind::Reader {
-            version: ReaderVersion::V1,
-        },
-        Point { x: 0.0, y: 0.0 },
-    )
+    Node::new(NodeKind::Reader, "Reader", Point { x: 0.0, y: 0.0 })
 }
 
 fn stops(node: &Node) -> Option<Value> {
@@ -30,14 +20,7 @@ fn stops(node: &Node) -> Option<Value> {
 
 /// Every built-in node type at every version.
 fn built_in() -> [NodeKind; 2] {
-    [
-        NodeKind::Reader {
-            version: ReaderVersion::V1,
-        },
-        NodeKind::Exposure {
-            version: ExposureVersion::V1,
-        },
-    ]
+    [NodeKind::Reader, NodeKind::Exposure]
 }
 
 #[test]
@@ -154,6 +137,17 @@ fn a_file_is_absent_until_set_and_never_empty() {
         Err(ValueError::UnknownParameter)
     );
     assert_eq!(node, reader());
+
+    // USD holds asset paths as strings, so a path that is not Unicode would be authored as another.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let latin1 = Path::new(std::ffi::OsStr::from_bytes(b"/shots/caf\xe9.exr"));
+        assert_eq!(
+            node.set_value("file", Value::File(latin1.into())),
+            Err(ValueError::NotUnicode)
+        );
+    }
 
     // Whether the file exists is the read's to say.
     node.set_value("file", Value::File(Path::new("missing.exr").into()))

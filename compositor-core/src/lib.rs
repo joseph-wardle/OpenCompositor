@@ -1,16 +1,19 @@
-//! OpenCompositor without its Qt shell: the document, its history and its presentation in OpenNG,
+//! OpenCompositor without its Qt shell: the project's stage, its history and its presentation in OpenNG,
 //! evaluation, and the application the shell dispatches events to, all usable and testable without
 //! a window or a GPU.
 
 mod app;
-mod document;
+mod author;
+mod compile;
 mod evaluate;
 mod files;
 #[cfg(test)]
 mod fixtures;
 mod gpu;
+mod history;
 mod image;
 mod kernels;
+mod network;
 mod panel;
 mod parameter;
 mod playback;
@@ -30,19 +33,20 @@ pub mod bench {
 }
 
 pub use app::{
-    Anchor, App, Command, Displayed, Event, FileIntent, Input, Key, Notice, Pane, Request,
+    Anchor, Answer, App, Command, Displayed, Event, FileIntent, Input, Key, Leave, Notice, Pane,
+    Question, Request,
 };
-pub use document::{
-    Assignment, BlurVersion, Changes, ConnectionError, Document, ExposureVersion, InputSlot,
-    MAX_SLOTS, MergeVersion, Missing, Node, NodeId, NodeInput, NodeKind, NodeType, ReaderVersion,
-    Slot, Timeline, TimelineError, missing, node_types,
-};
+pub use compile::InvalidConnection;
 pub use evaluate::{
     DeviceLost, EvalError, Evaluator, GpuEvaluation, GpuImage, Recorded, ResultKey, result_key,
 };
 pub use files::{Files, Pattern, Reading, Scan, input_range, readings};
 pub use gpu::{FrameCheck, FrameTiming, GpuMemory, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
+pub use network::{
+    Assignment, Changes, ConnectionError, InputSlot, MAX_SLOTS, Marks, Missing, Network, Node,
+    NodeId, NodeInput, NodeKind, NodeType, Slot, Timeline, TimelineError, missing, node_types,
+};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FRAME_LIMIT, FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,
@@ -52,7 +56,10 @@ pub use playback::{
     ntsc_rate, parse_timecode, timecode,
 };
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
-pub use session::{EditError, Reload, Session};
+pub use session::{
+    EditError, FileError, NameError, Property, PropertyError, RefusedConnection, RelativePaths,
+    Reload, Scalar, ScalarKind, Session,
+};
 pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};
 pub use viewer_cache::{DEFAULT_BUDGET, ViewerCache, ViewerCopy};
 pub use worker::{

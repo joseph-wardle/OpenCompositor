@@ -7,12 +7,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::document::NodeId;
 use crate::evaluate::GpuImage;
 use crate::evaluate::{
     DEEP_STACK, EvalError, Evaluator, GpuEvaluation, Pool, ResultKey, poll_device,
 };
 use crate::image::{Image, ImageInfo, Plane, Window};
+use crate::network::NodeId;
 use crate::viewer::Zoom;
 use crate::viewer_cache::{GpuCopy, ViewerCopy};
 
@@ -664,6 +664,7 @@ impl Mailbox {
             return None;
         }
         state.in_gpu_phase = true;
+        self.changed.notify_all();
         let device = (state.connection.as_ref()).map(|connection| PhaseDevice {
             device: connection.device.clone(),
             queue: connection.queue.clone(),

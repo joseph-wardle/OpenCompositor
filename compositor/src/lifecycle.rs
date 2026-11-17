@@ -214,7 +214,7 @@ fn step(index: usize) {
             if ffi::popup_open() {
                 fail("Escape left the creation menu open".to_owned());
             }
-            check_undo_label("Mark", "after the menu was dismissed");
+            check_undo_label("Create Reader", "after the menu was dismissed");
             choose_in_menu("exp");
         }
         14 => {
@@ -245,7 +245,7 @@ fn step(index: usize) {
         19 => ffi::close_modal_dialog(),
         20 => {
             check_undo_label("Stops", "after the Reader's dialog was cancelled");
-            let nodes = crate::read_app(|app| app.session().document().nodes().count());
+            let nodes = crate::read_app(|app| app.session().network().nodes().count());
             if nodes != 2 {
                 fail(format!(
                     "{nodes} nodes after the Reader's dialog was cancelled, not 2"
@@ -308,14 +308,14 @@ fn check_undo_label(expected: &str, when: &str) {
 fn check_inserted_exposure() -> Option<NodeId> {
     let slot = Slot::new(1).expect("1 is a slot");
     let (selection, source, marked) = crate::read_app(|app| {
-        let document = app.session().document();
-        let &[exposure] = document.selection() else {
-            return (document.selection().to_vec(), None, None);
+        let session = app.session();
+        let &[exposure] = session.selection() else {
+            return (session.selection().to_vec(), None, None);
         };
-        let source = (document.node(exposure))
-            .filter(|node| matches!(node.kind, NodeKind::Exposure { .. }))
+        let source = (session.network().node(exposure))
+            .filter(|node| node.kind == NodeKind::Exposure)
             .and_then(|node| node.input("source"));
-        (vec![exposure], source, document.mark(slot))
+        (vec![exposure], source, session.mark(slot))
     });
     match (selection.as_slice(), source) {
         (&[exposure], Some(source)) if marked == Some(source) => Some(exposure),
@@ -342,7 +342,7 @@ fn edit_stops(exposure: NodeId) {
     match edited {
         (Err(error), _) => fail(format!("the scripted edit failed: {error}")),
         (Ok(_), edited) if edited != version => {
-            fail("refreshing the panel after a scripted edit edited the document".to_owned())
+            fail("refreshing the panel after a scripted edit edited the stage".to_owned())
         }
         _ if before.is_none() || after <= before => fail(format!(
             "the panel's Stops slider went from {before:?} to {after:?} for 2 stops"

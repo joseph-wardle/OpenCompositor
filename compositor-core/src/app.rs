@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use open_ng::{Button, InputEvent, Modifiers, PhysicalPoint, Point};
 
-use crate::document::{Missing, NodeId, Slot, missing};
 use crate::evaluate::{EvalError, ResultKey, result_key};
 use crate::files::{Pattern, Scan, Scanner, readings};
 use crate::gpu::{
@@ -17,19 +16,23 @@ use crate::gpu::{
     ViewerFrame,
 };
 use crate::image::Window;
+use crate::network::{Missing, NodeId, Slot, missing};
 use crate::panel::Panel;
-use crate::parameter::Value;
+use crate::parameter::{Value, ValueError};
 use crate::playback::{
     Direction, FrameMark, Frames, MAX_MARKED_FRAMES, Playback, PlaybackMode, RangeSource, Timebar,
     ntsc_rate,
 };
-use crate::session::Session;
+use crate::session::{EditError, Session};
 use crate::viewer::{EXPOSURE_STEP, Zoom};
 use crate::viewer_cache::{ViewerCache, ViewerCopy};
 use crate::worker::{Evaluated, EvaluationDevice, Job, ViewerError, Worker};
 
+mod project;
 mod viewing;
 
+pub use project::{Answer, Leave, Question};
+use project::{Autosave, project_name};
 pub use viewing::Displayed;
 use viewing::{Asked, Shown, Viewing};
 
@@ -145,6 +148,21 @@ pub enum Event {
     TimecodeSet(bool),
     /// The artist chose which frames the timebar spans and playback plays through.
     RangeSourceChosen(RangeSource),
+    /// The project file chosen in the dialog a [`Request::ChooseProject`] opened, or the shell was
+    /// started with, or `None` if the dialog was cancelled.
+    ProjectChosen(Option<PathBuf>),
+    /// The file chosen in the dialog a [`Request::ChooseSaveAs`] opened, or `None` if it was
+    /// cancelled, with what then waits for the save.
+    SaveAsChosen {
+        file: Option<PathBuf>,
+        then: Option<Leave>,
+    },
+    /// The answer chosen for a [`Request::Ask`]'s question.
+    Answered(Answer),
+    /// The window is shown with an untitled project, the shell given no file to open.
+    Started,
+    /// The time to autosave if the project has been left alone, after [`Request::Autosave`].
+    Autosave,
 }
 
 /// What another thread, or wgpu inside a call, tells the GUI thread through the waker
@@ -250,11 +268,38 @@ pub enum Request {
     Advance { after: Duration },
     /// Show the timebar under the viewer as given. It starts empty.
     ShowTimebar(Timebar),
+    /// Name the project in the window's title, marked if modified. It starts untitled and
+    /// unmodified.
+    ShowProject { name: String, modified: bool },
+    /// Open a dialog choosing a USD file to open, then dispatch [`Event::ProjectChosen`].
+    ChooseProject,
+    /// Open a dialog choosing where to save the project, starting at `suggested`, offering
+    /// `.usda`, `.usdc` and `.usd`, then dispatch [`Event::SaveAsChosen`] with `then`.
+    ChooseSaveAs {
+        suggested: PathBuf,
+        then: Option<Leave>,
+    },
+    /// Ask the question in a dialog, then dispatch [`Event::Answered`] with the answer chosen.
+    Ask(Question),
+    /// Dispatch [`Event::Autosave`] after the delay. The app asks for one at a time.
+    Autosave { after: Duration },
+    /// Close the window and end the application.
+    Quit,
 }
 
 /// A window-wide command, from a menu or its shortcut, whichever pane has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Replaces the project with a new, untitled one, asking first to save a modified one.
+    New,
+    /// Replaces the project with a file chosen, asking first to save a modified one.
+    Open,
+    /// Saves the project to its file, or asks where for one without a file it can save to.
+    Save,
+    /// Saves the project to a file chosen, which becomes its file.
+    SaveAs,
+    /// Ends the application, asking first to save a modified project.
+    Quit,
     /// A Reader for each file chosen, placed where the pointer is over the graph, or below the
     /// current node.
     ReadFiles,
@@ -265,6 +310,8 @@ pub enum Command {
     UnpinPanel,
     /// Reload files on each selected Reader.
     Reload,
+    /// Activates the selected nodes if the first is inactive, and deactivates them otherwise.
+    ToggleActive,
     Undo,
     Redo,
     /// Views what the slot marks.
@@ -308,6 +355,8 @@ pub enum Key {
     Y,
     /// Delete or Backspace: deletes the selected nodes while the pointer is over the graph.
     Delete,
+    /// Activates or deactivates the selected nodes while the pointer is over the graph.
+    D,
     /// Opens the node creation menu while the pointer is over the graph.
     Tab,
     /// Over the viewer, the arrows step a frame, and J, K and L play backwards, stop and play
@@ -333,6 +382,7 @@ impl Key {
             Key::Y => open_ng::Key::Y,
             Key::E
             | Key::Delete
+            | Key::D
             | Key::Tab
             | Key::Left
             | Key::Right
@@ -505,12 +555,15 @@ pub struct App {
     ahead_sent: Vec<ResultKey>,
     /// What is known of each frame of the viewed node.
     marks: Marks,
+    autosave: Autosave,
     shell: Shell,
 }
 
 /// What the shell was last asked to show, which it is asked again only once changed.
 #[derive(Debug, Default)]
 struct Shell {
+    /// The project's name and whether it was modified.
+    project: Option<(String, bool)>,
     gpu_label: Option<String>,
     undo_labels: [Option<&'static str>; 2],
     panel: Option<Panel>,
@@ -575,7 +628,11 @@ impl App {
             playback: Playback::default(),
             ahead_sent: Vec::new(),
             marks: Marks::default(),
-            shell: Shell::default(),
+            autosave: Autosave::default(),
+            shell: Shell {
+                project: Some((project_name(None), false)),
+                ..Shell::default()
+            },
         }
     }
 
@@ -746,6 +803,15 @@ impl App {
                 self.playback.range_source = source;
                 Vec::new()
             }
+            Event::ProjectChosen(None) | Event::SaveAsChosen { file: None, .. } => Vec::new(),
+            Event::ProjectChosen(Some(file)) => self.open(&file),
+            Event::SaveAsChosen {
+                file: Some(file),
+                then,
+            } => self.save_as_chosen(file, then),
+            Event::Answered(answer) => self.answered(answer),
+            Event::Started => self.offer_untitled_autosave(),
+            Event::Autosave => self.autosave_if_idle(),
         };
         self.after_change(requests)
     }
@@ -786,7 +852,9 @@ impl App {
         requests.extend(self.playback.follow_shown(shown));
         self.follow_look_ahead();
         self.follow_readout(&mut requests);
+        requests.extend(self.follow_edits());
         let mut shows = Vec::new();
+        self.follow_project(&mut shows);
         let gpu_label = self.gpu_label();
         if gpu_label != self.shell.gpu_label {
             self.shell.gpu_label.clone_from(&gpu_label);
@@ -823,13 +891,26 @@ impl App {
         shows
     }
 
+    /// Names the project in the title, marked if modified.
+    fn follow_project(&mut self, shows: &mut Vec<Request>) {
+        let name = project_name(self.session.file().as_deref());
+        let project = (name, self.session.is_modified());
+        if self.shell.project.as_ref() != Some(&project) {
+            shows.push(Request::ShowProject {
+                name: project.0.clone(),
+                modified: project.1,
+            });
+            self.shell.project = Some(project);
+        }
+    }
+
     /// Keeps the panel on the pinned node, or the current node: shows it when it changed. A pin
     /// on a deleted node is dropped, so undoing the delete does not pin it again.
     fn follow_panel(&mut self, shows: &mut Vec<Request>) {
-        let document = self.session.document();
+        let network = self.session.network();
         if self
             .pinned
-            .is_some_and(|pinned| document.node(pinned).is_none())
+            .is_some_and(|pinned| network.node(pinned).is_none())
         {
             self.pinned = None;
         }
@@ -839,11 +920,12 @@ impl App {
             return;
         }
         self.panel_followed = followed;
-        let (files, frame) = (self.session.files(), self.session.frame());
+        let session = &self.session;
         let panel = match self.pinned {
-            Some(pinned) => Panel::of(document, files, pinned, true, frame),
-            None => (document.selection().last())
-                .and_then(|&current| Panel::of(document, files, current, false, frame)),
+            Some(pinned) => Panel::of(session, pinned, true),
+            None => {
+                (session.selection().last()).and_then(|&current| Panel::of(session, current, false))
+            }
         };
         if panel != self.shell.panel {
             self.shell.panel.clone_from(&panel);
@@ -1112,6 +1194,7 @@ impl App {
         }
         match (self.hovered, key.in_graph()) {
             (Some(Pane::Graph), _) if key == Key::Delete => self.delete_selected(),
+            (Some(Pane::Graph), _) if key == Key::D => self.toggle_active_selected(),
             (Some(Pane::Graph), _) if key == Key::Tab => {
                 vec![Request::ShowCreationMenu(self.anchor())]
             }
@@ -1125,14 +1208,33 @@ impl App {
     }
 
     fn delete_selected(&mut self) -> Vec<Request> {
-        let selection = self.session.document().selection().to_vec();
+        let selection = self.session.selection().to_vec();
         if selection.is_empty() {
             return vec![Request::ShowStatus(
                 "Select nodes to delete them".to_owned(),
             )];
         }
-        let deleted = self.session.delete_nodes(&selection);
-        debug_assert!(deleted.is_ok(), "selected nodes exist");
+        match self.session.delete_nodes(&selection) {
+            Ok(_) => vec![Request::Redraw(Pane::Graph)],
+            Err(error @ EditError::Delete { node, .. }) => {
+                let name = (self.session.network().node(node)).map_or("", |node| node.name());
+                vec![Request::ShowStatus(format!(
+                    "Cannot delete {name}: {error}"
+                ))]
+            }
+            Err(error) => vec![Request::ShowStatus(format!("Cannot delete: {error}"))],
+        }
+    }
+
+    fn toggle_active_selected(&mut self) -> Vec<Request> {
+        let selection = self.session.selection().to_vec();
+        if selection.is_empty() {
+            return vec![Request::ShowStatus(
+                "Select nodes to activate or deactivate them".to_owned(),
+            )];
+        }
+        let toggled = self.session.toggle_active(&selection);
+        debug_assert!(toggled.is_ok(), "selected nodes exist");
         vec![Request::Redraw(Pane::Graph)]
     }
 
@@ -1182,6 +1284,11 @@ impl App {
 
     fn command(&mut self, command: Command) -> Vec<Request> {
         match command {
+            Command::New => self.leave(Leave::New),
+            Command::Open => self.leave(Leave::Open),
+            Command::Quit => self.leave(Leave::Quit),
+            Command::Save => self.save(None),
+            Command::SaveAs => self.choose_save_as(None),
             Command::ReadFiles => vec![Request::ChooseFiles(FileIntent::CreateReaders(
                 self.anchor(),
             ))],
@@ -1197,16 +1304,17 @@ impl App {
                 Vec::new()
             }
             Command::Reload => {
-                let selection = self.session.document().selection().to_vec();
+                let selection = self.session.selection().to_vec();
                 self.reload(&selection)
             }
+            Command::ToggleActive => self.toggle_active_selected(),
             Command::Undo => redraw_if(Pane::Graph, !self.session.undo().is_empty()),
             Command::Redo => redraw_if(Pane::Graph, !self.session.redo().is_empty()),
             Command::ViewSlot(slot) => {
                 self.session.viewer_mut().show_slot(slot);
                 vec![Request::Redraw(Pane::Viewer)]
             }
-            Command::MarkSlot(slot) => match self.session.document().selection() {
+            Command::MarkSlot(slot) => match self.session.selection() {
                 &[id] => {
                     let changes = self.session.set_mark(slot, Some(id));
                     debug_assert!(changes.is_ok(), "a selected node exists");
@@ -1303,11 +1411,11 @@ impl App {
             if let Some(node) = viewed
                 && frames.count() <= MAX_MARKED_FRAMES
             {
-                let (document, files) = (session.document(), session.files());
+                let (network, files) = (session.network(), session.files());
                 for index in 0..frames.count() {
                     let frame = frames.frame(index);
-                    marks.keys.push(result_key(document, files, node, frame));
-                    let readings = readings(document, files, node, frame);
+                    marks.keys.push(result_key(network, files, node, frame));
+                    let readings = readings(network, files, node, frame);
                     marks.marks.push(FrameMark {
                         cached: false,
                         missing: (readings.iter()).any(|(_, read)| read.missing().is_some()),
@@ -1369,7 +1477,7 @@ impl App {
             let frame = frames.frame(index);
             let key = match marked.and_then(|keys| keys.get(index as usize)) {
                 Some(key) => key.clone(),
-                None => result_key(session.document(), session.files(), node, frame),
+                None => result_key(session.network(), session.files(), node, frame),
             };
             let Some(key) = key else {
                 continue;
@@ -1398,7 +1506,7 @@ impl App {
         });
         Anchor {
             at: view.to_graph(pointer),
-            current: self.session.document().selection().last().copied(),
+            current: self.session.selection().last().copied(),
         }
     }
 
@@ -1523,7 +1631,18 @@ impl App {
         };
         match intent {
             FileIntent::CreateReaders(Anchor { at, current }) => {
+                let refused = paths.iter().find(|path| path.to_str().is_none()).cloned();
                 self.session.create_readers(paths, at, current);
+                if let Some(path) = refused {
+                    return vec![
+                        Request::Redraw(Pane::Graph),
+                        Request::ShowStatus(format!(
+                            "Cannot read {}: {}",
+                            path.display(),
+                            ValueError::NotUnicode
+                        )),
+                    ];
+                }
             }
             FileIntent::SetFile { node, parameter } => {
                 let file = Value::File(first.into());
@@ -1803,18 +1922,21 @@ impl App {
     /// asked for.
     fn caption(&self) -> String {
         let slot = self.session.viewer().slot().digit();
-        let document = self.session.document();
+        let network = self.session.network();
         let Some(viewed) = self.session.viewed() else {
+            let marked = self.session.mark(self.session.viewer().slot());
             // The next step, for an artist who has not found the menus yet.
-            return if document.nodes().next().is_none() {
-                format!(
+            return match marked.and_then(|absent| self.session.name_of(absent)) {
+                Some(absent) => format!(
+                    "Slot {slot}: {absent} no longer exists. Ctrl+{slot} marks the selected node"
+                ),
+                None if network.nodes().next().is_none() => format!(
                     "Slot {slot}: nothing marked. Read files with R, then mark one with Ctrl+{slot}"
-                )
-            } else {
-                format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node")
+                ),
+                None => format!("Slot {slot}: nothing marked. Ctrl+{slot} marks the selected node"),
             };
         };
-        let node = document.node(viewed).expect("marks name existing nodes");
+        let node = network.node(viewed).expect("the viewed node exists");
         let current = self.viewing.shows_asked();
         let mut details = Vec::new();
         match &self.viewing.shown {
@@ -1847,11 +1969,19 @@ impl App {
             _ => details.push("updating…".to_owned()),
         }
         let (files, frame) = (self.session.files(), self.session.frame());
-        let name = |id| document.node(id).expect("upstream nodes exist").name();
-        for (id, what) in missing(document, viewed, frame) {
+        let name = |id| network.node(id).expect("upstream nodes exist").name();
+        for (id, what) in missing(network, viewed, frame) {
             let (label, lack) = match what {
                 Missing::Input(input) => (input.label, "is not connected"),
                 Missing::File(parameter) => (parameter.label, "is not set"),
+                Missing::Refused(problem) => {
+                    details.push(if id == viewed {
+                        problem.to_string()
+                    } else {
+                        format!("{}: {problem}", name(id))
+                    });
+                    continue;
+                }
             };
             details.push(if id == viewed {
                 format!("{label} {lack}")
@@ -1859,7 +1989,7 @@ impl App {
                 format!("{label} of {} {lack}", name(id))
             });
         }
-        for (id, reading) in readings(document, files, viewed, frame) {
+        for (id, reading) in readings(network, files, viewed, frame) {
             let Some(read) = reading.held() else {
                 continue;
             };

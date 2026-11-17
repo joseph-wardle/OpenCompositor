@@ -1,6 +1,6 @@
 [package]
 name = "opencompositor-core"
-version = "0.6.0"
+version = "0.7.0"
 description = "OpenCompositor without its Qt shell: document, history, evaluation, drawing, and everything testable headless."
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,8 @@ half = "2.7.1"
 imbl = "7.0.2"
 open-ng = { path = "../open-ng", version = "0.4.1" }
 opencompositor-kernels = { path = "../compositor-kernels" }
+# The fork's `opencompositor` branch: upstream with this project's open PRs, until a release has them.
+openusd = { git = "https://github.com/joseph-wardle/openusd", rev = "e886d289f5aa05b016974bd02ae5419342435938" }
 png = "0.18.1"
 pollster = "1.0.1"
 rayon = "1.12.0"

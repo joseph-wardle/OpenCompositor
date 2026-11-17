@@ -4,6 +4,7 @@
 #include <QtCore/QFile>
 #include <QtCore/QSignalBlocker>
 #include <QtCore/QTimer>
+#include <QtGui/QCloseEvent>
 #include <QtGui/QCursor>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QInputMethodQueryEvent>
@@ -23,6 +24,7 @@
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLineEdit>
 #include <QtWidgets/QListWidget>
+#include <QtWidgets/QMessageBox>
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QProxyStyle>
 #include <QtWidgets/QPushButton>
@@ -50,10 +52,20 @@ void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t argument) {
     QTimer::singleShot(ms, qApp, [=] { callback(argument); });
 }
 
-std::unique_ptr<QMainWindow> new_main_window() {
-    auto window = std::make_unique<QMainWindow>();
+MainWindow::MainWindow(rust::Fn<void()> close_requested) : close_requested(close_requested) {}
+void MainWindow::closeEvent(QCloseEvent *event) {
+    event->ignore();
+    close_requested();
+}
+
+std::unique_ptr<QMainWindow> new_main_window(rust::Fn<void()> close_requested) {
+    auto window = std::make_unique<MainWindow>(close_requested);
     window->statusBar();
     return window;
+}
+void show_project(QMainWindow *window, const QString &name, bool modified) {
+    window->setWindowTitle(name + QStringLiteral("[*] — OpenCompositor"));
+    window->setWindowModified(modified);
 }
 QMenu *new_menu(QMainWindow *window, const QString &title) {
     return window->menuBar()->addMenu(title);
@@ -824,11 +836,18 @@ ParameterPanel::ParameterPanel(rust::Fn<void(PanelGesture)> gestures, QWidget *p
     : QWidget(parent), gestures(gestures) {
     auto *layout = new QVBoxLayout(this);
     auto *header = new QHBoxLayout;
-    title = new QLabel;
-    title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    QFont bold = title->font();
+    name = new QLineEdit;
+    name->setToolTip(QStringLiteral("The node's name: type over it to rename the node"));
+    name->setEnabled(false);
+    name->setFocusPolicy(Qt::ClickFocus);
+    QFont bold = name->font();
     bold.setBold(true);
-    title->setFont(bold);
+    name->setFont(bold);
+    name->installEventFilter(this);
+    connect(name, &QLineEdit::editingFinished, this, [this] {
+        if (name->text() != shown_name) send(PanelGestureKind::Renamed, QString(), 0, name->text());
+    });
+    type = new QLabel;
     pin = new QToolButton;
     pin->setText(QStringLiteral("Pin"));
     pin->setCheckable(true);
@@ -837,9 +856,15 @@ ParameterPanel::ParameterPanel(rust::Fn<void(PanelGesture)> gestures, QWidget *p
     connect(pin, &QToolButton::toggled, this, [this](bool pinned) {
         send(pinned ? PanelGestureKind::Pin : PanelGestureKind::Unpin, QString());
     });
-    header->addWidget(title, 1);
+    header->addWidget(name, 1);
+    header->addWidget(type);
     header->addWidget(pin);
     layout->addLayout(header);
+    problem = new QLabel;
+    problem->setWordWrap(true);
+    problem->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    problem->hide();
+    layout->addWidget(problem);
     empty = new QLabel(QStringLiteral("No node selected"));
     empty->setAlignment(Qt::AlignCenter);
     empty->setEnabled(false);
@@ -855,16 +880,31 @@ void ParameterPanel::show_panel(const PanelData &data) {
     Refreshing refreshing(this->refreshing);
     pin->setChecked(data.pinned);
     pin->setEnabled(data.shown);
-    title->setText(data.title);
-    title->setToolTip(data.title);
+    shown_name = data.name;
+    name->setText(data.name);
+    name->setCursorPosition(0);
+    name->setEnabled(data.shown);
+    type->setText(data.type_label);
+    type->setVisible(!data.type_label.isEmpty());
+    problem->setText(data.problem);
+    problem->setVisible(data.shown && !data.problem.isEmpty());
     empty->setVisible(!data.shown);
     scroll->setVisible(data.shown);
     std::optional<uint64_t> shown = data.shown ? std::optional(data.node) : std::nullopt;
-    if (shown != node) {
+    if (shown != node || !same_rows(data)) {
         node = shown;
         rebuild(data);
     }
     for (size_t i = 0; i < rows.size() && i < data.rows.size(); ++i) refresh(rows[i], data.rows[i]);
+}
+
+bool ParameterPanel::same_rows(const PanelData &data) const {
+    if (rows.size() != data.rows.size()) return false;
+    for (size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].name != data.rows[i].name || rows[i].label->text() != data.rows[i].label ||
+            rows[i].kind != data.rows[i].kind)
+            return false;
+    return true;
 }
 
 QSlider *ParameterPanel::slider(const QString &name) const {
@@ -886,6 +926,17 @@ void ParameterPanel::rebuild(const PanelData &data) {
     int index = 0;
     for (const PanelRow &data : data.rows) {
         QString name = data.name;
+        bool sectioned = data.kind == RowKind::Property || data.kind == RowKind::Connection;
+        if (sectioned && (rows.empty() || rows.back().kind != data.kind)) {
+            auto *heading = new QLabel(data.kind == RowKind::Property
+                                           ? QStringLiteral("Other properties")
+                                           : QStringLiteral("Refused connections"));
+            QFont bold = heading->font();
+            bold.setBold(true);
+            heading->setFont(bold);
+            heading->setContentsMargins(0, 8, 0, 0);
+            grid->addWidget(heading, index++, 0, 1, 3);
+        }
         auto *label = new QLabel(data.label);
         label->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(label, &QLabel::customContextMenuRequested, this, [=, this](const QPoint &at) {
@@ -921,6 +972,9 @@ void ParameterPanel::rebuild(const PanelData &data) {
                                  12);
             field->setPlaceholderText(QStringLiteral("Unset"));
             grid->addWidget(field, index, 1);
+        } else if (data.kind == RowKind::Property || data.kind == RowKind::Connection) {
+            if (data.unused) label->setForegroundRole(QPalette::PlaceholderText);
+            grid->addWidget(field, index, 1, 1, 2);
         } else {
             field->setPlaceholderText(QStringLiteral("No file"));
             auto *browse = new QPushButton(QStringLiteral("Browse…"));
@@ -939,7 +993,7 @@ void ParameterPanel::rebuild(const PanelData &data) {
             box->addWidget(reload);
             grid->addLayout(box, index, 1, 1, 2);
         }
-        rows.push_back(Row{name, label, field, row_slider, QString(), false});
+        rows.push_back(Row{name, label, field, row_slider, QString(), false, data.kind});
         ++index;
     }
     grid->setRowStretch(index, 1);
@@ -955,6 +1009,8 @@ void ParameterPanel::refresh(Row &row, const PanelRow &data) {
     row.shown = data.text;
     row.field->setText(data.text);
     row.field->setCursorPosition(0);
+    if (row.kind == RowKind::Property || row.kind == RowKind::Connection)
+        row.field->setReadOnly(!data.editable);
     if (row.slider && !row.slider->isSliderDown()) {
         QSignalBlocker blocker(row.slider);
         row.slider->setValue(data.tick);
@@ -976,6 +1032,11 @@ void ParameterPanel::committed(const QString &name) {
 bool ParameterPanel::eventFilter(QObject *watched, QEvent *event) {
     if (event->type() == QEvent::KeyPress &&
         static_cast<QKeyEvent *>(event)->key() == Qt::Key_Escape) {
+        if (watched == name) {
+            name->setText(shown_name);
+            name->clearFocus();
+            return true;
+        }
         for (Row &row : rows) {
             if (row.field != watched) continue;
             row.field->setText(row.shown);
@@ -989,7 +1050,10 @@ bool ParameterPanel::eventFilter(QObject *watched, QEvent *event) {
 void ParameterPanel::popup_reset_menu(const QString &name, QMenu *menu, const QPoint &at) {
     Row *row = this->row(name);
     if (!menu->isEmpty()) menu->addSeparator();
-    QAction *reset = menu->addAction(QStringLiteral("Reset to Default"));
+    RowKind kind = row ? row->kind : RowKind::Float;
+    QAction *reset = menu->addAction(kind == RowKind::Property     ? QStringLiteral("Remove from This File")
+                                     : kind == RowKind::Connection ? QStringLiteral("Disconnect")
+                                                                   : QStringLiteral("Reset to Default"));
     reset->setEnabled(row && row->authored);
     connect(reset, &QAction::triggered, this, [=, this] { send(PanelGestureKind::Reset, name); });
     menu->setAttribute(Qt::WA_DeleteOnClose);
@@ -1171,6 +1235,51 @@ QStringList choose_files(QMainWindow *window, const QString &title, bool several
     if (several) return QFileDialog::getOpenFileNames(window, title);
     QString file = QFileDialog::getOpenFileName(window, title);
     return file.isEmpty() ? QStringList() : QStringList(file);
+}
+QString choose_project(QMainWindow *window) {
+    return QFileDialog::getOpenFileName(window, QStringLiteral("Open"), QString(),
+                                        QStringLiteral("USD (*.usd *.usda *.usdc *.usdz)"));
+}
+QString choose_save_as(QMainWindow *window, const QString &suggested) {
+    QFileDialog dialog(window, QStringLiteral("Save As"));
+    dialog.setAcceptMode(QFileDialog::AcceptSave);
+    dialog.setNameFilters({QStringLiteral("USD text (*.usda)"), QStringLiteral("USD binary (*.usdc)"),
+                           QStringLiteral("USD (*.usd)")});
+    dialog.setDefaultSuffix(QStringLiteral("usda"));
+    // A name typed without an extension takes the filter's.
+    QObject::connect(&dialog, &QFileDialog::filterSelected, &dialog, [&](const QString &filter) {
+        dialog.setDefaultSuffix(filter.section(QStringLiteral("*."), 1).chopped(1));
+    });
+    dialog.selectFile(suggested);
+    if (dialog.exec() != QDialog::Accepted) return QString();
+    QStringList files = dialog.selectedFiles();
+    return files.isEmpty() ? QString() : files.first();
+}
+size_t ask(QMainWindow *window, const QString &text, const QString &detail,
+           const QStringList &answers) {
+    QMessageBox box(window);
+    box.setIcon(QMessageBox::Question);
+    box.setText(text);
+    box.setInformativeText(detail);
+    std::vector<QPushButton *> buttons;
+    for (qsizetype i = 0; i < answers.size(); ++i) {
+        auto role = i == 0                    ? QMessageBox::AcceptRole
+                    : i == answers.size() - 1 ? QMessageBox::RejectRole
+                                              : QMessageBox::DestructiveRole;
+        buttons.push_back(box.addButton(answers[i], role));
+    }
+    box.setDefaultButton(buttons.front());
+    box.setEscapeButton(buttons.back());
+    box.exec();
+    auto clicked = std::find(buttons.begin(), buttons.end(), box.clickedButton());
+    if (clicked == buttons.end()) return answers.size() - 1;
+    return clicked - buttons.begin();
+}
+// Ends the edit in a focused text field, so that what was typed is applied first.
+void commit_focused_field() {
+    QWidget *focus = QApplication::focusWidget();
+    if (qobject_cast<QLineEdit *>(focus) || qobject_cast<QAbstractSpinBox *>(focus))
+        focus->clearFocus();
 }
 QByteArray encode_name(const QString &path) { return QFile::encodeName(path); }
 QString decode_name(rust::Slice<const uint8_t> name) {

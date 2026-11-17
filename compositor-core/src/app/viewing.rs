@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use crate::document::NodeId;
 use crate::image::{ImageInfo, Window};
+use crate::network::NodeId;
 use crate::viewer_cache::{ViewerCache, ViewerCopy};
 use crate::worker::Job;
 

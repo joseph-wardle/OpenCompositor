@@ -3,10 +3,10 @@ use std::path::Path;
 use opencompositor_kernels::ulp_distance;
 
 use super::*;
-use crate::document::{InputSlot, Node, NodeKind, ReaderVersion};
 use crate::evaluate::tests::{blur, chain, exposure, graph, key, merge, reader, write_png};
 use crate::fixtures::{directory, write_exr};
 use crate::kernels::headless;
+use crate::network::{InputSlot, Node, NodeKind};
 
 /// Tests' stand-in for the device running out of memory, which lavapipe never reports: with a
 /// cap, an attempt that ends with the planes alive over it is refused, as a failed creation's
@@ -161,10 +161,10 @@ fn exposure_on_the_gpu_shares_alpha_and_keeps_a_grey_image_one_plane() {
     let (device, queue) = headless::device();
     let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
-    let document = chain([reader(&grey), exposure(Some(1.0))]);
+    let network = chain([reader(&grey), exposure(Some(1.0))]);
 
-    let read = run(&mut evaluator, &mut gpu, &key(&document, 1));
-    let exposed = run(&mut evaluator, &mut gpu, &key(&document, 2));
+    let read = run(&mut evaluator, &mut gpu, &key(&network, 1));
+    let exposed = run(&mut evaluator, &mut gpu, &key(&network, 2));
 
     let texture = |image: &GpuImage, channel| image.texture(channel).unwrap() as *const _;
     assert_eq!(texture(&read, Channel::A), texture(&exposed, Channel::A));
@@ -296,9 +296,8 @@ fn merge_exr(path: &Path, origin: (i32, i32), size: (usize, usize), seed: usize)
 /// A Reader with no file, whose image is empty.
 fn reader_without_a_file() -> Node {
     Node::new(
-        NodeKind::Reader {
-            version: ReaderVersion::V1,
-        },
+        NodeKind::Reader,
+        "Reader",
         open_ng::Point { x: 0.0, y: 0.0 },
     )
 }
@@ -417,8 +416,8 @@ fn merge_of_the_base_alone_or_at_mix_0_is_the_base_itself() {
         &[(2, "background".into(), 1), (2, ("layer", 1).into(), 1)],
     );
     let read = run(&mut evaluator, &mut gpu, &key(&alone, 1));
-    for document in [alone, mix_0] {
-        let merged = run(&mut evaluator, &mut gpu, &key(&document, 2));
+    for network in [alone, mix_0] {
+        let merged = run(&mut evaluator, &mut gpu, &key(&network, 2));
         for channel in Channel::ALL {
             assert!(std::ptr::eq(
                 read.texture(channel).unwrap(),
@@ -428,8 +427,8 @@ fn merge_of_the_base_alone_or_at_mix_0_is_the_base_itself() {
     }
 }
 
-/// A document of a Reader, node 1, and a Blur of it at `size`, node 2.
-fn blurred(reader: Node, size: f64) -> crate::document::Document {
+/// A network of a Reader, node 1, and a Blur of it at `size`, node 2.
+fn blurred(reader: Node, size: f64) -> crate::network::Network {
     graph([reader, blur(Some(size))], &[(2, "source".into(), 1)])
 }
 
@@ -791,9 +790,9 @@ fn a_reader_without_a_file_gives_the_empty_image() {
     let (device, queue) = headless::device();
     let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
-    let document = chain([reader_without_a_file(), exposure(Some(1.0))]);
+    let network = chain([reader_without_a_file(), exposure(Some(1.0))]);
 
-    let image = run(&mut evaluator, &mut gpu, &key(&document, 2));
+    let image = run(&mut evaluator, &mut gpu, &key(&network, 2));
 
     assert!(image.info().data_window.is_empty());
     assert!(image.texture(Channel::R).is_none());
@@ -868,15 +867,15 @@ fn a_request_out_of_gpu_memory_releases_what_it_does_not_read_and_fits_on_its_re
     let (device, queue) = headless::device();
     let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
-    let document = chain([reader(&path), exposure(Some(1.0)), exposure(Some(2.0))]);
-    drop(run(&mut evaluator, &mut gpu, &key(&document, 2)));
+    let network = chain([reader(&path), exposure(Some(1.0)), exposure(Some(2.0))]);
+    drop(run(&mut evaluator, &mut gpu, &key(&network, 2)));
     // The upload's four planes and the first Exposure's three are alive; the second Exposure's
     // three fit only once the upload's colour planes, which it does not read, are released.
     let plane = 2 * size_of::<f32>() as u64;
     assert_eq!(gpu.retained_bytes(), 7 * plane);
     gpu.shortage.cap = Some(7 * plane);
 
-    let image = run(&mut evaluator, &mut gpu, &key(&document, 3));
+    let image = run(&mut evaluator, &mut gpu, &key(&network, 3));
 
     assert_eq!(
         gpu.retained_keys().len(),
@@ -885,7 +884,7 @@ fn a_request_out_of_gpu_memory_releases_what_it_does_not_read_and_fits_on_its_re
     );
     assert_eq!(gpu.retained_bytes(), 7 * plane);
     let expected = Evaluator::new()
-        .evaluate(&key(&document, 3), || false)
+        .evaluate(&key(&network, 3), || false)
         .unwrap()
         .unwrap();
     for channel in Channel::ALL {
@@ -903,13 +902,13 @@ fn a_request_out_of_gpu_memory_keeps_what_its_read_results_were_computed_from() 
     let (device, queue) = headless::device();
     let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
     let mut evaluator = Evaluator::new();
-    let document = chain([
+    let network = chain([
         reader(&path),
         exposure(Some(1.0)),
         exposure(Some(2.0)),
         exposure(Some(3.0)),
     ]);
-    drop(run(&mut evaluator, &mut gpu, &key(&document, 3)));
+    drop(run(&mut evaluator, &mut gpu, &key(&network, 3)));
     let uploaded = gpu.uploaded_bytes();
     // The upload's four planes and each Exposure's three are alive; the third Exposure's three
     // fit only once the upload's colour planes are released. Releasing the first Exposure too
@@ -918,7 +917,7 @@ fn a_request_out_of_gpu_memory_keeps_what_its_read_results_were_computed_from() 
     assert_eq!(gpu.retained_bytes(), 10 * plane);
     gpu.shortage.cap = Some(10 * plane);
 
-    let image = run(&mut evaluator, &mut gpu, &key(&document, 4));
+    let image = run(&mut evaluator, &mut gpu, &key(&network, 4));
 
     assert_eq!(gpu.uploaded_bytes(), uploaded, "nothing uploaded again");
     assert_eq!(
@@ -927,7 +926,7 @@ fn a_request_out_of_gpu_memory_keeps_what_its_read_results_were_computed_from() 
         "the Exposures, not the upload"
     );
     let expected = Evaluator::new()
-        .evaluate(&key(&document, 4), || false)
+        .evaluate(&key(&network, 4), || false)
         .unwrap()
         .unwrap();
     for channel in Channel::ALL {
@@ -946,9 +945,9 @@ fn a_deep_chain_writes_over_the_planes_of_images_already_read() {
     let path = directory("deep_chain").join("image.png");
     write_png(&path, 255);
     let (device, queue) = headless::device();
-    let document =
+    let network =
         chain(std::iter::once(reader(&path)).chain((0..20).map(|_| exposure(Some(0.25)))));
-    let requested = key(&document, 21);
+    let requested = key(&network, 21);
     let plane = 2 * size_of::<f32>() as u64;
     let record = |planes: u64| {
         let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());

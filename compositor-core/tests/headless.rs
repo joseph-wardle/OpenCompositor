@@ -1,4 +1,4 @@
-//! The compositor without a window: a document built by the same edits the interface makes,
+//! The compositor without a window: a project built by the same edits the interface makes,
 //! evaluated to pixels from files on disk.
 
 use std::fs::File;
@@ -18,7 +18,7 @@ fn frames_read(
     frame: f64,
     which: impl Fn(&Reading) -> Option<i64>,
 ) -> Vec<(NodeId, i64)> {
-    (readings(session.document(), session.files(), node, frame).into_iter())
+    (readings(session.network(), session.files(), node, frame).into_iter())
         .filter_map(|(id, reading)| Some((id, which(&reading)?)))
         .collect()
 }
@@ -52,7 +52,7 @@ fn reader(session: &mut Session, path: PathBuf) -> NodeId {
     *changes.nodes.first().unwrap()
 }
 
-/// The node's image as the session's document and reloads describe it.
+/// The node's image as the session's network and reloads describe it.
 fn evaluate(evaluator: &mut Evaluator, session: &Session, id: NodeId) -> Result<Image, EvalError> {
     let key = session.result_key(id).expect("the node exists");
     evaluator
@@ -199,7 +199,7 @@ fn width_at(evaluator: &mut Evaluator, session: &mut Session, id: NodeId, frame:
 
 fn key_at(session: &mut Session, id: NodeId, frame: f64) -> opencompositor_core::ResultKey {
     session.set_frame(frame).unwrap();
-    result_key(session.document(), session.files(), id, frame).unwrap()
+    result_key(session.network(), session.files(), id, frame).unwrap()
 }
 
 #[test]
@@ -341,7 +341,7 @@ fn a_read_stopped_part_way_keeps_nothing_and_reads_whole_when_asked_again() {
     let mut session = Session::new();
     let mut evaluator = Evaluator::new();
     let id = reader(&mut session, path);
-    let key = result_key(session.document(), session.files(), id, 1.0).unwrap();
+    let key = result_key(session.network(), session.files(), id, 1.0).unwrap();
 
     // Asked once before the node, then before each chunk.
     let asked = AtomicUsize::new(0);

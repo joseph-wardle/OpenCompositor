@@ -3,9 +3,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use super::*;
-use crate::document::NodeKind;
 use crate::evaluate::EvalError;
 use crate::image::ImageInfo;
+use crate::network::NodeKind;
 use crate::panel::ValueState;
 use crate::parameter::{Value, resolve};
 use crate::read::ReadError;
@@ -100,7 +100,7 @@ fn input(pane: Pane, input: Input) -> Event {
 }
 
 fn file(app: &App, id: NodeId) -> Option<Arc<Path>> {
-    let node = app.session().document().node(id)?;
+    let node = app.session().network().node(id)?;
     resolve(node, 1.0).file("file").cloned()
 }
 
@@ -113,7 +113,7 @@ fn create(app: &mut App, path: &str) -> NodeId {
         }),
         paths: vec![PathBuf::from(path)],
     });
-    app.session().document().selection()[0]
+    app.session().selection()[0]
 }
 
 fn slot_key(digit: u8, modifiers: Modifiers) -> Event {
@@ -196,11 +196,15 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
     let mut requests = app.dispatch(Event::FilesChosen { intent, paths });
 
     let panel = shown_panel(&requests).expect("the panel follows the selection");
-    assert_eq!(panel.map(|panel| panel.name.as_str()), Some("b.exr"));
+    assert_eq!(panel.map(|panel| panel.name.as_str()), Some("b"));
     requests.retain(|request| !matches!(request, Request::ShowPanel(_)));
     assert_eq!(
         requests,
         [
+            Request::ShowProject {
+                name: "Untitled".to_owned(),
+                modified: true
+            },
             Request::ShowUndoLabels {
                 undo: Some("Create Reader"),
                 redo: None
@@ -208,13 +212,16 @@ fn read_files_asks_for_files_to_read_where_the_pointer_is_over_the_graph() {
             Request::ShowViewerCaption(
                 "Slot 1: nothing marked. Ctrl+1 marks the selected node".to_owned()
             ),
-            Request::Redraw(Pane::Graph)
+            Request::Redraw(Pane::Graph),
+            Request::Autosave {
+                after: Duration::from_secs(5)
+            }
         ]
     );
-    let document = app.session().document();
-    assert_eq!(document.nodes().count(), 2);
-    let first = document.selection()[0];
-    assert_eq!(document.node(first).unwrap().position, at);
+    let network = app.session().network();
+    assert_eq!(network.nodes().count(), 2);
+    let first = app.session().selection()[0];
+    assert_eq!(network.node(first).unwrap().position, at);
     assert!(
         deliveries.recv_timeout(Duration::from_millis(100)).is_err(),
         "a Reader no slot marks was read"
@@ -274,7 +281,7 @@ fn changing_a_readers_file_fails_if_it_went_while_the_dialog_was_open() {
         intent: create,
         paths,
     });
-    let id = app.session().document().selection()[0];
+    let id = app.session().selection()[0];
 
     // As the panel's Browse… asks.
     let intent = FileIntent::SetFile {
@@ -387,7 +394,7 @@ fn only_the_graph_losing_the_keyboard_cancels_its_gesture() {
             }),
             paths: vec![PathBuf::from("/nonexistent/a.exr")],
         });
-        let id = app.session().document().selection()[0];
+        let id = app.session().selection()[0];
         // Just inside the Reader's top-left corner, at the graph origin.
         let press = PhysicalPoint { x: 204.0, y: 154.0 };
         app.dispatch(input(Pane::Graph, Input::PointerEntered));
@@ -413,7 +420,7 @@ fn only_the_graph_losing_the_keyboard_cancels_its_gesture() {
                 button: Button::Left,
             },
         ));
-        app.session().document().node(id).unwrap().position
+        app.session().network().node(id).unwrap().position
     };
 
     assert_eq!(drag(Pane::Viewer), Point { x: 50.0, y: 0.0 });
@@ -428,15 +435,12 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
 
     let requests = app.dispatch(slot_key(3, CTRL));
 
-    assert_eq!(
-        app.session().document().mark(Slot::new(3).unwrap()),
-        Some(id)
-    );
+    assert_eq!(app.session().mark(Slot::new(3).unwrap()), Some(id));
     assert_eq!(app.session().viewer().slot().digit(), 3);
     // Only the caption says it is updating, so the node keeps its size.
-    assert_eq!(title(&app, id), "a.exr [3]");
+    assert_eq!(title(&app, id), "a [3]");
     assert!(requests.contains(&Request::ShowViewerCaption(
-        "Slot 3 · a.exr · updating… · CPU".to_owned()
+        "Slot 3 · a · updating… · CPU".to_owned()
     )));
 
     let evaluated = receive(&deliveries);
@@ -449,7 +453,7 @@ fn marking_the_selected_node_views_it_and_reads_its_file() {
     assert!(
         app.shell
             .caption
-            .starts_with("Slot 3 · a.exr · /nonexistent/a.exr: No such file"),
+            .starts_with("Slot 3 · a · /nonexistent/a.exr: No such file"),
         "{}",
         app.shell.caption
     );
@@ -468,7 +472,7 @@ fn shift_and_a_digit_frames_the_node_the_slot_marks() {
     );
     let after = app.session().graph_view().to_graph(middle);
     assert_ne!(after, before);
-    assert_eq!(app.session().document().selection(), [id]);
+    assert_eq!(app.session().selection(), [id]);
 }
 
 #[test]
@@ -484,21 +488,21 @@ fn a_result_for_a_node_no_longer_viewed_is_not_shown() {
 
     // The first read finishes after the viewer moved on.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
-    assert_eq!(app.shell.caption, "Slot 2 · b.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · b · updating… · CPU");
 
     app.dispatch(read(&second, 8, 2));
-    assert_eq!(app.shell.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · b · 8 × 2 · CPU");
 
     // Back to slot 1, which is read again, showing slot 2's image until then.
     app.dispatch(slot_key(1, NONE));
     assert_eq!(asked(&app).key, first.key);
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · updating… · CPU");
     assert!(matches!(app.viewing.shown, Shown::Image { .. }));
     // Back to slot 2, which is shown already and asked for again, so that the worker lets slot
     // 1's read go.
     app.dispatch(slot_key(2, NONE));
     assert_eq!(asked(&app).key, second.key);
-    assert_eq!(app.shell.caption, "Slot 2 · b.exr · 8 × 2 · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · b · 8 × 2 · CPU");
 }
 
 #[test]
@@ -515,13 +519,13 @@ fn an_edit_faster_than_evaluation_shows_each_later_result_as_it_finishes() {
     // Superseded, but later than anything shown.
     app.dispatch(read(&second, 8, 2));
     assert!(matches!(&app.viewing.shown, Shown::Image { info, .. } if info.data_window.width == 8));
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · updating… · CPU");
     // Earlier than what is shown.
     assert_eq!(app.dispatch(read(&first, 4, 4)), []);
     assert!(matches!(&app.viewing.shown, Shown::Image { info, .. } if info.data_window.width == 8));
 
     app.dispatch(read(&third, 5, 1));
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · 5 × 1 · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · 5 × 1 · CPU");
 }
 
 #[test]
@@ -549,7 +553,7 @@ fn a_superseded_failure_leaves_the_viewer_and_the_node_as_they_are() {
     app.dispatch(failed(superseded));
 
     assert!(matches!(app.viewing.shown, Shown::Image { .. }));
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · updating… · CPU");
     assert_eq!(color(&app), unfailed);
     app.dispatch(failed(asked(&app)));
     assert!(matches!(app.viewing.shown, Shown::Failed { .. }));
@@ -747,7 +751,7 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
     assert!(matches!(app.viewing.shown, Shown::Failed { .. }));
     assert_eq!(
         app.shell.caption,
-        "Slot 1 · a.exr · /nonexistent/a.exr: not an EXR or PNG file · CPU"
+        "Slot 1 · a · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let failed = app.session().graph().node(id.into()).unwrap().color;
 
@@ -757,24 +761,25 @@ fn a_failed_read_shows_no_older_image_and_reloading_reads_again() {
 }
 
 #[test]
-fn undoing_a_mark_leaves_the_viewer_showing_nothing() {
+fn undoing_the_marked_nodes_creation_leaves_its_mark_doing_nothing() {
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(slot_key(1, CTRL));
     app.dispatch(read(&asked(&app), 4, 4));
 
+    // The mark is no step, so undo undoes the creation, and the mark names a node that is gone.
     let requests = app.dispatch(Event::Command(Command::Undo));
 
     assert!(requests.contains(&Request::Redraw(Pane::Viewer)));
     assert!(matches!(app.viewing.shown, Shown::Nothing));
     assert_eq!(
         app.shell.caption,
-        "Slot 1: nothing marked. Ctrl+1 marks the selected node"
+        "Slot 1: a no longer exists. Ctrl+1 marks the selected node"
     );
 
-    // Redo marks it again, and the file is read again.
+    // Redo brings the node back to its mark, and the file is read again.
     app.dispatch(Event::Command(Command::Redo));
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · updating… · CPU");
 }
 
 #[test]
@@ -820,19 +825,19 @@ fn delete_in_the_graph_deletes_the_selection_and_the_viewer_lets_go() {
     // Over the viewer, Delete does nothing.
     app.dispatch(input(Pane::Viewer, Input::PointerEntered));
     assert!(app.dispatch(delete()).is_empty());
-    assert!(app.session().document().node(id).is_some());
+    assert!(app.session().network().node(id).is_some());
 
     app.dispatch(input(Pane::Viewer, Input::PointerLeft));
     app.dispatch(input(Pane::Graph, Input::PointerEntered));
     let requests = app.dispatch(delete());
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
-    assert_eq!(app.session().document().node(id), None);
-    assert!(app.session().document().node(kept).is_some());
+    assert_eq!(app.session().network().node(id), None);
+    assert!(app.session().network().node(kept).is_some());
     assert_eq!(app.session().undo_label(), Some("Delete"));
     assert!(matches!(app.viewing.asked, Asked::Nothing));
     assert_eq!(
         app.shell.caption,
-        "Slot 1: nothing marked. Ctrl+1 marks the selected node"
+        "Slot 1: a no longer exists. Ctrl+1 marks the selected node"
     );
 
     assert!(matches!(
@@ -859,19 +864,19 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     app.dispatch(slot_key(2, CTRL));
     assert_eq!(
         app.shell.caption,
-        "Slot 2 · Exposure · updating…; Source of Exposure is not connected · CPU"
+        "Slot 2 · Exposure1 · updating…; Source of Exposure is not connected · CPU"
     );
     // The empty image, which the viewer does not frame.
     app.dispatch(read(&asked(&app), 0, 0));
     assert_eq!(
         app.shell.caption,
-        "Slot 2 · Exposure · Source of Exposure is not connected · CPU"
+        "Slot 2 · Exposure1 · Source of Exposure is not connected · CPU"
     );
     assert_eq!(app.viewing.shown.display_window(), None);
 
     app.session.connect(first, "source", reader).unwrap();
     app.dispatch(Event::Draw(Pane::Viewer));
-    assert_eq!(app.shell.caption, "Slot 2 · Exposure · updating… · CPU");
+    assert_eq!(app.shell.caption, "Slot 2 · Exposure1 · updating… · CPU");
     let key = |app: &App, id| {
         let session = app.session();
         session.result_key(id).unwrap()
@@ -888,7 +893,7 @@ fn a_viewed_exposure_says_what_is_not_connected_and_where_a_failure_happened() {
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
     assert_eq!(
         app.shell.caption,
-        "Slot 2 · Exposure · /nonexistent/a.exr: not an EXR or PNG file · CPU"
+        "Slot 2 · Exposure1 · /nonexistent/a.exr: not an EXR or PNG file · CPU"
     );
     let color = |id: NodeId| app.session().graph().node(id.into()).unwrap().color;
     assert_ne!(color(reader), color(second));
@@ -974,12 +979,12 @@ fn a_type_chosen_without_a_current_node_goes_where_the_pointer_was() {
     });
 
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
-    let document = app.session().document();
-    let &[id] = document.selection() else {
+    let network = app.session().network();
+    let &[id] = app.session().selection() else {
         panic!("one node selected")
     };
-    let node = document.node(id).unwrap();
-    assert!(matches!(node.kind, NodeKind::Exposure { .. }));
+    let node = network.node(id).unwrap();
+    assert!(matches!(node.kind, NodeKind::Exposure));
     assert_eq!(node.position, at);
     assert_eq!(app.session().undo_label(), Some("Create Exposure"));
 }
@@ -1005,23 +1010,23 @@ fn a_reader_chosen_in_the_menu_asks_for_its_files_and_goes_below_the_current_nod
         intent,
         paths: Vec::new(),
     });
-    assert_eq!(app.session().document().nodes().count(), 1);
+    assert_eq!(app.session().network().nodes().count(), 1);
     assert_eq!(app.session().undo_label(), Some("Create Exposure"));
 
     app.dispatch(Event::FilesChosen {
         intent,
         paths: vec!["/nonexistent/a.exr".into(), "/nonexistent/b.exr".into()],
     });
-    let document = app.session().document();
-    let &[first, _] = document.selection() else {
+    let network = app.session().network();
+    let &[first, _] = app.session().selection() else {
         panic!("both Readers selected")
     };
     let outline = app.session().graph().node_rect(exposure.into()).unwrap();
-    assert_eq!(document.node(first).unwrap().position.x, outline.min.x);
-    assert!(document.node(first).unwrap().position.y > outline.max.y);
+    assert_eq!(network.node(first).unwrap().position.x, outline.min.x);
+    assert!(network.node(first).unwrap().position.y > outline.max.y);
     assert_eq!(app.session().undo_label(), Some("Create Reader"));
     app.dispatch(Event::Command(Command::Undo));
-    assert_eq!(app.session().document().nodes().count(), 1);
+    assert_eq!(app.session().network().nodes().count(), 1);
 }
 
 #[test]
@@ -1129,11 +1134,11 @@ fn the_panel_follows_the_current_node_and_whether_its_values_were_set() {
             panel.type_label,
             panel.pinned
         ),
-        (reader, "a.exr", "Reader", false)
+        (reader, "a", "Reader", false)
     );
 
     let requests = choose_in_menu(&mut app, "exposure");
-    let exposure = app.session().document().selection()[0];
+    let exposure = app.session().selection()[0];
     assert_eq!(app.shell.panel.as_ref().unwrap().node, exposure);
     let default = (Some(Value::Float(0.0)), ValueState::Absent);
     assert_eq!(only_row(&requests), default);
@@ -1183,13 +1188,13 @@ fn a_pinned_panel_stays_on_its_node_until_unpinned_or_the_node_is_deleted() {
 
     let requests = choose_in_menu(&mut app, "exposure");
     assert_eq!(shown_panel(&requests), None);
-    let exposure = app.session().document().selection()[0];
+    let exposure = app.session().selection()[0];
 
     let requests = app.dispatch(Event::Command(Command::UnpinPanel));
     let panel = shown_panel(&requests).flatten().unwrap();
     assert_eq!((panel.node, panel.pinned), (exposure, false));
 
-    // Undoing the delete brings the node back, not the pin.
+    // Undoing the delete brings the node back, not the pin, nor the selection the panel follows.
     app.dispatch(Event::Command(Command::PinPanel));
     app.dispatch(input(Pane::Graph, Input::PointerEntered));
     app.dispatch(Event::KeyPressed {
@@ -1198,8 +1203,8 @@ fn a_pinned_panel_stays_on_its_node_until_unpinned_or_the_node_is_deleted() {
     });
     assert_eq!(app.shell.panel, None);
     app.dispatch(Event::Command(Command::Undo));
-    let panel = app.shell.panel.as_ref().unwrap();
-    assert_eq!((panel.node, panel.pinned), (exposure, false));
+    assert!(app.session().network().node(exposure).is_some());
+    assert_eq!(app.shell.panel, None);
 }
 
 #[test]
@@ -1241,12 +1246,12 @@ fn out_of_gpu_memory_moves_evaluation_to_the_cpu_until_the_artist_chooses_the_gp
     );
     assert_eq!(
         app.shell.caption,
-        "Slot 1 · a.exr · 4 × 4 · CPU (the GPU ran out of memory)"
+        "Slot 1 · a · 4 × 4 · CPU (the GPU ran out of memory)"
     );
     assert_eq!(receive(&deliveries).job.number, job.number);
     app.dispatch(Event::Command(Command::EvaluateOn(EvaluationDevice::Gpu)));
     assert_eq!(app.evaluation_device(), EvaluationDevice::Gpu);
-    assert_eq!(app.shell.caption, "Slot 1 · a.exr · 4 × 4 · GPU");
+    assert_eq!(app.shell.caption, "Slot 1 · a · 4 × 4 · GPU");
 }
 
 #[test]
@@ -1488,7 +1493,7 @@ fn a_device_loss_drops_the_read_of_its_copy_of_the_image() {
 }
 
 #[test]
-fn e_steps_the_viewers_exposure_and_its_control_follows_without_editing_the_document() {
+fn e_steps_the_viewers_exposure_and_its_control_follows_without_an_edit() {
     let (mut app, _deliveries) = viewing_a_cropped_image();
     app.dispatch(input(Pane::Viewer, Input::PointerEntered));
     let version = app.session().version();
@@ -1636,14 +1641,14 @@ fn a_frame_chosen_in_the_dialog_reads_its_sequence_once_a_scan_finds_other_frame
         }),
         paths: chosen,
     });
-    assert_eq!(app.session().document().nodes().count(), 0);
+    assert_eq!(app.session().network().nodes().count(), 0);
     let first = next_scan(&scans);
     app.dispatch(first);
-    assert_eq!(app.session().document().nodes().count(), 0);
+    assert_eq!(app.session().network().nodes().count(), 0);
     let requests = app.dispatch(next_scan(&scans));
 
     assert!(requests.contains(&Request::Redraw(Pane::Graph)));
-    let created = app.session().document().selection().to_vec();
+    let created = app.session().selection().to_vec();
     assert_eq!(
         files_of(&app, &created),
         [
@@ -1773,7 +1778,7 @@ fn a_scrub_shows_frames_in_the_order_asked_and_ends_on_the_last() {
     }
 
     assert!(shown.is_sorted(), "{shown:?}");
-    assert_eq!(app.shell.caption, "Slot 1 · plate.####.png · 20 × 1 · CPU");
+    assert_eq!(app.shell.caption, "Slot 1 · plate · 20 × 1 · CPU");
 }
 
 /// Views three 64 × 8 frames of a sequence in slot 1, in a 16-pixel-square viewer pane, which
@@ -1818,7 +1823,7 @@ fn a_frame_shown_before_is_shown_again_from_the_viewer_cache_without_the_worker(
     assert_eq!(app.session().frame(), 1.0);
     assert_eq!(
         app.shell.caption,
-        "Slot 1 · plate.####.png · 64 × 8; cached at 1/4 · CPU"
+        "Slot 1 · plate · 64 × 8; cached at 1/4 · CPU"
     );
     assert!(
         deliveries.recv_timeout(Duration::from_millis(200)).is_err(),
@@ -2161,9 +2166,9 @@ fn the_input_range_spans_the_viewed_sequence_moved_by_its_offset_and_playback_ke
     });
     assert_eq!(span(&app), (11.0, 14.0, true));
     assert_eq!(
-        app.session().document().timeline().last(),
+        app.session().timeline().last(),
         9.0,
-        "the document's range is left alone"
+        "the project's range is left alone"
     );
 
     let still = pattern.with_file_name("still.png");
@@ -2176,3 +2181,5 @@ fn the_input_range_spans_the_viewed_sequence_moved_by_its_offset_and_playback_ke
         "a still has no range of its own"
     );
 }
+
+mod project;

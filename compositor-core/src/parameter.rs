@@ -6,8 +6,8 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::document::Node;
 use crate::files::with_hashes;
+use crate::network::Node;
 
 /// One parameter of a node type. OpenFX properties beyond these stay in the plugin adapter.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,8 +63,8 @@ pub enum Value {
     /// A number, for a float or a frame.
     Float(f64),
     /// Kept as the artist chose it, never empty. Shared, so cloning a node to move it does not
-    /// copy the path. Resolving relative paths, variables or assets belongs between the value and
-    /// the read.
+    /// copy the path. A relative path is read as the layer authoring it anchors it, which
+    /// [`resolve`] gives; one no layer anchors is read nowhere.
     File(Arc<Path>),
 }
 
@@ -104,6 +104,10 @@ pub(crate) fn validate(
         (ParameterKind::File, Value::File(path)) if path.as_os_str().is_empty() => {
             return Err(ValueError::EmptyPath);
         }
+        // USD holds asset paths as strings.
+        (ParameterKind::File, Value::File(path)) if path.to_str().is_none() => {
+            return Err(ValueError::NotUnicode);
+        }
         (ParameterKind::File, Value::File(path)) => Value::File(with_hashes(path)),
         (ParameterKind::Float(_) | ParameterKind::Frame { .. } | ParameterKind::File, _) => {
             return Err(ValueError::WrongKind);
@@ -135,6 +139,11 @@ pub enum ValueError {
     NotWhole,
     OutOfLimits(RangeInclusive<f64>),
     EmptyPath,
+    NotUnicode,
+    /// A relative path set in a project with no file to read it beside.
+    Unanchored,
+    /// The parameter's value varies with time, which an edit cannot yet keep.
+    Animated,
 }
 
 impl fmt::Display for ValueError {
@@ -151,6 +160,15 @@ impl fmt::Display for ValueError {
                 limits.end()
             ),
             ValueError::EmptyPath => write!(f, "the path is empty"),
+            ValueError::NotUnicode => write!(f, "the path is not Unicode"),
+            ValueError::Unanchored => write!(
+                f,
+                "a relative path needs the project saved, to read beside it"
+            ),
+            ValueError::Animated => write!(
+                f,
+                "the parameter is animated, which this version cannot edit"
+            ),
         }
     }
 }
@@ -190,7 +208,7 @@ impl Resolved {
 }
 
 /// The boundary between what was authored and what executes: the node's authored values over its
-/// version's defaults. Inherited opinions would join here if layered composition arrives.
+/// version's defaults, each relative file anchored to the layer that authored it.
 ///
 /// Setting a value equal to its default and resetting it resolve alike, though only the first
 /// keeps the value authored.
@@ -203,8 +221,11 @@ pub fn resolve(node: &Node, _frame: f64) -> Resolved {
         .parameters()
         .iter()
         .filter_map(|parameter| {
-            let value = (node.authored_value(parameter.name).cloned())
-                .or_else(|| parameter.kind.default_value())?;
+            let value = match node.anchored(parameter.name) {
+                Some(path) => Value::File(path.clone()),
+                None => (node.authored_value(parameter.name).cloned())
+                    .or_else(|| parameter.kind.default_value())?,
+            };
             Some((parameter.name, value))
         })
         .collect();

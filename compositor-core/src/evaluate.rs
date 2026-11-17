@@ -12,13 +12,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use opencompositor_kernels::Exposure;
 use rayon::prelude::*;
 
-use crate::document::{
-    BlurVersion, Document, ExposureVersion, InputSlot, MergeVersion, Node, NodeId, NodeKind,
-    ReaderVersion,
-};
-use crate::files::{Files, reading};
+use crate::files::{Files, reading, unanchored};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::{self, Level};
+use crate::network::{InputSlot, Network, Node, NodeId, NodeKind};
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image_until};
 
@@ -29,8 +26,8 @@ mod merge;
 pub(crate) use gpu::poll_device;
 pub use gpu::{DeviceLost, GpuEvaluation, GpuImage, Recorded};
 
-/// Everything that decides a node's image: each node on its upstream chain with its kind,
-/// version and resolved values, its inputs in declaration order, and for a Reader with a file
+/// Everything that decides a node's image: each node on its upstream chain with its kind and
+/// resolved values, its inputs in declaration order, and for a Reader with a file
 /// the file it reads, a sequence's frame file, with its reload count. Within one evaluator, equal
 /// keys name the same image.
 ///
@@ -98,13 +95,11 @@ impl ResultKey {
 #[derive(Debug)]
 enum Recipe {
     Reader {
-        version: ReaderVersion,
         /// The file read, `None` while the Reader has no file, with the reload count 0.
         path: Option<Arc<Path>>,
         reload: u64,
     },
     Exposure {
-        version: ExposureVersion,
         /// The resolved value's bits. Validation refuses non-finite values and stores -0 as 0, so
         /// equal values have equal bits.
         stops: u64,
@@ -112,7 +107,6 @@ enum Recipe {
         source: Option<ResultKey>,
     },
     Merge {
-        version: MergeVersion,
         /// The resolved value's bits, as Exposure's `stops`.
         mix: u64,
         background: Option<ResultKey>,
@@ -121,7 +115,6 @@ enum Recipe {
         layers: Vec<ResultKey>,
     },
     Blur {
-        version: BlurVersion,
         /// The resolved value's bits, as Exposure's `stops`.
         size: u64,
         source: Option<ResultKey>,
@@ -146,31 +139,19 @@ impl Recipe {
     fn with_inputs(&self, inputs: &[&ResultKey]) -> Recipe {
         let mut inputs = inputs.iter().map(|&key| key.clone());
         match self {
-            Recipe::Reader {
-                version,
-                path,
-                reload,
-            } => Recipe::Reader {
-                version: *version,
+            Recipe::Reader { path, reload } => Recipe::Reader {
                 path: path.clone(),
                 reload: *reload,
             },
-            Recipe::Exposure {
-                version,
-                stops,
-                source,
-            } => Recipe::Exposure {
-                version: *version,
+            Recipe::Exposure { stops, source } => Recipe::Exposure {
                 stops: *stops,
                 source: source.as_ref().and_then(|_| inputs.next()),
             },
             Recipe::Merge {
-                version,
                 mix,
                 background,
                 layers,
             } => Recipe::Merge {
-                version: *version,
                 mix: *mix,
                 background: background.as_ref().and_then(|_| inputs.next()),
                 layers: layers
@@ -178,12 +159,7 @@ impl Recipe {
                     .map(|_| inputs.next().expect("one key per connected layer"))
                     .collect(),
             },
-            Recipe::Blur {
-                version,
-                size,
-                source,
-            } => Recipe::Blur {
-                version: *version,
+            Recipe::Blur { size, source } => Recipe::Blur {
                 size: *size,
                 source: source.as_ref().and_then(|_| inputs.next()),
             },
@@ -195,27 +171,14 @@ impl Recipe {
     fn fingerprint(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         match self {
-            Recipe::Reader {
-                version,
-                path,
-                reload,
-            } => (0u8, version, path, reload).hash(&mut hasher),
-            Recipe::Exposure {
-                version,
-                stops,
-                source,
-            } => (1u8, version, stops, source.is_some()).hash(&mut hasher),
+            Recipe::Reader { path, reload } => (0u8, path, reload).hash(&mut hasher),
+            Recipe::Exposure { stops, source } => (1u8, stops, source.is_some()).hash(&mut hasher),
             Recipe::Merge {
-                version,
                 mix,
                 background,
                 layers,
-            } => (2u8, version, mix, background.is_some(), layers.len()).hash(&mut hasher),
-            Recipe::Blur {
-                version,
-                size,
-                source,
-            } => (3u8, version, size, source.is_some()).hash(&mut hasher),
+            } => (2u8, mix, background.is_some(), layers.len()).hash(&mut hasher),
+            Recipe::Blur { size, source } => (3u8, size, source.is_some()).hash(&mut hasher),
         }
         for input in self.inputs() {
             input.1.hash(&mut hasher);
@@ -235,68 +198,42 @@ impl Recipe {
     fn same_but_inputs(&self, other: &Recipe) -> bool {
         match (self, other) {
             (
+                Recipe::Reader { path, reload },
                 Recipe::Reader {
-                    version,
-                    path,
-                    reload,
-                },
-                Recipe::Reader {
-                    version: other_version,
                     path: other_path,
                     reload: other_reload,
                 },
-            ) => version == other_version && path == other_path && reload == other_reload,
+            ) => path == other_path && reload == other_reload,
             (
+                Recipe::Exposure { stops, source },
                 Recipe::Exposure {
-                    version,
-                    stops,
-                    source,
-                },
-                Recipe::Exposure {
-                    version: other_version,
                     stops: other_stops,
                     source: other_source,
                 },
-            ) => {
-                version == other_version
-                    && stops == other_stops
-                    && source.is_some() == other_source.is_some()
-            }
+            ) => stops == other_stops && source.is_some() == other_source.is_some(),
             (
                 Recipe::Merge {
-                    version,
                     mix,
                     background,
                     layers,
                 },
                 Recipe::Merge {
-                    version: other_version,
                     mix: other_mix,
                     background: other_background,
                     layers: other_layers,
                 },
             ) => {
-                version == other_version
-                    && mix == other_mix
+                mix == other_mix
                     && background.is_some() == other_background.is_some()
                     && layers.len() == other_layers.len()
             }
             (
+                Recipe::Blur { size, source },
                 Recipe::Blur {
-                    version,
-                    size,
-                    source,
-                },
-                Recipe::Blur {
-                    version: other_version,
                     size: other_size,
                     source: other_source,
                 },
-            ) => {
-                version == other_version
-                    && size == other_size
-                    && source.is_some() == other_source.is_some()
-            }
+            ) => size == other_size && source.is_some() == other_source.is_some(),
             // Listed by kind, so that a new kind cannot fall through as never equal.
             (
                 Recipe::Reader { .. }
@@ -309,8 +246,8 @@ impl Recipe {
     }
 }
 
-/// The key of a node's image at a frame in the document as it stands, or `None` if the document
-/// has no such node.
+/// The key of a node's image at a frame in the network as it stands, or `None` if the network has
+/// no such node.
 ///
 /// A key holds what the frame resolves to, not the frame, so a branch that is the same at two
 /// frames has equal keys at both and its image is computed once: a still, or a sequence holding
@@ -318,28 +255,24 @@ impl Recipe {
 ///
 /// Each upstream node is visited once, however many nodes take its image, and without recursion,
 /// however deep the chain.
-pub fn result_key(
-    document: &Document,
-    files: &Files,
-    node: NodeId,
-    frame: f64,
-) -> Option<ResultKey> {
-    document.node(node)?;
-    keys(document, files, frame, [node]).remove(&node)
+pub fn result_key(network: &Network, files: &Files, node: NodeId, frame: f64) -> Option<ResultKey> {
+    network.node(node)?;
+    keys(network, files, frame, [node]).remove(&node)
 }
 
-/// The key of every node in the document at a frame, each upstream node visited once.
+/// The key of every node in the network at a frame, each upstream node visited once.
 pub(crate) fn result_keys(
-    document: &Document,
+    network: &Network,
     files: &Files,
     frame: f64,
 ) -> BTreeMap<NodeId, ResultKey> {
-    keys(document, files, frame, document.nodes().map(|(id, _)| id))
+    keys(network, files, frame, network.nodes().map(|(id, _)| id))
 }
 
-/// The keys of existing nodes and of everything upstream of them.
+/// The keys of existing nodes and of everything upstream of them. A refused node takes nothing
+/// from its inputs, so a cycle, whose nodes are refused, is never followed.
 fn keys(
-    document: &Document,
+    network: &Network,
     files: &Files,
     frame: f64,
     nodes: impl IntoIterator<Item = NodeId>,
@@ -350,8 +283,8 @@ fn keys(
     // when it reaches the top again, after all of them.
     let mut pending: Vec<NodeId> = nodes.into_iter().collect();
     while let Some(&id) = pending.last() {
-        let current = document.node(id).expect("inputs name existing nodes");
-        if entered.insert(id) {
+        let current = network.node(id).expect("inputs name existing nodes");
+        if entered.insert(id) && current.problem().is_none() {
             let sources = current.inputs().map(|(_, source)| source);
             pending.extend(sources.filter(|source| !entered.contains(source)));
             continue;
@@ -370,32 +303,36 @@ fn recipe(node: &Node, files: &Files, frame: f64, built: &BTreeMap<NodeId, Resul
     let key_of = |source: NodeId| -> ResultKey {
         built
             .get(&source)
-            .expect("the document has no cycles")
+            .expect("a node takes its inputs' keys only where the network has no cycle")
             .clone()
     };
     let input = |input: InputSlot<'_>| node.input(input).map(key_of);
+    // A refused node gives the empty image, as a Reader without a file does.
+    if node.problem().is_some() {
+        return Recipe::Reader {
+            path: None,
+            reload: 0,
+        };
+    }
     let resolved = resolve(node, frame);
     match &node.kind {
-        NodeKind::Reader { version } => {
+        NodeKind::Reader => {
             let path = reading(&resolved, files, frame).map(|reading| reading.file().clone());
             Recipe::Reader {
-                version: *version,
                 reload: path.as_deref().map_or(0, |path| files.reloads(path)),
                 path,
             }
         }
-        NodeKind::Exposure { version } => {
+        NodeKind::Exposure => {
             let stops = resolved.float("stops").expect("Exposure has Stops");
             Recipe::Exposure {
-                version: *version,
                 stops: stops.to_bits(),
                 source: input("source".into()),
             }
         }
-        NodeKind::Merge { version } => {
+        NodeKind::Merge => {
             let mix = resolved.float("mix").expect("Merge has Mix");
             Recipe::Merge {
-                version: *version,
                 mix: mix.to_bits(),
                 background: input("background".into()),
                 layers: node
@@ -404,10 +341,9 @@ fn recipe(node: &Node, files: &Files, frame: f64, built: &BTreeMap<NodeId, Resul
                     .collect(),
             }
         }
-        NodeKind::Blur { version } => {
+        NodeKind::Blur => {
             let size = resolved.float("size").expect("Blur has Size");
             Recipe::Blur {
-                version: *version,
                 size: size.to_bits(),
                 source: input("source".into()),
             }
@@ -728,6 +664,12 @@ fn read_file(
     let Some(path) = path else {
         return Ok(Some(Image::empty()));
     };
+    if path.is_relative() {
+        return Err(EvalError::Read {
+            origin: key.clone(),
+            error: ReadError::Io(unanchored()),
+        });
+    }
     let read = || {
         read_image_until(path, stop).map_err(|error| EvalError::Read {
             origin: key.clone(),

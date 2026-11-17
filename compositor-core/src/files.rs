@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::app::{Notice, Waker};
-use crate::document::{Document, NodeId, NodeKind};
+use crate::network::{Network, NodeId, NodeKind};
 use crate::parameter::{Resolved, resolve};
 use crate::session::Session;
 
@@ -123,6 +123,15 @@ pub(crate) fn with_hashes(path: Arc<Path>) -> Arc<Path> {
     path
 }
 
+/// Why a relative path no layer anchors is read nowhere: USD would not read it from the working
+/// directory either.
+pub(crate) fn unanchored() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "not found: no saved layer anchors the relative path",
+    )
+}
+
 /// A file's size and modification time, which a scan compares to tell a changed file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
@@ -140,6 +149,9 @@ impl Scan {
     /// Lists the pattern's directory and stats each of its files there. It waits on the
     /// filesystem, which on NFS may be for many seconds, so never on the GUI thread.
     pub fn of(pattern: &Pattern) -> io::Result<Scan> {
+        if pattern.path().is_relative() {
+            return Err(unanchored());
+        }
         let mut frames = BTreeMap::new();
         for entry in std::fs::read_dir(pattern.directory())? {
             let path = entry?.path();
@@ -381,17 +393,17 @@ pub(crate) fn reading(resolved: &Resolved, files: &Files, frame: f64) -> Option<
 }
 
 /// What each Reader with a file on the node's upstream, itself included, reads at a frame, in the
-/// order [`missing`](crate::missing) visits them. Empty if the document has no such node.
+/// order [`missing`](crate::missing) visits them. Empty if the network has no such node.
 pub fn readings(
-    document: &Document,
+    network: &Network,
     files: &Files,
     node: NodeId,
     frame: f64,
 ) -> Vec<(NodeId, Reading)> {
-    (document.upstream(node).into_iter())
+    (network.upstream(node).into_iter())
         .filter_map(|id| {
-            let reader = document.node(id).expect("upstream nodes exist");
-            if !matches!(reader.kind, NodeKind::Reader { .. }) {
+            let reader = network.node(id).expect("upstream nodes exist");
+            if reader.kind != NodeKind::Reader || reader.problem().is_some() {
                 return None;
             }
             Some((id, reading(&resolve(reader, frame), files, frame)?))
@@ -424,15 +436,15 @@ pub(crate) fn scanned_end(resolved: &Resolved, files: &Files, parameter: &str) -
 /// The frames the sequences the node's upstream Readers read span on the timeline, each moved by
 /// its Offset, resolved at the frame. `None` if none reads a sequence with both ends known.
 pub fn input_range(
-    document: &Document,
+    network: &Network,
     files: &Files,
     node: NodeId,
     frame: f64,
 ) -> Option<(f64, f64)> {
     let mut span: Option<(f64, f64)> = None;
-    for id in document.upstream(node) {
-        let reader = document.node(id).expect("upstream nodes exist");
-        if !matches!(reader.kind, NodeKind::Reader { .. }) {
+    for id in network.upstream(node) {
+        let reader = network.node(id).expect("upstream nodes exist");
+        if reader.kind != NodeKind::Reader || reader.problem().is_some() {
             continue;
         }
         let resolved = resolve(reader, frame);

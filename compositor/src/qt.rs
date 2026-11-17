@@ -154,8 +154,13 @@ pub mod ffi {
         /// The shown node's id: rows of another node than last shown are made anew, otherwise
         /// they refresh in place.
         node: u64,
-        title: QString,
+        /// The node's prim name, which the artist can type over to rename it.
+        name: QString,
+        /// The node's type, shown beside a name that does not say it, or empty.
+        type_label: QString,
         pinned: bool,
+        /// Why the stage's definition of the node was refused, or empty.
+        problem: QString,
         rows: Vec<PanelRow>,
     }
 
@@ -170,24 +175,36 @@ pub mod ffi {
         /// Float only: the slider's positions from 0, and where it is.
         ticks: i32,
         tick: i32,
+        /// Property only: whether a value can be typed, and whether evaluation ignores it. A
+        /// connection is never typed into.
+        editable: bool,
+        unused: bool,
     }
 
     #[derive(Debug)]
+    #[repr(u8)]
     enum RowKind {
         Float,
         /// A whole frame number, in a field alone.
         Frame,
         File,
+        /// One of the node's other properties, under its full name, removed where a parameter
+        /// is reset.
+        Property,
+        /// A declared input whose connections were refused, read-only, disconnected where a
+        /// parameter is reset.
+        Connection,
     }
 
-    /// What the artist did to the panel, on the row of the parameter named.
+    /// What the artist did to the panel, on the row of the parameter named, or to the node's name
+    /// for a rename.
     #[derive(Debug)]
     struct PanelGesture {
         kind: PanelGestureKind,
         parameter: QString,
         /// Where the slider is, for a drag began or dragged.
         tick: i32,
-        /// What was typed, into a field of either kind.
+        /// What was typed, into a field of either kind or the name.
         text: QString,
     }
 
@@ -205,6 +222,8 @@ pub mod ffi {
         Reload,
         Pin,
         Unpin,
+        /// A new name typed for the node.
+        Renamed,
     }
 
     /// The timebar as Rust sends it.
@@ -310,7 +329,10 @@ pub mod ffi {
         fn qt_runtime_version() -> QString;
         fn single_shot(ms: i32, callback: fn(usize), argument: usize);
 
-        fn new_main_window() -> UniquePtr<QMainWindow>;
+        /// The window, which calls `close_requested` instead of closing.
+        fn new_main_window(close_requested: fn()) -> UniquePtr<QMainWindow>;
+        /// Names the project in the title, marked if modified.
+        unsafe fn show_project(window: *mut QMainWindow, name: &QString, modified: bool);
         /// A menu at the end of the window's menu bar, which owns it.
         unsafe fn new_menu(window: *mut QMainWindow, title: &QString) -> *mut QMenu;
         /// A menu at the end of `menu`, which owns it.
@@ -413,6 +435,22 @@ pub mod ffi {
             title: &QString,
             several: bool,
         ) -> QStringList;
+        /// Runs a modal dialog choosing a USD file to open, as `choose_files` does. Empty if
+        /// cancelled.
+        unsafe fn choose_project(window: *mut QMainWindow) -> QString;
+        /// Runs a modal dialog choosing where to save, starting at `suggested`. Empty if
+        /// cancelled.
+        unsafe fn choose_save_as(window: *mut QMainWindow, suggested: &QString) -> QString;
+        /// Runs a modal message box with a button per answer, the first the default and the last
+        /// the escape. Returns the index of the answer chosen.
+        unsafe fn ask(
+            window: *mut QMainWindow,
+            text: &QString,
+            detail: &QString,
+            answers: &QStringList,
+        ) -> usize;
+        /// Takes the keyboard from a focused text field, which applies what was typed in it.
+        fn commit_focused_field();
         /// A path as the file system names it.
         fn encode_name(path: &QString) -> QByteArray;
         /// A file system name as a path.

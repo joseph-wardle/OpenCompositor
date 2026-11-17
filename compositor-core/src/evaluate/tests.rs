@@ -5,10 +5,10 @@ use open_ng::Point;
 use opencompositor_kernels::BoxPass;
 
 use super::*;
-use crate::document::{Assignment, BlurVersion, ReaderVersion};
 use crate::files::Files;
 use crate::fixtures::{self, directory};
 use crate::image::{Channel, Warning, Window};
+use crate::network::Assignment;
 use crate::parameter::Value;
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
@@ -17,24 +17,14 @@ const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 const DEEP_CHAIN: u64 = 10_000;
 
 pub(crate) fn reader(path: impl AsRef<Path>) -> Node {
-    let mut node = Node::new(
-        NodeKind::Reader {
-            version: ReaderVersion::V1,
-        },
-        ORIGIN,
-    );
+    let mut node = Node::new(NodeKind::Reader, "Reader", ORIGIN);
     node.set_value("file", Value::File(path.as_ref().into()))
         .unwrap();
     node
 }
 
 pub(crate) fn exposure(stops: Option<f64>) -> Node {
-    let mut node = Node::new(
-        NodeKind::Exposure {
-            version: ExposureVersion::V1,
-        },
-        ORIGIN,
-    );
+    let mut node = Node::new(NodeKind::Exposure, "Exposure", ORIGIN);
     if let Some(stops) = stops {
         node.set_value("stops", Value::Float(stops)).unwrap();
     }
@@ -62,12 +52,7 @@ fn write(path: &Path, color: png::ColorType, data: &[u8]) {
 }
 
 pub(crate) fn merge(mix: Option<f64>) -> Node {
-    let mut node = Node::new(
-        NodeKind::Merge {
-            version: MergeVersion::V1,
-        },
-        ORIGIN,
-    );
+    let mut node = Node::new(NodeKind::Merge, "Merge", ORIGIN);
     if let Some(mix) = mix {
         node.set_value("mix", Value::Float(mix)).unwrap();
     }
@@ -75,27 +60,22 @@ pub(crate) fn merge(mix: Option<f64>) -> Node {
 }
 
 pub(crate) fn blur(size: Option<f64>) -> Node {
-    let mut node = Node::new(
-        NodeKind::Blur {
-            version: BlurVersion::V1,
-        },
-        ORIGIN,
-    );
+    let mut node = Node::new(NodeKind::Blur, "Blur", ORIGIN);
     if let Some(size) = size {
         node.set_value("size", Value::Float(size)).unwrap();
     }
     node
 }
 
-/// A document of these nodes, with IDs from 1, and these wires, each a consumer, its input and
+/// A network of these nodes, with IDs from 1, and these wires, each a consumer, its input and
 /// the source.
 pub(crate) fn graph(
     nodes: impl IntoIterator<Item = Node>,
     wires: &[(u64, InputSlot<'static>, u64)],
-) -> Document {
-    let mut document = Document::default();
+) -> Network {
+    let mut network = Network::default();
     for (id, node) in (1..).map(NodeId).zip(nodes) {
-        document.nodes.insert(id, Arc::new(node));
+        network.nodes.insert(id, Arc::new(node));
     }
     let assignments: Vec<Assignment> = wires
         .iter()
@@ -105,35 +85,35 @@ pub(crate) fn graph(
             source: Some(NodeId(source)),
         })
         .collect();
-    document.assign_inputs(&assignments).unwrap()
+    network.assign_inputs(&assignments).unwrap()
 }
 
-/// A document of these nodes, with IDs from 1, each Exposure taking the image of the node before
+/// A network of these nodes, with IDs from 1, each Exposure taking the image of the node before
 /// it.
-pub(crate) fn chain(nodes: impl IntoIterator<Item = Node>) -> Document {
-    let mut document = Document::default();
+pub(crate) fn chain(nodes: impl IntoIterator<Item = Node>) -> Network {
+    let mut network = Network::default();
     let mut previous = None;
     let mut assignments = Vec::new();
     for (id, node) in (1..).map(NodeId).zip(nodes) {
-        if let (NodeKind::Exposure { .. }, Some(source)) = (&node.kind, previous) {
+        if let (NodeKind::Exposure, Some(source)) = (&node.kind, previous) {
             assignments.push(Assignment {
                 consumer: id,
                 input: "source".into(),
                 source: Some(source),
             });
         }
-        document.nodes.insert(id, Arc::new(node));
+        network.nodes.insert(id, Arc::new(node));
         previous = Some(id);
     }
     // From the end of the chain, so that each cycle check finds its source unconnected.
     for assignment in assignments.iter().rev() {
-        document = document.assign_inputs(&[*assignment]).unwrap();
+        network = network.assign_inputs(&[*assignment]).unwrap();
     }
-    document
+    network
 }
 
-pub(crate) fn key(document: &Document, id: u64) -> ResultKey {
-    result_key(document, &Files::default(), NodeId(id), 1.0).unwrap()
+pub(crate) fn key(network: &Network, id: u64) -> ResultKey {
+    result_key(network, &Files::default(), NodeId(id), 1.0).unwrap()
 }
 
 /// An image of these planes over `width` × `height`, as a reader would make it.
@@ -178,12 +158,12 @@ fn finite_plane(len: usize, seed: u32) -> Plane {
 
 #[test]
 fn keys_name_what_decides_the_image_and_nothing_else() {
-    let document = chain([reader("a.exr"), exposure(Some(1.0))]);
+    let network = chain([reader("a.exr"), exposure(Some(1.0))]);
     let mut elsewhere = chain([reader("b.exr"), reader("a.exr"), exposure(Some(1.0))]);
     let moved = Arc::make_mut(elsewhere.nodes.get_mut(&NodeId(3)).unwrap());
     moved.position = Point { x: 50.0, y: 20.0 };
-    assert_eq!(key(&document, 2), key(&elsewhere, 3));
-    assert_eq!(key(&document, 1), key(&elsewhere, 2));
+    assert_eq!(key(&network, 2), key(&elsewhere, 3));
+    assert_eq!(key(&network, 1), key(&elsewhere, 2));
 
     let different = [
         (chain([reader("b.exr"), exposure(Some(1.0))]), 2),
@@ -194,9 +174,9 @@ fn keys_name_what_decides_the_image_and_nothing_else() {
         ),
     ];
     for (other, id) in &different {
-        assert_ne!(key(&document, 2), key(other, *id));
+        assert_ne!(key(&network, 2), key(other, *id));
     }
-    assert_ne!(key(&document, 1), key(&document, 2));
+    assert_ne!(key(&network, 1), key(&network, 2));
 }
 
 #[test]
@@ -218,12 +198,12 @@ fn an_unconnected_input_keys_apart_from_any_connection() {
 
 #[test]
 fn reloading_a_path_changes_the_key_of_everything_downstream_of_it() {
-    let document = chain([reader("a.exr"), exposure(None), reader("b.exr")]);
+    let network = chain([reader("a.exr"), exposure(None), reader("b.exr")]);
     let mut files = Files::default();
-    let before = |id| result_key(&document, &Files::default(), NodeId(id), 1.0);
+    let before = |id| result_key(&network, &Files::default(), NodeId(id), 1.0);
 
     files.reload(Path::new("a.exr").into());
-    let after = |id| result_key(&document, &files, NodeId(id), 1.0);
+    let after = |id| result_key(&network, &files, NodeId(id), 1.0);
     assert_ne!(after(1), before(1));
     assert_ne!(after(2), before(2));
     assert_eq!(after(3), before(3));
@@ -232,9 +212,9 @@ fn reloading_a_path_changes_the_key_of_everything_downstream_of_it() {
 
 #[test]
 fn a_missing_node_has_no_key() {
-    let document = chain([reader("a.exr")]);
+    let network = chain([reader("a.exr")]);
     assert_eq!(
-        result_key(&document, &Files::default(), NodeId(2), 1.0),
+        result_key(&network, &Files::default(), NodeId(2), 1.0),
         None
     );
 }
@@ -243,12 +223,12 @@ fn a_missing_node_has_no_key() {
 fn a_deep_chain_keys_without_recursion() {
     let nodes = std::iter::once(reader("a.exr"))
         .chain((1..DEEP_CHAIN).map(|stops| exposure(Some(stops as f64 % 64.0))));
-    let document = chain(nodes);
+    let network = chain(nodes);
 
     // Built and compared on the test's own stack, which recursion this deep would overflow.
-    let first = key(&document, DEEP_CHAIN);
-    let second = key(&document, DEEP_CHAIN);
-    let shallower = key(&document, DEEP_CHAIN - 1);
+    let first = key(&network, DEEP_CHAIN);
+    let second = key(&network, DEEP_CHAIN);
+    let shallower = key(&network, DEEP_CHAIN - 1);
     assert!(first == second);
     assert!(first != shallower);
 
@@ -277,9 +257,9 @@ fn keys_from_separate_builds_compare_each_shared_input_once() {
             .collect();
         graph(nodes, &wires)
     };
-    let document = ladder("a.exr");
-    assert!(key(&document, MERGES + 1) == key(&document, MERGES + 1));
-    assert!(key(&document, MERGES + 1) != key(&ladder("b.exr"), MERGES + 1));
+    let network = ladder("a.exr");
+    assert!(key(&network, MERGES + 1) == key(&network, MERGES + 1));
+    assert!(key(&network, MERGES + 1) != key(&ladder("b.exr"), MERGES + 1));
 }
 
 fn run(evaluator: &mut Evaluator, key: &ResultKey) -> Result<Image, EvalError> {
@@ -313,11 +293,11 @@ fn exposure_keys(path: &Path, stops: [f64; 2]) -> [ResultKey; 2] {
 fn exposure_scales_colour_and_shares_alpha() {
     let path = directory("exposure").join("image.png");
     write_png(&path, 255);
-    let document = chain([reader(&path), exposure(Some(-2.0))]);
+    let network = chain([reader(&path), exposure(Some(-2.0))]);
     let mut evaluator = Evaluator::new();
 
-    let read = run(&mut evaluator, &key(&document, 1)).unwrap();
-    let exposed = run(&mut evaluator, &key(&document, 2)).unwrap();
+    let read = run(&mut evaluator, &key(&network, 1)).unwrap();
+    let exposed = run(&mut evaluator, &key(&network, 2)).unwrap();
 
     for channel in [Channel::R, Channel::G, Channel::B] {
         let expected: Vec<f32> = read.plane(channel).iter().map(|v| v * 0.25).collect();
@@ -352,16 +332,11 @@ fn exposure_keeps_a_grey_image_one_plane() {
 
 #[test]
 fn an_unconnected_input_or_a_reader_without_a_file_gives_the_empty_image() {
-    let without_file = Node::new(
-        NodeKind::Reader {
-            version: ReaderVersion::V1,
-        },
-        ORIGIN,
-    );
-    let documents = [chain([exposure(Some(3.0))]), chain([without_file])];
+    let without_file = Node::new(NodeKind::Reader, "Reader", ORIGIN);
+    let networks = [chain([exposure(Some(3.0))]), chain([without_file])];
     let mut evaluator = Evaluator::new();
-    for document in documents {
-        let image = run(&mut evaluator, &key(&document, 1)).unwrap();
+    for network in networks {
+        let image = run(&mut evaluator, &key(&network, 1)).unwrap();
         assert_eq!(image.display_window().width, 0);
         assert_eq!(image.data_window().height, 0);
         assert!(image.plane(Channel::R).is_empty());
@@ -382,8 +357,8 @@ fn a_stops_edit_reuses_the_read_and_reload_reads_again() {
 
     let mut files = Files::default();
     files.reload(path.as_path().into());
-    let document = chain([reader(&path), exposure(Some(2.0))]);
-    let reloaded = result_key(&document, &files, NodeId(2), 1.0).unwrap();
+    let network = chain([reader(&path), exposure(Some(2.0))]);
+    let reloaded = result_key(&network, &files, NodeId(2), 1.0).unwrap();
     assert_eq!(red(&run(&mut evaluator, &reloaded).unwrap()), 0.0);
 }
 
@@ -444,11 +419,11 @@ fn a_request_reads_its_files_together() {
         let channels = ["R", "G", "B", "A"].map(|name| (name, vec![1.0; 2]));
         fixtures::write_exr(path, ((0, 0), (2, 1)), (0, 0), (2, 1), channels.into());
     }
-    let document = graph(
+    let network = graph(
         [reader(&paths[0]), reader(&paths[1]), merge(None)],
         &[(3, "background".into(), 1), (3, ("layer", 1).into(), 2)],
     );
-    let merged = key(&document, 3);
+    let merged = key(&network, 3);
     let requester = std::thread::current().id();
     for on_gpu in [false, true] {
         let asking = Mutex::new(Vec::new());
@@ -520,17 +495,30 @@ fn a_plane_shared_with_an_input_is_counted_once() {
 #[test]
 fn a_failure_carries_the_key_of_the_node_it_happened_at() {
     let missing = directory("failure").join("missing.png");
-    let document = chain([reader(&missing), exposure(Some(1.0))]);
+    let network = chain([reader(&missing), exposure(Some(1.0))]);
     let mut evaluator = Evaluator::new();
 
-    let error = run(&mut evaluator, &key(&document, 2)).unwrap_err();
+    let error = run(&mut evaluator, &key(&network, 2)).unwrap_err();
 
-    assert_eq!(*error.origin(), key(&document, 1));
+    assert_eq!(*error.origin(), key(&network, 1));
     assert!(
         matches!(&error, EvalError::Read { error: ReadError::Io(io), .. } if io.kind() == std::io::ErrorKind::NotFound),
         "{error:?}"
     );
     assert!(error.to_string().contains("missing.png"), "{error}");
+}
+
+#[test]
+fn a_relative_file_no_layer_anchors_is_read_nowhere() {
+    // Tests run in the package's directory, which has this file.
+    let network = chain([reader("Cargo.toml")]);
+
+    let error = run(&mut Evaluator::new(), &key(&network, 1)).unwrap_err();
+
+    assert!(
+        matches!(&error, EvalError::Read { error: ReadError::Io(io), .. } if io.kind() == std::io::ErrorKind::NotFound),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -724,11 +712,11 @@ fn merge_keys_name_the_connected_layers_in_slot_order() {
 
 /// The key of a Merge of a background and one layer at `mix`, for computing from given images.
 fn merge_key(mix: f64) -> ResultKey {
-    let document = graph(
+    let network = graph(
         [reader("a.png"), reader("b.png"), merge(Some(mix))],
         &[(3, "background".into(), 1), (3, ("layer", 1).into(), 2)],
     );
-    key(&document, 3)
+    key(&network, 3)
 }
 
 fn values(image: &Image, x: i32, y: i32) -> [f32; 4] {
@@ -1045,11 +1033,11 @@ fn blur_keys_name_the_size_and_the_source() {
 
 /// The key of a Blur of a Reader at `size`, for computing from a given image.
 fn blur_key(size: f64) -> ResultKey {
-    let document = graph(
+    let network = graph(
         [reader("a.png"), blur(Some(size))],
         &[(2, "source".into(), 1)],
     );
-    key(&document, 2)
+    key(&network, 2)
 }
 
 /// Blur's one-dimensional kernel along either axis: the three passes' weights convolved
@@ -1344,9 +1332,9 @@ fn a_stopped_blur_leaves_the_rest_undone() {
 
     let path = directory("blur_stop").join("image.png");
     write_png(&path, 255);
-    let document = graph([reader(&path), blur(Some(3.0))], &[(2, "source".into(), 1)]);
+    let network = graph([reader(&path), blur(Some(3.0))], &[(2, "source".into(), 1)]);
     let mut evaluator = Evaluator::new();
-    let blurred = key(&document, 2);
+    let blurred = key(&network, 2);
     // Asked before the Reader, before the Blur, and at its first chunk.
     asked.store(0, Ordering::Relaxed);
     assert!(evaluator.evaluate(&blurred, stop).is_none());

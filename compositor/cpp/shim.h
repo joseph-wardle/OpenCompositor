@@ -27,6 +27,7 @@ struct PanelData;
 struct PanelRow;
 struct PanelGesture;
 enum class PanelGestureKind : uint8_t;
+enum class RowKind : uint8_t;
 struct TimebarData;
 struct TimebarGesture;
 enum class TimebarGestureKind : uint8_t;
@@ -64,7 +65,10 @@ class ParameterPanel : public QWidget {
         // The field's text as last refreshed, which Escape restores.
         QString shown;
         bool authored;
+        RowKind kind;
     };
+    // Whether the rows shown are those `data` names, with the same labels and kinds.
+    bool same_rows(const PanelData &data) const;
     void rebuild(const PanelData &data);
     void refresh(Row &row, const PanelRow &data);
     Row *row(const QString &name);
@@ -78,11 +82,26 @@ class ParameterPanel : public QWidget {
     rust::Fn<void(PanelGesture)> gestures;
     bool refreshing = false;
     std::optional<uint64_t> node;
-    QLabel *title;
+    QLineEdit *name;
+    QString shown_name;
+    QLabel *type;
     QToolButton *pin;
+    QLabel *problem;
     QLabel *empty;
     QScrollArea *scroll;
     std::vector<Row> rows;
+};
+
+// The application's window.
+class MainWindow : public QMainWindow {
+  public:
+    explicit MainWindow(rust::Fn<void()> close_requested);
+
+  protected:
+    void closeEvent(QCloseEvent *event) override;
+
+  private:
+    rust::Fn<void()> close_requested;
 };
 
 class FrameBar;
@@ -164,7 +183,8 @@ QString qt_compiled_version();
 QString qt_runtime_version();
 void single_shot(int ms, rust::Fn<void(size_t)> callback, size_t argument);
 
-std::unique_ptr<QMainWindow> new_main_window();
+std::unique_ptr<QMainWindow> new_main_window(rust::Fn<void()> close_requested);
+void show_project(QMainWindow *window, const QString &name, bool modified);
 QMenu *new_menu(QMainWindow *window, const QString &title);
 QMenu *new_submenu(QMenu *menu, const QString &title);
 void add_separator(QMenu *menu);
@@ -202,6 +222,11 @@ void show_error(QMainWindow *window, const QString &text);
 QLabel *new_permanent_status(QMainWindow *window);
 void set_permanent_status(QLabel *label, const QString &text);
 QStringList choose_files(QMainWindow *window, const QString &title, bool several);
+QString choose_project(QMainWindow *window);
+QString choose_save_as(QMainWindow *window, const QString &suggested);
+size_t ask(QMainWindow *window, const QString &text, const QString &detail,
+           const QStringList &answers);
+void commit_focused_field();
 QByteArray encode_name(const QString &path);
 QString decode_name(rust::Slice<const uint8_t> name);
 void close_modal_dialog();

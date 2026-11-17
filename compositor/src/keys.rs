@@ -15,6 +15,7 @@ const APPLICATION_DEACTIVATE: i32 = 122;
 /// `Qt::Key` values.
 pub mod qt_key {
     pub const SPACE: i32 = 0x20;
+    pub const D: i32 = 0x44;
     pub const E: i32 = 0x45;
     pub const G: i32 = 0x47;
     pub const H: i32 = 0x48;
@@ -82,6 +83,7 @@ fn key(fields: &ffi::InputFields) -> Option<Key> {
         qt_key::SPACE => Key::Space,
         qt_key::ESCAPE => Key::Escape,
         qt_key::TAB => Key::Tab,
+        qt_key::D => Key::D,
         qt_key::E => Key::E,
         qt_key::G => Key::G,
         qt_key::H => Key::H,

@@ -80,7 +80,7 @@ impl Run {
     /// `None` if the arguments after the pattern make no sense.
     pub fn parse(pattern: &OsString, rest: &[OsString]) -> Option<Run> {
         let mut run = Run {
-            pattern: pattern.into(),
+            pattern: crate::absolute(pattern),
             chain: Chain::Exposure,
             budget: None,
             cold: false,
@@ -90,7 +90,7 @@ impl Run {
             match argument.to_str()? {
                 "exposure" => run.chain = Chain::Exposure,
                 "blur" => run.chain = Chain::Blur,
-                "merge" => run.chain = Chain::Merge(rest.next()?.into()),
+                "merge" => run.chain = Chain::Merge(crate::absolute(rest.next()?)),
                 "cold" => run.cold = true,
                 mebibytes => run.budget = Some(mebibytes.parse::<u64>().ok()? << 20),
             }
@@ -492,7 +492,7 @@ fn after_uncached_scrub() {
 }
 
 fn range() -> (f64, f64) {
-    let timeline = crate::read_app(|app| app.session().document().timeline());
+    let timeline = crate::read_app(|app| app.session().timeline());
     (timeline.first(), timeline.last())
 }
 
