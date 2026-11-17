@@ -9,7 +9,7 @@ use openusd::vt;
 
 use super::{EditError, Session};
 use crate::author::{NumberType, OUTPUT, POSITION};
-use crate::compile::input_slot;
+use crate::compile::{input_slot, is_animated};
 use crate::network::{Changes, NodeId};
 use crate::parameter::describe;
 
@@ -252,7 +252,7 @@ fn shown(attribute: &Attribute, type_name: &str) -> (String, Option<ScalarKind>)
     if !connections.is_empty() {
         return (format!("→ {}", paths(&connections)), None);
     }
-    if attribute.num_time_samples().unwrap_or(0) > 0 {
+    if is_animated(attribute) {
         return ("animated".to_owned(), None);
     }
     let value = attribute.get::<vt::Value>().ok().flatten();

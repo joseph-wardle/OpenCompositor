@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use open_ng::{Graph, InputEvent, Point, Response, View, Viewport};
 use openusd::sdf::{self, Layer, LayerEdit};
-use openusd::usd::Stage;
+use openusd::usd::{NamespaceEditor, Stage};
 
 use crate::author::{
     NumberType, ValueEdit, Wire, author_moves, author_node, author_range, author_rate, author_root,
     author_value, author_wires, input_attribute,
 };
-use crate::compile::{Compiler, Ids};
+use crate::compile::{Compiler, Ids, is_animated};
 use crate::evaluate::{ResultKey, result_key, result_keys};
 use crate::files::{Files, Pattern, Scan};
 use crate::history::{Inverse, Recorder};
@@ -115,6 +115,8 @@ pub enum EditError {
         node: NodeId,
         layer: String,
     },
+    /// A delete the namespace editor refused, with its reason.
+    DeleteRefused(String),
 }
 
 impl fmt::Display for EditError {
@@ -144,6 +146,7 @@ impl fmt::Display for EditError {
                     "{layer} defines or connects to the node; delete it there"
                 )
             }
+            EditError::DeleteRefused(why) => write!(f, "{why}"),
         }
     }
 }
@@ -591,11 +594,16 @@ impl Session {
             .expect("some name is free")
     }
 
-    /// Whether a prim or a node this session has known has the path.
+    /// Whether a prim or a node this session has known has the path, or a relocate moved or
+    /// deleted the prim a reference brings in there, where USD lets nothing be authored again.
     fn is_taken(&self, path: &sdf::Path) -> bool {
         self.compiler.ids().contains(path)
             || (self.stage.prim(path.clone()).ok())
                 .is_some_and(|prim| prim.is_valid().unwrap_or(true))
+            || (self.stage.layer_stack().iter())
+                .filter_map(|identifier| self.stage.layer(identifier).ok().flatten())
+                .flat_map(|layer| layer.relocates().unwrap_or_default())
+                .any(|(source, _)| source == *path)
     }
 
     /// A free path named `name` for a new node under the root, interned.
@@ -806,9 +814,10 @@ impl Session {
         Ok(changes)
     }
 
-    /// Deletes nodes as one step, disconnecting every input that took one. Refused whole if any
-    /// of them is already gone, or another layer defines or connects to one. Their marks stay,
-    /// doing nothing until an undo brings the nodes back.
+    /// Deletes nodes as one step, disconnecting every input that took one. The namespace editor
+    /// removes their prims, by a relocate for one a reference or a variant brings in. Refused
+    /// whole if any of them is already gone, or a sublayer defines or connects to one. Their
+    /// marks stay, doing nothing until an undo brings the nodes back.
     ///
     /// A gesture in the graph view ends unapplied, since it may hold a deleted node. Reads of a
     /// deleted node are left alone: its ID returns only with its path, so nothing can mistake
@@ -841,14 +850,30 @@ impl Session {
             .collect();
         let wires = self.wires(&disconnected);
         let prims: Vec<sdf::Path> = deleted.iter().map(|&id| self.path(id).clone()).collect();
-        // Committing finishes an edit in progress, which may belong to a deleted node.
-        Ok(self.commit("Delete", |layer| {
-            author_wires(layer, &wires)?;
+        // An edit in progress may belong to a deleted node.
+        self.finish_edit();
+        let root = self.stage.root_layer();
+        let (deleted, inverse) = self.recorder.record(|| {
+            (self.stage).batch_edit(&[root.identifier()], |edits| {
+                author_wires(&mut edits[0], &wires).map_err(Into::into)
+            })?;
+            let mut editor = NamespaceEditor::new(&self.stage);
             for prim in &prims {
-                layer.remove_spec(prim)?;
+                editor.delete_prim(prim.clone())?;
             }
-            Ok(())
-        }))
+            editor.apply().map_err(Box::<dyn std::error::Error>::from)
+        });
+        if let Err(error) = deleted {
+            (inverse.restore(&self.stage)).expect("a recorded state restores");
+            return Err(EditError::DeleteRefused(error.to_string()));
+        }
+        self.undo.push(Step {
+            label: "Delete",
+            inverse,
+            renamed: None,
+        });
+        self.redo.clear();
+        Ok(self.update(Changes::default()))
     }
 
     /// Connects a node's input, named or with its slot, to the output of `source`, replacing
@@ -1057,6 +1082,11 @@ impl Session {
         let path = self.path(id).clone();
         let attribute = (path.append_property(format!("inputs:{}", described.name)))
             .expect("a parameter's name is a property name");
+        // A default set under samples would never be read, and a reset would leave them.
+        if (self.stage.attribute(attribute.clone())).is_ok_and(|attribute| is_animated(&attribute))
+        {
+            return Err(invalid(ValueError::Animated));
+        }
         let edit = ValueEdit {
             number: NumberType::of(&self.stage, &attribute),
             node: path,

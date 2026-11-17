@@ -5,8 +5,8 @@ use open_ng::Point;
 
 use super::{ORIGIN, create, create_exposure, slot};
 use crate::network::{Changes, NodeId, Timeline, TimelineError};
-use crate::parameter::Value;
-use crate::session::Session;
+use crate::parameter::{Value, ValueError};
+use crate::session::{EditError, Session};
 
 const NEW_PROJECT: &str = r#"#usda 1.0
 (
@@ -606,4 +606,118 @@ def OcComp "B"
         .unwrap();
     session.update(Changes::default());
     assert_eq!(names(&session), ["InB"]);
+}
+
+const ANOTHER_TOOLS: &str = r#"#usda 1.0
+(
+    defaultPrim = "Comp"
+)
+
+def OcComp "Comp"
+{
+    def OcReader "Plate"
+    {
+    }
+
+    def OcExposure "Documented"
+    {
+        custom double inputs:stops = 2 (
+            customData = {
+                string owner = "another tool"
+            }
+            doc = "how far to push"
+        )
+        opaque inputs:source (
+            doc = "the plate"
+        )
+        opaque inputs:source.connect = </Comp/Plate.outputs:image>
+    }
+
+    def OcExposure "Sampled"
+    {
+        double inputs:stops.timeSamples = {
+            1: 1,
+            10: 3,
+        }
+    }
+
+    def OcExposure "SampledOverDefault"
+    {
+        double inputs:stops = 7
+        double inputs:stops.timeSamples = {
+            1: 1,
+            10: 3,
+        }
+    }
+
+    def OcExposure "Splined"
+    {
+        double inputs:stops = 7
+        double inputs:stops.spline = {
+            1: 5; pre (0, 0); post curve (0, 0),
+            10: 7; pre (0, 0),
+        }
+    }
+}
+"#;
+
+#[test]
+fn a_reset_and_a_disconnect_keep_what_else_the_attribute_holds() {
+    let mut session = Session::from_usda(ANOTHER_TOOLS);
+    let before = session.root_layer_text();
+    let documented = named(&session, "Documented");
+    session.reset_value(documented, "stops").unwrap();
+    session.disconnect(documented, "source").unwrap();
+
+    assert_eq!(stops(&session, documented), None);
+    let node = session.network().node(documented).unwrap();
+    assert_eq!(node.input("source"), None);
+    let text = session.root_layer_text();
+    let kept = r#"    def OcExposure "Documented"
+    {
+        opaque inputs:source (
+            doc = "the plate"
+        )
+        custom double inputs:stops (
+            customData = {
+                string owner = "another tool"
+            }
+            doc = "how far to push"
+        )
+    }
+"#;
+    assert!(text.contains(kept), "{text}");
+
+    session.undo();
+    session.undo();
+    assert_eq!(session.root_layer_text(), before);
+}
+
+#[test]
+fn an_animated_parameter_refuses_its_node_and_its_edits() {
+    let mut session = Session::from_usda(ANOTHER_TOOLS);
+    let before = session.root_layer_text();
+    for name in ["Sampled", "SampledOverDefault", "Splined"] {
+        let id = named(&session, name);
+        assert_eq!(
+            problem(&session, id).as_deref(),
+            Some("Stops is animated, which this version cannot evaluate"),
+            "{name}"
+        );
+        assert_eq!(stops(&session, id), None, "{name}");
+        let animated = EditError::InvalidValue {
+            node: id,
+            parameter: "stops".to_owned(),
+            error: ValueError::Animated,
+        };
+        let set = session.set_value(id, "stops", Value::Float(5.0));
+        assert_eq!(set.unwrap_err(), animated, "{name}");
+        assert_eq!(session.reset_value(id, "stops").unwrap_err(), animated);
+        session.begin_edit(id, "Stops").unwrap();
+        let dragged = session.edit_value("stops", Value::Float(5.0));
+        assert_eq!(dragged.unwrap_err(), animated, "{name}");
+        session.cancel_edit();
+    }
+    assert_eq!(session.root_layer_text(), before);
+    assert_eq!(session.undo_label(), None);
 }

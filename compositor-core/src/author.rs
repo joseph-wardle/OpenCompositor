@@ -14,8 +14,10 @@
 //! }
 //! ```
 //!
-//! An unset parameter has no attribute. A repeating input's slots are `inputs:layer1` and on,
-//! keeping their numbers. A known type's output is the catalog's, authored or not.
+//! An unset parameter authors no value and an unconnected input no connection; either keeps its
+//! attribute only for what else it holds, such as documentation. A repeating input's slots are
+//! `inputs:layer1` and on, keeping their numbers. A known type's output is the catalog's, authored
+//! or not.
 
 use open_ng::Point;
 use openusd::gf::Vec2f;
@@ -176,18 +178,44 @@ pub(crate) fn author_value(
     spec.set_default(value)
 }
 
-/// Removes a property's spec from the layer.
-fn remove_property(
+/// Removes a parameter's default from the layer, as `UsdAttribute::ClearDefault` does.
+fn clear_value(
     layer: &mut LayerEdit<'_>,
     node: &sdf::Path,
-    property: &str,
+    parameter: &str,
 ) -> Result<(), sdf::AuthoringError> {
-    layer.remove_spec(&node.append_property(property)?)?;
+    let path = node.append_property(format!("inputs:{parameter}"))?;
+    if let Ok(Some(mut spec)) = layer.attribute_mut(path.clone()) {
+        spec.clear_default();
+    }
+    remove_bare_declaration(layer, &path)
+}
+
+/// Removes an attribute's spec if it only declares the attribute, as one this module declared
+/// does once its value or connection is gone. Anything else it holds keeps it.
+fn remove_bare_declaration(
+    layer: &mut LayerEdit<'_>,
+    attribute: &sdf::Path,
+) -> Result<(), sdf::AuthoringError> {
+    let Ok(Some(spec)) = layer.attribute(attribute.clone()) else {
+        return Ok(());
+    };
+    let declaration = [
+        sdf::FieldKey::TypeName,
+        sdf::FieldKey::Variability,
+        sdf::FieldKey::Custom,
+    ];
+    let bare = !spec.is_custom()
+        && (spec.fields().iter()).all(|field| declaration.iter().any(|key| key.as_str() == field));
+    if bare {
+        layer.remove_spec(attribute)?;
+    }
     Ok(())
 }
 
-/// Connects an input's attribute to a node's image, or disconnects it: by removing its spec, or,
-/// where a weaker layer connects it, by an empty list, as UsdShade's `DisconnectSource` blocks.
+/// Connects an input's attribute to a node's image, or disconnects it: by clearing its
+/// connections, as `UsdAttribute::ClearConnections` does, or, where a weaker layer connects it,
+/// by an empty list, as UsdShade's `DisconnectSource` blocks.
 fn author_connection(
     layer: &mut LayerEdit<'_>,
     node: &sdf::Path,
@@ -197,7 +225,12 @@ fn author_connection(
     let targets = match &wire.source {
         Some(source) => vec![source.append_property(OUTPUT)?],
         None if wire.block => Vec::new(),
-        None => return remove_property(layer, node, &wire.attribute),
+        None => {
+            if let Ok(Some(mut spec)) = layer.attribute_mut(path.clone()) {
+                spec.edit_connections().clear();
+            }
+            return remove_bare_declaration(layer, &path);
+        }
     };
     attribute_spec(layer, &path, "opaque", Variability::Varying)?
         .edit_connections()
@@ -305,7 +338,7 @@ impl ValueEdit {
     pub(crate) fn author(&self, layer: &mut LayerEdit<'_>) -> Result<(), sdf::AuthoringError> {
         match &self.value {
             Some(value) => author_value(layer, &self.node, self.parameter, value, self.number),
-            None => remove_property(layer, &self.node, &format!("inputs:{}", self.parameter)),
+            None => clear_value(layer, &self.node, self.parameter),
         }
     }
 }

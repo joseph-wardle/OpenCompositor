@@ -40,19 +40,22 @@ impl Session {
         }))
     }
 
-    /// Whether the strongest `active` opinion below the root layer deactivates the prim.
+    /// Whether the prim's strongest `active` opinion, apart from the one this session authors on
+    /// it in the root layer, deactivates it: one of a sublayer, or across a reference or variant.
     fn inactive_elsewhere(&self, path: &sdf::Path) -> bool {
         let root = self.stage.root_layer().identifier().to_owned();
         let field = sdf::FieldKey::Active.as_str();
-        (self.stage.layer_stack().into_iter())
-            .filter(|identifier| *identifier != root)
-            .filter_map(|identifier| self.stage.layer(&identifier).ok().flatten())
-            .find_map(|layer| {
-                let layer = layer.borrow();
+        let Ok(prim) = self.stage.prim(path.clone()) else {
+            return false;
+        };
+        (prim.prim_stack().unwrap_or_default().iter())
+            .filter(|site| site.layer.identifier() != root || site.path != *path)
+            .find_map(|site| {
+                let layer = site.layer.borrow();
                 let data = layer.data();
                 let value = data
-                    .has_field(path, field)
-                    .then(|| data.field(path, field).ok())??;
+                    .has_field(&site.path, field)
+                    .then(|| data.field(&site.path, field).ok())??;
                 Some(matches!(*value, vt::Value::Bool(false)))
             })
             .unwrap_or(false)

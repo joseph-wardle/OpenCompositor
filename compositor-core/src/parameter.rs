@@ -142,6 +142,8 @@ pub enum ValueError {
     NotUnicode,
     /// A relative path set in a project with no file to read it beside.
     Unanchored,
+    /// The parameter's value varies with time, which an edit cannot yet keep.
+    Animated,
 }
 
 impl fmt::Display for ValueError {
@@ -162,6 +164,10 @@ impl fmt::Display for ValueError {
             ValueError::Unanchored => write!(
                 f,
                 "a relative path needs the project saved, to read beside it"
+            ),
+            ValueError::Animated => write!(
+                f,
+                "the parameter is animated, which this version cannot edit"
             ),
         }
     }

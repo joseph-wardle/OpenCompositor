@@ -11,7 +11,7 @@ use std::sync::Arc;
 use imbl::OrdMap;
 use open_ng::Point;
 use openusd::sdf;
-use openusd::usd::{Attribute, CommittedChange, Stage};
+use openusd::usd::{Attribute, CommittedChange, ResolveInfoSource, Stage};
 use openusd::vt;
 
 use crate::author::{COMP_TYPE, OUTPUT, POSITION};
@@ -318,6 +318,13 @@ impl Compiler {
                 continue;
             };
             if let Ok(parameter) = describe(kind.parameters(), name) {
+                if is_animated(&attribute) {
+                    node.refuse(format!(
+                        "{} is animated, which this version cannot evaluate",
+                        parameter.label
+                    ));
+                    continue;
+                }
                 let Ok(Some(authored)) = attribute.get::<vt::Value>() else {
                     continue;
                 };
@@ -515,6 +522,27 @@ fn number(value: &vt::Value) -> Option<f64> {
         vt::Value::Int(number) => Some(f64::from(number)),
         _ => None,
     }
+}
+
+/// Whether an attribute's value varies with time: its strongest value opinion is time samples,
+/// value clips or a spline.
+pub(crate) fn is_animated(attribute: &Attribute) -> bool {
+    let source = attribute.resolve_info().map(|info| info.source());
+    if matches!(
+        source,
+        Ok(ResolveInfoSource::TimeSamples | ResolveInfoSource::ValueClips)
+    ) {
+        return true;
+    }
+    // The crate holds a spline without resolving it. USD reads one before the default beside it.
+    (attribute.property_stack().unwrap_or_default().iter())
+        .find_map(|site| {
+            let layer = site.layer.borrow();
+            let has = |key: sdf::FieldKey| layer.data().has_field(&site.path, key.as_str());
+            let spline = has(sdf::FieldKey::Spline);
+            (spline || has(sdf::FieldKey::Default)).then_some(spline)
+        })
+        .unwrap_or(false)
 }
 
 fn wrong_type(label: &str, attribute: &Attribute, wanted: &str) -> String {
