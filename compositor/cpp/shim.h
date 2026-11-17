@@ -83,7 +83,6 @@ class ParameterPanel : public QWidget {
     bool refreshing = false;
     std::optional<uint64_t> node;
     QLineEdit *name;
-    // The name as last shown, which Escape restores.
     QString shown_name;
     QLabel *type;
     QToolButton *pin;
@@ -93,8 +92,7 @@ class ParameterPanel : public QWidget {
     std::vector<Row> rows;
 };
 
-// The application's window. Closing it any way asks Rust to quit, which may ask first to save, and
-// ends the application with `exit`.
+// The application's window.
 class MainWindow : public QMainWindow {
   public:
     explicit MainWindow(rust::Fn<void()> close_requested);

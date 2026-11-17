@@ -338,8 +338,6 @@ fn main() {
     std::process::exit(status);
 }
 
-/// A path from the command line as an absolute one: a Reader reads a relative path nowhere, since
-/// no saved layer anchors it.
 pub fn absolute(path: &OsString) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.into())
 }
