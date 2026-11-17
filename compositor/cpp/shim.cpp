@@ -839,6 +839,9 @@ ParameterPanel::ParameterPanel(rust::Fn<void(PanelGesture)> gestures, QWidget *p
     name = new QLineEdit;
     name->setToolTip(QStringLiteral("The node's name: type over it to rename the node"));
     name->setEnabled(false);
+    // Click only: as the first field in the window, it would take the keyboard from the panes
+    // whenever a dialog closes.
+    name->setFocusPolicy(Qt::ClickFocus);
     QFont bold = name->font();
     bold.setBold(true);
     name->setFont(bold);
