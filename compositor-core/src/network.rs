@@ -515,7 +515,7 @@ pub fn missing(network: &Network, node: NodeId, frame: f64) -> Vec<(NodeId, Miss
 }
 
 /// The frames a project spans and the rate it plays at; with USD, a stage's `startTimeCode`,
-/// `endTimeCode` and `framesPerSecond`. Frames are `f64`, as USD's time codes are, and may be
+/// `endTimeCode` and `timeCodesPerSecond`. Frames are `f64`, as USD's time codes are, and may be
 /// negative.
 ///
 /// The rate only paces playback. A source's own rate is never used to retime it, and the range

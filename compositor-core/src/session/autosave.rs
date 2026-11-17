@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use openusd::sdf::Layer;
 
-use super::project::{io_why, why};
+use super::project::{io_why, project_format, why};
 use super::{Changes, FileError, Session, Step};
 use crate::history::Inverse;
 
@@ -55,11 +55,11 @@ impl Session {
         self.recovery.as_deref()
     }
 
-    /// The file the project autosaves to: beside its file, or for an untitled project or a
-    /// package in the recovery directory.
+    /// The file the project autosaves to: beside its file, or for an untitled project in the
+    /// recovery directory. A package has none: its edits last until Save As gives them a file.
     pub fn autosave_file(&self) -> Option<PathBuf> {
-        match self.saved_file() {
-            Some(file) => Some(sidecar(&file)),
+        match self.file() {
+            Some(file) => project_format(&file).then(|| sidecar(&file)),
             None => Some(self.recovery.as_ref()?.join(UNTITLED)),
         }
     }

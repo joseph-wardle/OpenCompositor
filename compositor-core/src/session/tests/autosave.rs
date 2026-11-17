@@ -108,3 +108,22 @@ fn an_untitled_project_is_offered_recovered_and_removed_on_save() {
         .unwrap();
     assert!(!autosave.exists());
 }
+
+#[test]
+fn a_package_does_not_autosave() {
+    let directory = directory("package");
+    let (session, _) = edited(&directory);
+    let package = directory.join("shot.usdz");
+    let root = session.stage.root_layer();
+    openusd::usd_utils::create_usdz_package(&session.stage, &*root.borrow(), &package, None)
+        .unwrap();
+
+    let mut session = Session::open(&package).unwrap();
+    session.recovery = Some(directory.join("recovery"));
+    let (id, _) = session.network().nodes().next().unwrap();
+    session.set_value(id, "stops", Value::Float(3.0)).unwrap();
+    assert!(session.is_modified());
+    assert_eq!(session.autosave_file(), None);
+    assert!(!session.autosave().unwrap());
+    assert_eq!(untitled_autosave(&directory.join("recovery")), None);
+}

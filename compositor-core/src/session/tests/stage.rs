@@ -111,6 +111,27 @@ fn a_new_project_holds_only_the_template_and_the_default_timeline() {
 }
 
 #[test]
+fn the_rate_is_the_time_codes_per_second_which_frames_per_second_stands_in_for() {
+    let stage = |metadata: &str| {
+        Session::from_usda(&format!(
+            "#usda 1.0\n(\n    defaultPrim = \"Comp\"\n{metadata})\n\ndef Scope \"Comp\"\n{{\n}}\n"
+        ))
+    };
+    let retimed = "    framesPerSecond = 24\n    timeCodesPerSecond = 48\n";
+    let mut session = stage(retimed);
+    assert_eq!(session.timeline().rate(), 48.0);
+    assert_eq!(stage("    framesPerSecond = 30\n").timeline().rate(), 30.0);
+    assert_eq!(stage("").timeline().rate(), 24.0);
+
+    session.set_frame_rate(25.0).unwrap();
+    assert_eq!(session.timeline().rate(), 25.0);
+    session.undo();
+    assert_eq!(session.timeline().rate(), 48.0);
+    let text = session.root_layer_text();
+    assert!(text.contains("timeCodesPerSecond = 48"), "{text}");
+}
+
+#[test]
 fn undo_restores_the_root_layer_exactly_and_redo_reapplies() {
     let mut session = Session::new();
     let reader = create(&mut session, "/shots/a.exr", ORIGIN);

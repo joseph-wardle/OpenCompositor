@@ -279,12 +279,13 @@ fn open_offers_a_newer_autosave_to_recover_or_discard() {
     let directory = directory("recover");
     let shot = directory.join("shot.usda");
     let autosave = directory.join("shot.usda.autosave");
-    let (mut app, _deliveries) = app();
-    create(&mut app, "/nonexistent/a.exr");
-    app.dispatch(saved_as(&shot, None));
-    create(&mut app, "/nonexistent/b.exr");
-    assert!(app.session().autosave().unwrap());
+    let (mut crashed, _deliveries) = app();
+    create(&mut crashed, "/nonexistent/a.exr");
+    crashed.dispatch(saved_as(&shot, None));
+    create(&mut crashed, "/nonexistent/b.exr");
+    assert!(crashed.session().autosave().unwrap());
 
+    let (mut app, _deliveries) = app();
     let requests = app.dispatch(Event::ProjectChosen(Some(shot.clone())));
     let question = question(&requests).expect("a newer autosave is offered");
     let recover = Answer::Recover {
@@ -306,14 +307,38 @@ fn open_offers_a_newer_autosave_to_recover_or_discard() {
 }
 
 #[test]
-fn dont_save_removes_the_autosave() {
+fn dont_save_removes_the_autosave_once_the_project_is_left() {
     let directory = directory("discard");
     let shot = directory.join("shot.usda");
+    let autosave = directory.join("shot.usda.autosave");
     let (mut app, _deliveries) = app();
     create(&mut app, "/nonexistent/a.exr");
     app.dispatch(saved_as(&shot, None));
+
+    for leave in [Leave::New, Leave::Quit] {
+        create(&mut app, "/nonexistent/b.exr");
+        assert!(app.session().autosave().unwrap());
+        app.dispatch(Event::Answered(Answer::Discard(leave)));
+        assert!(!autosave.exists(), "{leave:?}");
+        app.dispatch(Event::ProjectChosen(Some(shot.clone())));
+    }
+
+    // Open leaves only once a file is chosen: cancelling the chooser keeps the project and its
+    // autosave.
     create(&mut app, "/nonexistent/b.exr");
     assert!(app.session().autosave().unwrap());
-    app.dispatch(Event::Answered(Answer::Discard(Leave::New)));
-    assert!(!directory.join("shot.usda.autosave").exists());
+    assert_eq!(
+        app.dispatch(Event::Answered(Answer::Discard(Leave::Open))),
+        [Request::ChooseProject]
+    );
+    assert_eq!(app.dispatch(Event::ProjectChosen(None)), []);
+    assert!(app.session().is_modified());
+    assert!(autosave.exists());
+
+    // Choosing the project's own file opens it as saved, without offering what was discarded.
+    let requests = app.dispatch(Event::ProjectChosen(Some(shot.clone())));
+    assert_eq!(question(&requests), None);
+    assert_eq!(app.session().network().nodes().count(), 1);
+    assert!(!app.session().is_modified());
+    assert!(!autosave.exists());
 }

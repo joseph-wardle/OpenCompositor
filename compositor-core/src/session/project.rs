@@ -309,7 +309,7 @@ pub(super) fn io_why(file: &Path, error: &io::Error) -> String {
 }
 
 /// Whether the file's extension names a format the project can be saved in again.
-fn project_format(file: &Path) -> bool {
+pub(super) fn project_format(file: &Path) -> bool {
     (file.extension().and_then(|extension| extension.to_str())).is_some_and(|extension| {
         (PROJECT_FORMATS.iter()).any(|format| extension.eq_ignore_ascii_case(format))
     })

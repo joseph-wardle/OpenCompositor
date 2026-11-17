@@ -37,7 +37,7 @@ pub enum Answer {
     Save(Option<Leave>),
     /// Chooses where to save, then leaves as asked, if asked.
     SaveAs(Option<Leave>),
-    /// Leaves without saving, removing the autosave.
+    /// Leaves without saving. The autosave goes when the project does.
     Discard(Leave),
     /// Opens the file, if one, and recovers the autosave into its project, or into this untitled
     /// one without a file.
@@ -167,8 +167,20 @@ impl App {
     fn proceed(&mut self, leave: Leave) -> Vec<Request> {
         match leave {
             Leave::New => self.replace_session(Session::new()),
+            // The project stays, autosave and all, until a file is chosen and opens.
             Leave::Open => vec![Request::ChooseProject],
-            Leave::Quit => vec![Request::Quit],
+            Leave::Quit => {
+                self.remove_discarded_autosave();
+                vec![Request::Quit]
+            }
+        }
+    }
+
+    /// Removes the autosave of a project left without saving. Left unmodified, an untitled
+    /// project keeps the autosave it was not asked to recover.
+    fn remove_discarded_autosave(&self) {
+        if self.session.is_modified() {
+            self.session.remove_autosave();
         }
     }
 
@@ -176,10 +188,7 @@ impl App {
         match answer {
             Answer::Save(then) => self.save(then),
             Answer::SaveAs(then) => self.choose_save_as(then),
-            Answer::Discard(leave) => {
-                self.session.remove_autosave();
-                self.proceed(leave)
-            }
+            Answer::Discard(leave) => self.proceed(leave),
             Answer::Recover { file, autosave } => self.recover(file.as_deref(), &autosave),
             Answer::DiscardAutosave { file, autosave } => {
                 // Already gone is as good.
@@ -198,7 +207,13 @@ impl App {
     /// Opens a project in place of this one, which was saved or discarded already, first asking
     /// whether to recover an autosave newer than its file.
     pub(super) fn open(&mut self, file: &Path) -> Vec<Request> {
-        let Some(autosave) = newer_autosave(file) else {
+        // This project's own autosave was discarded with it.
+        let discarded = (self.session.is_modified())
+            .then(|| self.session.autosave_file())
+            .flatten();
+        let Some(autosave) =
+            newer_autosave(file).filter(|autosave| Some(autosave) != discarded.as_ref())
+        else {
             return self
                 .open_now(file)
                 .unwrap_or_else(|error| vec![Request::ShowError(error)]);
@@ -254,6 +269,7 @@ impl App {
     }
 
     fn replace_session(&mut self, mut session: Session) -> Vec<Request> {
+        self.remove_discarded_autosave();
         session.succeed(&mut self.session);
         self.session = session;
         self.autosave.edits = self.session.edits();

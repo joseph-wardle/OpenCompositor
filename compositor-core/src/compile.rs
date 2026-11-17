@@ -265,7 +265,9 @@ impl Compiler {
         let default = Timeline::default();
         let first = authored("startTimeCode").unwrap_or(default.first());
         let last = authored("endTimeCode").unwrap_or(default.last());
-        let rate = authored("framesPerSecond").unwrap_or(default.rate());
+        // A frame is a time code, so the rate is the time codes in a second, which USD reads
+        // from `framesPerSecond` where `timeCodesPerSecond` is not authored.
+        let rate = stage.time_codes_per_second();
         match default
             .with_range(first, last)
             .and_then(|timeline| timeline.with_rate(rate))
