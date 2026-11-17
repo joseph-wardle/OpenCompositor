@@ -130,7 +130,7 @@ fn deleting_a_node_another_layer_defines_or_connects_to_is_refused() {
             panic!("{name}: {error}");
         };
         assert_eq!(*node, id);
-        assert!(layer.ends_with("sub.usda"), "{layer}");
+        assert_eq!(layer, "sub.usda");
         assert!(session.network().node(id).is_some());
     }
     assert_eq!(session.root_layer_text(), before);

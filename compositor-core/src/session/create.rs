@@ -47,7 +47,7 @@ impl Session {
 
     /// Whether a prim or a node this session has known has the path, or a relocate moved or
     /// deleted the prim a reference brings in there, where USD lets nothing be authored again.
-    pub(super) fn is_taken(&self, path: &sdf::Path) -> bool {
+    fn is_taken(&self, path: &sdf::Path) -> bool {
         self.compiler.ids().contains(path)
             || (self.stage.prim(path.clone()).ok())
                 .is_some_and(|prim| prim.is_valid().unwrap_or(true))

@@ -22,24 +22,26 @@ use crate::parameter::{ParameterKind, Value, describe};
 
 const IN_CYCLE: &str = "takes its own image, through a cycle of wires";
 
-/// Session IDs by prim path. A path keeps its ID for the session, so a node returning through
-/// undo or redo is the node it was, and an ID is never given to another path. A renamed node
-/// keeps its ID at its new path, and its earlier paths name it still.
+/// Session IDs by prim path. A node returning through undo or redo is the node it was: a path
+/// names the node that last took it, and that node's leaving it by an undo gives the path back
+/// to the node before. A renamed node keeps its ID at its new path, and a path it alone has had
+/// names it still.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Ids {
-    by_path: HashMap<sdf::Path, NodeId>,
+    /// The nodes that have taken each path, the last of them the one it names.
+    by_path: HashMap<sdf::Path, Vec<NodeId>>,
     /// By ID, from 1.
     paths: Vec<sdf::Path>,
 }
 
 impl Ids {
     pub(crate) fn intern(&mut self, path: &sdf::Path) -> NodeId {
-        if let Some(&id) = self.by_path.get(path) {
+        if let Some(id) = self.get(path) {
             return id;
         }
         self.paths.push(path.clone());
         let id = NodeId(self.paths.len() as u64);
-        self.by_path.insert(path.clone(), id);
+        self.by_path.insert(path.clone(), vec![id]);
         id
     }
 
@@ -47,21 +49,27 @@ impl Ids {
         self.by_path.contains_key(path)
     }
 
-    /// The ID a path has, or had before its node was renamed.
+    /// The node a path names, which may have left it since.
     pub(crate) fn get(&self, path: &sdf::Path) -> Option<NodeId> {
-        self.by_path.get(path).copied()
+        self.by_path.get(path)?.last().copied()
     }
 
-    /// Moves the node to `path`, a path no other node has had. Its earlier paths still name it,
-    /// so that the one an undo restores finds it again.
+    /// Moves the node to `path`, which then names it. The path it leaves goes back to the node
+    /// that had it before, if one did, so that undoing a rename onto a deleted node's name lets
+    /// the next undo bring that node back as itself.
     pub(crate) fn rename(&mut self, id: NodeId, path: &sdf::Path) {
-        let previous = self.by_path.insert(path.clone(), id);
-        assert!(
-            previous.is_none_or(|previous| previous == id),
-            "{path} names another node"
-        );
         let index = usize::try_from(id.0 - 1).expect("an ID from 1");
-        self.paths[index] = path.clone();
+        let left = std::mem::replace(&mut self.paths[index], path.clone());
+        if let Some(owners) = self.by_path.get_mut(&left)
+            && owners.len() > 1
+            && let Some(last) = owners.iter().rposition(|&owner| owner == id)
+        {
+            owners.remove(last);
+        }
+        let owners = self.by_path.entry(path.clone()).or_default();
+        if owners.last() != Some(&id) {
+            owners.push(id);
+        }
     }
 
     pub(crate) fn path(&self, id: NodeId) -> Option<&sdf::Path> {
@@ -220,7 +228,7 @@ impl Compiler {
         let mut rewired = false;
         for path in dirty {
             let id = self.ids.intern(&path);
-            // A renamed node's earlier path, which its node is no longer read from.
+            // A path its node has left, which it is no longer read from.
             if self.ids.path(id) != Some(&path) {
                 continue;
             }

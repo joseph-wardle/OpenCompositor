@@ -3,7 +3,7 @@
 use super::project::write;
 use super::stage::named;
 use crate::fixtures::directory;
-use crate::session::Session;
+use crate::session::{EditError, NameError, Session};
 
 const LIBRARY: &str = r#"#usda 1.0
 (
@@ -190,4 +190,45 @@ fn disconnecting_what_a_reference_or_a_variant_connects_authors_an_empty_connect
     session.undo();
     assert_eq!(session.root_layer_text(), before);
     assert!(source(&session, "WiredInVariant").is_some());
+}
+
+#[test]
+fn a_delete_the_namespace_editor_refuses_leaves_the_project_as_it_was() {
+    let mut session = open();
+    let [plate, mine] = ["Plate", "Mine"].map(|name| named(&session, name));
+    session.rename(plate, "Moved").unwrap();
+    let before = session.root_layer_text();
+
+    // The crate cannot yet turn a relocate that moved a prim into one that deletes it.
+    let refused = session.delete_nodes(&[plate, mine]);
+    assert!(
+        matches!(refused, Err(EditError::DeleteRefused(_))),
+        "{refused:?}"
+    );
+    assert_eq!(session.root_layer_text(), before);
+    assert!(exists(&session, "Moved") && exists(&session, "Mine"));
+    assert_eq!(source(&session, "Mine"), Some("Moved"));
+    assert_eq!(session.undo_label(), Some("Rename"));
+}
+
+#[test]
+fn a_name_a_relocate_holds_is_refused() {
+    let mut session = open();
+    let [plate, mine] = ["Plate", "Mine"].map(|name| named(&session, name));
+    session.delete_nodes(&[plate]).unwrap();
+    let before = session.root_layer_text();
+
+    let refused = session.rename(mine, "Plate");
+    assert!(
+        matches!(
+            &refused,
+            Err(EditError::Name {
+                error: NameError::Refused(_),
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(session.root_layer_text(), before);
+    assert_eq!(session.name_of(mine), Some("Mine"));
 }

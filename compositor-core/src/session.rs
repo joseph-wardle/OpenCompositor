@@ -98,7 +98,7 @@ pub enum EditError {
         property: String,
         error: PropertyError,
     },
-    /// A delete refused: a layer other than the root, by its identifier, defines the node or
+    /// A delete refused: a layer other than the root, by its file's name, defines the node or
     /// connects to it. Save writes the root layer alone, so the delete would not last.
     Delete {
         node: NodeId,

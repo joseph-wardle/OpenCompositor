@@ -53,23 +53,51 @@ fn a_rename_keeps_the_node_its_wires_and_marks_and_undoes_as_one_step() {
 }
 
 #[test]
-fn a_node_takes_back_a_name_it_had_but_not_one_another_node_has_or_had() {
+fn a_node_takes_a_name_it_or_another_node_left_but_not_one_a_node_has() {
     let mut session = Session::new();
     let a = create(&mut session, "/shots/a.exr", ORIGIN);
     let b = create(&mut session, "/shots/b.exr", ORIGIN);
-    let c = create(&mut session, "/shots/c.exr", ORIGIN);
-    session.delete_nodes(&[c]).unwrap();
-
     assert_eq!(session.rename(b, "a"), refused(b, "a", NameError::Taken));
-    assert_eq!(session.rename(b, "c"), refused(b, "c", NameError::Used));
+
     session.rename(a, "x").unwrap();
-    assert_eq!(session.rename(b, "a"), refused(b, "a", NameError::Used));
     session.rename(a, "a").unwrap();
     assert_eq!(session.name_of(a), Some("a"));
-
     let steps = session.undo_label();
     assert!(session.rename(a, "a").unwrap().is_empty());
     assert_eq!(session.undo_label(), steps);
+
+    session.rename(a, "x").unwrap();
+    session.rename(b, "a").unwrap();
+    assert_eq!(session.name_of(b), Some("a"));
+    assert_eq!(session.rename(a, "a"), refused(a, "a", NameError::Taken));
+}
+
+#[test]
+fn undoing_a_rename_onto_a_deleted_nodes_name_lets_undo_bring_that_node_back_as_itself() {
+    let mut session = Session::new();
+    let a = create(&mut session, "/shots/a.exr", ORIGIN);
+    let b = create(&mut session, "/shots/b.exr", ORIGIN);
+    session.set_mark(slot(1), Some(a)).unwrap();
+    session.delete_nodes(&[a]).unwrap();
+    session.rename(b, "a").unwrap();
+    assert_eq!(session.name_of(b), Some("a"));
+    assert!(session.network().node(a).is_none());
+    assert_presented(&session);
+
+    session.undo();
+    session.undo();
+    assert_eq!(session.name_of(a), Some("a"));
+    assert_eq!(session.name_of(b), Some("b"));
+    assert!(session.network().node(a).is_some() && session.network().node(b).is_some());
+    assert_eq!(session.mark(slot(1)), Some(a));
+    assert_presented(&session);
+
+    session.redo();
+    session.redo();
+    assert_eq!(session.name_of(b), Some("a"));
+    assert!(session.network().node(a).is_none());
+    assert_eq!(session.network().nodes().count(), 1);
+    assert_presented(&session);
 }
 
 #[test]
@@ -135,13 +163,12 @@ def OcComp "Comp"
 "#,
     );
     let mut session = Session::open(&root).unwrap();
-    let layer = session.stage.layer_stack()[1].clone();
 
     for name in ["Texture", "Plate"] {
         let node = named(&session, name);
         assert_eq!(
             session.rename(node, "Renamed"),
-            refused(node, "Renamed", NameError::InLayer(layer.clone())),
+            refused(node, "Renamed", NameError::InLayer("sub.usda".to_owned())),
         );
     }
     assert!(!session.is_modified());

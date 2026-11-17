@@ -8,6 +8,7 @@ Two early, work-in-progress Rust projects developed together:
 ## Status
 
 - **Nodes:** Reader, Exposure, Merge and Blur, with undo, viewer slots and a parameters panel.
+- **Projects:** saved as USD (`.usda`, `.usdc` or `.usd`), each node a prim that other USD tools can read. Opens projects that sublayer, reference or put nodes in variants of other files, and edits only the project's own layer. Unsaved changes are autosaved beside the file and offered for recovery.
 - **Files:** EXR and PNG stills and numbered sequences, with a frame range, offset and reload. A frame missing inside the range fails visibly; outside it, the nearest end is held and the viewer says so. EXR files the viewer cannot honour yet are refused or load with a warning.
 - **Time:** a timebar, playback forwards and backwards in real time or every frame, looping and scrubbing, from a viewer cache of reduced copies.
 - **Evaluation:** on the GPU or the CPU (at the widest SIMD level the machine has), off the GUI thread. Everything but the window lives in `opencompositor-core`, which runs headless without Qt.
@@ -35,6 +36,7 @@ The window, `compositor/`, needs Qt 6 with its private headers. Arch's `qt6-base
 ```sh
 cargo build --workspace
 cargo run -p opencompositor
+cargo run -p opencompositor -- shot.usda   # opens a project file
 cargo test --workspace
 ```
 

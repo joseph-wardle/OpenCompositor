@@ -3,6 +3,7 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::path::Path;
 
 use openusd::sdf::{self, AbstractData};
 use openusd::usd::NamespaceEditor;
@@ -19,10 +20,7 @@ pub enum NameError {
     Character(char),
     /// Another prim has the name.
     Taken,
-    /// Another node had the name earlier this session, deleted or renamed since, and undo can
-    /// bring it back.
-    Used,
-    /// A layer other than the root defines the node or connects to it, by its identifier. Save
+    /// A layer other than the root defines the node or connects to it, by its file's name. Save
     /// writes the root layer alone, so the rename would not last.
     InLayer(String),
     /// The namespace editor refused the rename.
@@ -39,10 +37,6 @@ impl fmt::Display for NameError {
                 "a name holds only letters, digits and _, not {character:?}"
             ),
             NameError::Taken => write!(f, "another node has that name"),
-            NameError::Used => write!(
-                f,
-                "another node had that name earlier this session, and undo can bring it back"
-            ),
             NameError::InLayer(layer) => {
                 write!(
                     f,
@@ -58,8 +52,9 @@ impl std::error::Error for NameError {}
 
 impl Session {
     /// Renames a node as one step, keeping its ID, and moves every connection to it with it.
-    /// Refused for a name other USD tools may not read, one another prim has or another node had
-    /// this session, and for a node another layer defines or connects to.
+    /// Refused for a name other USD tools may not read or another prim has, and for a node another
+    /// layer defines or connects to. A name a deleted or renamed node left is free: undoing the
+    /// rename gives it back.
     pub fn rename(&mut self, id: NodeId, name: &str) -> Result<Changes, EditError> {
         if self.network().node(id).is_none() {
             return Err(EditError::MissingNode(id));
@@ -76,15 +71,8 @@ impl Session {
         check_name(name).map_err(refused)?;
         let parent = from.parent().expect("a node is under its comp");
         let to = parent.append_path(name).expect("a checked name");
-        if self.is_taken(&to) {
-            match self.compiler.ids().get(&to) {
-                // A name this node had before.
-                Some(other) if other == id && !self.is_composed(&to) => {}
-                Some(other) if other != id && !self.is_composed(&to) => {
-                    return Err(refused(NameError::Used));
-                }
-                _ => return Err(refused(NameError::Taken)),
-            }
+        if self.is_composed(&to) {
+            return Err(refused(NameError::Taken));
         }
         if let Some(layer) = self.held_elsewhere(&from) {
             return Err(refused(NameError::InLayer(layer)));
@@ -110,7 +98,7 @@ impl Session {
     }
 
     /// The first layer of the root's stack, other than the root, with a spec at or beneath `path`
-    /// or a path into it, which the namespace editor would change too.
+    /// or a path into it, which the namespace editor would change too: its file's name.
     pub(super) fn held_elsewhere(&self, path: &sdf::Path) -> Option<String> {
         let root = self.stage.root_layer().identifier().to_owned();
         (self.stage.layer_stack().into_iter())
@@ -120,6 +108,10 @@ impl Session {
                     return false;
                 };
                 holds(layer.borrow().data(), path)
+            })
+            .map(|identifier| match Path::new(&identifier).file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => identifier,
             })
     }
 }
