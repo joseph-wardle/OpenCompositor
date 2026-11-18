@@ -1,7 +1,8 @@
-//! `--drag-check IMAGE [CHAIN]`: drags a parameter panel slider with synthetic mouse events, one
+//! `--drag-check IMAGE [CHAIN] [keyed]`: drags a parameter panel slider with synthetic mouse events, one
 //! pixel each refresh of the viewer's screen, on a chain: `exposure`, Stops on Reader → Exposure;
 //! `merge`, Mix on Reader → Merge with IMAGE as background and layer; or `blur`, Size on Reader →
 //! Blur. Without CHAIN it runs each chain in a child process of its own and fails if any failed.
+//! `keyed` gives the dragged parameter keys first, so that the drag sets a key at the frame.
 //!
 //! The worker evaluates the latest request and discards the rest, so an edit's latency ends at
 //! the first viewer frame that samples a result from its request or a later one: a superseded
@@ -22,8 +23,8 @@ use std::time::{Duration, Instant};
 use cxx_qt_lib::QString;
 use open_ng::Point;
 use opencompositor_core::{
-    Changes, Command, EvaluationDevice, Event, FrameTiming, NodeId, Pane, Slot, Timing, Value,
-    Window,
+    Changes, Command, EvaluationDevice, Event, FrameTiming, NodeId, Pane, Session, Slot, Timing,
+    Value, Window, resolve,
 };
 
 use crate::check::{Durations, Seen, finish, gui_frames, resident_memory};
@@ -90,10 +91,13 @@ impl Chain {
 struct Check {
     image: PathBuf,
     chain: Chain,
+    /// Whether the dragged parameter has keys, so that the drag sets one at the frame.
+    keyed: bool,
     device: EvaluationDevice,
     /// The chain's nodes: the Reader and the node whose slider is dragged.
     nodes: Vec<NodeId>,
-    /// The dragged parameter's authored value before the drag, which one undo restores.
+    /// The dragged parameter's authored value before the drag, or keyed its value at the frame,
+    /// which one undo restores.
     before: Option<Value>,
     /// The request marking the chain's node made, which the viewer must show before the drag.
     marked: u64,
@@ -161,7 +165,7 @@ thread_local! {
 /// Runs each chain in a child process of its own, and exits 1 if any failed, else 0. A chain run
 /// after another in the same process stages several times slower (hypothesis: the recreated
 /// staging buffer lands in a slower heap), so chains are only comparable from equal starts.
-pub fn run_chains(image: &Path, device: EvaluationDevice) -> ! {
+pub fn run_chains(image: &Path, device: EvaluationDevice, keyed: bool) -> ! {
     let binary = std::env::current_exe().expect("the binary knows its own path");
     let mut failed = false;
     for chain in CHAINS {
@@ -169,11 +173,14 @@ pub fn run_chains(image: &Path, device: EvaluationDevice) -> ! {
         if device == EvaluationDevice::Cpu {
             command.arg("--cpu");
         }
-        let status = command
+        command
             .arg("--drag-check")
             .arg(image)
-            .arg(chain.type_name())
-            .status();
+            .arg(chain.type_name());
+        if keyed {
+            command.arg("keyed");
+        }
+        let status = command.status();
         match status {
             Ok(status) if status.success() => {}
             Ok(status) => {
@@ -192,12 +199,13 @@ pub fn run_chains(image: &Path, device: EvaluationDevice) -> ! {
     std::process::exit(i32::from(failed))
 }
 
-pub fn start(image: PathBuf, chain: Chain) {
+pub fn start(image: PathBuf, chain: Chain, keyed: bool) {
     let device = crate::evaluation_device();
     CHECK.with(|cell| {
         *cell.borrow_mut() = Some(Check {
             image,
             chain,
+            keyed,
             device,
             nodes: Vec::new(),
             before: None,
@@ -302,7 +310,7 @@ fn poll_in(tries: usize) -> i32 {
 /// Makes the chain, which selects its last node for the panel, and marks that node in the
 /// viewer's slot.
 fn setup(_: usize) {
-    let (image, chain) = with(|check| (check.image.clone(), check.chain));
+    let (image, chain, keyed) = with(|check| (check.image.clone(), check.chain, check.keyed));
     let nodes = crate::edit(|session| {
         let reader = created(session.create_readers(vec![image], Point::default(), None));
         let node = created(
@@ -319,6 +327,21 @@ fn setup(_: usize) {
                 .connect(node, ("layer", 1), reader)
                 .expect("a Merge takes a layer");
         }
+        if keyed {
+            // A key here and one ten frames on, so that the drag keys this frame.
+            let (parameter, _) = chain.parameter();
+            if chain == Chain::Merge {
+                // Away from 1, where the drag ends: a drag back to the key's value is no step.
+                session
+                    .set_value(node, parameter, Value::Float(0.5))
+                    .expect("a Merge has a Mix");
+            }
+            let frame = session.frame();
+            for at in [frame + 10.0, frame] {
+                session.set_frame(at).expect("the frame is finite");
+                (session.toggle_key(node, parameter)).expect("the parameter takes keys");
+            }
+        }
         session
             .set_mark(Slot::new(1).expect("1 is a slot"), Some(node))
             .expect("the node exists");
@@ -331,6 +354,17 @@ fn setup(_: usize) {
         check.marked_at = Some(Instant::now());
     });
     ffi::single_shot(poll_in(1), wait_for_image, 1);
+}
+
+/// The parameter's authored value, or keyed its value at the session's frame, which is where a
+/// drag's key goes.
+fn value(session: &Session, node: NodeId, parameter: &str, keyed: bool) -> Option<Value> {
+    let node = session.network().node(node)?;
+    if keyed {
+        resolve(node, session.frame()).get(parameter).cloned()
+    } else {
+        node.authored_value(parameter).cloned()
+    }
 }
 
 fn created(changes: Changes) -> NodeId {
@@ -357,10 +391,8 @@ fn wait_for_image(tries: usize) {
             return;
         }
         let (parameter, _) = chain.parameter();
-        let before = crate::read_app(|app| {
-            let node = app.session().network().node(node);
-            node.and_then(|node| node.authored_value(parameter).cloned())
-        });
+        let keyed = with(|check| check.keyed);
+        let before = crate::read_app(|app| value(app.session(), node, parameter, keyed));
         with(|check| check.before = before);
         begin();
     } else if POLL * tries as u32 >= LONGEST_WAIT {
@@ -475,7 +507,7 @@ fn wait_for_final(tries: usize) {
 
 /// Checks that one undo removes the drag and that a drag cancelled with Escape changes nothing.
 fn check_steps() -> Vec<String> {
-    let (node, before, slider, span, (parameter, label)) = with(|check| {
+    let (node, before, slider, span, (parameter, label), keyed) = with(|check| {
         let node = *check.nodes.last().expect("set up");
         let before = check.before.clone();
         (
@@ -484,13 +516,13 @@ fn check_steps() -> Vec<String> {
             check.slider,
             check.span,
             check.chain.parameter(),
+            check.keyed,
         )
     });
     let state = || {
         crate::read_app(|app| {
             let session = app.session();
-            let value = (session.network().node(node))
-                .and_then(|node| node.authored_value(parameter).cloned());
+            let value = value(session, node, parameter, keyed);
             (value, session.undo_label(), session.editing().is_some())
         })
     };
@@ -557,7 +589,8 @@ fn report(mut failures: Vec<String>) {
     let check = CHECK
         .with(|cell| cell.borrow_mut().take())
         .expect("the check has started");
-    let name = format!("drag check ({:?})", check.chain);
+    let keyed = if check.keyed { ", keyed" } else { "" };
+    let name = format!("drag check ({:?}{keyed})", check.chain);
     let gpu = check.device == EvaluationDevice::Gpu;
     let budget = check.chain.budget(check.device, check.refresh);
     let edits = &check.edits;

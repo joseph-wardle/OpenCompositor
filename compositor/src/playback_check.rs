@@ -1,4 +1,5 @@
-//! `--playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]`:
+//! `--playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]
+//! [keyed]`:
 //! the step 5 workloads over at most the first 150 frames the scan finds, at 24 frames a second.
 //! `exposure` is Reader → Exposure at one stop (W1, the default); `blur`, Reader → Blur at Size
 //! 50 (W2); `merge`, Readers of both patterns → Merge → Blur at Size 50 (W3). BUDGET_MIB sets the
@@ -7,6 +8,9 @@
 //!
 //! `cold` drops the sequences' files from this machine's page cache before each stage that reads
 //! them; whether the NFS server's cache was warm is the runner's to say.
+//!
+//! `keyed` animates the viewed node's parameter across the range, its panel open, so that every
+//! frame has another value and the panel shows each as it plays.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -74,6 +78,7 @@ pub struct Run {
     pub chain: Chain,
     pub budget: Option<u64>,
     pub cold: bool,
+    pub keyed: bool,
 }
 
 impl Run {
@@ -84,6 +89,7 @@ impl Run {
             chain: Chain::Exposure,
             budget: None,
             cold: false,
+            keyed: false,
         };
         let mut rest = rest.iter();
         while let Some(argument) = rest.next() {
@@ -92,6 +98,7 @@ impl Run {
                 "blur" => run.chain = Chain::Blur,
                 "merge" => run.chain = Chain::Merge(crate::absolute(rest.next()?)),
                 "cold" => run.cold = true,
+                "keyed" => run.keyed = true,
                 mebibytes => run.budget = Some(mebibytes.parse::<u64>().ok()? << 20),
             }
         }
@@ -185,9 +192,10 @@ fn say(line: &str) {
 pub fn start(run: Run) {
     let device = crate::evaluation_device();
     let name = format!(
-        "playback check ({}, {device}{})",
+        "playback check ({}, {device}{}{})",
         run.chain.name(),
-        if run.cold { ", cold" } else { "" }
+        if run.cold { ", cold" } else { "" },
+        if run.keyed { ", keyed" } else { "" }
     );
     CHECK.with(|cell| {
         *cell.borrow_mut() = Some(Check {
@@ -367,9 +375,37 @@ fn scanned() -> Option<(f64, f64)> {
 
 fn set_range() {
     let (first, last) = scanned().expect("the scans are in");
-    with(|check| check.whole = (first, last));
-    if range() != (first, last) {
+    let keyed = with(|check| {
+        check.whole = (first, last);
+        check.run.keyed.then(|| {
+            (
+                check.viewed.expect("setup made it"),
+                check.run.chain.parameter(),
+            )
+        })
+    });
+    if let Some((viewed, (parameter, value, edited))) = keyed {
+        // A key before the range and one at its end, where each edit sets another, so that an
+        // edit changes every frame of the range.
+        crate::edit(|session| {
+            session.set_frame(first - 1.0).expect("the frame is finite");
+            (session.toggle_key(viewed, parameter)).expect("the parameter takes keys");
+            session.set_frame(last).expect("the frame is finite");
+            (session.set_value(viewed, parameter, Value::Float((value + edited) / 2.0)))
+                .expect("the node has it");
+        });
+        let shown = crate::read_app(|app| app.panel().map(|panel| panel.node));
+        if shown != Some(viewed) {
+            with(|check| {
+                (check.failures).push("the panel does not show the keyed node".to_owned())
+            });
+        }
+    }
+    let ranged = range() != (first, last);
+    if ranged {
         crate::dispatch(Event::FrameRangeSet { first, last });
+    }
+    if ranged || keyed.is_some() {
         crate::dispatch(Event::Command(Command::FirstFrame));
     }
     wait_for("the first frame", shows_first, play_every_frame);
