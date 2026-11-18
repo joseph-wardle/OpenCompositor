@@ -11,6 +11,7 @@ Two early, work-in-progress Rust projects developed together:
 - **Projects:** saved as native USD.
 - **Files:** EXR and PNG stills and numbered sequences, with a frame range, offset and reload.
 - **Time:** a timebar, playback forwards and backwards in real time or every frame, looping and scrubbing, from a viewer cache of reduced copies.
+- **Animation:** numeric parameters animate by USD time samples, read as other USD tools read them. Each has a key button in the panel, the timebar shows the keys of the panel's node, and Alt+Left and Alt+Right go between them.
 - **Evaluation:** on the GPU or the CPU (at the widest SIMD level the machine has), off the GUI thread. Everything but the window lives in `opencompositor-core`, which runs headless without Qt.
 
 ## Goals
@@ -44,8 +45,8 @@ The window must run against the Qt it was built with, and refuses to start other
 Each exits non-zero on failure. Run the last two in release, on the machine being judged.
 
 - `--lifecycle-check IMAGE`: docks, floats and closes the panes and replaces the GPU device, checking that every pane keeps drawing. Run it after upgrading Qt.
-- `--drag-check IMAGE [exposure | merge | blur]`: drags a parameter with synthetic mouse events, against each chain's latency budget and one undo step per drag.
-- `--playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]`: plays, scrubs and edits a sequence, against playback, scrub and memory budgets.
+- `--drag-check IMAGE [exposure | merge | blur] [keyed]`: drags a parameter with synthetic mouse events, against each chain's latency budget and one undo step per drag. `keyed` drags an animated parameter, so that the drag sets a key.
+- `--playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold] [keyed]`: plays, scrubs and edits a sequence, against playback, scrub and memory budgets. `keyed` animates the viewed node's parameter across the range.
 
 ## License
 
