@@ -228,6 +228,11 @@ fn main() {
         ("&Stop\tK", Command::Stop),
         ("Step F&orwards\tRight", Command::Step(Direction::Forward)),
         ("Step Back&wards\tLeft", Command::Step(Direction::Backward)),
+        ("&Next Key\tAlt+Right", Command::GoToKey(Direction::Forward)),
+        (
+            "Previous &Key\tAlt+Left",
+            Command::GoToKey(Direction::Backward),
+        ),
         ("F&irst Frame", Command::FirstFrame),
         ("&Last Frame", Command::LastFrame),
     ];

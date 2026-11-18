@@ -17,6 +17,9 @@ pub struct Panel {
     pub problem: Option<String>,
     /// In description order.
     pub rows: Vec<Row>,
+    /// The frames at which any parameter has a time sample, whichever file authors it,
+    /// ascending and each once.
+    pub key_frames: Vec<f64>,
     /// The declared inputs whose connections were refused.
     pub refused: Vec<RefusedConnection>,
     /// What else the node's prim authors, by name.
@@ -76,8 +79,15 @@ impl Panel {
                 },
             })
             .collect();
+        let mut key_frames: Vec<f64> = (shown.kind.parameters().iter())
+            .filter_map(|parameter| shown.samples(parameter.name))
+            .flat_map(|samples| samples.frames())
+            .collect();
+        key_frames.sort_by(f64::total_cmp);
+        key_frames.dedup();
         Some(Panel {
             node,
+            key_frames,
             name: shown.name().to_owned(),
             type_label: shown.kind.label(),
             pinned,

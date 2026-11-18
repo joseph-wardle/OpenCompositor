@@ -40,6 +40,11 @@ impl Samples {
         (!samples.is_empty()).then(|| Samples(samples.into()))
     }
 
+    /// The frames that have a sample, ascending.
+    pub(crate) fn frames(&self) -> impl Iterator<Item = f64> + '_ {
+        self.0.iter().map(|&(frame, _)| frame)
+    }
+
     /// The value at a frame as `UsdAttribute::Get` reads it from a stage interpolating linearly,
     /// by the same arithmetic as the `openusd` crate: `double`, `float` and `half` in a straight
     /// line between two samples, each in its own precision, and anything else, `int` or a pair

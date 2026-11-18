@@ -338,6 +338,9 @@ pub enum Command {
     Stop,
     /// Stops playback and goes one frame that way, round to the other end when looping.
     Step(Direction),
+    /// Stops playback and goes to the nearest frame that way at which the parameter panel's node
+    /// has a key, staying where there is none.
+    GoToKey(Direction),
     /// Stops playback and goes to the timeline's first frame.
     FirstFrame,
     /// Stops playback and goes to the timeline's last frame.
@@ -867,7 +870,8 @@ impl App {
             shows.push(Request::ShowUndoLabels { undo, redo });
         }
         self.follow_panel(&mut shows);
-        let timebar = self.playback.timebar(&self.session, &self.marks.marks);
+        let key_frames = (self.shell.panel.as_ref()).map_or(&[][..], |panel| &panel.key_frames);
+        let timebar = (self.playback).timebar(&self.session, &self.marks.marks, key_frames);
         if self.shell.timebar.as_ref() != Some(&timebar) {
             self.shell.timebar = Some(timebar.clone());
             shows.push(Request::ShowTimebar(timebar));
@@ -1375,6 +1379,19 @@ impl App {
             Command::Step(direction) => {
                 self.playback.stop();
                 self.go_to(self.playback.step(&self.session, direction))
+            }
+            Command::GoToKey(direction) => {
+                self.playback.stop();
+                let frame = self.session.frame();
+                let keys = (self.shell.panel.as_ref()).map_or(&[][..], |panel| &panel.key_frames);
+                let key = match direction {
+                    Direction::Forward => keys.iter().find(|&&key| key > frame),
+                    Direction::Backward => keys.iter().rev().find(|&&key| key < frame),
+                };
+                match key {
+                    Some(&key) => self.go_to(key),
+                    None => Vec::new(),
+                }
             }
             Command::FirstFrame | Command::LastFrame => {
                 self.playback.stop();

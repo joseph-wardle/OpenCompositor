@@ -521,7 +521,12 @@ fn check_steps() -> Vec<String> {
     // SAFETY: as in `begin`.
     unsafe {
         let window = crate::widgets().window;
-        ffi::press_key(window, crate::keys::qt_key::ESCAPE, &QString::default());
+        ffi::press_key(
+            window,
+            crate::keys::qt_key::ESCAPE,
+            &QString::default(),
+            false,
+        );
         ffi::drag_slider(slider, MOUSE_BUTTON_RELEASE, middle);
     }
     let cancelled = state();
