@@ -37,6 +37,7 @@ pub use connections::RefusedConnection;
 pub use project::{FileError, RelativePaths};
 pub use properties::{Property, PropertyError, Scalar, ScalarKind};
 pub use rename::NameError;
+pub use values::KeyState;
 
 /// What a new project's root layer holds.
 const TEMPLATE: &str = r#"#usda 1.0
@@ -67,6 +68,19 @@ struct EditInProgress {
     node: NodeId,
     /// What the edit touched so far, which finishing records and cancelling restores.
     inverse: Inverse,
+    /// Whether the edit set a key, which a frame change then records as that frame's own step.
+    keyed: bool,
+}
+
+impl EditInProgress {
+    fn new(node: NodeId, label: &'static str) -> EditInProgress {
+        EditInProgress {
+            label,
+            node,
+            inverse: Inverse::default(),
+            keyed: false,
+        }
+    }
 }
 
 /// An edit refused before applying.
@@ -388,6 +402,12 @@ impl Session {
         // Adding zero turns -0 into 0, which reads the same frame.
         let frame = frame + 0.0;
         if frame != self.frame {
+            // A drag across frames keys each of them, each as its own step.
+            if let Some(edit) = self.editing.as_ref().filter(|edit| edit.keyed) {
+                let (node, label) = (edit.node, edit.label);
+                self.finish_edit();
+                self.editing = Some(EditInProgress::new(node, label));
+            }
             self.frame = frame;
             self.version += 1;
             self.frames_set += 1;

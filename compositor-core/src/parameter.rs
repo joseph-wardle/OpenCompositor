@@ -146,8 +146,14 @@ pub enum ValueError {
     NotUnicode,
     /// A relative path set in a project with no file to read it beside.
     Unanchored,
-    /// The parameter's value varies with time, which an edit cannot yet keep.
+    /// The parameter is animated by what this version cannot edit: a spline or value clips, or
+    /// anything on a parameter that takes no keys.
     Animated,
+    /// A key on a parameter that takes none, as a Reader's.
+    NoKeys,
+    /// A key that is no whole number, or beyond an `int`, where the parameter's file types it
+    /// `int`: nothing is retyped under time samples.
+    NotInt,
 }
 
 impl fmt::Display for ValueError {
@@ -171,7 +177,12 @@ impl fmt::Display for ValueError {
             ),
             ValueError::Animated => write!(
                 f,
-                "the parameter is animated, which this version cannot edit"
+                "the parameter is animated in a way this version cannot edit"
+            ),
+            ValueError::NoKeys => write!(f, "the parameter takes no keys"),
+            ValueError::NotInt => write!(
+                f,
+                "its file types the parameter int, whose keys are whole numbers"
             ),
         }
     }

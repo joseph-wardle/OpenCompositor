@@ -9,8 +9,9 @@ use super::stage::named;
 use crate::evaluate::result_key;
 use crate::fixtures::directory;
 use crate::network::{Changes, NodeId};
-use crate::parameter::resolve;
-use crate::session::Session;
+use crate::panel::{Panel, ValueState};
+use crate::parameter::{Value, ValueError, resolve};
+use crate::session::{EditError, KeyState, Session};
 
 const SHOT: &str = r#"#usda 1.0
 (
@@ -316,4 +317,312 @@ fn frames_key_apart_where_the_value_differs_and_alike_where_it_is_held() {
     assert_ne!(key("Double", 5.0), key("Double", 6.0));
     assert_eq!(key("Int", 5.0), key("Int", 6.0));
     assert_eq!(key("Double", 20.0), key("Double", 30.0));
+}
+
+const KEYED: &str = r#"#usda 1.0
+(
+    defaultPrim = "Comp"
+)
+
+def OcComp "Comp"
+{
+    def OcExposure "Constant"
+    {
+        double inputs:stops = 7
+    }
+
+    def OcExposure "Unset"
+    {
+    }
+
+    def OcExposure "Keyed"
+    {
+        double inputs:stops = 7
+        double inputs:stops.timeSamples = {
+            1: 0,
+            11: 10,
+        }
+    }
+
+    def OcExposure "Whole"
+    {
+        int inputs:stops.timeSamples = {
+            1: 0,
+            11: 10,
+        }
+    }
+
+    def OcReader "Reader"
+    {
+    }
+}
+"#;
+
+fn refused(node: NodeId, parameter: &str, error: ValueError) -> EditError {
+    EditError::InvalidValue {
+        node,
+        parameter: parameter.to_owned(),
+        error,
+    }
+}
+
+#[test]
+fn a_value_set_on_an_animated_parameter_keys_the_frame_as_one_step() {
+    let mut session = Session::from_usda(KEYED);
+    let before = session.root_layer_text();
+    let id = named(&session, "Keyed");
+    session.set_frame(6.0).unwrap();
+    assert_eq!(
+        session.key_state(id, "stops"),
+        Ok(KeyState::Keyed { here: false })
+    );
+    session.set_value(id, "stops", Value::Float(2.5)).unwrap();
+
+    let keyed = r#"        double inputs:stops = 7
+        double inputs:stops.timeSamples = {
+            1: 0,
+            6: 2.5,
+            11: 10,
+        }
+"#;
+    assert!(
+        session.root_layer_text().contains(keyed),
+        "{}",
+        session.root_layer_text()
+    );
+    assert_eq!(
+        session.key_state(id, "stops"),
+        Ok(KeyState::Keyed { here: true })
+    );
+    assert_eq!(resolved(&session, id, 6.0), 2.5);
+    assert_eq!(resolved(&session, id, 3.5), 1.25);
+    assert_eq!(session.undo_label(), Some("Stops"));
+    session.undo();
+    assert_eq!(session.root_layer_text(), before);
+    assert_eq!(session.undo_label(), None);
+}
+
+#[test]
+fn a_drag_keys_each_frame_it_crosses_as_its_own_step() {
+    let mut session = Session::from_usda(KEYED);
+    let id = named(&session, "Keyed");
+    session.set_frame(3.0).unwrap();
+    session.begin_edit(id, "Stops").unwrap();
+    session.edit_value("stops", Value::Float(4.0)).unwrap();
+    session.edit_value("stops", Value::Float(5.0)).unwrap();
+    session.set_frame(4.0).unwrap();
+    assert_eq!(session.editing(), Some(id));
+    session.edit_value("stops", Value::Float(6.0)).unwrap();
+    session.finish_edit();
+
+    assert_eq!(resolved(&session, id, 3.0), 5.0);
+    assert_eq!(resolved(&session, id, 4.0), 6.0);
+    session.undo();
+    assert_eq!(resolved(&session, id, 3.0), 5.0);
+    assert_eq!(
+        session.key_state(id, "stops"),
+        Ok(KeyState::Keyed { here: false })
+    );
+    session.undo();
+    assert_eq!(resolved(&session, id, 3.0), 2.0);
+    assert_eq!(session.undo_label(), None);
+}
+
+#[test]
+fn a_frame_change_leaves_a_drag_of_a_constant_value_one_step() {
+    let mut session = Session::from_usda(KEYED);
+    let id = named(&session, "Constant");
+    session.begin_edit(id, "Stops").unwrap();
+    session.edit_value("stops", Value::Float(4.0)).unwrap();
+    session.set_frame(4.0).unwrap();
+    session.edit_value("stops", Value::Float(6.0)).unwrap();
+    session.finish_edit();
+    session.undo();
+    assert_eq!(resolved(&session, id, 4.0), 7.0);
+    assert_eq!(session.undo_label(), None);
+}
+
+#[test]
+fn a_key_toggles_at_the_frame_and_the_first_leaves_the_value_beneath_it() {
+    let mut session = Session::from_usda(KEYED);
+    let before = session.root_layer_text();
+    for (name, value) in [("Constant", 7.0), ("Unset", 0.0)] {
+        let id = named(&session, name);
+        session.set_frame(5.0).unwrap();
+        assert_eq!(session.key_state(id, "stops"), Ok(KeyState::Constant));
+        session.toggle_key(id, "stops").unwrap();
+        assert_eq!(session.undo_label(), Some("Set Key"));
+        assert_eq!(
+            session.key_state(id, "stops"),
+            Ok(KeyState::Keyed { here: true })
+        );
+        assert_eq!(resolved(&session, id, 9.0), value, "{name}");
+
+        session.set_frame(9.0).unwrap();
+        assert_eq!(
+            session.key_state(id, "stops"),
+            Ok(KeyState::Keyed { here: false })
+        );
+        session.set_value(id, "stops", Value::Float(1.0)).unwrap();
+        assert_eq!(resolved(&session, id, 7.0), (value + 1.0) / 2.0, "{name}");
+        session.toggle_key(id, "stops").unwrap();
+        assert_eq!(session.undo_label(), Some("Remove Key"));
+        session.set_frame(5.0).unwrap();
+        session.toggle_key(id, "stops").unwrap();
+        assert_eq!(session.key_state(id, "stops"), Ok(KeyState::Constant));
+        assert_eq!(resolved(&session, id, 9.0), value, "{name}");
+    }
+    assert_eq!(session.root_layer_text(), before);
+    let constant = named(&session, "Constant");
+    session.toggle_key(constant, "stops").unwrap();
+    let keyed = r#"        double inputs:stops = 7
+        double inputs:stops.timeSamples = {
+            5: 7,
+        }
+"#;
+    assert!(
+        session.root_layer_text().contains(keyed),
+        "{}",
+        session.root_layer_text()
+    );
+}
+
+#[test]
+fn a_reset_removes_the_keys_with_the_value() {
+    let mut session = Session::from_usda(KEYED);
+    let before = session.root_layer_text();
+    let id = named(&session, "Keyed");
+    session.reset_value(id, "stops").unwrap();
+    assert_eq!(session.key_state(id, "stops"), Ok(KeyState::Constant));
+    assert_eq!(resolved(&session, id, 6.0), 0.0);
+    let bare = "    def OcExposure \"Keyed\"\n    {\n    }\n";
+    assert!(
+        session.root_layer_text().contains(bare),
+        "{}",
+        session.root_layer_text()
+    );
+    assert_eq!(session.undo_label(), Some("Reset"));
+    session.undo();
+    assert_eq!(session.root_layer_text(), before);
+}
+
+#[test]
+fn a_key_on_int_samples_is_a_whole_number_or_refused() {
+    let mut session = Session::from_usda(KEYED);
+    let before = session.root_layer_text();
+    let id = named(&session, "Whole");
+    session.set_frame(6.0).unwrap();
+    let set = session.set_value(id, "stops", Value::Float(2.5));
+    assert_eq!(set.unwrap_err(), refused(id, "stops", ValueError::NotInt));
+    assert_eq!(session.root_layer_text(), before);
+    session.set_value(id, "stops", Value::Float(4.0)).unwrap();
+    let keyed = r#"        int inputs:stops.timeSamples = {
+            1: 0,
+            6: 4,
+            11: 10,
+        }
+"#;
+    assert!(
+        session.root_layer_text().contains(keyed),
+        "{}",
+        session.root_layer_text()
+    );
+}
+
+#[test]
+fn a_key_over_another_files_animation_replaces_it_until_it_is_removed() {
+    let mut session = shot("elsewhere");
+    for name in ["Sublayer", "Referenced"] {
+        let id = named(&session, name);
+        session.set_frame(20.0).unwrap();
+        let curve = [0.0, 20.0, 40.0].map(|frame| resolved(&session, id, frame));
+        assert_ne!(curve[0], curve[2], "{name}");
+        assert_eq!(
+            session.key_state(id, "stops"),
+            Ok(KeyState::Elsewhere),
+            "{name}"
+        );
+        // A reset has nothing of the project's own to remove.
+        session.reset_value(id, "stops").unwrap();
+        assert_eq!(session.undo_label(), None, "{name}");
+
+        session.set_value(id, "stops", Value::Float(1.5)).unwrap();
+        assert_eq!(
+            session.key_state(id, "stops"),
+            Ok(KeyState::Keyed { here: true })
+        );
+        for frame in [0.0, 20.0, 40.0] {
+            assert_eq!(resolved(&session, id, frame), 1.5, "{name} at {frame}");
+        }
+        session.toggle_key(id, "stops").unwrap();
+        assert_eq!(
+            session.key_state(id, "stops"),
+            Ok(KeyState::Elsewhere),
+            "{name}"
+        );
+        assert_eq!(
+            [0.0, 20.0, 40.0].map(|frame| resolved(&session, id, frame)),
+            curve
+        );
+        session.undo();
+        session.undo();
+        assert_eq!(
+            [0.0, 20.0, 40.0].map(|frame| resolved(&session, id, frame)),
+            curve
+        );
+        assert_eq!(session.undo_label(), None, "{name}");
+    }
+}
+
+#[test]
+fn a_reader_takes_no_keys_and_the_panel_says_which_rows_do() {
+    let mut session = Session::from_usda(KEYED);
+    let reader = named(&session, "Reader");
+    assert_eq!(
+        session.toggle_key(reader, "first").unwrap_err(),
+        refused(reader, "first", ValueError::NoKeys)
+    );
+    let panel = Panel::of(&session, reader, false).unwrap();
+    assert!(panel.rows.iter().all(|row| row.keys.is_none()));
+
+    session.set_frame(6.0).unwrap();
+    let keyed = named(&session, "Keyed");
+    let panel = Panel::of(&session, keyed, false).unwrap();
+    let [row] = panel.rows.as_slice() else {
+        panic!("{panel:?}");
+    };
+    assert_eq!(row.value, Some(Value::Float(5.0)));
+    assert_eq!(row.state, ValueState::Authored);
+    assert_eq!(row.keys, Some(KeyState::Keyed { here: false }));
+}
+
+#[test]
+fn a_spline_over_a_weaker_layers_samples_refuses_the_node() {
+    let directory = directory("spline");
+    fs::write(directory.join("sub.usda"), SUBLAYER).unwrap();
+    let file = directory.join("shot.usda");
+    let shot = r#"#usda 1.0
+(
+    defaultPrim = "Comp"
+    subLayers = [ @./sub.usda@ ]
+)
+
+def OcComp "Comp"
+{
+    over "Sublayer"
+    {
+        double inputs:stops.spline = {
+            1: 5; pre (0, 0); post curve (0, 0),
+            10: 7; pre (0, 0),
+        }
+    }
+}
+"#;
+    fs::write(&file, shot).unwrap();
+    let session = Session::open(&file).unwrap();
+    let node = session.network().node(named(&session, "Sublayer")).unwrap();
+    assert_eq!(
+        node.problem(),
+        Some("Stops is animated by a spline, which this version cannot evaluate")
+    );
 }

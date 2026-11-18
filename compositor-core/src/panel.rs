@@ -3,7 +3,7 @@
 use crate::files::scanned_end;
 use crate::network::NodeId;
 use crate::parameter::{Parameter, ParameterKind, Value, resolve};
-use crate::session::{Property, RefusedConnection, Session};
+use crate::session::{KeyState, Property, RefusedConnection, Session};
 
 /// One node's parameters as the panel shows them.
 #[derive(Clone, Debug, PartialEq)]
@@ -28,17 +28,20 @@ pub struct Panel {
 pub struct Row {
     pub parameter: &'static Parameter,
     /// The authored value as written, a relative file unanchored; otherwise what evaluation reads
-    /// at the frame: the default, or what the node decides for an unset value without a default,
+    /// at the frame: an animated value there, the default, or what the node decides for an unset value without a default,
     /// such as a sequence's first frame found. None for a file not set, or for what the node
     /// cannot decide yet.
     pub value: Option<Value>,
     pub state: ValueState,
+    /// How the parameter stands in time at the frame. `None` for one that takes no keys, or is
+    /// animated in a way this version does not read.
+    pub keys: Option<KeyState>,
     /// A number's type as authored, if other than `double`: `float`, `half` or `int`.
     pub number: Option<&'static str>,
 }
 
-/// Whether a value was set, which the panel shows apart from what it resolves to: a value set to
-/// its default is still set.
+/// Whether a value or animation was set, which the panel shows apart from what it resolves to: a
+/// value set to its default is still set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueState {
     Authored,
@@ -57,10 +60,14 @@ impl Panel {
                 value: (shown.authored_value(parameter.name).cloned())
                     .or_else(|| resolved.get(parameter.name).cloned())
                     .or_else(|| scanned_end(&resolved, files, parameter.name).map(Value::Float)),
-                state: match shown.authored_value(parameter.name) {
-                    Some(_) => ValueState::Authored,
-                    None => ValueState::Absent,
+                state: if shown.authored_value(parameter.name).is_some()
+                    || shown.samples(parameter.name).is_some()
+                {
+                    ValueState::Authored
+                } else {
+                    ValueState::Absent
                 },
+                keys: session.key_state(node, parameter.name).ok(),
                 number: match parameter.kind {
                     ParameterKind::Float(_) | ParameterKind::Frame { .. } => {
                         session.number_type(node, parameter.name)

@@ -592,6 +592,12 @@ pub(crate) fn is_animated(attribute: &Attribute) -> bool {
     animation(attribute) != Animation::None
 }
 
+/// Whether a parameter can vary with time. A Reader's cannot: it scans its file, and reads its
+/// range and whole frames, as constants.
+pub(crate) fn takes_keys(kind: &NodeKind, parameter: &Parameter) -> bool {
+    !matches!(kind, NodeKind::Reader) && matches!(parameter.kind, ParameterKind::Float(_))
+}
+
 /// An animated parameter's composed samples in stage time, each checked as a value of the
 /// parameter is, or why they are refused. `Ok(None)` if there are none after all.
 fn samples(
@@ -600,8 +606,7 @@ fn samples(
     attribute: &Attribute,
 ) -> Result<Option<Samples>, String> {
     let label = parameter.label;
-    // A Reader scans its file, and reads its range and whole frames, as constants.
-    if matches!(kind, NodeKind::Reader) || !matches!(parameter.kind, ParameterKind::Float(_)) {
+    if !takes_keys(kind, parameter) {
         return Err(format!(
             "{label} is animated, which this version cannot evaluate for a {}",
             kind.label()

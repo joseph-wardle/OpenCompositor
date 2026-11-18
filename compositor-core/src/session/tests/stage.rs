@@ -718,33 +718,32 @@ fn a_reset_and_a_disconnect_keep_what_else_the_attribute_holds() {
 }
 
 #[test]
-fn an_animated_parameter_refuses_its_edits_and_a_splined_one_its_node() {
+fn a_splined_parameter_refuses_its_node_and_its_edits() {
     let mut session = Session::from_usda(ANOTHER_TOOLS);
     let before = session.root_layer_text();
-    for (name, refused) in [
-        ("Sampled", None),
-        ("SampledOverDefault", None),
-        (
-            "Splined",
-            Some("Stops is animated by a spline, which this version cannot evaluate"),
-        ),
-    ] {
+    for name in ["Sampled", "SampledOverDefault"] {
         let id = named(&session, name);
-        assert_eq!(problem(&session, id).as_deref(), refused, "{name}");
+        assert_eq!(problem(&session, id), None, "{name}");
         assert_eq!(stops(&session, id), None, "{name}");
-        let animated = EditError::InvalidValue {
-            node: id,
-            parameter: "stops".to_owned(),
-            error: ValueError::Animated,
-        };
-        let set = session.set_value(id, "stops", Value::Float(5.0));
-        assert_eq!(set.unwrap_err(), animated, "{name}");
-        assert_eq!(session.reset_value(id, "stops").unwrap_err(), animated);
-        session.begin_edit(id, "Stops").unwrap();
-        let dragged = session.edit_value("stops", Value::Float(5.0));
-        assert_eq!(dragged.unwrap_err(), animated, "{name}");
-        session.cancel_edit();
     }
+    let id = named(&session, "Splined");
+    assert_eq!(
+        problem(&session, id).as_deref(),
+        Some("Stops is animated by a spline, which this version cannot evaluate"),
+    );
+    let animated = EditError::InvalidValue {
+        node: id,
+        parameter: "stops".to_owned(),
+        error: ValueError::Animated,
+    };
+    let set = session.set_value(id, "stops", Value::Float(5.0));
+    assert_eq!(set.unwrap_err(), animated);
+    assert_eq!(session.reset_value(id, "stops").unwrap_err(), animated);
+    assert_eq!(session.toggle_key(id, "stops").unwrap_err(), animated);
+    session.begin_edit(id, "Stops").unwrap();
+    let dragged = session.edit_value("stops", Value::Float(5.0));
+    assert_eq!(dragged.unwrap_err(), animated);
+    session.cancel_edit();
     assert_eq!(session.root_layer_text(), before);
     assert_eq!(session.undo_label(), None);
 }
