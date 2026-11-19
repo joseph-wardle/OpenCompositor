@@ -22,7 +22,7 @@ OpenNG aims to be a fast, programmable node editor for applications that own the
 
 ## Building
 
-Everything but the window builds with Cargo alone:
+Everything but the window builds with Cargo:
 
 ```sh
 cargo build --workspace --exclude opencompositor
@@ -39,14 +39,6 @@ cargo test --workspace
 ```
 
 The window must run against the Qt it was built with, and refuses to start otherwise. It draws with Vulkan; `WGPU_BACKEND` chooses another backend, and `WGPU_ADAPTER_NAME` or `WGPU_POWER_PREF` another GPU. `--cpu` evaluates on the CPU.
-
-## Checks
-
-Each exits non-zero on failure. Run the last two in release, on the machine being judged.
-
-- `--lifecycle-check IMAGE`: docks, floats and closes the panes and replaces the GPU device, checking that every pane keeps drawing. Run it after upgrading Qt.
-- `--drag-check IMAGE [exposure | merge | blur] [keyed]`: drags a parameter with synthetic mouse events, against each chain's latency budget and one undo step per drag. `keyed` drags an animated parameter, so that the drag sets a key.
-- `--playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold] [keyed]`: plays, scrubs and edits a sequence, against playback, scrub and memory budgets. `keyed` animates the viewed node's parameter across the range.
 
 ## License
 
