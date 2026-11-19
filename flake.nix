@@ -26,6 +26,8 @@
           rustup
           trunk
           spirv-tools # spirv-dis, for comparing a rebuilt kernels.spv as CI does
+          curl # with unzip, for test_media/fetch.sh
+          unzip
         ];
 
         # The shell links Qt, private headers included. The linker records where it lives, so the
