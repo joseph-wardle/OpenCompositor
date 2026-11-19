@@ -29,6 +29,10 @@ harness = false
 # The loader's staging is tested without a GPU; the kernels on a real Vulkan adapter.
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "spirv", "noop", "vulkan"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# madvise, to ask for huge pages under an image's planes.
+libc = "0.2"
+
 [target.'cfg(unix)'.dev-dependencies]
 # O_NONBLOCK, to open a named pipe for writing without waiting for a reader.
 libc = "0.2"

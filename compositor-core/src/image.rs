@@ -365,6 +365,35 @@ fn check_planes(planes: &[Plane; 4], data_window: Window) {
     );
 }
 
+/// Asks the kernel to back new storage with huge pages, where it leaves that to the program.
+///
+/// A plane is first written a page at a time, and each first write to a 4 KiB page is a fault:
+/// for a 4096 × 2160 image's four planes those faults cost several times what decoding an
+/// uncompressed EXR into them does.
+#[cfg(target_os = "linux")]
+fn prefer_huge_pages(storage: &[f32]) {
+    const HUGE_PAGE: usize = 2 << 20;
+    // SAFETY: sysconf reads a constant of the system and touches no memory of ours.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let Ok(page) = usize::try_from(page) else {
+        return;
+    };
+    let bytes = storage.as_ptr_range();
+    // Only pages wholly inside the storage: its first and last are shared with whatever the
+    // allocator put beside it.
+    let first = (bytes.start as usize).next_multiple_of(page);
+    let end = bytes.end as usize / page * page;
+    if end.saturating_sub(first) < HUGE_PAGE {
+        return;
+    }
+    // SAFETY: the pages lie inside one live allocation, and the advice changes how the kernel
+    // backs them, never what they hold.
+    unsafe { libc::madvise(first as *mut libc::c_void, end - first, libc::MADV_HUGEPAGE) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prefer_huge_pages(_storage: &[f32]) {}
+
 /// A channel's values over a data window, bottom row first, read as a slice. Its storage may
 /// be longer than the window: an operation reuses a released plane for a window up to its
 /// storage's length, so that a window grown a little each edit, as dragging Blur's Size grows
@@ -382,7 +411,8 @@ impl Plane {
         assert!(len <= capacity, "a plane's values fit its storage");
         // SAFETY: all zero bits are the f32 0.0. Zeroed memory comes from the allocator already
         // cleared, where a safe fill would write every value once more before the reader does.
-        let storage = unsafe { Arc::new_zeroed_slice(capacity).assume_init() };
+        let storage: Arc<[f32]> = unsafe { Arc::new_zeroed_slice(capacity).assume_init() };
+        prefer_huge_pages(&storage);
         Plane { storage, len }
     }
 

@@ -136,7 +136,8 @@ fn read_planes(
         .iter()
         .any(|&(plane, ..)| plane == Channel::A as usize)
     {
-        planes[Channel::A as usize] = std::iter::repeat_n(1.0, area).collect();
+        let alpha = planes[Channel::A as usize].get_mut();
+        alpha.expect("not yet shared").fill(1.0);
     }
     let mut out = planes
         .each_mut()
