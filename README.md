@@ -22,6 +22,8 @@ OpenNG aims to be a fast, programmable node editor for applications that own the
 
 ## Building
 
+On NixOS, or anywhere with Nix, `flake.nix` supplies everything below: `nix develop`, or `direnv allow` once, then the same Cargo commands.
+
 Everything but the window builds with Cargo:
 
 ```sh
