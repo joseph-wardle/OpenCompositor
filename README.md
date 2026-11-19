@@ -11,6 +11,7 @@ Two early, work-in-progress Rust projects developed together:
 - **Projects:** saved as native USD.
 - **Files:** EXR and PNG stills and numbered sequences, with a frame range, offset and reload.
 - **Time:** a timebar, playback forwards and backwards in real time or every frame, looping and scrubbing, from a viewer cache of reduced copies.
+- **Animation:** numeric parameters animate by USD time samples, read as other USD tools read them. Each has a key button in the panel, the timebar shows the keys of the panel's node, and Alt+Left and Alt+Right go between them.
 - **Evaluation:** on the GPU or the CPU (at the widest SIMD level the machine has), off the GUI thread. Everything but the window lives in `opencompositor-core`, which runs headless without Qt.
 
 ## Goals

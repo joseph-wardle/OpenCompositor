@@ -3,7 +3,7 @@
 //! the pointer.
 
 use open_ng::Modifiers;
-use opencompositor_core::{Event, Key, Pane, Slot};
+use opencompositor_core::{Command, Direction, Event, Key, Pane, Slot};
 
 use crate::qt::ffi;
 
@@ -47,6 +47,20 @@ fn handle(kind: i32, fields: ffi::InputFields) -> bool {
             crate::dispatch(Event::FocusLost(pane));
         }
         return false;
+    }
+    // Alt belongs to the menus' mnemonics, except with the arrows, which go between keys
+    // wherever the pointer is.
+    if kind == KEY_PRESS && fields.alt && !fields.meta && !fields.ctrl && !fields.shift {
+        let direction = match fields.key {
+            qt_key::LEFT => Direction::Backward,
+            qt_key::RIGHT => Direction::Forward,
+            _ => return false,
+        };
+        if ffi::keyboard_taken() {
+            return false;
+        }
+        crate::dispatch(Event::Command(Command::GoToKey(direction)));
+        return true;
     }
     let Some(key) = key(&fields) else {
         return false;

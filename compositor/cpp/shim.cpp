@@ -153,7 +153,15 @@ enum class Glyph {
     Loop,
     Once,
     RealTime,
+    // A key: a diamond, and its outline.
+    Key,
+    NoKey,
 };
+
+// Keys, on the timebar and the panel's key buttons, and animation another file authors: neither
+// the blue most themes highlight with, which the bar's current frame is drawn in.
+const QColor KEY_COLOR(235, 165, 35);
+const QColor OTHER_FILE_COLOR(165, 120, 225);
 
 QIcon glyph_icon(Glyph glyph, const QColor &color) {
     // Drawn on a 16 by 16 grid, at twice the pixels for high-density screens.
@@ -234,6 +242,15 @@ QIcon glyph_icon(Glyph glyph, const QColor &color) {
         painter.drawLine(QPointF(8, 8), QPointF(8, 3.8));
         painter.drawLine(QPointF(8, 8), QPointF(11, 8));
         break;
+    case Glyph::NoKey:
+        painter.setPen(QPen(color, 1.4, Qt::SolidLine, Qt::SquareCap, Qt::MiterJoin));
+        painter.setBrush(Qt::NoBrush);
+        [[fallthrough]];
+    case Glyph::Key: {
+        const QPointF points[] = {{8, 3}, {13, 8}, {8, 13}, {3, 8}};
+        painter.drawPolygon(points, 4);
+        break;
+    }
     }
     painter.end();
     return QIcon(pixmap);
@@ -249,7 +266,8 @@ class FrameBar : public QWidget {
         setToolTip(QStringLiteral(
             "Click or drag to go to a frame. The wheel zooms; a middle drag or Shift with the "
             "wheel scrolls. Green below: in the viewer cache. Red: a missing file. Shaded: "
-            "outside a sequence's frames, holding its nearest."));
+            "outside a sequence's frames, holding its nearest. Amber: a key of the node in the "
+            "parameter panel; Alt with the arrows goes between them."));
     }
     void show_frames(const TimebarData &data) {
         if (data.first != first || data.last != last) {
@@ -264,6 +282,7 @@ class FrameBar : public QWidget {
         rate = data.rate;
         timecode = data.timecode;
         marks.assign(data.marks.begin(), data.marks.end());
+        key_frames.assign(data.key_frames.begin(), data.key_frames.end());
         update();
     }
     QSize sizeHint() const override { return {200, fontMetrics().height() + 14}; }
@@ -283,6 +302,11 @@ class FrameBar : public QWidget {
                 painter.fillRect(QRectF(left, 0, right - left, h), QColor(190, 60, 60, 150));
             if (mark.cached)
                 painter.fillRect(QRectF(left, h - 3, right - left, 3), QColor(80, 170, 90));
+        }
+        // Behind the ticks and their labels, each at its frame's middle.
+        for (double key : key_frames) {
+            const double x = x_of(key - first + 0.5);
+            if (x >= 0 && x <= width()) painter.fillRect(QRectF(x - 1.5, 0, 3, h - 3), KEY_COLOR);
         }
         paint_ticks(painter);
         if (span < count()) {
@@ -450,6 +474,7 @@ class FrameBar : public QWidget {
     double offset = 0, span = 1;
     bool timecode = false;
     std::vector<FrameMark> marks;
+    std::vector<double> key_frames;
     std::optional<double> sent;
     // Where a middle drag began, and the view's offset then.
     std::optional<std::pair<double, double>> dragged_from;
@@ -951,6 +976,7 @@ void ParameterPanel::rebuild(const PanelData &data) {
         connect(field, &QLineEdit::editingFinished, this, [=, this] { committed(name); });
         grid->addWidget(label, index, 0);
         QSlider *row_slider = nullptr;
+        QToolButton *row_key = nullptr;
         if (data.kind == RowKind::Float) {
             field->setFixedWidth(field->fontMetrics().horizontalAdvance(QStringLiteral("-000.0000")) +
                                  12);
@@ -967,6 +993,16 @@ void ParameterPanel::rebuild(const PanelData &data) {
             grid->addWidget(field, index, 1);
             grid->addWidget(slider, index, 2);
             row_slider = slider;
+            row_key = new QToolButton;
+            row_key->setAutoRaise(true);
+            row_key->setFocusPolicy(Qt::NoFocus);
+            // Its place stays when it hides, so that the sliders keep one width.
+            QSizePolicy policy = row_key->sizePolicy();
+            policy.setRetainSizeWhenHidden(true);
+            row_key->setSizePolicy(policy);
+            connect(row_key, &QToolButton::clicked, this,
+                    [=, this] { send(PanelGestureKind::KeyToggled, name); });
+            grid->addWidget(row_key, index, 3);
         } else if (data.kind == RowKind::Frame) {
             field->setFixedWidth(field->fontMetrics().horizontalAdvance(QStringLiteral("-000.0000")) +
                                  12);
@@ -993,7 +1029,8 @@ void ParameterPanel::rebuild(const PanelData &data) {
             box->addWidget(reload);
             grid->addLayout(box, index, 1, 1, 2);
         }
-        rows.push_back(Row{name, label, field, row_slider, QString(), false, data.kind});
+        rows.push_back(
+            Row{name, label, field, row_slider, row_key, std::nullopt, QString(), false, data.kind});
         ++index;
     }
     grid->setRowStretch(index, 1);
@@ -1015,6 +1052,39 @@ void ParameterPanel::refresh(Row &row, const PanelRow &data) {
         QSignalBlocker blocker(row.slider);
         row.slider->setValue(data.tick);
     }
+    if (row.key && row.keys != data.keys) {
+        row.keys = data.keys;
+        row.key->setVisible(data.keys != RowKeys::None);
+        QColor plain = palette().color(QPalette::Text);
+        plain.setAlphaF(0.5);
+        switch (data.keys) {
+        case RowKeys::KeyHere:
+            row.key->setIcon(glyph_icon(Glyph::Key, KEY_COLOR));
+            row.key->setToolTip(QStringLiteral("A key on this frame. Click to remove it"));
+            break;
+        case RowKeys::Keyed:
+            row.key->setIcon(glyph_icon(Glyph::NoKey, KEY_COLOR));
+            row.key->setToolTip(QStringLiteral("Animated. Click to set a key on this frame"));
+            break;
+        case RowKeys::Elsewhere:
+            row.key->setIcon(glyph_icon(Glyph::NoKey, OTHER_FILE_COLOR));
+            row.key->setToolTip(QStringLiteral(
+                "Animated by another file. A key set here replaces that animation in this "
+                "project"));
+            break;
+        default:
+            row.key->setIcon(glyph_icon(Glyph::NoKey, plain));
+            row.key->setToolTip(QStringLiteral("Click to set a key on this frame"));
+            break;
+        }
+    }
+}
+
+bool ParameterPanel::click_key_button(const QString &name) {
+    Row *row = this->row(name);
+    if (!row || !row->key || row->key->isHidden()) return false;
+    row->key->click();
+    return true;
 }
 
 ParameterPanel::Row *ParameterPanel::row(const QString &name) {
@@ -1083,6 +1153,9 @@ QDockWidget *panel_dock(ParameterPanel *panel) {
     return static_cast<QDockWidget *>(panel->parentWidget());
 }
 QSlider *panel_slider(ParameterPanel *panel, const QString &name) { return panel->slider(name); }
+bool click_key_button(ParameterPanel *panel, const QString &name) {
+    return panel->click_key_button(name);
+}
 int slider_span(QSlider *slider) { return static_cast<ParameterSlider *>(slider)->span(); }
 void drag_slider(QSlider *slider, int type, int pixel) {
     // To the window, as the platform delivers the mouse, so that a modal dialog or a popup
@@ -1096,11 +1169,11 @@ void drag_slider(QSlider *slider, int type, int pixel) {
                       buttons, Qt::NoModifier);
     QCoreApplication::sendEvent(window->windowHandle(), &event);
 }
-void press_key(QMainWindow *window, int key, const QString &text) {
+void press_key(QMainWindow *window, int key, const QString &text, bool alt) {
     // To the window, as the platform delivers keys, so that the key filter sees it first. Qt
     // sends a popup's keys to the popup whichever window receives them.
     for (auto type : {QEvent::KeyPress, QEvent::KeyRelease}) {
-        QKeyEvent event(type, key, Qt::NoModifier, text);
+        QKeyEvent event(type, key, alt ? Qt::AltModifier : Qt::NoModifier, text);
         QCoreApplication::sendEvent(window->windowHandle(), &event);
     }
 }

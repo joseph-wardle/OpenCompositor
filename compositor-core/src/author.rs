@@ -68,6 +68,21 @@ impl NumberType {
         }
     }
 
+    /// Whether the type holds the number as it is: an `int`, only a whole number in its range.
+    pub(crate) fn holds(self, number: f64) -> bool {
+        !matches!(self, NumberType::Int)
+            || number.fract() == 0.0 && number.abs() <= f64::from(i32::MAX)
+    }
+
+    fn typed(self, number: f64) -> vt::Value {
+        match self {
+            NumberType::Double => vt::Value::Double(number),
+            NumberType::Float => vt::Value::Float(number as f32),
+            NumberType::Half => vt::Value::Half(openusd::gf::f16::from_f64(number)),
+            NumberType::Int => vt::Value::Int(number as i32),
+        }
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             NumberType::Double => "double",
@@ -150,20 +165,10 @@ pub(crate) fn author_value(
         &Value::Float(number_value) => {
             // An `int` keeps its type only for a whole number it holds.
             let number = match number.unwrap_or(NumberType::Double) {
-                NumberType::Int
-                    if number_value.fract() != 0.0 || number_value.abs() > f64::from(i32::MAX) =>
-                {
-                    NumberType::Double
-                }
+                NumberType::Int if !NumberType::Int.holds(number_value) => NumberType::Double,
                 number => number,
             };
-            let value = match number {
-                NumberType::Double => vt::Value::Double(number_value),
-                NumberType::Float => vt::Value::Float(number_value as f32),
-                NumberType::Half => vt::Value::Half(openusd::gf::f16::from_f64(number_value)),
-                NumberType::Int => vt::Value::Int(number_value as i32),
-            };
-            (number.name(), value)
+            (number.name(), number.typed(number_value))
         }
     };
     let mut spec = attribute_spec(layer, &path, type_name, Variability::Varying)?;
@@ -178,7 +183,7 @@ pub(crate) fn author_value(
     spec.set_default(value)
 }
 
-/// Removes a parameter's default from the layer, as `UsdAttribute::ClearDefault` does.
+/// Removes a parameter's default and time samples from the layer, as `UsdAttribute::Clear` does.
 fn clear_value(
     layer: &mut LayerEdit<'_>,
     node: &sdf::Path,
@@ -187,6 +192,38 @@ fn clear_value(
     let path = node.append_property(format!("inputs:{parameter}"))?;
     if let Ok(Some(mut spec)) = layer.attribute_mut(path.clone()) {
         spec.clear_default();
+        (layer.data_mut()).erase_field(&path, sdf::FieldKey::TimeSamples.as_str());
+    }
+    remove_bare_declaration(layer, &path)
+}
+
+/// Sets a parameter's time sample at a frame, in the type the attribute has, or `double` for a
+/// new one. The type must hold the number: nothing is retyped under samples.
+fn author_key(
+    layer: &mut LayerEdit<'_>,
+    node: &sdf::Path,
+    parameter: &str,
+    frame: f64,
+    value: f64,
+    number: Option<NumberType>,
+) -> Result<(), sdf::AuthoringError> {
+    let path = node.append_property(format!("inputs:{parameter}"))?;
+    let number = number.unwrap_or(NumberType::Double);
+    attribute_spec(layer, &path, number.name(), Variability::Varying)?
+        .set_time_sample(frame, number.typed(value))
+}
+
+/// Removes a parameter's time sample at a frame, and with the last of them the samples, as
+/// `UsdAttribute::ClearAtTime` does.
+fn remove_key(
+    layer: &mut LayerEdit<'_>,
+    node: &sdf::Path,
+    parameter: &str,
+    frame: f64,
+) -> Result<(), sdf::AuthoringError> {
+    let path = node.append_property(format!("inputs:{parameter}"))?;
+    if let Ok(Some(mut spec)) = layer.attribute_mut(path.clone()) {
+        spec.erase_time_sample(frame)?;
     }
     remove_bare_declaration(layer, &path)
 }
@@ -328,17 +365,37 @@ pub(crate) fn author_moves(
 pub(crate) struct ValueEdit {
     pub(crate) node: sdf::Path,
     pub(crate) parameter: &'static str,
-    /// As validation stores it; `None` removes the value.
-    pub(crate) value: Option<Value>,
+    pub(crate) change: ValueChange,
     /// The type an existing numeric attribute keeps.
     pub(crate) number: Option<NumberType>,
 }
 
+#[derive(Debug)]
+pub(crate) enum ValueChange {
+    /// The value at every frame, as validation stores it.
+    Set(Value),
+    /// A time sample at a frame.
+    Key {
+        frame: f64,
+        value: f64,
+    },
+    RemoveKey {
+        frame: f64,
+    },
+    /// Removes the value and every time sample.
+    Clear,
+}
+
 impl ValueEdit {
     pub(crate) fn author(&self, layer: &mut LayerEdit<'_>) -> Result<(), sdf::AuthoringError> {
-        match &self.value {
-            Some(value) => author_value(layer, &self.node, self.parameter, value, self.number),
-            None => clear_value(layer, &self.node, self.parameter),
+        let (node, parameter) = (&self.node, self.parameter);
+        match &self.change {
+            ValueChange::Set(value) => author_value(layer, node, parameter, value, self.number),
+            &ValueChange::Key { frame, value } => {
+                author_key(layer, node, parameter, frame, value, self.number)
+            }
+            &ValueChange::RemoveKey { frame } => remove_key(layer, node, parameter, frame),
+            ValueChange::Clear => clear_value(layer, node, parameter),
         }
     }
 }

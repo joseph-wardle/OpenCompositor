@@ -10,7 +10,8 @@ use imbl::ordmap::DiffItem;
 use open_ng::Point;
 
 use crate::parameter::{
-    FloatParameter, Parameter, ParameterKind, Value, ValueError, describe, resolve, validate,
+    FloatParameter, Parameter, ParameterKind, Samples, Value, ValueError, describe, resolve,
+    validate,
 };
 
 /// A node's identity: its prim's path, numbered for the session. An ID is never given to another
@@ -361,6 +362,9 @@ pub struct Node {
     /// Each authored file that the layer authoring it anchors, as that layer anchors it: what
     /// is read in place of the authored path.
     anchored: BTreeMap<&'static str, Arc<Path>>,
+    /// The time samples of each animated number, which then has no authored value: the value
+    /// varies with the frame. Each sample is valid for its parameter.
+    sampled: BTreeMap<&'static str, Samples>,
     /// Only the connected inputs, each naming the node whose output it takes, in input order and
     /// then slot order. An unconnected input is legal and reports itself when evaluated.
     inputs: BTreeMap<InputSlot<'static>, NodeId>,
@@ -378,6 +382,7 @@ impl Node {
             position,
             authored: BTreeMap::new(),
             anchored: BTreeMap::new(),
+            sampled: BTreeMap::new(),
             inputs: BTreeMap::new(),
             problem: None,
             active: true,
@@ -436,6 +441,16 @@ impl Node {
     /// Reads a file parameter's authored value at `path`, as the layer authoring it anchors it.
     pub(crate) fn anchor(&mut self, name: &'static str, path: Arc<Path>) {
         self.anchored.insert(name, path);
+    }
+
+    /// The time samples of an animated parameter.
+    pub(crate) fn samples(&self, name: &str) -> Option<&Samples> {
+        self.sampled.get(name)
+    }
+
+    /// Animates a parameter by these samples, each already checked as a value of it is.
+    pub(crate) fn animate(&mut self, name: &'static str, samples: Samples) {
+        self.sampled.insert(name, samples);
     }
 
     /// Removes a parameter's authored value, so it reads as its default again.

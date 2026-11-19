@@ -2077,6 +2077,46 @@ fn stepping_and_going_to_a_frame_stop_playback() {
 }
 
 #[test]
+fn the_timebar_shows_the_panel_nodes_keys_and_a_command_goes_from_one_to_the_next() {
+    let (mut app, _deliveries) = app();
+    app.edit(|session| {
+        session
+            .create_node("exposure", Point::default(), None)
+            .unwrap();
+    });
+    let exposure = app.session().selection()[0];
+    for frame in [8.0, 3.0] {
+        app.dispatch(Event::FrameSet(frame));
+        app.edit(|session| session.toggle_key(exposure, "stops").unwrap());
+    }
+    assert_eq!(app.panel().unwrap().key_frames, [3.0, 8.0]);
+    assert_eq!(app.timebar().unwrap().key_frames, [3.0, 8.0]);
+
+    let mut go = |direction| {
+        app.dispatch(Event::Command(Command::Play(Direction::Forward)));
+        app.dispatch(Event::Command(Command::GoToKey(direction)));
+        assert_eq!(app.playing(), None);
+        app.session().frame()
+    };
+    assert_eq!(
+        go(Direction::Backward),
+        3.0,
+        "there is none before the first"
+    );
+    assert_eq!(go(Direction::Forward), 8.0);
+    assert_eq!(go(Direction::Forward), 8.0, "nor after the last");
+    app.dispatch(Event::FrameSet(5.5));
+    app.dispatch(Event::Command(Command::GoToKey(Direction::Backward)));
+    assert_eq!(app.session().frame(), 3.0);
+
+    // With no node in the panel there are no keys to show or go to.
+    app.edit(|session| session.delete_nodes(&[exposure]).unwrap());
+    assert_eq!(app.timebar().unwrap().key_frames, [] as [f64; 0]);
+    app.dispatch(Event::Command(Command::GoToKey(Direction::Forward)));
+    assert_eq!(app.session().frame(), 3.0);
+}
+
+#[test]
 fn the_timebar_marks_the_frames_a_sequence_lacks_and_those_it_holds() {
     let (mut app, _deliveries, scans) = app_scanning();
     let pattern = crate::fixtures::png_sequence("timebar-marks", [1, 2, 4], |_| (4, 4));

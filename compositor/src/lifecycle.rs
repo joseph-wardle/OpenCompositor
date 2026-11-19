@@ -7,7 +7,8 @@
 //! the surface can be read back, at the viewer's centre; Tab over the graph opened the creation
 //! menu, and Escape closed it with no step; Exposure chosen in it was inserted after the Reader as
 //! one step, leaving the Reader marked; an edit from a script moved the panel's slider without an
-//! edit of its own; the panel survived its dock floated, closed and reopened; Reader chosen in the
+//! edit of its own; the row's key button set a key, which the timebar showed and Alt+Left went
+//! back to; the panel survived its dock floated, closed and reopened; Reader chosen in the
 //! menu and its dialog cancelled created nothing; after the device was destroyed, a new one
 //! drew both panes, with the same centre and caption, within the rebuild's budget; both panes had a
 //! surface at the end; and the GPU reported no uncaptured error. It exits 1 if a check failed, and
@@ -26,7 +27,8 @@ use std::time::{Duration, Instant};
 use cxx_qt_lib::QString;
 use open_ng::{Modifiers, Point};
 use opencompositor_core::{
-    Anchor, Event, FileIntent, FrameCheck, Input, Key, NodeId, NodeKind, Pane, Request, Slot, Value,
+    Anchor, Command, Event, FileIntent, FrameCheck, Input, Key, KeyState, NodeId, NodeKind, Pane,
+    Request, Slot, Value,
 };
 
 use crate::check::Seen;
@@ -64,7 +66,11 @@ const STEPS: [(i32, &str, &[Pane]); 22] = [
         "choose Exposure in the creation menu",
         &[Pane::Graph],
     ),
-    (17_500, "edit Stops from a script", &[]),
+    (
+        17_500,
+        "edit Stops from a script, then key it and go to the key",
+        &[],
+    ),
     (18_000, "float the parameter panel", &[]),
     (18_500, "close the parameter panel", &[]),
     (19_000, "reopen the parameter panel", &[]),
@@ -222,6 +228,7 @@ fn step(index: usize) {
             let exposure = check_inserted_exposure();
             if let Some(exposure) = exposure {
                 edit_stops(exposure);
+                check_keys(exposure);
             }
         }
         15 => with_panel_dock(|dock| dock.set_floating(true)),
@@ -293,7 +300,7 @@ fn choose_in_menu(text: &str) {
 
 fn press_key(key: i32, text: &str) {
     // SAFETY: the window lives until it is destroyed after the event loop.
-    unsafe { ffi::press_key(crate::widgets().window, key, &QString::from(text)) };
+    unsafe { ffi::press_key(crate::widgets().window, key, &QString::from(text), false) };
 }
 
 fn check_undo_label(expected: &str, when: &str) {
@@ -348,6 +355,49 @@ fn edit_stops(exposure: NodeId) {
             "the panel's Stops slider went from {before:?} to {after:?} for 2 stops"
         )),
         _ => check_undo_label("Stops", "after the scripted edit"),
+    }
+}
+
+/// Clicks Stops' key button, goes three frames on and back to the key with Alt+Left, then undoes
+/// the key.
+fn check_keys(exposure: NodeId) {
+    let state = || crate::read_app(|app| app.session().key_state(exposure, "stops"));
+    let frame = || crate::read_app(|app| app.session().frame());
+    let start = frame();
+    // SAFETY: the panel lives as long as its dock.
+    let clicked = unsafe { ffi::click_key_button(crate::widgets().panel, &QString::from("stops")) };
+    if !clicked || state() != Ok(KeyState::Keyed { here: true }) {
+        let state = state();
+        return fail(format!(
+            "Stops' key button (shown: {clicked}) left the parameter {state:?}"
+        ));
+    }
+    check_undo_label("Set Key", "after the key button was clicked");
+    crate::dispatch(Event::FrameSet(start + 3.0));
+    let shown = crate::read_app(|app| app.timebar().map(|timebar| timebar.key_frames.clone()));
+    if shown.as_deref() != Some(&[start]) || state() != Ok(KeyState::Keyed { here: false }) {
+        fail(format!(
+            "three frames after a key at {start}, the timebar shows keys at {shown:?}"
+        ));
+    }
+    // SAFETY: the window is live.
+    unsafe {
+        ffi::press_key(
+            crate::widgets().window,
+            qt_key::LEFT,
+            &QString::default(),
+            true,
+        )
+    };
+    if frame() != start {
+        let frame = frame();
+        fail(format!(
+            "Alt+Left went to frame {frame}, not the key at {start}"
+        ));
+    }
+    crate::dispatch(Event::Command(Command::Undo));
+    if state() != Ok(KeyState::Constant) {
+        fail("undoing Set Key left Stops animated".to_owned());
     }
 }
 

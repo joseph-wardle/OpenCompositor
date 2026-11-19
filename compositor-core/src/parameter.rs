@@ -9,6 +9,10 @@ use std::sync::Arc;
 use crate::files::with_hashes;
 use crate::network::Node;
 
+mod samples;
+
+pub(crate) use samples::{Number, Samples};
+
 /// One parameter of a node type. OpenFX properties beyond these stay in the plugin adapter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Parameter {
@@ -142,8 +146,14 @@ pub enum ValueError {
     NotUnicode,
     /// A relative path set in a project with no file to read it beside.
     Unanchored,
-    /// The parameter's value varies with time, which an edit cannot yet keep.
+    /// The parameter is animated by what this version cannot edit: a spline or value clips, or
+    /// anything on a parameter that takes no keys.
     Animated,
+    /// A key on a parameter that takes none, as a Reader's.
+    NoKeys,
+    /// A key that is no whole number, or beyond an `int`, where the parameter's file types it
+    /// `int`: nothing is retyped under time samples.
+    NotInt,
 }
 
 impl fmt::Display for ValueError {
@@ -167,7 +177,12 @@ impl fmt::Display for ValueError {
             ),
             ValueError::Animated => write!(
                 f,
-                "the parameter is animated, which this version cannot edit"
+                "the parameter is animated in a way this version cannot edit"
+            ),
+            ValueError::NoKeys => write!(f, "the parameter takes no keys"),
+            ValueError::NotInt => write!(
+                f,
+                "its file types the parameter int, whose keys are whole numbers"
             ),
         }
     }
@@ -208,22 +223,33 @@ impl Resolved {
 }
 
 /// The boundary between what was authored and what executes: the node's authored values over its
-/// version's defaults, each relative file anchored to the layer that authored it.
+/// version's defaults, each relative file anchored to the layer that authored it, and each
+/// animated value as USD reads its time samples at the frame.
 ///
 /// Setting a value equal to its default and resetting it resolve alike, though only the first
-/// keeps the value authored.
-///
-/// Values are resolved at a frame, so that animated values can be sampled there; until a
-/// parameter can be animated, every value is the same at every frame.
-pub fn resolve(node: &Node, _frame: f64) -> Resolved {
+/// keeps the value authored. A frame at which an animated parameter's samples are blocked
+/// resolves as an absent value does.
+pub fn resolve(node: &Node, frame: f64) -> Resolved {
     let values = node
         .kind
         .parameters()
         .iter()
         .filter_map(|parameter| {
+            let sampled = || {
+                let value = node.samples(parameter.name)?.at(frame)?;
+                Some(match &parameter.kind {
+                    // Between two samples inside the limits, rounding can land an ulp outside.
+                    ParameterKind::Float(float) => {
+                        value.clamp(*float.limits.start(), *float.limits.end())
+                    }
+                    ParameterKind::Frame { .. } | ParameterKind::File => value,
+                })
+            };
             let value = match node.anchored(parameter.name) {
                 Some(path) => Value::File(path.clone()),
-                None => (node.authored_value(parameter.name).cloned())
+                // Adding zero stores equal values as equal bits, as validation does.
+                None => (sampled().map(|value| Value::Float(value + 0.0)))
+                    .or_else(|| node.authored_value(parameter.name).cloned())
                     .or_else(|| parameter.kind.default_value())?,
             };
             Some((parameter.name, value))

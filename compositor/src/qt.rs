@@ -179,6 +179,22 @@ pub mod ffi {
         /// connection is never typed into.
         editable: bool,
         unused: bool,
+        /// What the row's key button shows.
+        keys: RowKeys,
+    }
+
+    /// How a row stands in time at the frame, as its key button shows it.
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum RowKeys {
+        /// The row takes no keys, and has no button.
+        None,
+        Constant,
+        /// Keyed in the project file, with no key at the frame.
+        Keyed,
+        KeyHere,
+        /// Animated by another file.
+        Elsewhere,
     }
 
     #[derive(Debug)]
@@ -220,6 +236,8 @@ pub mod ffi {
         Browse,
         /// Reload files, on a file's row.
         Reload,
+        /// The key button: set a key at the frame, or remove the one there.
+        KeyToggled,
         Pin,
         Unpin,
         /// A new name typed for the node.
@@ -250,6 +268,8 @@ pub mod ffi {
         status: QString,
         /// Each whole frame's from the first.
         marks: Vec<FrameMark>,
+        /// The frames at which the parameter panel's node has a key.
+        key_frames: Vec<f64>,
     }
 
     #[derive(Debug)]
@@ -398,9 +418,12 @@ pub mod ffi {
         /// Sends the panel slider's window a left-button mouse event of the `QEvent::Type`, where
         /// the slider's handle sits `pixel` along its span, as the platform does, for the checks.
         unsafe fn drag_slider(slider: *mut QSlider, kind: i32, pixel: i32);
-        /// Presses and releases the `Qt::Key` typing `text` in the window, as the platform does,
-        /// for the checks.
-        unsafe fn press_key(window: *mut QMainWindow, key: i32, text: &QString);
+        /// Clicks the named row's key button, for the lifecycle check. Returns whether the row
+        /// shows one.
+        unsafe fn click_key_button(panel: *mut ParameterPanel, name: &QString) -> bool;
+        /// Presses and releases the `Qt::Key` typing `text` in the window, with Alt held or not,
+        /// as the platform does, for the checks.
+        unsafe fn press_key(window: *mut QMainWindow, key: i32, text: &QString, alt: bool);
         /// Whether a popup, such as a menu, has the keyboard and pointer.
         fn popup_open() -> bool;
         /// Whether a modal dialog blocks input to the other windows.

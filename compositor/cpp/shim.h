@@ -28,6 +28,7 @@ struct PanelRow;
 struct PanelGesture;
 enum class PanelGestureKind : uint8_t;
 enum class RowKind : uint8_t;
+enum class RowKeys : uint8_t;
 struct TimebarData;
 struct TimebarGesture;
 enum class TimebarGestureKind : uint8_t;
@@ -51,6 +52,8 @@ class ParameterPanel : public QWidget {
     void show_panel(const PanelData &data);
     // The named row's slider, or null.
     QSlider *slider(const QString &name) const;
+    // Clicks the named row's key button, if it shows one.
+    bool click_key_button(const QString &name);
 
   protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -62,6 +65,10 @@ class ParameterPanel : public QWidget {
         QLineEdit *field;
         // Null for a file.
         QSlider *slider;
+        // Null for a row that never takes keys; hidden while it takes none.
+        QToolButton *key;
+        // What the key button last showed, so that it is drawn anew only when that changes.
+        std::optional<RowKeys> keys;
         // The field's text as last refreshed, which Escape restores.
         QString shown;
         bool authored;
@@ -209,7 +216,8 @@ QDockWidget *panel_dock(ParameterPanel *panel);
 QSlider *panel_slider(ParameterPanel *panel, const QString &name);
 int slider_span(QSlider *slider);
 void drag_slider(QSlider *slider, int type, int pixel);
-void press_key(QMainWindow *window, int key, const QString &text);
+bool click_key_button(ParameterPanel *panel, const QString &name);
+void press_key(QMainWindow *window, int key, const QString &text, bool alt);
 bool popup_open();
 bool modal_open();
 CreationMenu *new_creation_menu(QMainWindow *window, rust::Fn<void(size_t)> chosen);

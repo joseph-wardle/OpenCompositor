@@ -82,6 +82,7 @@ pub fn show(timebar: &Timebar) {
         input_found: timebar.input_found,
         status: QString::from(&status),
         marks,
+        key_frames: timebar.key_frames.clone(),
     };
     // SAFETY: the strip lives as long as the viewer's dock, until the main window is destroyed
     // after the event loop.

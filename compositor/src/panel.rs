@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use cxx_qt_lib::QString;
 use opencompositor_core::{
-    Command, EditError, Event, FRAME_LIMIT, FileIntent, FloatParameter, Panel, Parameter,
+    Command, EditError, Event, FRAME_LIMIT, FileIntent, FloatParameter, KeyState, Panel, Parameter,
     ParameterKind, Property, PropertyError, RefusedConnection, Request, Row, Session, Value,
     ValueState,
 };
 
-use crate::qt::ffi::{self, PanelGestureKind, RowKind};
+use crate::qt::ffi::{self, PanelGestureKind, RowKeys, RowKind};
 
 /// Shows the app's panel again, putting back what a refused or unchanged edit left in a field.
 fn refresh() {
@@ -117,6 +117,13 @@ fn row(row: &Row) -> ffi::PanelRow {
         tick,
         editable: true,
         unused: false,
+        keys: match row.keys {
+            None => RowKeys::None,
+            Some(KeyState::Constant) => RowKeys::Constant,
+            Some(KeyState::Keyed { here: false }) => RowKeys::Keyed,
+            Some(KeyState::Keyed { here: true }) => RowKeys::KeyHere,
+            Some(KeyState::Elsewhere) => RowKeys::Elsewhere,
+        },
     }
 }
 
@@ -139,6 +146,7 @@ fn property_row(panel: &Panel, property: &Property) -> ffi::PanelRow {
         tick: 0,
         editable: property.editor.is_some(),
         unused: property.unused,
+        keys: RowKeys::None,
     }
 }
 
@@ -166,6 +174,7 @@ fn connection_row(refused: &RefusedConnection) -> ffi::PanelRow {
         tick: 0,
         editable: false,
         unused: false,
+        keys: RowKeys::None,
     }
 }
 
@@ -290,6 +299,9 @@ pub fn gesture(gesture: ffi::PanelGesture) {
         }
         PanelGestureKind::DragCancelled => Ok(crate::edit(Session::cancel_edit)),
         PanelGestureKind::Reset => crate::edit(|session| session.reset_value(node, parameter.name)),
+        PanelGestureKind::KeyToggled => {
+            crate::edit(|session| session.toggle_key(node, parameter.name))
+        }
         PanelGestureKind::Reload => return crate::dispatch(Event::ReloadFiles(node)),
         PanelGestureKind::Browse => {
             crate::perform(Request::ChooseFiles(FileIntent::SetFile {

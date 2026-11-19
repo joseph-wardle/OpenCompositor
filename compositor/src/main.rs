@@ -70,13 +70,13 @@ pub struct Widgets {
 /// What the shell was started to do besides showing the window.
 enum Check {
     Lifecycle(PathBuf),
-    Drag(PathBuf, drag::Chain),
+    Drag(PathBuf, drag::Chain, bool),
     Playback(playback_check::Run),
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--cpu] [FILE | --lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur] | --playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold]]"
+        "usage: opencompositor [--cpu] [FILE | --lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur] [keyed] | --playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold] [keyed]]"
     );
     std::process::exit(2)
 }
@@ -97,11 +97,18 @@ fn main() {
             None
         }
         [flag, image] if flag == "--lifecycle-check" => Some(Check::Lifecycle(absolute(image))),
-        [flag, image] if flag == "--drag-check" => drag::run_chains(&absolute(image), device),
-        [flag, image, name] if flag == "--drag-check" => {
-            match name.to_str().and_then(drag::Chain::from_name) {
-                Some(chain) => Some(Check::Drag(absolute(image), chain)),
-                None => usage(),
+        [flag, image, rest @ ..] if flag == "--drag-check" => {
+            let (rest, keyed) = match rest {
+                [rest @ .., last] if last == "keyed" => (rest, true),
+                rest => (rest, false),
+            };
+            match rest {
+                [] => drag::run_chains(&absolute(image), device, keyed),
+                [name] => match name.to_str().and_then(drag::Chain::from_name) {
+                    Some(chain) => Some(Check::Drag(absolute(image), chain, keyed)),
+                    None => usage(),
+                },
+                _ => usage(),
             }
         }
         [flag, pattern, rest @ ..] if flag == "--playback-check" => {
@@ -228,6 +235,11 @@ fn main() {
         ("&Stop\tK", Command::Stop),
         ("Step F&orwards\tRight", Command::Step(Direction::Forward)),
         ("Step Back&wards\tLeft", Command::Step(Direction::Backward)),
+        ("&Next Key\tAlt+Right", Command::GoToKey(Direction::Forward)),
+        (
+            "Previous &Key\tAlt+Left",
+            Command::GoToKey(Direction::Backward),
+        ),
         ("F&irst Frame", Command::FirstFrame),
         ("&Last Frame", Command::LastFrame),
     ];
@@ -322,7 +334,7 @@ fn main() {
     }
     match check {
         Some(Check::Lifecycle(image)) => lifecycle::start(image),
-        Some(Check::Drag(image, chain)) => drag::start(image, chain),
+        Some(Check::Drag(image, chain, keyed)) => drag::start(image, chain, keyed),
         Some(Check::Playback(run)) => playback_check::start(run),
         None => {}
     }

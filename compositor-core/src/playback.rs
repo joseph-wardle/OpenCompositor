@@ -63,6 +63,8 @@ pub struct Timebar {
     /// Each whole frame's from the first, while a node is viewed and the timeline has at most
     /// [`MAX_MARKED_FRAMES`]; otherwise empty.
     pub marks: Vec<FrameMark>,
+    /// The frames at which the parameter panel's node has a key, ascending.
+    pub key_frames: Vec<f64>,
 }
 
 /// What is known of a frame of the viewed node, without evaluating it.
@@ -316,7 +318,12 @@ impl Playback {
         Some(Request::Advance { after })
     }
 
-    pub(crate) fn timebar(&self, session: &Session, marks: &[FrameMark]) -> Timebar {
+    pub(crate) fn timebar(
+        &self,
+        session: &Session,
+        marks: &[FrameMark],
+        key_frames: &[f64],
+    ) -> Timebar {
         let range = self.range(session);
         let clock = self.clock.as_ref();
         Timebar {
@@ -334,6 +341,7 @@ impl Playback {
                 .map(|rate| (rate * 10.0).round() / 10.0),
             drops: clock.map_or(0, Clock::drops),
             marks: marks.to_vec(),
+            key_frames: key_frames.to_vec(),
         }
     }
 }

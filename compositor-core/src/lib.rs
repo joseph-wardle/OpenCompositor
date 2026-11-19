@@ -57,8 +57,8 @@ pub use playback::{
 };
 pub use read::{MAX_PIXELS, ReadError, Refusal, read_image};
 pub use session::{
-    EditError, FileError, NameError, Property, PropertyError, RefusedConnection, RelativePaths,
-    Reload, Scalar, ScalarKind, Session,
+    EditError, FileError, KeyState, NameError, Property, PropertyError, RefusedConnection,
+    RelativePaths, Reload, Scalar, ScalarKind, Session,
 };
 pub use viewer::{EXPOSURE_STEP, MAX_EXPOSURE, Placement, Viewer};
 pub use viewer_cache::{DEFAULT_BUDGET, ViewerCache, ViewerCopy};
