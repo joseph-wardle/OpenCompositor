@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "opencompositor-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "exr",
  "half",
