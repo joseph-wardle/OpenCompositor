@@ -1,24 +1,21 @@
 //! The node types: what each offers to be set, the images it takes, and how it is created.
+//! Each node's file says what it computes and holds its description.
+
+mod blur;
+mod exposure;
+mod merge;
+mod reader;
 
 use open_ng::Color;
 
 use crate::network::InputSlot;
-use crate::parameter::{FloatParameter, Parameter, ParameterKind};
+use crate::parameter::Parameter;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
-    /// Reads the image file its File names, or for a sequence the file numbered the frame less its
-    /// Offset, holding the nearest end of its range, from First to Last, outside it. Without a
-    /// file it gives the empty image.
     Reader,
-    /// Multiplies R, G and B by two to the power of its Stops and leaves A. On premultiplied
-    /// pixels that equals unpremultiplying, scaling and premultiplying again.
     Exposure,
-    /// Composes its layers over its background, each layer in slot order over the result so far,
-    /// then dissolves that stack by its Mix against the base, the lowest connected input.
     Merge,
-    /// Blurs its source by its Size, a radius in pixels, every channel as it is, so that
-    /// premultiplied edges fade without an unpremultiply; the data window grows by the reach.
     Blur,
 }
 
@@ -26,10 +23,10 @@ impl NodeKind {
     /// Everything that describes a node of this kind.
     pub const fn node_type(&self) -> &'static NodeType {
         match self {
-            NodeKind::Reader => &READER,
-            NodeKind::Exposure => &EXPOSURE,
-            NodeKind::Merge => &MERGE,
-            NodeKind::Blur => &BLUR,
+            NodeKind::Reader => &reader::NODE_TYPE,
+            NodeKind::Exposure => &exposure::NODE_TYPE,
+            NodeKind::Merge => &merge::NODE_TYPE,
+            NodeKind::Blur => &blur::NODE_TYPE,
         }
     }
 
@@ -113,148 +110,3 @@ impl NodeInput {
         }
     }
 }
-
-const READER_PARAMETERS: &[Parameter] = &[
-    Parameter {
-        name: "file",
-        label: "File",
-        kind: ParameterKind::File,
-    },
-    // Unset until the artist sets them, rather than filled in by the scan: a scan finishes on its
-    // own thread, and an edit arriving then would land outside undo's order.
-    Parameter {
-        name: "first",
-        label: "First",
-        kind: ParameterKind::Frame { default: None },
-    },
-    Parameter {
-        name: "last",
-        label: "Last",
-        kind: ParameterKind::Frame { default: None },
-    },
-    // Added to the file's frame, as Nuke's frame offset is: at 10, file frame 1 shows at 11.
-    Parameter {
-        name: "offset",
-        label: "Offset",
-        kind: ParameterKind::Frame { default: Some(0.0) },
-    },
-];
-
-const EXPOSURE_PARAMETERS: &[Parameter] = &[Parameter {
-    name: "stops",
-    label: "Stops",
-    kind: ParameterKind::Float(FloatParameter {
-        default: 0.0,
-        slider: -6.0..=6.0,
-        // Keeps the gain, two to these powers, many orders of magnitude inside f32's range.
-        limits: -64.0..=64.0,
-    }),
-}];
-
-const EXPOSURE_INPUTS: &[NodeInput] = &[NodeInput {
-    name: "source",
-    label: "Source",
-    repeating: false,
-    required: true,
-}];
-
-const MERGE_PARAMETERS: &[Parameter] = &[Parameter {
-    name: "mix",
-    label: "Mix",
-    kind: ParameterKind::Float(FloatParameter {
-        default: 1.0,
-        slider: 0.0..=1.0,
-        limits: 0.0..=1.0,
-    }),
-}];
-
-// Neither is required: the base is the lowest connected input, whichever that is, and nothing
-// connected gives the empty image.
-const MERGE_INPUTS: &[NodeInput] = &[
-    NodeInput {
-        name: "background",
-        label: "Background",
-        repeating: false,
-        required: false,
-    },
-    NodeInput {
-        name: "layer",
-        label: "Layer",
-        repeating: true,
-        required: false,
-    },
-];
-
-const BLUR_PARAMETERS: &[Parameter] = &[Parameter {
-    name: "size",
-    label: "Size",
-    kind: ParameterKind::Float(FloatParameter {
-        // A new Blur changes nothing until its size is set.
-        default: 0.0,
-        slider: 0.0..=100.0,
-        limits: 0.0..=4096.0,
-    }),
-}];
-
-const BLUR_INPUTS: &[NodeInput] = &[NodeInput {
-    name: "source",
-    label: "Source",
-    repeating: false,
-    required: true,
-}];
-
-const READER: NodeType = NodeType {
-    name: "reader",
-    label: "Reader",
-    type_name: "OcReader",
-    step: "Create Reader",
-    color: Color {
-        r: 70,
-        g: 110,
-        b: 150,
-    },
-    parameters: READER_PARAMETERS,
-    inputs: &[],
-};
-
-const EXPOSURE: NodeType = NodeType {
-    name: "exposure",
-    label: "Exposure",
-    type_name: "OcExposure",
-    step: "Create Exposure",
-    color: Color {
-        r: 90,
-        g: 130,
-        b: 80,
-    },
-    parameters: EXPOSURE_PARAMETERS,
-    inputs: EXPOSURE_INPUTS,
-};
-
-const MERGE: NodeType = NodeType {
-    name: "merge",
-    label: "Merge",
-    type_name: "OcMerge",
-    step: "Create Merge",
-    color: Color {
-        r: 150,
-        g: 105,
-        b: 60,
-    },
-    parameters: MERGE_PARAMETERS,
-    inputs: MERGE_INPUTS,
-};
-
-const BLUR: NodeType = NodeType {
-    name: "blur",
-    label: "Blur",
-    type_name: "OcBlur",
-    step: "Create Blur",
-    color: Color {
-        r: 100,
-        g: 90,
-        b: 140,
-    },
-    parameters: BLUR_PARAMETERS,
-    inputs: BLUR_INPUTS,
-};
