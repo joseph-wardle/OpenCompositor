@@ -57,7 +57,7 @@ impl Panel {
         let (files, frame) = (session.files(), session.frame());
         let shown = session.network().node(node)?;
         let resolved = resolve(shown, frame);
-        let rows = (shown.kind.parameters().iter())
+        let rows = (shown.kind.node_type().parameters.iter())
             .map(|parameter| Row {
                 parameter,
                 value: (shown.authored_value(parameter.name).cloned())
@@ -79,7 +79,7 @@ impl Panel {
                 },
             })
             .collect();
-        let mut key_frames: Vec<f64> = (shown.kind.parameters().iter())
+        let mut key_frames: Vec<f64> = (shown.kind.node_type().parameters.iter())
             .filter_map(|parameter| shown.samples(parameter.name))
             .flat_map(|samples| samples.frames())
             .collect();
@@ -89,7 +89,7 @@ impl Panel {
             node,
             key_frames,
             name: shown.name().to_owned(),
-            type_label: shown.kind.label(),
+            type_label: shown.kind.node_type().label,
             pinned,
             problem: shown.problem().map(str::to_owned),
             rows,

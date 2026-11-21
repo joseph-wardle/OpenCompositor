@@ -105,7 +105,7 @@ pub(crate) fn author_node(
         layer.data_mut(),
         path.clone(),
         Specifier::Def,
-        kind.type_name(),
+        kind.node_type().type_name,
     )?;
     author_position(layer, path, position)?;
     let output = path.append_property(OUTPUT)?;

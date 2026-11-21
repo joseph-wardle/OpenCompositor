@@ -230,9 +230,7 @@ impl Resolved {
 /// keeps the value authored. A frame at which an animated parameter's samples are blocked
 /// resolves as an absent value does.
 pub fn resolve(node: &Node, frame: f64) -> Resolved {
-    let values = node
-        .kind
-        .parameters()
+    let values = (node.kind.node_type().parameters)
         .iter()
         .filter_map(|parameter| {
             let sampled = || {

@@ -9,7 +9,7 @@ use openusd::sdf;
 use super::{Changes, EditError, Session};
 use crate::author::{author_comp, author_moves, author_node, author_value, author_wires};
 use crate::network::{Assignment, NodeId};
-use crate::nodes::{NodeKind, node_types};
+use crate::nodes::{NodeKind, node_kinds};
 use crate::parameter::{Value, validate};
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.
@@ -93,7 +93,7 @@ impl Session {
             };
             let file = self
                 .as_authored(Value::File(file.into()))
-                .and_then(|file| validate(NodeKind::Reader.parameters(), "file", file));
+                .and_then(|file| validate(NodeKind::Reader.node_type().parameters, "file", file));
             created.push(id);
             readers.push((path, position, file.ok().map(|(_, file)| file)));
         }
@@ -126,21 +126,22 @@ impl Session {
         at: Point,
         current: Option<NodeId>,
     ) -> Result<Changes, EditError> {
-        let node_type = node_types()
+        let kind = node_kinds()
             .iter()
-            .find(|node_type| node_type.name == type_name)
+            .find(|kind| kind.node_type().name == type_name)
             .ok_or_else(|| EditError::UnknownType(type_name.to_owned()))?;
+        let node_type = kind.node_type();
         if let Some(current) = current
             && self.network().node(current).is_none()
         {
             return Err(EditError::MissingNode(current));
         }
         let (comp, define_comp) = self.comp();
-        let (id, path) = self.new_node(&comp, node_type.kind.label());
+        let (id, path) = self.new_node(&comp, node_type.label);
         let mut position = at;
         let mut assignments = Vec::new();
         if let Some(current) = current {
-            if let Some(input) = node_type.kind.inputs().first() {
+            if let Some(input) = node_type.inputs.first() {
                 position =
                     (self.after(current)).expect("the graph presents every node the network has");
                 for (consumer, node) in self.network().nodes() {
@@ -170,7 +171,7 @@ impl Session {
             if define_comp {
                 author_comp(layer, &comp)?;
             }
-            author_node(layer, &path, &node_type.kind, position)?;
+            author_node(layer, &path, kind, position)?;
             author_wires(layer, &wires)
         });
         if !assignments.is_empty() {
@@ -248,7 +249,7 @@ fn reader_name(file: &Path) -> String {
         name.insert(0, '_');
     }
     match name.is_empty() {
-        true => NodeKind::Reader.label().to_owned(),
+        true => NodeKind::Reader.node_type().label.to_owned(),
         false => name,
     }
 }

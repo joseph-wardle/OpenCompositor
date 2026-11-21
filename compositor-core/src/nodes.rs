@@ -1,5 +1,7 @@
 //! The node types: what each offers to be set, the images it takes, and how it is created.
 
+use open_ng::Color;
+
 use crate::network::InputSlot;
 use crate::parameter::{FloatParameter, Parameter, ParameterKind};
 
@@ -21,97 +23,70 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
-    /// What the node offers to be set.
-    pub fn parameters(&self) -> &'static [Parameter] {
+    /// Everything that describes a node of this kind.
+    pub const fn node_type(&self) -> &'static NodeType {
         match self {
-            NodeKind::Reader => READER_PARAMETERS,
-            NodeKind::Exposure => EXPOSURE_PARAMETERS,
-            NodeKind::Merge => MERGE_PARAMETERS,
-            NodeKind::Blur => BLUR_PARAMETERS,
-        }
-    }
-
-    /// What the artist calls the node's type.
-    pub fn label(&self) -> &'static str {
-        match self {
-            NodeKind::Reader => "Reader",
-            NodeKind::Exposure => "Exposure",
-            NodeKind::Merge => "Merge",
-            NodeKind::Blur => "Blur",
-        }
-    }
-
-    /// The images the node takes.
-    pub fn inputs(&self) -> &'static [NodeInput] {
-        match self {
-            NodeKind::Reader => &[],
-            NodeKind::Exposure => EXPOSURE_INPUTS,
-            NodeKind::Merge => MERGE_INPUTS,
-            NodeKind::Blur => BLUR_INPUTS,
-        }
-    }
-
-    /// The prim type a node of this kind is authored as. Types, parameters and defaults change in
-    /// place until 1.0; after it, a breaking change takes USD's suffix, as `OcExposure_1`.
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            NodeKind::Reader => "OcReader",
-            NodeKind::Exposure => "OcExposure",
-            NodeKind::Merge => "OcMerge",
-            NodeKind::Blur => "OcBlur",
+            NodeKind::Reader => &READER,
+            NodeKind::Exposure => &EXPOSURE,
+            NodeKind::Merge => &MERGE,
+            NodeKind::Blur => &BLUR,
         }
     }
 
     pub(crate) fn of_type(type_name: &str) -> Option<NodeKind> {
-        (NODE_TYPES.iter())
-            .map(|node_type| node_type.kind.clone())
-            .find(|kind| kind.type_name() == type_name)
+        (NODE_KINDS.iter())
+            .find(|kind| kind.node_type().type_name == type_name)
+            .cloned()
     }
 }
 
-/// A node type the artist and scripts can create.
+/// What a node kind is to the artist, to scripts and to the stage.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeType {
     /// Unchanged across labels: scripts create nodes by it.
     pub name: &'static str,
+    /// What the artist calls the type.
+    pub label: &'static str,
+    /// The prim type a node of this kind is authored as. Types, parameters and defaults change in
+    /// place until 1.0; after it, a breaking change takes USD's suffix, as `OcExposure_1`.
+    pub type_name: &'static str,
     /// What creating one names in the undo history.
     pub(crate) step: &'static str,
-    pub(crate) kind: NodeKind,
+    /// The node's colour in the graph.
+    pub(crate) color: Color,
+    /// What the node offers to be set.
+    pub parameters: &'static [Parameter],
+    /// The images the node takes.
+    pub inputs: &'static [NodeInput],
 }
 
-const NODE_TYPES: &[NodeType] = &[
-    NodeType {
-        name: "reader",
-        step: "Create Reader",
-        kind: NodeKind::Reader,
-    },
-    NodeType {
-        name: "exposure",
-        step: "Create Exposure",
-        kind: NodeKind::Exposure,
-    },
-    NodeType {
-        name: "merge",
-        step: "Create Merge",
-        kind: NodeKind::Merge,
-    },
-    NodeType {
-        name: "blur",
-        step: "Create Blur",
-        kind: NodeKind::Blur,
-    },
+const NODE_KINDS: &[NodeKind] = &[
+    NodeKind::Reader,
+    NodeKind::Exposure,
+    NodeKind::Merge,
+    NodeKind::Blur,
 ];
 
-impl NodeType {
-    pub fn label(&self) -> &'static str {
-        self.kind.label()
-    }
+/// Every node kind that can be created, in menu order.
+pub fn node_kinds() -> &'static [NodeKind] {
+    NODE_KINDS
 }
 
-/// Every node type that can be created, in menu order.
-pub fn node_types() -> &'static [NodeType] {
-    NODE_TYPES
-}
+const _: () = {
+    let mut kind = 0;
+    while kind < NODE_KINDS.len() {
+        let inputs = NODE_KINDS[kind].node_type().inputs;
+        let mut index = 0;
+        while index < inputs.len() {
+            assert!(
+                !(inputs[index].repeating && inputs[index].required),
+                "a repeating input is never required"
+            );
+            index += 1;
+        }
+        kind += 1;
+    }
+};
 
 /// One image a node type takes, from another node's output, or for a repeating input a numbered
 /// series of them.
@@ -228,19 +203,58 @@ const BLUR_INPUTS: &[NodeInput] = &[NodeInput {
     required: true,
 }];
 
-const _: () = {
-    let tables = [EXPOSURE_INPUTS, MERGE_INPUTS, BLUR_INPUTS];
-    let mut table = 0;
-    while table < tables.len() {
-        let mut index = 0;
-        while index < tables[table].len() {
-            let input = &tables[table][index];
-            assert!(
-                !(input.repeating && input.required),
-                "a repeating input is never required"
-            );
-            index += 1;
-        }
-        table += 1;
-    }
+const READER: NodeType = NodeType {
+    name: "reader",
+    label: "Reader",
+    type_name: "OcReader",
+    step: "Create Reader",
+    color: Color {
+        r: 70,
+        g: 110,
+        b: 150,
+    },
+    parameters: READER_PARAMETERS,
+    inputs: &[],
+};
+
+const EXPOSURE: NodeType = NodeType {
+    name: "exposure",
+    label: "Exposure",
+    type_name: "OcExposure",
+    step: "Create Exposure",
+    color: Color {
+        r: 90,
+        g: 130,
+        b: 80,
+    },
+    parameters: EXPOSURE_PARAMETERS,
+    inputs: EXPOSURE_INPUTS,
+};
+
+const MERGE: NodeType = NodeType {
+    name: "merge",
+    label: "Merge",
+    type_name: "OcMerge",
+    step: "Create Merge",
+    color: Color {
+        r: 150,
+        g: 105,
+        b: 60,
+    },
+    parameters: MERGE_PARAMETERS,
+    inputs: MERGE_INPUTS,
+};
+
+const BLUR: NodeType = NodeType {
+    name: "blur",
+    label: "Blur",
+    type_name: "OcBlur",
+    step: "Create Blur",
+    color: Color {
+        r: 100,
+        g: 90,
+        b: 140,
+    },
+    parameters: BLUR_PARAMETERS,
+    inputs: BLUR_INPUTS,
 };

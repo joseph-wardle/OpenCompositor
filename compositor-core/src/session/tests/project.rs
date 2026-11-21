@@ -34,7 +34,7 @@ fn nodes(session: &Session) -> Vec<(String, String)> {
                 .inputs()
                 .map(|(slot, source)| (slot, name(source)))
                 .collect();
-            let values: Vec<_> = (node.kind.parameters().iter())
+            let values: Vec<_> = (node.kind.node_type().parameters.iter())
                 .map(|parameter| node.authored_value(parameter.name))
                 .collect();
             let described = format!("{:?} {:?} {values:?} {inputs:?}", node.kind, node.position);

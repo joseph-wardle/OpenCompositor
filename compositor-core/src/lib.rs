@@ -48,7 +48,7 @@ pub use network::{
     Assignment, Changes, ConnectionError, InputSlot, MAX_SLOTS, Marks, Missing, Network, Node,
     NodeId, Slot, Timeline, TimelineError, missing,
 };
-pub use nodes::{NodeInput, NodeKind, NodeType, node_types};
+pub use nodes::{NodeInput, NodeKind, NodeType, node_kinds};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FRAME_LIMIT, FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,

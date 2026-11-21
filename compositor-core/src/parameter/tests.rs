@@ -26,7 +26,7 @@ fn built_in() -> [NodeKind; 2] {
 #[test]
 fn built_in_descriptions_are_consistent() {
     for kind in built_in() {
-        let parameters = kind.parameters();
+        let parameters = kind.node_type().parameters;
         let names: HashSet<_> = parameters.iter().map(|parameter| parameter.name).collect();
         assert_eq!(names.len(), parameters.len(), "{kind:?}: names repeat");
         for parameter in parameters {

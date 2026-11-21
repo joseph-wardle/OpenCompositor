@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 
 use cxx_qt_lib::{QList, QString, QStringList};
-use opencompositor_core::{Anchor, Event, node_types};
+use opencompositor_core::{Anchor, Event, node_kinds};
 
 use crate::qt::ffi;
 
@@ -16,7 +16,7 @@ thread_local! {
 }
 
 pub fn show(anchor: Anchor) {
-    let mut types: Vec<_> = node_types().iter().collect();
+    let mut types: Vec<_> = node_kinds().iter().map(|kind| kind.node_type()).collect();
     RECENT.with(|cell| {
         let recent = cell.borrow();
         let rank = |name| recent.iter().position(|&recent| recent == name);
@@ -25,7 +25,7 @@ pub fn show(anchor: Anchor) {
     });
     let mut labels = QList::<QString>::default();
     for node_type in &types {
-        labels.append(QString::from(node_type.label()));
+        labels.append(QString::from(node_type.label));
     }
     let names = types.iter().map(|node_type| node_type.name).collect();
     OPEN.with(|cell| *cell.borrow_mut() = Some((anchor, names)));

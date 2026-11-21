@@ -185,7 +185,7 @@ impl Node {
     /// Sets a parameter's value, refusing one its description does not allow. A value equal to
     /// the default stays set.
     pub(crate) fn set_value(&mut self, name: &str, value: Value) -> Result<(), ValueError> {
-        let (name, value) = validate(self.kind.parameters(), name, value)?;
+        let (name, value) = validate(self.kind.node_type().parameters, name, value)?;
         self.anchored.remove(name);
         self.authored.insert(name, value);
         Ok(())
@@ -213,7 +213,7 @@ impl Node {
 
     /// Removes a parameter's authored value, so it reads as its default again.
     pub(crate) fn reset(&mut self, name: &str) -> Result<(), ValueError> {
-        let parameter = describe(self.kind.parameters(), name)?;
+        let parameter = describe(self.kind.node_type().parameters, name)?;
         self.anchored.remove(parameter.name);
         self.authored.remove(parameter.name);
         Ok(())
@@ -271,14 +271,14 @@ pub fn missing(network: &Network, node: NodeId, frame: f64) -> Vec<(NodeId, Miss
             continue;
         }
         let resolved = resolve(current, frame);
-        for parameter in current.kind.parameters() {
+        for parameter in current.kind.node_type().parameters {
             if matches!(parameter.kind, ParameterKind::File)
                 && resolved.get(parameter.name).is_none()
             {
                 missing.push((id, Missing::File(parameter)));
             }
         }
-        for input in current.kind.inputs() {
+        for input in current.kind.node_type().inputs {
             if input.required && current.input(input.first_slot()).is_none() {
                 missing.push((id, Missing::Input(input)));
             }
@@ -509,7 +509,7 @@ impl Network {
 /// The slot as the consumer's kind declares it, with the declaration's own name, or why the
 /// kind has no such slot.
 fn declared(kind: &NodeKind, slot: InputSlot<'_>) -> Result<InputSlot<'static>, ConnectionError> {
-    let input = (kind.inputs().iter())
+    let input = (kind.node_type().inputs.iter())
         .find(|input| input.name == slot.input)
         .ok_or_else(|| ConnectionError::UnknownInput(slot.input.to_owned()))?;
     let has_slot = if input.repeating {

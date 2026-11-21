@@ -10,7 +10,7 @@ use open_ng::{
 use super::create::{PLACEMENT_GAP, READER_SPACING};
 use super::*;
 use crate::network::{Node, Timeline};
-use crate::nodes::node_types;
+use crate::nodes::node_kinds;
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
 
@@ -540,10 +540,11 @@ fn creating_by_an_unknown_type_or_after_a_missing_node_changes_nothing() {
 #[test]
 fn every_node_type_is_created_by_its_name() {
     let mut session = Session::new();
-    for node_type in node_types() {
+    for kind in node_kinds() {
+        let node_type = kind.node_type();
         let changes = session.create_node(node_type.name, ORIGIN, None).unwrap();
         let id = *changes.nodes.first().expect("one node created");
-        assert_eq!(session.network().node(id).unwrap().kind, node_type.kind);
+        assert_eq!(session.network().node(id).unwrap().kind, *kind);
         assert_eq!(session.undo_label(), Some(node_type.step));
     }
 }
