@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use opencompositor_kernels::ulp_distance;
+use opencompositor_kernels::{BoxPass, ulp_distance};
 
 use super::*;
 use crate::evaluate::tests::{blur, chain, exposure, graph, key, merge, reader, write_png};

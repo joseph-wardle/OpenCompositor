@@ -1,7 +1,7 @@
 //! The node types: what each offers to be set, the images it takes, and how it is created.
 //! Each node's file says what it computes and holds its description.
 
-mod blur;
+pub(crate) mod blur;
 pub(crate) mod exposure;
 pub(crate) mod merge;
 mod reader;

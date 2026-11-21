@@ -15,11 +15,10 @@ use crate::files::{Files, reading, unanchored};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::Level;
 use crate::network::{InputSlot, Network, Node, NodeId};
-use crate::nodes::{NodeKind, exposure, merge};
+use crate::nodes::{NodeKind, blur, exposure, merge};
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image_until};
 
-pub(crate) mod blur;
 mod gpu;
 
 pub(crate) use gpu::GpuPlane;
@@ -726,7 +725,7 @@ impl Evaluator {
                 let mix = f64::from_bits(*mix) as f32;
                 merge::compute(&self.pool, key, inputs, mix, released).map(Some)
             }
-            Recipe::Blur { size, source, .. } => blur::blur(
+            Recipe::Blur { size, source, .. } => blur::compute(
                 &self.pool,
                 key,
                 image_of(source),
