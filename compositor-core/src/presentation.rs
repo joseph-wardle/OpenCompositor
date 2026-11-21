@@ -9,8 +9,8 @@ use open_ng::{
 
 use crate::network::{
     Assignment, Changes, ConnectionError, InputSlot, MAX_SLOTS, Marks, Network, Node, NodeId,
-    NodeKind,
 };
+use crate::nodes::NodeKind;
 
 /// Every node's one output. An input's pin is derived from its declaration index and, for a
 /// repeating input, its slot, so pins are never stored and a slot's pin is its own for the
@@ -18,26 +18,6 @@ use crate::network::{
 /// that are never reused.
 const OUTPUT_PIN: PinId = PinId(0);
 
-const READER_COLOR: Color = Color {
-    r: 70,
-    g: 110,
-    b: 150,
-};
-const EXPOSURE_COLOR: Color = Color {
-    r: 90,
-    g: 130,
-    b: 80,
-};
-const MERGE_COLOR: Color = Color {
-    r: 150,
-    g: 105,
-    b: 60,
-};
-const BLUR_COLOR: Color = Color {
-    r: 100,
-    g: 90,
-    b: 140,
-};
 const FAILED_COLOR: Color = Color {
     r: 160,
     g: 60,
@@ -133,12 +113,7 @@ pub(crate) fn record(
     node: &Node,
 ) -> NodeRecord {
     let mut title = shorten(node.name());
-    let color = match node.kind {
-        NodeKind::Reader => READER_COLOR,
-        NodeKind::Exposure => EXPOSURE_COLOR,
-        NodeKind::Merge => MERGE_COLOR,
-        NodeKind::Blur => BLUR_COLOR,
-    };
+    let color = node.kind.node_type().color;
     // Slot numbers go in the title, and a failure in the colour, until OpenNG has badges.
     // Nothing shows an evaluation in progress: the title would widen the node while it lasted, and the
     // viewer's caption says it.
@@ -183,7 +158,7 @@ fn dimmed(color: Color) -> Color {
 /// The node's input pins: one per input, and for a repeating input one per slot up to the last
 /// connected one, empty slots included, then one free slot, while there is one.
 fn input_pins(node: &Node) -> impl Iterator<Item = Pin> {
-    (node.kind.inputs().iter().enumerate()).flat_map(|(index, input)| {
+    (node.kind.node_type().inputs.iter().enumerate()).flat_map(|(index, input)| {
         let slots = if input.repeating {
             let last = (node.slots(input.name).next_back()).map_or(0, |(slot, _)| slot);
             1..=last.saturating_add(1).min(MAX_SLOTS)
@@ -211,7 +186,7 @@ fn input_pin(index: usize, slot: u32) -> PinId {
 fn input_at(kind: &NodeKind, pin: PinId) -> Option<InputSlot<'static>> {
     let index = usize::try_from((pin.0 & u64::from(u32::MAX)).checked_sub(1)?).ok()?;
     Some(InputSlot {
-        input: kind.inputs().get(index)?.name,
+        input: kind.node_type().inputs.get(index)?.name,
         slot: (pin.0 >> 32) as u32,
     })
 }
@@ -223,8 +198,7 @@ pub(crate) fn wires_into(id: NodeId, node: &Node) -> impl Iterator<Item = Connec
 }
 
 fn wire(consumer: NodeId, kind: &NodeKind, input: InputSlot<'_>, source: NodeId) -> Connection {
-    let index = kind
-        .inputs()
+    let index = (kind.node_type().inputs)
         .iter()
         .position(|declared| declared.name == input.input)
         .expect("a connected input is declared");

@@ -98,7 +98,7 @@ impl Session {
         };
         let state = self.key_state(node, parameter).map_err(invalid)?;
         let shown = (self.network().node(node)).ok_or(EditError::MissingNode(node))?;
-        let described = describe(shown.kind.parameters(), parameter).map_err(invalid)?;
+        let described = describe(shown.kind.node_type().parameters, parameter).map_err(invalid)?;
         let attribute = self.parameter_attribute(node, described.name);
         let (label, change) = if state == (KeyState::Keyed { here: true }) {
             ("Remove Key", ValueChange::RemoveKey { frame: self.frame })
@@ -121,7 +121,7 @@ impl Session {
     /// or is animated in a way this version does not read.
     pub fn key_state(&self, node: NodeId, parameter: &str) -> Result<KeyState, ValueError> {
         let shown = (self.network().node(node)).ok_or(ValueError::UnknownParameter)?;
-        let described = describe(shown.kind.parameters(), parameter)?;
+        let described = describe(shown.kind.node_type().parameters, parameter)?;
         if !takes_keys(&shown.kind, described) {
             return Err(ValueError::NoKeys);
         }
@@ -172,7 +172,7 @@ impl Session {
             error,
         };
         let node = self.network().node(id).ok_or(EditError::MissingNode(id))?;
-        let described = describe(node.kind.parameters(), parameter).map_err(invalid)?;
+        let described = describe(node.kind.node_type().parameters, parameter).map_err(invalid)?;
         let mut edited = node.clone();
         match value {
             Some(value) if matches!(described.kind, ParameterKind::File) => self

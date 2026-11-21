@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::*;
 use crate::evaluate::EvalError;
 use crate::image::ImageInfo;
-use crate::network::NodeKind;
+use crate::nodes::NodeKind;
 use crate::panel::ValueState;
 use crate::parameter::{Value, resolve};
 use crate::read::ReadError;

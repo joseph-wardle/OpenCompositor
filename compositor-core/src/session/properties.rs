@@ -122,7 +122,7 @@ impl Session {
             name == POSITION
                 || name == OUTPUT
                 || name.strip_prefix("inputs:").is_some_and(|input| {
-                    describe(node.kind.parameters(), input).is_ok()
+                    describe(node.kind.node_type().parameters, input).is_ok()
                         || input_slot(&node.kind, input).is_some()
                 })
         };

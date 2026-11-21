@@ -146,14 +146,14 @@ fn shot(name: &str) -> Session {
 /// The node's one parameter as evaluation reads it at a frame.
 fn resolved(session: &Session, id: NodeId, frame: f64) -> f64 {
     let node = session.network().node(id).unwrap();
-    let parameter = node.kind.parameters()[0].name;
+    let parameter = node.kind.node_type().parameters[0].name;
     resolve(node, frame).float(parameter).unwrap()
 }
 
 /// The same as the crate reads it from the stage, an absent value being the parameter's default.
 fn read(session: &Session, id: NodeId, frame: f64) -> f64 {
     let node = session.network().node(id).unwrap();
-    let parameter = &node.kind.parameters()[0];
+    let parameter = &node.kind.node_type().parameters[0];
     let path = (session.path(id))
         .append_property(format!("inputs:{}", parameter.name))
         .unwrap();

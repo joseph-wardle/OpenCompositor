@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "opencompositor"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "cxx",
  "cxx-qt",
@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "opencompositor-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "exr",
  "half",

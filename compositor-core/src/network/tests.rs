@@ -240,6 +240,9 @@ fn a_merge_is_never_missing_an_input_but_reports_what_is_missing_through_its_slo
     Arc::make_mut(reader).reset("file").unwrap();
     assert_eq!(
         missing(&unset, NodeId(2), 1.0),
-        [(NodeId(0), Missing::File(&READER_PARAMETERS[0]))]
+        [(
+            NodeId(0),
+            Missing::File(&NodeKind::Reader.node_type().parameters[0])
+        )]
     );
 }

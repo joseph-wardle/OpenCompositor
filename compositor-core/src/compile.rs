@@ -15,9 +15,8 @@ use openusd::usd::{Attribute, CommittedChange, ResolveInfoSource, Stage};
 use openusd::vt;
 
 use crate::author::{COMP_TYPE, OUTPUT, POSITION};
-use crate::network::{
-    InputSlot, MAX_SLOTS, Network, Node, NodeId, NodeKind, Timeline, TimelineError,
-};
+use crate::network::{InputSlot, MAX_SLOTS, Network, Node, NodeId, Timeline, TimelineError};
+use crate::nodes::NodeKind;
 use crate::parameter::{Number, Parameter, ParameterKind, Samples, Value, describe, validate};
 
 const IN_CYCLE: &str = "takes its own image, through a cycle of wires";
@@ -328,7 +327,7 @@ impl Compiler {
             else {
                 continue;
             };
-            if let Ok(parameter) = describe(kind.parameters(), name) {
+            if let Ok(parameter) = describe(kind.node_type().parameters, name) {
                 match animation(&attribute) {
                     Animation::None => {}
                     Animation::Samples => {
@@ -383,7 +382,7 @@ impl Compiler {
                 continue;
             }
             let Some(slot) = input_slot(&kind, name) else {
-                if let Some(repeating) = (kind.inputs().iter())
+                if let Some(repeating) = (kind.node_type().inputs.iter())
                     .find(|input| input.repeating && name.starts_with(input.name))
                 {
                     node.refuse(format!(
@@ -609,7 +608,7 @@ fn samples(
     if !takes_keys(kind, parameter) {
         return Err(format!(
             "{label} is animated, which this version cannot evaluate for a {}",
-            kind.label()
+            kind.node_type().label
         ));
     }
     let composed = (attribute.time_samples().ok().flatten()).unwrap_or_default();
@@ -625,7 +624,7 @@ fn samples(
         };
         if let Some(number) = sample {
             validate(
-                kind.parameters(),
+                kind.node_type().parameters,
                 parameter.name,
                 Value::Float(number.value()),
             )
@@ -646,7 +645,7 @@ fn wrong_type(label: &str, attribute: &Attribute, wanted: &str) -> String {
 
 /// The input slot an `inputs:` attribute name is, as the kind declares it.
 pub(crate) fn input_slot(kind: &NodeKind, name: &str) -> Option<InputSlot<'static>> {
-    kind.inputs().iter().find_map(|input| {
+    kind.node_type().inputs.iter().find_map(|input| {
         if !input.repeating {
             return (input.name == name).then_some(InputSlot {
                 input: input.name,
@@ -664,7 +663,7 @@ pub(crate) fn input_slot(kind: &NodeKind, name: &str) -> Option<InputSlot<'stati
 }
 
 pub(crate) fn slot_label(kind: &NodeKind, slot: InputSlot<'_>) -> String {
-    let label = (kind.inputs().iter())
+    let label = (kind.node_type().inputs.iter())
         .find(|input| input.name == slot.input)
         .map_or(slot.input, |input| input.label);
     InputSlot {

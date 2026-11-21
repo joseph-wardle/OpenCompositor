@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::app::{Notice, Waker};
-use crate::network::{Network, NodeId, NodeKind};
+use crate::network::{Network, NodeId};
+use crate::nodes::NodeKind;
 use crate::parameter::{Resolved, resolve};
 use crate::session::Session;
 

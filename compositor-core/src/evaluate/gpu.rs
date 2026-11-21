@@ -12,15 +12,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, LineReduce, Merge};
-
-use super::merge::{is_the_base, merged_warnings, merged_window};
 use super::{
-    EvalError, Evaluator, Recipe, ResultKey, Retained, check_node_bytes, distinct_bytes, needs,
-    read_file, read_files,
+    EvalError, Evaluator, Recipe, ResultKey, Retained, distinct_bytes, needs, read_file, read_files,
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
-use crate::kernels::{Kernels, Planes, plane_bytes};
+use crate::kernels::{Kernels, Planes};
+use crate::nodes::{blur, exposure, merge};
 use crate::viewer_cache::{GpuCopier, GpuCopy};
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
@@ -169,8 +166,13 @@ impl GpuEvaluation {
         )
     }
 
+    /// The kernels' pipelines on this device, for a node to record its dispatches with.
+    pub(crate) fn kernels(&mut self) -> &mut Kernels {
+        &mut self.kernels
+    }
+
     /// A plane over `window`'s size whose contents the caller overwrites.
-    fn plane(&self, released: &mut Planes, window: Window) -> GpuPlane {
+    pub(crate) fn plane(&self, released: &mut Planes, window: Window) -> GpuPlane {
         GpuPlane(released.take(&self.device, window))
     }
 
@@ -186,7 +188,7 @@ impl GpuEvaluation {
         let (info, _) = image.clone().into_parts();
         let window = info.data_window;
         if window.is_empty() {
-            return Ok(GpuImage { info, planes: None });
+            return Ok(GpuImage::new(info, None));
         }
         self.check_side(origin, window)?;
         let mut uploaded: Vec<(&Plane, GpuPlane)> = Vec::new();
@@ -206,15 +208,12 @@ impl GpuEvaluation {
                 .expect("every plane uploaded");
             texture.clone()
         });
-        Ok(GpuImage {
-            info,
-            planes: Some(planes),
-        })
+        Ok(GpuImage::new(info, Some(planes)))
     }
 
     /// Fails unless the device's textures can be as large as `window`, which `origin` would
     /// write.
-    fn check_side(&self, origin: &ResultKey, window: Window) -> Result<(), EvalError> {
+    pub(crate) fn check_side(&self, origin: &ResultKey, window: Window) -> Result<(), EvalError> {
         let side = self.device.limits().max_texture_dimension_2d;
         if window.width.max(window.height) > side {
             return Err(EvalError::BeyondDevice {
@@ -299,207 +298,6 @@ impl GpuEvaluation {
         self.uploaded_bytes += (plane.len() * size_of::<f32>()) as u64;
     }
 
-    /// Records Exposure, as the CPU's `exposure` computes it: R, G and B each through the map,
-    /// planes the channels share staying shared, and A the input's.
-    fn exposure(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        image: &GpuImage,
-        stops: f64,
-        released: &mut Planes,
-    ) -> GpuImage {
-        let Some([r, g, b, a]) = &image.planes else {
-            return image.clone();
-        };
-        // The host's gain, as the CPU computes it.
-        let op = Exposure {
-            gain: stops.exp2() as f32,
-        };
-        let window = image.info.data_window;
-        let mut scaled = |plane: &GpuPlane| -> GpuPlane {
-            let output = self.plane(released, window);
-            self.kernels
-                .map(encoder, &op, [(&plane.0, window)], window, [&output.0])
-                .expect("planes over the data window");
-            output
-        };
-        let red = scaled(r);
-        let green = if GpuPlane::ptr_eq(g, r) {
-            red.clone()
-        } else {
-            scaled(g)
-        };
-        let blue = if GpuPlane::ptr_eq(b, r) {
-            red.clone()
-        } else if GpuPlane::ptr_eq(b, g) {
-            green.clone()
-        } else {
-            scaled(b)
-        };
-        GpuImage {
-            info: image.info.clone(),
-            planes: Some([red, green, blue, a.clone()]),
-        }
-    }
-
-    /// Records Merge, as the CPU's `merge` computes it: the fold over the connected inputs, the
-    /// base first, into four planes over their union, or the base itself where the CPU returns
-    /// it unchanged.
-    fn merge(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        key: &ResultKey,
-        inputs: &[&GpuImage],
-        mix: f32,
-        released: &mut Planes,
-    ) -> Result<GpuImage, EvalError> {
-        let Some((base, layers)) = inputs.split_first() else {
-            return Ok(GpuImage::empty());
-        };
-        if is_the_base(layers.len(), mix) {
-            return Ok((*base).clone());
-        }
-        let window = merged_window(key, inputs.iter().map(|input| input.info.data_window))?;
-        let info = ImageInfo {
-            display_window: base.info.display_window,
-            data_window: window,
-            warnings: merged_warnings(inputs.iter().map(|input| &input.info.warnings[..])),
-        };
-        if window.is_empty() {
-            return Ok(GpuImage { info, planes: None });
-        }
-        // The outputs, and the stack between layers: the planes the last layer's dispatch reads
-        // and those it writes, each four over the union.
-        let stacks = (layers.len() - 1).min(2) as u64;
-        check_node_bytes(
-            key,
-            window,
-            plane_bytes(window).saturating_mul(4 * (1 + stacks)),
-        )?;
-        self.check_side(key, window)?;
-        // An empty input has no textures, and covers nothing, so its planes are never read; the
-        // fold still binds four, another input's.
-        let stand_in = (inputs.iter())
-            .find_map(|input| input.planes.as_ref())
-            .expect("an input over the union");
-        fn planes_of<'a>(
-            image: &'a GpuImage,
-            stand_in: &'a [GpuPlane; 4],
-        ) -> [&'a wgpu::Texture; 4] {
-            (image.planes.as_ref().unwrap_or(stand_in))
-                .each_ref()
-                .map(|plane| &*plane.0)
-        }
-        let outputs: [GpuPlane; 4] = [(); 4].map(|()| self.plane(released, window));
-        let stack: Vec<([&wgpu::Texture; 4], Window)> = (layers.iter())
-            .map(|layer| (planes_of(layer, stand_in), layer.info.data_window))
-            .collect();
-        self.kernels
-            .fold(
-                encoder,
-                &Merge { mix },
-                (planes_of(base, stand_in), base.info.data_window),
-                &stack,
-                window,
-                outputs.each_ref().map(|plane| &*plane.0),
-                released,
-            )
-            .expect("planes over their windows");
-        Ok(GpuImage {
-            info,
-            planes: Some(outputs),
-        })
-    }
-
-    /// Records Blur, as the CPU's `blur` computes it: each distinct plane's three box passes
-    /// along its rows into a scratch plane of the grown width, then along the scratch plane's
-    /// columns into an output over the data window grown by the reach. The empty image, and a
-    /// size whose reach is zero, give the source itself.
-    ///
-    /// The scratch plane and the passes' intermediate planes go back to `released` once
-    /// recorded, for later nodes of the request.
-    fn blur(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        key: &ResultKey,
-        image: &GpuImage,
-        size: f64,
-        released: &mut Planes,
-    ) -> Result<GpuImage, EvalError> {
-        let pass = BoxPass::new(size);
-        let reach = pass.reach();
-        let input = image.info.data_window;
-        let Some(planes) = image.planes.as_ref().filter(|_| reach > 0) else {
-            return Ok(image.clone());
-        };
-        let window = input.grow(reach).map_err(|oversize| EvalError::Oversize {
-            origin: key.clone(),
-            oversize,
-        })?;
-        let scratch_window = Window {
-            width: window.width,
-            ..input
-        };
-        let op = BoxSum::new(pass);
-        let mut sources: Vec<&GpuPlane> = Vec::new();
-        for plane in planes {
-            if !sources.iter().any(|other| GpuPlane::ptr_eq(other, plane)) {
-                sources.push(plane);
-            }
-        }
-        let bytes = plane_bytes(window)
-            .saturating_mul(sources.len() as u64)
-            .saturating_add(plane_bytes(scratch_window))
-            .saturating_add(intermediate_bytes(&op, input, window));
-        check_node_bytes(key, window, bytes)?;
-        self.check_side(key, window)?;
-        // The outputs before the scratch plane, as on the CPU.
-        let outputs: Vec<GpuPlane> = (sources.iter())
-            .map(|_| self.plane(released, window))
-            .collect();
-        let scratch = self.plane(released, scratch_window);
-        for (source, output) in sources.iter().zip(&outputs) {
-            self.kernels
-                .line(
-                    encoder,
-                    &op,
-                    Axis::Rows,
-                    BoxPass::PASSES,
-                    &source.0,
-                    (input.width, input.height),
-                    &scratch.0,
-                    released,
-                )
-                .expect("a scratch plane of the grown width");
-            self.kernels
-                .line(
-                    encoder,
-                    &op,
-                    Axis::Columns,
-                    BoxPass::PASSES,
-                    &scratch.0,
-                    (window.width, input.height),
-                    &output.0,
-                    released,
-                )
-                .expect("an output over the grown window");
-        }
-        released.keep(scratch.0);
-        let blurred = planes.each_ref().map(|plane| {
-            let index = (sources.iter())
-                .position(|source| GpuPlane::ptr_eq(source, plane))
-                .expect("every plane blurred");
-            outputs[index].clone()
-        });
-        Ok(GpuImage {
-            info: ImageInfo {
-                data_window: window,
-                ..image.info.clone()
-            },
-            planes: Some(blurred),
-        })
-    }
-
     /// Submits a request recorded on this generation, retains what its recording chose, and
     /// returns its image. Its completion is counted when the GPU reports it. Fails if wgpu
     /// rejected anything in the submission, which then runs none of it, or the device is lost,
@@ -567,26 +365,6 @@ fn bytes_of(values: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
 }
 
-/// The bytes of Blur's planes between its first pass and its last along each axis, from
-/// `input` to the grown `window`: those of the rows' passes are as tall as the input, and those
-/// of the columns' as wide as the window.
-fn intermediate_bytes(op: &BoxSum, input: Window, window: Window) -> u64 {
-    (1..BoxPass::PASSES)
-        .map(|passes| {
-            let growth = op.growth() * passes;
-            let rows = Window {
-                width: input.width + growth,
-                ..input
-            };
-            let columns = Window {
-                height: input.height + growth,
-                ..window
-            };
-            plane_bytes(rows).saturating_add(plane_bytes(columns))
-        })
-        .fold(0, u64::saturating_add)
-}
-
 /// The planes, each once however many channels and images share it.
 fn distinct(planes: impl IntoIterator<Item = GpuPlane>) -> Vec<GpuPlane> {
     let mut distinct: Vec<GpuPlane> = Vec::new();
@@ -623,12 +401,33 @@ pub struct GpuImage {
 }
 
 impl GpuImage {
+    /// `planes` are in `Channel::ALL`'s order, each covering the data window, and `None` exactly
+    /// when it is empty.
+    pub(crate) fn new(info: ImageInfo, planes: Option<[GpuPlane; 4]>) -> GpuImage {
+        assert_eq!(
+            planes.is_none(),
+            info.data_window.is_empty(),
+            "planes exactly when the data window has pixels"
+        );
+        GpuImage { info, planes }
+    }
+
     /// The image of an unconnected input, with no planes.
-    fn empty() -> GpuImage {
+    pub(crate) fn empty() -> GpuImage {
         GpuImage {
             info: Image::empty().into_parts().0,
             planes: None,
         }
+    }
+
+    /// This image with other values over the same data window, in `Channel::ALL`'s order.
+    pub(crate) fn with_planes(&self, planes: [GpuPlane; 4]) -> GpuImage {
+        GpuImage::new(self.info.clone(), Some(planes))
+    }
+
+    /// Every channel's plane, in `Channel::ALL`'s order, or `None` if the data window is empty.
+    pub(crate) fn planes(&self) -> Option<&[GpuPlane; 4]> {
+        self.planes.as_ref()
     }
 
     pub fn info(&self) -> &ImageInfo {
@@ -653,10 +452,19 @@ impl GpuImage {
 /// One texture of a result, shared by the channels, images and tables that hold it: one the
 /// tables release is reused only once nothing else holds it.
 #[derive(Clone, Debug)]
-struct GpuPlane(Arc<wgpu::Texture>);
+pub(crate) struct GpuPlane(Arc<wgpu::Texture>);
 
 impl GpuPlane {
-    fn ptr_eq(a: &GpuPlane, b: &GpuPlane) -> bool {
+    pub(crate) fn texture(&self) -> &wgpu::Texture {
+        &self.0
+    }
+
+    /// The texture itself, for a plane nothing else holds to go back to the free planes.
+    pub(crate) fn into_texture(self) -> Arc<wgpu::Texture> {
+        self.0
+    }
+
+    pub(crate) fn ptr_eq(a: &GpuPlane, b: &GpuPlane) -> bool {
         Arc::ptr_eq(&a.0, &b.0)
     }
 }
@@ -855,17 +663,23 @@ impl Evaluator {
                     let empty = GpuImage::empty();
                     let source = inputs.first().copied().unwrap_or(&empty);
                     let stops = f64::from_bits(*stops);
-                    Ok(gpu.exposure(&mut encoder, source, stops, &mut released))
+                    Ok(exposure::record(
+                        gpu,
+                        &mut encoder,
+                        source,
+                        stops,
+                        &mut released,
+                    ))
                 }
                 Recipe::Merge { mix, .. } => {
                     let mix = f64::from_bits(*mix) as f32;
-                    gpu.merge(&mut encoder, &step.key, &inputs, mix, &mut released)
+                    merge::record(gpu, &mut encoder, &step.key, &inputs, mix, &mut released)
                 }
                 Recipe::Blur { size, .. } => {
                     let empty = GpuImage::empty();
                     let source = inputs.first().copied().unwrap_or(&empty);
                     let size = f64::from_bits(*size);
-                    gpu.blur(&mut encoder, &step.key, source, size, &mut released)
+                    blur::record(gpu, &mut encoder, &step.key, source, size, &mut released)
                 }
             };
             // As on the CPU, a panic fails the node instead of ending the worker; the request

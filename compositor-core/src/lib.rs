@@ -14,6 +14,7 @@ mod history;
 mod image;
 mod kernels;
 mod network;
+mod nodes;
 mod panel;
 mod parameter;
 mod playback;
@@ -45,8 +46,9 @@ pub use gpu::{FrameCheck, FrameTiming, GpuMemory, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
 pub use network::{
     Assignment, Changes, ConnectionError, InputSlot, MAX_SLOTS, Marks, Missing, Network, Node,
-    NodeId, NodeInput, NodeKind, NodeType, Slot, Timeline, TimelineError, missing, node_types,
+    NodeId, Slot, Timeline, TimelineError, missing,
 };
+pub use nodes::{NodeInput, NodeKind, NodeType, node_kinds};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FRAME_LIMIT, FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,

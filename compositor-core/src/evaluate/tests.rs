@@ -8,6 +8,7 @@ use super::*;
 use crate::files::Files;
 use crate::fixtures::{self, directory};
 use crate::image::{Channel, Warning, Window};
+use crate::kernels::cpu;
 use crate::network::Assignment;
 use crate::parameter::Value;
 
