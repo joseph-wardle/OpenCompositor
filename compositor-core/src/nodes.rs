@@ -2,7 +2,7 @@
 //! Each node's file says what it computes and holds its description.
 
 mod blur;
-mod exposure;
+pub(crate) mod exposure;
 mod merge;
 mod reader;
 

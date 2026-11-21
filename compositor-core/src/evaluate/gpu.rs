@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, LineReduce, Merge};
+use opencompositor_kernels::{Axis, BoxPass, BoxSum, LineReduce, Merge};
 
 use super::merge::{is_the_base, merged_warnings, merged_window};
 use super::{
@@ -21,6 +21,7 @@ use super::{
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
 use crate::kernels::{Kernels, Planes, plane_bytes};
+use crate::nodes::exposure;
 use crate::viewer_cache::{GpuCopier, GpuCopy};
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
@@ -169,8 +170,13 @@ impl GpuEvaluation {
         )
     }
 
+    /// The kernels' pipelines on this device, for a node to record its dispatches with.
+    pub(crate) fn kernels(&mut self) -> &mut Kernels {
+        &mut self.kernels
+    }
+
     /// A plane over `window`'s size whose contents the caller overwrites.
-    fn plane(&self, released: &mut Planes, window: Window) -> GpuPlane {
+    pub(crate) fn plane(&self, released: &mut Planes, window: Window) -> GpuPlane {
         GpuPlane(released.take(&self.device, window))
     }
 
@@ -294,46 +300,6 @@ impl GpuEvaluation {
             );
         }
         self.uploaded_bytes += (plane.len() * size_of::<f32>()) as u64;
-    }
-
-    /// Records Exposure, as the CPU's `exposure` computes it: R, G and B each through the map,
-    /// planes the channels share staying shared, and A the input's.
-    fn exposure(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        image: &GpuImage,
-        stops: f64,
-        released: &mut Planes,
-    ) -> GpuImage {
-        let Some([r, g, b, a]) = image.planes() else {
-            return image.clone();
-        };
-        // The host's gain, as the CPU computes it.
-        let op = Exposure {
-            gain: stops.exp2() as f32,
-        };
-        let window = image.info().data_window;
-        let mut scaled = |plane: &GpuPlane| -> GpuPlane {
-            let output = self.plane(released, window);
-            self.kernels
-                .map(encoder, &op, [(&plane.0, window)], window, [&output.0])
-                .expect("planes over the data window");
-            output
-        };
-        let red = scaled(r);
-        let green = if GpuPlane::ptr_eq(g, r) {
-            red.clone()
-        } else {
-            scaled(g)
-        };
-        let blue = if GpuPlane::ptr_eq(b, r) {
-            red.clone()
-        } else if GpuPlane::ptr_eq(b, g) {
-            green.clone()
-        } else {
-            scaled(b)
-        };
-        image.with_planes([red, green, blue, a.clone()])
     }
 
     /// Records Merge, as the CPU's `merge` computes it: the fold over the connected inputs, the
@@ -666,6 +632,10 @@ impl GpuImage {
 pub(crate) struct GpuPlane(Arc<wgpu::Texture>);
 
 impl GpuPlane {
+    pub(crate) fn texture(&self) -> &wgpu::Texture {
+        &self.0
+    }
+
     pub(crate) fn ptr_eq(a: &GpuPlane, b: &GpuPlane) -> bool {
         Arc::ptr_eq(&a.0, &b.0)
     }
@@ -865,7 +835,13 @@ impl Evaluator {
                     let empty = GpuImage::empty();
                     let source = inputs.first().copied().unwrap_or(&empty);
                     let stops = f64::from_bits(*stops);
-                    Ok(gpu.exposure(&mut encoder, source, stops, &mut released))
+                    Ok(exposure::record(
+                        gpu,
+                        &mut encoder,
+                        source,
+                        stops,
+                        &mut released,
+                    ))
                 }
                 Recipe::Merge { mix, .. } => {
                     let mix = f64::from_bits(*mix) as f32;

@@ -9,14 +9,13 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use opencompositor_kernels::Exposure;
 use rayon::prelude::*;
 
 use crate::files::{Files, reading, unanchored};
 use crate::image::{Image, Oversize, Plane, Window};
-use crate::kernels::cpu::{self, Level};
+use crate::kernels::cpu::Level;
 use crate::network::{InputSlot, Network, Node, NodeId};
-use crate::nodes::NodeKind;
+use crate::nodes::{NodeKind, exposure};
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image_until};
 
@@ -24,6 +23,7 @@ pub(crate) mod blur;
 mod gpu;
 mod merge;
 
+pub(crate) use gpu::GpuPlane;
 pub(crate) use gpu::poll_device;
 pub use gpu::{DeviceLost, GpuEvaluation, GpuImage, Recorded};
 
@@ -713,7 +713,7 @@ impl Evaluator {
         };
         let operation = || match &*key.0 {
             Recipe::Reader { .. } => read_file(key, stop),
-            Recipe::Exposure { stops, source, .. } => Ok(Some(exposure(
+            Recipe::Exposure { stops, source, .. } => Ok(Some(exposure::compute(
                 &self.pool,
                 image_of(source),
                 f64::from_bits(*stops),
@@ -1020,7 +1020,7 @@ fn cpus_in(list: &str) -> Option<Vec<usize>> {
 /// pass is first to (page faults, then unmapping when it drops), which is what reusing released
 /// planes saves. Half to spare on reuse lets storage made for a window that grew serve the drag
 /// back down as well.
-fn output_plane(released: &mut Vec<Plane>, len: usize, capacity: usize) -> Plane {
+pub(crate) fn output_plane(released: &mut Vec<Plane>, len: usize, capacity: usize) -> Plane {
     let closest = (released.iter().enumerate())
         .filter(|(_, plane)| (len..=len + len / 2).contains(&plane.capacity()))
         .min_by_key(|(_, plane)| plane.capacity())
@@ -1029,42 +1029,6 @@ fn output_plane(released: &mut Vec<Plane>, len: usize, capacity: usize) -> Plane
         Some(index) => released.swap_remove(index).resized(len),
         None => Plane::zeroed(len, capacity),
     }
-}
-
-/// Multiplies R, G and B by two to the power of `stops` and shares A, each colour plane through
-/// the map. Inputs are never written: an output is a plane from `released` or a new one, and A
-/// is the input's.
-fn exposure(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Plane>) -> Image {
-    // Exact for whole stops, and far inside f32's range at the limits.
-    let op = Exposure {
-        gain: stops.exp2() as f32,
-    };
-    let window = image.data_window();
-    let [r, g, b, a] = image.planes();
-    let mut scaled = |plane: &Plane| -> Plane {
-        // As roomy as its input, so that below a Blur whose Size is dragged it grows as rarely.
-        let mut output = output_plane(released, plane.len(), plane.capacity());
-        let dst = output
-            .get_mut()
-            .expect("nothing else holds an output plane");
-        cpu::map(pool, &op, [(plane, window)], window, [dst]);
-        output
-    };
-    // A grey image's colour planes are one plane, and stay one.
-    let red = scaled(r);
-    let green = if Plane::ptr_eq(g, r) {
-        red.clone()
-    } else {
-        scaled(g)
-    };
-    let blue = if Plane::ptr_eq(b, r) {
-        red.clone()
-    } else if Plane::ptr_eq(b, g) {
-        green.clone()
-    } else {
-        scaled(b)
-    };
-    image.with_planes([red, green, blue, a.clone()])
 }
 
 /// Why a key's image could not be computed.
