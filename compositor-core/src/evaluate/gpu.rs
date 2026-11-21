@@ -186,7 +186,7 @@ impl GpuEvaluation {
         let (info, _) = image.clone().into_parts();
         let window = info.data_window;
         if window.is_empty() {
-            return Ok(GpuImage { info, planes: None });
+            return Ok(GpuImage::new(info, None));
         }
         self.check_side(origin, window)?;
         let mut uploaded: Vec<(&Plane, GpuPlane)> = Vec::new();
@@ -206,10 +206,7 @@ impl GpuEvaluation {
                 .expect("every plane uploaded");
             texture.clone()
         });
-        Ok(GpuImage {
-            info,
-            planes: Some(planes),
-        })
+        Ok(GpuImage::new(info, Some(planes)))
     }
 
     /// Fails unless the device's textures can be as large as `window`, which `origin` would
@@ -308,14 +305,14 @@ impl GpuEvaluation {
         stops: f64,
         released: &mut Planes,
     ) -> GpuImage {
-        let Some([r, g, b, a]) = &image.planes else {
+        let Some([r, g, b, a]) = image.planes() else {
             return image.clone();
         };
         // The host's gain, as the CPU computes it.
         let op = Exposure {
             gain: stops.exp2() as f32,
         };
-        let window = image.info.data_window;
+        let window = image.info().data_window;
         let mut scaled = |plane: &GpuPlane| -> GpuPlane {
             let output = self.plane(released, window);
             self.kernels
@@ -336,10 +333,7 @@ impl GpuEvaluation {
         } else {
             scaled(b)
         };
-        GpuImage {
-            info: image.info.clone(),
-            planes: Some([red, green, blue, a.clone()]),
-        }
+        image.with_planes([red, green, blue, a.clone()])
     }
 
     /// Records Merge, as the CPU's `merge` computes it: the fold over the connected inputs, the
@@ -359,14 +353,14 @@ impl GpuEvaluation {
         if is_the_base(layers.len(), mix) {
             return Ok((*base).clone());
         }
-        let window = merged_window(key, inputs.iter().map(|input| input.info.data_window))?;
+        let window = merged_window(key, inputs.iter().map(|input| input.info().data_window))?;
         let info = ImageInfo {
-            display_window: base.info.display_window,
+            display_window: base.info().display_window,
             data_window: window,
-            warnings: merged_warnings(inputs.iter().map(|input| &input.info.warnings[..])),
+            warnings: merged_warnings(inputs.iter().map(|input| &input.info().warnings[..])),
         };
         if window.is_empty() {
-            return Ok(GpuImage { info, planes: None });
+            return Ok(GpuImage::new(info, None));
         }
         // The outputs, and the stack between layers: the planes the last layer's dispatch reads
         // and those it writes, each four over the union.
@@ -380,35 +374,32 @@ impl GpuEvaluation {
         // An empty input has no textures, and covers nothing, so its planes are never read; the
         // fold still binds four, another input's.
         let stand_in = (inputs.iter())
-            .find_map(|input| input.planes.as_ref())
+            .find_map(|input| input.planes())
             .expect("an input over the union");
         fn planes_of<'a>(
             image: &'a GpuImage,
             stand_in: &'a [GpuPlane; 4],
         ) -> [&'a wgpu::Texture; 4] {
-            (image.planes.as_ref().unwrap_or(stand_in))
+            (image.planes().unwrap_or(stand_in))
                 .each_ref()
                 .map(|plane| &*plane.0)
         }
         let outputs: [GpuPlane; 4] = [(); 4].map(|()| self.plane(released, window));
         let stack: Vec<([&wgpu::Texture; 4], Window)> = (layers.iter())
-            .map(|layer| (planes_of(layer, stand_in), layer.info.data_window))
+            .map(|layer| (planes_of(layer, stand_in), layer.info().data_window))
             .collect();
         self.kernels
             .fold(
                 encoder,
                 &Merge { mix },
-                (planes_of(base, stand_in), base.info.data_window),
+                (planes_of(base, stand_in), base.info().data_window),
                 &stack,
                 window,
                 outputs.each_ref().map(|plane| &*plane.0),
                 released,
             )
             .expect("planes over their windows");
-        Ok(GpuImage {
-            info,
-            planes: Some(outputs),
-        })
+        Ok(GpuImage::new(info, Some(outputs)))
     }
 
     /// Records Blur, as the CPU's `blur` computes it: each distinct plane's three box passes
@@ -428,8 +419,8 @@ impl GpuEvaluation {
     ) -> Result<GpuImage, EvalError> {
         let pass = BoxPass::new(size);
         let reach = pass.reach();
-        let input = image.info.data_window;
-        let Some(planes) = image.planes.as_ref().filter(|_| reach > 0) else {
+        let input = image.info().data_window;
+        let Some(planes) = image.planes().filter(|_| reach > 0) else {
             return Ok(image.clone());
         };
         let window = input.grow(reach).map_err(|oversize| EvalError::Oversize {
@@ -491,13 +482,11 @@ impl GpuEvaluation {
                 .expect("every plane blurred");
             outputs[index].clone()
         });
-        Ok(GpuImage {
-            info: ImageInfo {
-                data_window: window,
-                ..image.info.clone()
-            },
-            planes: Some(blurred),
-        })
+        let info = ImageInfo {
+            data_window: window,
+            ..image.info().clone()
+        };
+        Ok(GpuImage::new(info, Some(blurred)))
     }
 
     /// Submits a request recorded on this generation, retains what its recording chose, and
@@ -623,12 +612,33 @@ pub struct GpuImage {
 }
 
 impl GpuImage {
+    /// `planes` are in `Channel::ALL`'s order, each covering the data window, and `None` exactly
+    /// when it is empty.
+    pub(crate) fn new(info: ImageInfo, planes: Option<[GpuPlane; 4]>) -> GpuImage {
+        assert_eq!(
+            planes.is_none(),
+            info.data_window.is_empty(),
+            "planes exactly when the data window has pixels"
+        );
+        GpuImage { info, planes }
+    }
+
     /// The image of an unconnected input, with no planes.
-    fn empty() -> GpuImage {
+    pub(crate) fn empty() -> GpuImage {
         GpuImage {
             info: Image::empty().into_parts().0,
             planes: None,
         }
+    }
+
+    /// This image with other values over the same data window, in `Channel::ALL`'s order.
+    pub(crate) fn with_planes(&self, planes: [GpuPlane; 4]) -> GpuImage {
+        GpuImage::new(self.info.clone(), Some(planes))
+    }
+
+    /// Every channel's plane, in `Channel::ALL`'s order, or `None` if the data window is empty.
+    pub(crate) fn planes(&self) -> Option<&[GpuPlane; 4]> {
+        self.planes.as_ref()
     }
 
     pub fn info(&self) -> &ImageInfo {
@@ -653,10 +663,10 @@ impl GpuImage {
 /// One texture of a result, shared by the channels, images and tables that hold it: one the
 /// tables release is reused only once nothing else holds it.
 #[derive(Clone, Debug)]
-struct GpuPlane(Arc<wgpu::Texture>);
+pub(crate) struct GpuPlane(Arc<wgpu::Texture>);
 
 impl GpuPlane {
-    fn ptr_eq(a: &GpuPlane, b: &GpuPlane) -> bool {
+    pub(crate) fn ptr_eq(a: &GpuPlane, b: &GpuPlane) -> bool {
         Arc::ptr_eq(&a.0, &b.0)
     }
 }
