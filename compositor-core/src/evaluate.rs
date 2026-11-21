@@ -15,13 +15,12 @@ use crate::files::{Files, reading, unanchored};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::Level;
 use crate::network::{InputSlot, Network, Node, NodeId};
-use crate::nodes::{NodeKind, exposure};
+use crate::nodes::{NodeKind, exposure, merge};
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image_until};
 
 pub(crate) mod blur;
 mod gpu;
-mod merge;
 
 pub(crate) use gpu::GpuPlane;
 pub(crate) use gpu::poll_device;
@@ -601,7 +600,11 @@ impl Evaluator {
 
 /// Fails unless `bytes`, what a node would allocate for `window` on the device evaluating it,
 /// are within the cap on one node's allocation.
-fn check_node_bytes(origin: &ResultKey, window: Window, bytes: u64) -> Result<(), EvalError> {
+pub(crate) fn check_node_bytes(
+    origin: &ResultKey,
+    window: Window,
+    bytes: u64,
+) -> Result<(), EvalError> {
     if bytes > NODE_BYTES_CAP {
         return Err(EvalError::OverCap {
             origin: origin.clone(),
@@ -721,7 +724,7 @@ impl Evaluator {
             ))),
             Recipe::Merge { mix, .. } => {
                 let mix = f64::from_bits(*mix) as f32;
-                merge::merge(&self.pool, key, inputs, mix, released).map(Some)
+                merge::compute(&self.pool, key, inputs, mix, released).map(Some)
             }
             Recipe::Blur { size, source, .. } => blur::blur(
                 &self.pool,

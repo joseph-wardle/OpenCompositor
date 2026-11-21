@@ -12,16 +12,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use opencompositor_kernels::{Axis, BoxPass, BoxSum, LineReduce, Merge};
+use opencompositor_kernels::{Axis, BoxPass, BoxSum, LineReduce};
 
-use super::merge::{is_the_base, merged_warnings, merged_window};
 use super::{
     EvalError, Evaluator, Recipe, ResultKey, Retained, check_node_bytes, distinct_bytes, needs,
     read_file, read_files,
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
 use crate::kernels::{Kernels, Planes, plane_bytes};
-use crate::nodes::exposure;
+use crate::nodes::{exposure, merge};
 use crate::viewer_cache::{GpuCopier, GpuCopy};
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
@@ -217,7 +216,7 @@ impl GpuEvaluation {
 
     /// Fails unless the device's textures can be as large as `window`, which `origin` would
     /// write.
-    fn check_side(&self, origin: &ResultKey, window: Window) -> Result<(), EvalError> {
+    pub(crate) fn check_side(&self, origin: &ResultKey, window: Window) -> Result<(), EvalError> {
         let side = self.device.limits().max_texture_dimension_2d;
         if window.width.max(window.height) > side {
             return Err(EvalError::BeyondDevice {
@@ -300,72 +299,6 @@ impl GpuEvaluation {
             );
         }
         self.uploaded_bytes += (plane.len() * size_of::<f32>()) as u64;
-    }
-
-    /// Records Merge, as the CPU's `merge` computes it: the fold over the connected inputs, the
-    /// base first, into four planes over their union, or the base itself where the CPU returns
-    /// it unchanged.
-    fn merge(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        key: &ResultKey,
-        inputs: &[&GpuImage],
-        mix: f32,
-        released: &mut Planes,
-    ) -> Result<GpuImage, EvalError> {
-        let Some((base, layers)) = inputs.split_first() else {
-            return Ok(GpuImage::empty());
-        };
-        if is_the_base(layers.len(), mix) {
-            return Ok((*base).clone());
-        }
-        let window = merged_window(key, inputs.iter().map(|input| input.info().data_window))?;
-        let info = ImageInfo {
-            display_window: base.info().display_window,
-            data_window: window,
-            warnings: merged_warnings(inputs.iter().map(|input| &input.info().warnings[..])),
-        };
-        if window.is_empty() {
-            return Ok(GpuImage::new(info, None));
-        }
-        // The outputs, and the stack between layers: the planes the last layer's dispatch reads
-        // and those it writes, each four over the union.
-        let stacks = (layers.len() - 1).min(2) as u64;
-        check_node_bytes(
-            key,
-            window,
-            plane_bytes(window).saturating_mul(4 * (1 + stacks)),
-        )?;
-        self.check_side(key, window)?;
-        // An empty input has no textures, and covers nothing, so its planes are never read; the
-        // fold still binds four, another input's.
-        let stand_in = (inputs.iter())
-            .find_map(|input| input.planes())
-            .expect("an input over the union");
-        fn planes_of<'a>(
-            image: &'a GpuImage,
-            stand_in: &'a [GpuPlane; 4],
-        ) -> [&'a wgpu::Texture; 4] {
-            (image.planes().unwrap_or(stand_in))
-                .each_ref()
-                .map(|plane| &*plane.0)
-        }
-        let outputs: [GpuPlane; 4] = [(); 4].map(|()| self.plane(released, window));
-        let stack: Vec<([&wgpu::Texture; 4], Window)> = (layers.iter())
-            .map(|layer| (planes_of(layer, stand_in), layer.info().data_window))
-            .collect();
-        self.kernels
-            .fold(
-                encoder,
-                &Merge { mix },
-                (planes_of(base, stand_in), base.info().data_window),
-                &stack,
-                window,
-                outputs.each_ref().map(|plane| &*plane.0),
-                released,
-            )
-            .expect("planes over their windows");
-        Ok(GpuImage::new(info, Some(outputs)))
     }
 
     /// Records Blur, as the CPU's `blur` computes it: each distinct plane's three box passes
@@ -845,7 +778,7 @@ impl Evaluator {
                 }
                 Recipe::Merge { mix, .. } => {
                     let mix = f64::from_bits(*mix) as f32;
-                    gpu.merge(&mut encoder, &step.key, &inputs, mix, &mut released)
+                    merge::record(gpu, &mut encoder, &step.key, &inputs, mix, &mut released)
                 }
                 Recipe::Blur { size, .. } => {
                     let empty = GpuImage::empty();
