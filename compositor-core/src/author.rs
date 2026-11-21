@@ -25,7 +25,8 @@ use openusd::sdf::{self, AttributeSpecMut, LayerEdit, PrimSpecMut, Specifier, Va
 use openusd::usd::Stage;
 use openusd::vt;
 
-use crate::network::{InputSlot, NodeKind, Timeline};
+use crate::network::{InputSlot, Timeline};
+use crate::nodes::NodeKind;
 use crate::parameter::Value;
 
 /// The type of the prim whose children are the graph's nodes.

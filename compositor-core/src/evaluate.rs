@@ -15,7 +15,8 @@ use rayon::prelude::*;
 use crate::files::{Files, reading, unanchored};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::{self, Level};
-use crate::network::{InputSlot, Network, Node, NodeId, NodeKind};
+use crate::network::{InputSlot, Network, Node, NodeId};
+use crate::nodes::NodeKind;
 use crate::parameter::resolve;
 use crate::read::{ReadError, read_image_until};
 

@@ -8,7 +8,8 @@ use openusd::sdf;
 
 use super::{Changes, EditError, Session};
 use crate::author::{author_comp, author_moves, author_node, author_value, author_wires};
-use crate::network::{Assignment, NodeId, NodeKind, node_types};
+use crate::network::{Assignment, NodeId};
+use crate::nodes::{NodeKind, node_types};
 use crate::parameter::{Value, validate};
 
 /// The vertical distance between Readers created together: a Reader is 50 units tall in OpenNG.

@@ -9,7 +9,8 @@ use open_ng::{
 
 use super::create::{PLACEMENT_GAP, READER_SPACING};
 use super::*;
-use crate::network::{Node, Timeline, node_types};
+use crate::network::{Node, Timeline};
+use crate::nodes::node_types;
 use crate::parameter::{Value, ValueError, resolve};
 use crate::presentation::{judge, record, wires_into};
 

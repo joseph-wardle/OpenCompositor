@@ -16,9 +16,10 @@ use crate::evaluate::{ResultKey, result_key, result_keys};
 use crate::files::{Files, Pattern, Scan};
 use crate::history::{Inverse, Recorder};
 use crate::network::{
-    Assignment, Changes, ConnectionError, InputSlot, Marks, Network, NodeId, NodeKind, Slot,
-    Timeline, TimelineError,
+    Assignment, Changes, ConnectionError, InputSlot, Marks, Network, NodeId, Slot, Timeline,
+    TimelineError,
 };
+use crate::nodes::NodeKind;
 use crate::parameter::{ValueError, resolve};
 use crate::presentation::{assignments, judge, present};
 use crate::viewer::Viewer;

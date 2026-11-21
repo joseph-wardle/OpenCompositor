@@ -4,7 +4,7 @@ use std::path::Path;
 use open_ng::Point;
 
 use super::*;
-use crate::network::NodeKind;
+use crate::nodes::NodeKind;
 
 fn exposure() -> Node {
     Node::new(NodeKind::Exposure, "Exposure", Point { x: 0.0, y: 0.0 })

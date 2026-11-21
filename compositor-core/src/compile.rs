@@ -15,9 +15,8 @@ use openusd::usd::{Attribute, CommittedChange, ResolveInfoSource, Stage};
 use openusd::vt;
 
 use crate::author::{COMP_TYPE, OUTPUT, POSITION};
-use crate::network::{
-    InputSlot, MAX_SLOTS, Network, Node, NodeId, NodeKind, Timeline, TimelineError,
-};
+use crate::network::{InputSlot, MAX_SLOTS, Network, Node, NodeId, Timeline, TimelineError};
+use crate::nodes::NodeKind;
 use crate::parameter::{Number, Parameter, ParameterKind, Samples, Value, describe, validate};
 
 const IN_CYCLE: &str = "takes its own image, through a cycle of wires";

@@ -6,7 +6,8 @@ use super::*;
 use crate::evaluate::tests::{blur, chain, exposure, graph, key, merge, reader, write_png};
 use crate::fixtures::{directory, write_exr};
 use crate::kernels::headless;
-use crate::network::{InputSlot, Node, NodeKind};
+use crate::network::{InputSlot, Node};
+use crate::nodes::NodeKind;
 
 /// Tests' stand-in for the device running out of memory, which lavapipe never reports: with a
 /// cap, an attempt that ends with the planes alive over it is refused, as a failed creation's

@@ -9,8 +9,8 @@ use open_ng::{
 
 use crate::network::{
     Assignment, Changes, ConnectionError, InputSlot, MAX_SLOTS, Marks, Network, Node, NodeId,
-    NodeKind,
 };
+use crate::nodes::NodeKind;
 
 /// Every node's one output. An input's pin is derived from its declaration index and, for a
 /// repeating input, its slot, so pins are never stored and a slot's pin is its own for the
