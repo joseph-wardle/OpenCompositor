@@ -11,7 +11,7 @@ use crate::evaluate::{
 use crate::image::{Image, ImageInfo, Plane, Warning, Window};
 use crate::kernels::{Planes, cpu, plane_bytes};
 use crate::nodes::{NodeInput, NodeType};
-use crate::parameter::{FloatParameter, Parameter, ParameterKind};
+use crate::parameter::{FloatParameter, Parameter, ParameterKind, Resolved};
 
 pub(super) const NODE_TYPE: NodeType = NodeType {
     name: "merge",
@@ -59,12 +59,13 @@ pub(crate) fn compute(
     pool: &Pool,
     key: &ResultKey,
     inputs: &[&Image],
-    mix: f32,
+    values: &Resolved,
     released: &mut Vec<Plane>,
 ) -> Result<Image, EvalError> {
     let Some((base, layers)) = inputs.split_first() else {
         return Ok(Image::empty());
     };
+    let mix = mix(values);
     if is_the_base(layers.len(), mix) {
         return Ok((*base).clone());
     }
@@ -95,12 +96,13 @@ pub(crate) fn record(
     encoder: &mut wgpu::CommandEncoder,
     key: &ResultKey,
     inputs: &[&GpuImage],
-    mix: f32,
+    values: &Resolved,
     released: &mut Planes,
 ) -> Result<GpuImage, EvalError> {
     let Some((base, layers)) = inputs.split_first() else {
         return Ok(GpuImage::empty());
     };
+    let mix = mix(values);
     if is_the_base(layers.len(), mix) {
         return Ok((*base).clone());
     }
@@ -148,6 +150,11 @@ pub(crate) fn record(
         )
         .expect("planes over their windows");
     Ok(GpuImage::new(info, Some(outputs)))
+}
+
+/// Mix as the kernel receives it.
+fn mix(values: &Resolved) -> f32 {
+    values.float("mix").expect("Mix has a default") as f32
 }
 
 /// Whether Merge of a base and `layers` layers at `mix` is the base unchanged: the base alone,
