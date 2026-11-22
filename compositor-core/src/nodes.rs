@@ -99,7 +99,10 @@ pub struct NodeInput {
     /// attribute, `inputs:` and the name, or for a repeating input's slot the name and its number.
     pub name: &'static str,
     pub label: &'static str,
-    /// Whether the input is a series of slots, each taking an image, rather than one image.
+    /// Whether the input is a stack rather than one image: a series of numbered slots, each
+    /// taking an image, of which the node receives the connected ones in slot order. An empty
+    /// slot is no part of the result, so a node to which a slot's number matters needs another
+    /// kind of input.
     pub repeating: bool,
     /// Whether the node reports the input as missing while it takes no image, rather than making
     /// do without it. Never set on a repeating input: no node type asks for at least one slot.
