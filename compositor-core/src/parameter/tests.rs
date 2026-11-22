@@ -169,6 +169,22 @@ fn negative_zero_is_stored_as_zero() {
 }
 
 #[test]
+fn values_are_equal_when_their_bits_are() {
+    let hash = |value: &Value| {
+        let mut hasher = std::hash::DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    };
+    let nan = Value::Float(f64::NAN);
+    assert_eq!(nan, nan);
+    assert_eq!(hash(&nan), hash(&nan.clone()));
+    assert_ne!(Value::Float(-0.0), Value::Float(0.0));
+    assert_eq!(Value::Float(0.5), Value::Float(0.5));
+    assert_eq!(hash(&Value::Float(0.5)), hash(&Value::Float(0.5)));
+    assert_ne!(Value::Float(0.5), Value::File(Path::new("a.exr").into()));
+}
+
+#[test]
 fn a_frame_is_whole_and_unset_without_a_default() {
     let mut node = reader();
     let resolved = resolve(&node, 1.0);

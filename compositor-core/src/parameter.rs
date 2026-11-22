@@ -2,6 +2,7 @@
 //! validation alike, and the values a node resolves to.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
@@ -62,7 +63,12 @@ pub struct FloatParameter {
 pub const FRAME_LIMIT: f64 = 1e9;
 
 /// One parameter's value, of the kind its description names.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Two numbers are equal when their bits are, so that a value always equals itself and equal
+/// values hash alike, whatever number it holds: `-0` is not `0`, and a NaN equals itself. A
+/// node's values are finite with `-0` stored as `0`, so among them this is the numbers' own
+/// equality.
+#[derive(Clone, Debug)]
 pub enum Value {
     /// A number, for a float or a frame.
     Float(f64),
@@ -70,6 +76,28 @@ pub enum Value {
     /// copy the path. A relative path is read as the layer authoring it anchors it, which
     /// [`resolve`] gives; one no layer anchors is read nowhere.
     File(Arc<Path>),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+            (Value::File(a), Value::File(b)) => a == b,
+            (Value::Float(_) | Value::File(_), _) => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Float(number) => number.to_bits().hash(state),
+            Value::File(path) => path.hash(state),
+        }
+    }
 }
 
 /// Checks a value against the named parameter's description. Returns the description's own name,
@@ -192,7 +220,7 @@ impl std::error::Error for ValueError {}
 
 /// A node's values as evaluation sees them, in description order: one per parameter that has a
 /// value or a default.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Resolved {
     values: Vec<(&'static str, Value)>,
 }

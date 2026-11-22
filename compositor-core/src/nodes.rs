@@ -11,7 +11,7 @@ use open_ng::Color;
 use crate::network::InputSlot;
 use crate::parameter::Parameter;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     Reader,
     Exposure,
