@@ -13,7 +13,7 @@ use crate::image::{Image, ImageInfo, Plane, Window};
 use crate::kernels::cpu::{self, Stopped};
 use crate::kernels::{Planes, plane_bytes};
 use crate::nodes::{NodeInput, NodeType};
-use crate::parameter::{FloatParameter, Parameter, ParameterKind};
+use crate::parameter::{FloatParameter, Parameter, ParameterKind, Resolved};
 
 pub(super) const NODE_TYPE: NodeType = NodeType {
     name: "blur",
@@ -54,11 +54,11 @@ pub(crate) fn compute(
     pool: &Pool,
     key: &ResultKey,
     source: &Image,
-    size: f64,
+    values: &Resolved,
     released: &mut Vec<Plane>,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Option<Image>, EvalError> {
-    let pass = BoxPass::new(size);
+    let pass = pass(values);
     let reach = pass.reach();
     let input = source.data_window();
     if reach == 0 || input.is_empty() {
@@ -116,6 +116,11 @@ pub(crate) fn compute(
         outputs,
         source.warnings().to_vec(),
     )))
+}
+
+/// The box pass of the node's Size.
+fn pass(values: &Resolved) -> BoxPass {
+    BoxPass::new(values.float("size").expect("Size has a default"))
 }
 
 /// The most bytes one thread's temporaries hold over `input`: the rows pass's or the columns
@@ -182,10 +187,10 @@ pub(crate) fn record(
     encoder: &mut wgpu::CommandEncoder,
     key: &ResultKey,
     image: &GpuImage,
-    size: f64,
+    values: &Resolved,
     released: &mut Planes,
 ) -> Result<GpuImage, EvalError> {
-    let pass = BoxPass::new(size);
+    let pass = pass(values);
     let reach = pass.reach();
     let input = image.info().data_window;
     let Some(planes) = image.planes().filter(|_| reach > 0) else {

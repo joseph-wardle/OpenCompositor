@@ -672,23 +672,16 @@ impl Evaluator {
             Recipe::Reader { .. } => read_file(key, stop),
             Recipe::Operation { kind, values, .. } => match kind {
                 NodeKind::Reader => unreachable!("a Reader's recipe is its file"),
-                NodeKind::Exposure => {
-                    let stops = values.float("stops").expect("Exposure has Stops");
-                    Ok(Some(exposure::compute(
-                        &self.pool,
-                        source(),
-                        stops,
-                        released,
-                    )))
-                }
+                NodeKind::Exposure => Ok(Some(exposure::compute(
+                    &self.pool,
+                    source(),
+                    values,
+                    released,
+                ))),
                 NodeKind::Merge => {
-                    let mix = values.float("mix").expect("Merge has Mix") as f32;
-                    merge::compute(&self.pool, key, inputs, mix, released).map(Some)
+                    merge::compute(&self.pool, key, inputs, values, released).map(Some)
                 }
-                NodeKind::Blur => {
-                    let size = values.float("size").expect("Blur has Size");
-                    blur::compute(&self.pool, key, source(), size, released, stop)
-                }
+                NodeKind::Blur => blur::compute(&self.pool, key, source(), values, released, stop),
             },
         };
         // Operations write only their own outputs, so a panic leaves nothing half done, and the

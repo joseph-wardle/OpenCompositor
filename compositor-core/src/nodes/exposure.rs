@@ -8,7 +8,7 @@ use crate::evaluate::{GpuEvaluation, GpuImage, GpuPlane, Pool, output_plane};
 use crate::image::{Image, Plane};
 use crate::kernels::{Planes, cpu};
 use crate::nodes::{NodeInput, NodeType};
-use crate::parameter::{FloatParameter, Parameter, ParameterKind};
+use crate::parameter::{FloatParameter, Parameter, ParameterKind, Resolved};
 
 pub(super) const NODE_TYPE: NodeType = NodeType {
     name: "exposure",
@@ -40,11 +40,13 @@ pub(super) const NODE_TYPE: NodeType = NodeType {
 
 /// Each colour plane through the map, and A shared. Inputs are never written: an output is a
 /// plane from `released` or a new one, and A is the input's.
-pub(crate) fn compute(pool: &Pool, image: &Image, stops: f64, released: &mut Vec<Plane>) -> Image {
-    // Exact for whole stops, and far inside f32's range at the limits.
-    let op = Exposure {
-        gain: stops.exp2() as f32,
-    };
+pub(crate) fn compute(
+    pool: &Pool,
+    image: &Image,
+    values: &Resolved,
+    released: &mut Vec<Plane>,
+) -> Image {
+    let op = op(values);
     let window = image.data_window();
     let [r, g, b, a] = image.planes();
     let mut scaled = |plane: &Plane| -> Plane {
@@ -79,16 +81,13 @@ pub(crate) fn record(
     gpu: &mut GpuEvaluation,
     encoder: &mut wgpu::CommandEncoder,
     image: &GpuImage,
-    stops: f64,
+    values: &Resolved,
     released: &mut Planes,
 ) -> GpuImage {
     let Some([r, g, b, a]) = image.planes() else {
         return image.clone();
     };
-    // The host's gain, as the CPU computes it.
-    let op = Exposure {
-        gain: stops.exp2() as f32,
-    };
+    let op = op(values);
     let window = image.info().data_window;
     let mut scaled = |plane: &GpuPlane| -> GpuPlane {
         let output = gpu.plane(released, window);
@@ -117,4 +116,13 @@ pub(crate) fn record(
         scaled(b)
     };
     image.with_planes([red, green, blue, a.clone()])
+}
+
+/// The map both devices run: the gain computed here, on the host, so that they agree on it.
+fn op(values: &Resolved) -> Exposure {
+    let stops = values.float("stops").expect("Stops has a default");
+    // Exact for whole stops, and far inside f32's range at the limits.
+    Exposure {
+        gain: stops.exp2() as f32,
+    }
 }

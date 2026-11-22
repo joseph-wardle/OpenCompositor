@@ -664,23 +664,18 @@ impl Evaluator {
                 }
                 Recipe::Operation { kind, values, .. } => match kind {
                     NodeKind::Reader => unreachable!("a Reader's recipe is its file"),
-                    NodeKind::Exposure => {
-                        let stops = values.float("stops").expect("Exposure has Stops");
-                        Ok(exposure::record(
-                            gpu,
-                            &mut encoder,
-                            source,
-                            stops,
-                            &mut released,
-                        ))
-                    }
+                    NodeKind::Exposure => Ok(exposure::record(
+                        gpu,
+                        &mut encoder,
+                        source,
+                        values,
+                        &mut released,
+                    )),
                     NodeKind::Merge => {
-                        let mix = values.float("mix").expect("Merge has Mix") as f32;
-                        merge::record(gpu, &mut encoder, &step.key, &inputs, mix, &mut released)
+                        merge::record(gpu, &mut encoder, &step.key, &inputs, values, &mut released)
                     }
                     NodeKind::Blur => {
-                        let size = values.float("size").expect("Blur has Size");
-                        blur::record(gpu, &mut encoder, &step.key, source, size, &mut released)
+                        blur::record(gpu, &mut encoder, &step.key, source, values, &mut released)
                     }
                 },
             };
