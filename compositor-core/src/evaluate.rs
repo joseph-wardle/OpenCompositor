@@ -14,9 +14,9 @@ use rayon::prelude::*;
 use crate::files::{Files, reading, unanchored};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::Level;
-use crate::network::{InputSlot, Network, Node, NodeId};
+use crate::network::{Network, Node, NodeId};
 use crate::nodes::{NodeKind, blur, exposure, merge};
-use crate::parameter::resolve;
+use crate::parameter::{Resolved, resolve};
 use crate::read::{ReadError, read_image_until};
 
 mod gpu;
@@ -98,40 +98,26 @@ enum Recipe {
         path: Option<Arc<Path>>,
         reload: u64,
     },
-    Exposure {
-        /// The resolved value's bits. Validation refuses non-finite values and stores -0 as 0, so
-        /// equal values have equal bits.
-        stops: u64,
-        /// `None` while the input is unconnected.
-        source: Option<ResultKey>,
-    },
-    Merge {
-        /// The resolved value's bits, as Exposure's `stops`.
-        mix: u64,
-        background: Option<ResultKey>,
-        /// The connected layers in slot order. An empty slot composes as the empty image, which
-        /// changes nothing, so which slots they occupy is not part of the key.
-        layers: Vec<ResultKey>,
-    },
-    Blur {
-        /// The resolved value's bits, as Exposure's `stops`.
-        size: u64,
-        source: Option<ResultKey>,
+    /// Any other node's image.
+    Operation {
+        kind: NodeKind,
+        /// Shared, as the planner copies a recipe to give it other inputs.
+        values: Arc<Resolved>,
+        /// One for each input that does not repeat, in declaration order, `None` while it is
+        /// unconnected, then the repeating input's connected slots in slot order. An empty slot
+        /// is no part of a stack, so which slots they occupy is not part of the key.
+        inputs: Vec<Option<ResultKey>>,
     },
 }
 
 impl Recipe {
     /// The keys of the connected inputs, in declaration order and then slot order.
     fn inputs(&self) -> impl Iterator<Item = &ResultKey> {
-        let (first, rest): (Option<&ResultKey>, &[ResultKey]) = match self {
-            Recipe::Reader { .. } => (None, &[]),
-            Recipe::Exposure { source, .. } => (source.as_ref(), &[]),
-            Recipe::Merge {
-                background, layers, ..
-            } => (background.as_ref(), layers),
-            Recipe::Blur { source, .. } => (source.as_ref(), &[]),
+        let inputs: &[Option<ResultKey>] = match self {
+            Recipe::Reader { .. } => &[],
+            Recipe::Operation { inputs, .. } => inputs,
         };
-        first.into_iter().chain(rest)
+        inputs.iter().flatten()
     }
 
     /// This recipe with other keys for its connected inputs, in declaration order.
@@ -142,25 +128,19 @@ impl Recipe {
                 path: path.clone(),
                 reload: *reload,
             },
-            Recipe::Exposure { stops, source } => Recipe::Exposure {
-                stops: *stops,
-                source: source.as_ref().and_then(|_| inputs.next()),
-            },
-            Recipe::Merge {
-                mix,
-                background,
-                layers,
-            } => Recipe::Merge {
-                mix: *mix,
-                background: background.as_ref().and_then(|_| inputs.next()),
-                layers: layers
+            Recipe::Operation {
+                kind,
+                values,
+                inputs: connected,
+            } => Recipe::Operation {
+                kind: kind.clone(),
+                values: values.clone(),
+                inputs: connected
                     .iter()
-                    .map(|_| inputs.next().expect("one key per connected layer"))
+                    .map(|input| {
+                        (input.as_ref()).map(|_| inputs.next().expect("a key per connected input"))
+                    })
                     .collect(),
-            },
-            Recipe::Blur { size, source } => Recipe::Blur {
-                size: *size,
-                source: source.as_ref().and_then(|_| inputs.next()),
             },
         }
     }
@@ -171,13 +151,16 @@ impl Recipe {
         let mut hasher = DefaultHasher::new();
         match self {
             Recipe::Reader { path, reload } => (0u8, path, reload).hash(&mut hasher),
-            Recipe::Exposure { stops, source } => (1u8, stops, source.is_some()).hash(&mut hasher),
-            Recipe::Merge {
-                mix,
-                background,
-                layers,
-            } => (2u8, mix, background.is_some(), layers.len()).hash(&mut hasher),
-            Recipe::Blur { size, source } => (3u8, size, source.is_some()).hash(&mut hasher),
+            Recipe::Operation {
+                kind,
+                values,
+                inputs,
+            } => {
+                (1u8, kind, values, inputs.len()).hash(&mut hasher);
+                for input in inputs {
+                    input.is_some().hash(&mut hasher);
+                }
+            }
         }
         for input in self.inputs() {
             input.1.hash(&mut hasher);
@@ -204,43 +187,26 @@ impl Recipe {
                 },
             ) => path == other_path && reload == other_reload,
             (
-                Recipe::Exposure { stops, source },
-                Recipe::Exposure {
-                    stops: other_stops,
-                    source: other_source,
+                Recipe::Operation {
+                    kind,
+                    values,
+                    inputs,
                 },
-            ) => stops == other_stops && source.is_some() == other_source.is_some(),
-            (
-                Recipe::Merge {
-                    mix,
-                    background,
-                    layers,
-                },
-                Recipe::Merge {
-                    mix: other_mix,
-                    background: other_background,
-                    layers: other_layers,
+                Recipe::Operation {
+                    kind: other_kind,
+                    values: other_values,
+                    inputs: other_inputs,
                 },
             ) => {
-                mix == other_mix
-                    && background.is_some() == other_background.is_some()
-                    && layers.len() == other_layers.len()
+                let connected = |inputs: &[Option<ResultKey>]| -> Vec<bool> {
+                    inputs.iter().map(Option::is_some).collect()
+                };
+                kind == other_kind
+                    && values == other_values
+                    && connected(inputs) == connected(other_inputs)
             }
-            (
-                Recipe::Blur { size, source },
-                Recipe::Blur {
-                    size: other_size,
-                    source: other_source,
-                },
-            ) => size == other_size && source.is_some() == other_source.is_some(),
-            // Listed by kind, so that a new kind cannot fall through as never equal.
-            (
-                Recipe::Reader { .. }
-                | Recipe::Exposure { .. }
-                | Recipe::Merge { .. }
-                | Recipe::Blur { .. },
-                _,
-            ) => false,
+            // Listed, so that a new recipe cannot fall through as never equal.
+            (Recipe::Reader { .. } | Recipe::Operation { .. }, _) => false,
         }
     }
 }
@@ -305,7 +271,6 @@ fn recipe(node: &Node, files: &Files, frame: f64, built: &BTreeMap<NodeId, Resul
             .expect("a node takes its inputs' keys only where the network has no cycle")
             .clone()
     };
-    let input = |input: InputSlot<'_>| node.input(input).map(key_of);
     // A refused node gives the empty image, as a Reader without a file does.
     if node.problem().is_some() {
         return Recipe::Reader {
@@ -314,39 +279,28 @@ fn recipe(node: &Node, files: &Files, frame: f64, built: &BTreeMap<NodeId, Resul
         };
     }
     let resolved = resolve(node, frame);
-    match &node.kind {
-        NodeKind::Reader => {
-            let path = reading(&resolved, files, frame).map(|reading| reading.file().clone());
-            Recipe::Reader {
-                reload: path.as_deref().map_or(0, |path| files.reloads(path)),
-                path,
-            }
+    if node.kind == NodeKind::Reader {
+        let path = reading(&resolved, files, frame).map(|reading| reading.file().clone());
+        return Recipe::Reader {
+            reload: path.as_deref().map_or(0, |path| files.reloads(path)),
+            path,
+        };
+    }
+    let mut inputs = Vec::new();
+    for input in node.kind.node_type().inputs {
+        if input.repeating {
+            inputs.extend(
+                node.slots(input.name)
+                    .map(|(_, source)| Some(key_of(source))),
+            );
+        } else {
+            inputs.push(node.input(input.first_slot()).map(key_of));
         }
-        NodeKind::Exposure => {
-            let stops = resolved.float("stops").expect("Exposure has Stops");
-            Recipe::Exposure {
-                stops: stops.to_bits(),
-                source: input("source".into()),
-            }
-        }
-        NodeKind::Merge => {
-            let mix = resolved.float("mix").expect("Merge has Mix");
-            Recipe::Merge {
-                mix: mix.to_bits(),
-                background: input("background".into()),
-                layers: node
-                    .slots("layer")
-                    .map(|(_, source)| key_of(source))
-                    .collect(),
-            }
-        }
-        NodeKind::Blur => {
-            let size = resolved.float("size").expect("Blur has Size");
-            Recipe::Blur {
-                size: size.to_bits(),
-                source: input("source".into()),
-            }
-        }
+    }
+    Recipe::Operation {
+        kind: node.kind.clone(),
+        values: Arc::new(resolved),
+        inputs,
     }
 }
 
@@ -707,32 +661,35 @@ impl Evaluator {
         released: &mut Vec<Plane>,
         stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<Image>, EvalError> {
-        // An unconnected input takes the empty image.
+        // An unconnected input takes the empty image. The first connected input is a node's one
+        // input only while it declares one that does not repeat: a node with two takes more.
         let empty = Image::empty();
-        let image_of = |source: &Option<ResultKey>| match source {
+        let source = || match key.0.inputs().next() {
             Some(_) => inputs[0],
             None => &empty,
         };
         let operation = || match &*key.0 {
             Recipe::Reader { .. } => read_file(key, stop),
-            Recipe::Exposure { stops, source, .. } => Ok(Some(exposure::compute(
-                &self.pool,
-                image_of(source),
-                f64::from_bits(*stops),
-                released,
-            ))),
-            Recipe::Merge { mix, .. } => {
-                let mix = f64::from_bits(*mix) as f32;
-                merge::compute(&self.pool, key, inputs, mix, released).map(Some)
-            }
-            Recipe::Blur { size, source, .. } => blur::compute(
-                &self.pool,
-                key,
-                image_of(source),
-                f64::from_bits(*size),
-                released,
-                stop,
-            ),
+            Recipe::Operation { kind, values, .. } => match kind {
+                NodeKind::Reader => unreachable!("a Reader's recipe is its file"),
+                NodeKind::Exposure => {
+                    let stops = values.float("stops").expect("Exposure has Stops");
+                    Ok(Some(exposure::compute(
+                        &self.pool,
+                        source(),
+                        stops,
+                        released,
+                    )))
+                }
+                NodeKind::Merge => {
+                    let mix = values.float("mix").expect("Merge has Mix") as f32;
+                    merge::compute(&self.pool, key, inputs, mix, released).map(Some)
+                }
+                NodeKind::Blur => {
+                    let size = values.float("size").expect("Blur has Size");
+                    blur::compute(&self.pool, key, source(), size, released, stop)
+                }
+            },
         };
         // Operations write only their own outputs, so a panic leaves nothing half done, and the
         // node fails instead of ending the worker. The panic hook has already reported it. A
@@ -1104,9 +1061,7 @@ impl fmt::Display for EvalError {
                 path: Some(path), ..
             } => write!(f, "{}: ", path.display())?,
             Recipe::Reader { path: None, .. } => write!(f, "Reader: ")?,
-            Recipe::Exposure { .. } => write!(f, "Exposure: ")?,
-            Recipe::Merge { .. } => write!(f, "Merge: ")?,
-            Recipe::Blur { .. } => write!(f, "Blur: ")?,
+            Recipe::Operation { kind, .. } => write!(f, "{}: ", kind.node_type().label)?,
         }
         match self {
             EvalError::Read { error, .. } => error.fmt(f),

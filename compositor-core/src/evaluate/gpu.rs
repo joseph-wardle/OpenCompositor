@@ -17,7 +17,7 @@ use super::{
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
 use crate::kernels::{Kernels, Planes};
-use crate::nodes::{blur, exposure, merge};
+use crate::nodes::{NodeKind, blur, exposure, merge};
 use crate::viewer_cache::{GpuCopier, GpuCopy};
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
@@ -648,6 +648,9 @@ impl Evaluator {
             let inputs: Vec<&GpuImage> = (step.inputs.iter())
                 .map(|&input| images[input].as_ref().expect("inputs come first"))
                 .collect();
+            // As on the CPU: the first connected input, or the empty image.
+            let empty = GpuImage::empty();
+            let source = inputs.first().copied().unwrap_or(&empty);
             let operation = || match &*step.key.0 {
                 Recipe::Reader { .. } => {
                     let decoded = match &step.retained {
@@ -659,28 +662,27 @@ impl Evaluator {
                     };
                     gpu.upload(&mut encoder, &step.key, &decoded, &mut released)
                 }
-                Recipe::Exposure { stops, .. } => {
-                    let empty = GpuImage::empty();
-                    let source = inputs.first().copied().unwrap_or(&empty);
-                    let stops = f64::from_bits(*stops);
-                    Ok(exposure::record(
-                        gpu,
-                        &mut encoder,
-                        source,
-                        stops,
-                        &mut released,
-                    ))
-                }
-                Recipe::Merge { mix, .. } => {
-                    let mix = f64::from_bits(*mix) as f32;
-                    merge::record(gpu, &mut encoder, &step.key, &inputs, mix, &mut released)
-                }
-                Recipe::Blur { size, .. } => {
-                    let empty = GpuImage::empty();
-                    let source = inputs.first().copied().unwrap_or(&empty);
-                    let size = f64::from_bits(*size);
-                    blur::record(gpu, &mut encoder, &step.key, source, size, &mut released)
-                }
+                Recipe::Operation { kind, values, .. } => match kind {
+                    NodeKind::Reader => unreachable!("a Reader's recipe is its file"),
+                    NodeKind::Exposure => {
+                        let stops = values.float("stops").expect("Exposure has Stops");
+                        Ok(exposure::record(
+                            gpu,
+                            &mut encoder,
+                            source,
+                            stops,
+                            &mut released,
+                        ))
+                    }
+                    NodeKind::Merge => {
+                        let mix = values.float("mix").expect("Merge has Mix") as f32;
+                        merge::record(gpu, &mut encoder, &step.key, &inputs, mix, &mut released)
+                    }
+                    NodeKind::Blur => {
+                        let size = values.float("size").expect("Blur has Size");
+                        blur::record(gpu, &mut encoder, &step.key, source, size, &mut released)
+                    }
+                },
             };
             // As on the CPU, a panic fails the node instead of ending the worker; the request
             // submits nothing.

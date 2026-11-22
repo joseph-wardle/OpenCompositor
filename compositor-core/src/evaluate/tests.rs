@@ -9,7 +9,7 @@ use crate::files::Files;
 use crate::fixtures::{self, directory};
 use crate::image::{Channel, Warning, Window};
 use crate::kernels::cpu;
-use crate::network::Assignment;
+use crate::network::{Assignment, InputSlot};
 use crate::parameter::Value;
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
@@ -195,6 +195,24 @@ fn an_unconnected_input_keys_apart_from_any_connection() {
     let connected = chain([reader("a.exr"), exposure(None)]);
     assert_eq!(key(&unconnected, 1), key(&chain([exposure(None)]), 1));
     assert_ne!(key(&unconnected, 1), key(&connected, 2));
+}
+
+/// Built from recipes, as no two kinds resolve to equal values through a network.
+#[test]
+fn operations_of_different_kinds_with_equal_values_have_different_keys() {
+    let values = Arc::new(resolve(&exposure(None), 1.0));
+    let operation = |kind: NodeKind| {
+        ResultKey::new(Recipe::Operation {
+            kind,
+            values: values.clone(),
+            inputs: vec![None],
+        })
+    };
+    let exposure = operation(NodeKind::Exposure);
+    assert_eq!(exposure, operation(NodeKind::Exposure));
+    assert_ne!(exposure, operation(NodeKind::Blur));
+    // The planner compares recipes without their fingerprints.
+    assert!(!exposure.0.same_as(&operation(NodeKind::Blur).0));
 }
 
 #[test]

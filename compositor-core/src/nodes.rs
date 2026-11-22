@@ -79,6 +79,12 @@ const _: () = {
                 !(inputs[index].repeating && inputs[index].required),
                 "a repeating input is never required"
             );
+            // A result's key lists a node's inputs in one run, which says where the stack starts
+            // only while nothing follows it.
+            assert!(
+                !inputs[index].repeating || index + 1 == inputs.len(),
+                "only the last input repeats"
+            );
             index += 1;
         }
         kind += 1;
