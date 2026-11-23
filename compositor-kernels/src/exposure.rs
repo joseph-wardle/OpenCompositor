@@ -1,5 +1,6 @@
 //! Exposure: each colour sample times a gain.
 
+use crate::primitives::map_entry;
 use crate::{Map, Params, flush};
 
 /// Multiplies one sample by a gain, Exposure's whole per-pixel operation.
@@ -23,13 +24,15 @@ pub struct Exposure {
 unsafe impl Params for Exposure {}
 
 impl Map<1, 1> for Exposure {
-    const ENTRY: &'static str = "gpu::exposure";
+    const ENTRY: &'static str = ENTRY;
 
     #[inline(always)]
     fn apply(&self, [v]: [f32; 1]) -> [f32; 1] {
         [exposure(v, self.gain)]
     }
 }
+
+map_entry!(1 => 1, Exposure);
 
 #[cfg(test)]
 mod tests {

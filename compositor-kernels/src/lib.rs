@@ -12,11 +12,13 @@
 #[cfg(not(target_arch = "spirv"))]
 extern crate std;
 
-mod blur;
-mod exposure;
+// Public, as every operation's module is: rust-gpu leaves out the entry point of a module the
+// crate does not export, without an error.
+pub mod blur;
+pub mod exposure;
 #[cfg(target_arch = "spirv")]
 pub mod gpu;
-mod merge;
+pub mod merge;
 pub mod primitives;
 
 pub use blur::{BoxPass, BoxSum};

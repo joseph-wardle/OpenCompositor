@@ -739,6 +739,8 @@ pub(crate) mod headless {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use opencompositor_kernels::{BoxPass, BoxSum, Exposure, Merge, ulp_distance};
 
     use super::*;
@@ -757,8 +759,8 @@ mod tests {
         window(0, 0, width, height)
     }
 
-    /// Records every entry point once, which builds its pipeline: naga validates each against
-    /// its layout without a GPU.
+    /// Records each operation once, which builds its entry point's pipeline: naga validates each
+    /// against its layout without a GPU.
     #[test]
     fn the_module_and_pipelines_validate_without_a_gpu() {
         // The queue kept: a noop device whose queue dropped refuses to make an encoder.
@@ -809,7 +811,15 @@ mod tests {
                 )
                 .expect("an output grown by the pass");
         }
-        assert_eq!(kernels.pipelines.len(), 5, "every entry point");
+        // Against the module's own list: an operation whose entry rust-gpu left out, or a new
+        // entry no line above records, fails here.
+        let module = wgpu::naga::front::spv::parse_u8_slice(SPIRV, &Default::default())
+            .expect("the module parses");
+        let entries: HashSet<&str> = (module.entry_points.iter())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        let recorded: HashSet<&str> = kernels.pipelines.keys().copied().collect();
+        assert_eq!(recorded, entries, "every entry point, each recorded");
     }
 
     #[test]
