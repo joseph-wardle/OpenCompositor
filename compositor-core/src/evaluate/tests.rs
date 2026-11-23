@@ -1,8 +1,9 @@
+use std::iter::zip;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use open_ng::Point;
-use opencompositor_kernels::BoxPass;
+use opencompositor_kernels::{BoxPass, Exposure};
 
 use super::*;
 use crate::files::Files;
@@ -10,6 +11,7 @@ use crate::fixtures::{self, directory};
 use crate::image::{Channel, Warning, Window};
 use crate::kernels::cpu;
 use crate::network::{Assignment, InputSlot};
+use crate::nodes::pointwise::{self, ChannelMap};
 use crate::parameter::Value;
 
 const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
@@ -118,7 +120,7 @@ pub(crate) fn key(network: &Network, id: u64) -> ResultKey {
 }
 
 /// An image of these planes over `width` × `height`, as a reader would make it.
-fn image(width: u32, height: u32, planes: [Plane; 4]) -> Image {
+pub(crate) fn image(width: u32, height: u32, planes: [Plane; 4]) -> Image {
     let window = Window {
         x: 0,
         y: 0,
@@ -146,7 +148,7 @@ fn flat(display: Window, data: Window, values: [f32; 4], warnings: Vec<Warning>)
 }
 
 /// `len` finite values of both signs, from tiny to huge, different for each `seed`.
-fn finite_plane(len: usize, seed: u32) -> Plane {
+pub(crate) fn finite_plane(len: usize, seed: u32) -> Plane {
     let mut state = seed.wrapping_mul(2_654_435_761) | 1;
     (0..len)
         .map(|_| {
@@ -625,6 +627,82 @@ fn exposure_never_writes_its_input_even_where_alpha_is_a_colour_plane() {
         output.plane(Channel::B)
     ));
     assert_eq!(output.value(Channel::R, 1, 2), plane[9] * 4.0);
+}
+
+/// One map of a pointwise node: `channel` times `gain` into `into`.
+pub(crate) fn gain(gain: f32, channel: Channel, into: Channel) -> ChannelMap<Exposure, 1, 1> {
+    ChannelMap {
+        op: Exposure { gain },
+        reads: [channel],
+        writes: [into],
+    }
+}
+
+/// `image` through `maps` on the CPU.
+fn through(image: &Image, maps: &[ChannelMap<Exposure, 1, 1>]) -> Image {
+    pointwise::compute(&Pool::new(), image, maps, &mut Vec::new())
+}
+
+#[test]
+fn equal_maps_of_one_plane_give_one_plane_and_a_zero_gain_is_not_a_negative_one() {
+    let plane = finite_plane(12, 3);
+    let grey = image(4, 3, [(); 4].map(|()| plane.clone()));
+    let colour = [Channel::R, Channel::G, Channel::B];
+
+    let equal = through(&grey, &colour.map(|channel| gain(2.0, channel, channel)));
+    let zeros = through(
+        &grey,
+        &[
+            gain(0.0, Channel::R, Channel::R),
+            gain(-0.0, Channel::G, Channel::G),
+        ],
+    );
+
+    let [r, g, b, _] = equal.planes();
+    assert!(Plane::ptr_eq(r, g) && Plane::ptr_eq(r, b));
+    assert!(!Plane::ptr_eq(r, &plane));
+    let [r, g, ..] = zeros.planes();
+    assert!(!Plane::ptr_eq(r, g));
+    for ((r, g), v) in zip(zip(r.iter(), g.iter()), plane.iter()) {
+        assert_eq!(r.to_bits(), (v * 0.0).to_bits());
+        assert_eq!(g.to_bits(), (v * -0.0).to_bits());
+    }
+}
+
+#[test]
+fn a_map_reads_the_source_and_an_unwritten_channel_is_the_sources_plane() {
+    let source = image(4, 3, [0, 1, 2, 3].map(|seed| finite_plane(12, seed)));
+
+    // Each reads the other's channel: the second must read the source's R, not the first's.
+    let swapped = through(
+        &source,
+        &[
+            gain(2.0, Channel::G, Channel::R),
+            gain(2.0, Channel::R, Channel::G),
+        ],
+    );
+
+    for (into, from) in [(Channel::R, Channel::G), (Channel::G, Channel::R)] {
+        let expected: Vec<f32> = source.plane(from).iter().map(|v| v * 2.0).collect();
+        assert_eq!(**swapped.plane(into), *expected);
+    }
+    for channel in [Channel::B, Channel::A] {
+        assert!(Plane::ptr_eq(swapped.plane(channel), source.plane(channel)));
+    }
+    assert_eq!(swapped.data_window(), source.data_window());
+}
+
+#[test]
+#[should_panic(expected = "two maps write R")]
+fn two_maps_writing_one_channel_fail_the_node() {
+    let source = image(4, 3, [0, 1, 2, 3].map(|seed| finite_plane(12, seed)));
+    through(
+        &source,
+        &[
+            gain(2.0, Channel::R, Channel::R),
+            gain(2.0, Channel::G, Channel::R),
+        ],
+    );
 }
 
 /// The addresses of the R, G and B planes.

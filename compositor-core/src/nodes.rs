@@ -4,6 +4,7 @@
 pub(crate) mod blur;
 pub(crate) mod exposure;
 pub(crate) mod merge;
+pub(crate) mod pointwise;
 mod reader;
 
 use open_ng::Color;

@@ -17,7 +17,7 @@ use super::{
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
 use crate::kernels::{Kernels, Planes};
-use crate::nodes::{NodeKind, blur, exposure, merge};
+use crate::nodes::{NodeKind, blur, exposure, merge, pointwise};
 use crate::viewer_cache::{GpuCopier, GpuCopy};
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
@@ -664,11 +664,11 @@ impl Evaluator {
                 }
                 Recipe::Operation { kind, values, .. } => match kind {
                     NodeKind::Reader => unreachable!("a Reader's recipe is its file"),
-                    NodeKind::Exposure => Ok(exposure::record(
+                    NodeKind::Exposure => Ok(pointwise::record(
                         gpu,
                         &mut encoder,
                         source,
-                        values,
+                        &exposure::maps(values),
                         &mut released,
                     )),
                     NodeKind::Merge => {
