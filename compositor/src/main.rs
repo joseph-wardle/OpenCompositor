@@ -70,13 +70,13 @@ pub struct Widgets {
 /// What the shell was started to do besides showing the window.
 enum Check {
     Lifecycle(PathBuf),
-    Drag(PathBuf, drag::Chain, bool),
+    Drag(PathBuf, drag::Drag, bool),
     Playback(playback_check::Run),
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: opencompositor [--cpu] [FILE | --lifecycle-check IMAGE | --drag-check IMAGE [exposure | merge | blur] [keyed] | --playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold] [keyed]]"
+        "usage: opencompositor [--cpu] [FILE | --lifecycle-check IMAGE | --drag-check IMAGE [TYPE [PARAMETER]] [keyed] | --playback-check IMAGE_PATTERN [exposure | blur | merge SECOND_PATTERN] [BUDGET_MIB] [cold] [keyed]]"
     );
     std::process::exit(2)
 }
@@ -102,13 +102,19 @@ fn main() {
                 [rest @ .., last] if last == "keyed" => (rest, true),
                 rest => (rest, false),
             };
-            match rest {
-                [] => drag::run_chains(&absolute(image), device, keyed),
-                [name] => match name.to_str().and_then(drag::Chain::from_name) {
-                    Some(chain) => Some(Check::Drag(absolute(image), chain, keyed)),
-                    None => usage(),
-                },
+            let names: Option<Vec<&str>> = rest.iter().map(|name| name.to_str()).collect();
+            let parsed = match names.as_deref() {
+                Some([]) => drag::run_all(&absolute(image), device, keyed),
+                Some(&[type_name]) => drag::Drag::parse(type_name, None),
+                Some(&[type_name, parameter]) => drag::Drag::parse(type_name, Some(parameter)),
                 _ => usage(),
+            };
+            match parsed {
+                Ok(drag) => Some(Check::Drag(absolute(image), drag, keyed)),
+                Err(refusal) => {
+                    eprintln!("opencompositor: {refusal}");
+                    usage()
+                }
             }
         }
         [flag, pattern, rest @ ..] if flag == "--playback-check" => {
@@ -334,7 +340,7 @@ fn main() {
     }
     match check {
         Some(Check::Lifecycle(image)) => lifecycle::start(image),
-        Some(Check::Drag(image, chain, keyed)) => drag::start(image, chain, keyed),
+        Some(Check::Drag(image, drag, keyed)) => drag::start(image, drag, keyed),
         Some(Check::Playback(run)) => playback_check::start(run),
         None => {}
     }

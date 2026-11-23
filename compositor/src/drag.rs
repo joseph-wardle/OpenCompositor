@@ -1,8 +1,10 @@
-//! `--drag-check IMAGE [CHAIN] [keyed]`: drags a parameter panel slider with synthetic mouse events, one
-//! pixel each refresh of the viewer's screen, on a chain: `exposure`, Stops on Reader → Exposure;
-//! `merge`, Mix on Reader → Merge with IMAGE as background and layer; or `blur`, Size on Reader →
-//! Blur. Without CHAIN it runs each chain in a child process of its own and fails if any failed.
-//! `keyed` gives the dragged parameter keys first, so that the drag sets a key at the frame.
+//! `--drag-check IMAGE [TYPE [PARAMETER]] [keyed]`: drags a parameter panel slider with synthetic
+//! mouse events, one pixel each refresh of the viewer's screen, on Reader → a node of TYPE, the
+//! Reader of IMAGE feeding each of the node's inputs. PARAMETER is a Float parameter of the type,
+//! by default its first. A type with no Float parameter gets Reader → Exposure → the node instead,
+//! dragging the Exposure's Stops. Without TYPE it runs every type that takes an image, each in a
+//! child process of its own, and fails if any failed. `keyed` gives the dragged parameter keys
+//! first, so that the drag sets a key at the frame.
 //!
 //! The worker evaluates the latest request and discards the rest, so an edit's latency ends at
 //! the first viewer frame that samples a result from its request or a later one: a superseded
@@ -17,14 +19,15 @@
 //! twice, since the first run's shader and file caches are cold.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cxx_qt_lib::QString;
 use open_ng::Point;
 use opencompositor_core::{
-    Changes, Command, EvaluationDevice, Event, FrameTiming, NodeId, Pane, Session, Slot, Timing,
-    Value, Window, resolve,
+    Changes, Command, EvaluationDevice, Event, FloatParameter, FrameTiming, NodeId, NodeKind, Pane,
+    Parameter, ParameterKind, Session, Slot, Timing, Value, Window, node_kinds, resolve,
 };
 
 use crate::check::{Durations, Seen, finish, gui_frames, resident_memory};
@@ -38,63 +41,145 @@ const MOUSE_MOVE: i32 = 5;
 const POLL: Duration = Duration::from_millis(100);
 const LONGEST_WAIT: Duration = Duration::from_secs(60);
 
-/// The Blur's Sizes shown before the drag, the last its starting value: one summed directly on
-/// the GPU and one by blocks, either side of `DIRECT_T`, so that the drag's pipelines are built.
-const BLUR_SIZES: [f64; 2] = [3.0, 30.0];
-
-/// A chain the check drags a slider on, from its Reader to the node whose panel has the slider.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Chain {
-    Exposure,
-    Merge,
-    Blur,
+/// What a kind's drag needs beyond its description. A kind not named takes the defaults; one that
+/// fails them needs its budget decided here, not raised to pass.
+struct Tuning {
+    /// The dragged parameter's values shown before the drag, the last its starting value.
+    warm_up: &'static [f64],
+    /// What the latencies' p95 and the final edit's must meet on the workstation in a CPU
+    /// session. A GPU session's budget is two refreshes for every kind.
+    cpu_budget: Duration,
 }
 
-/// The chains, in the order the check runs them.
-const CHAINS: [Chain; 3] = [Chain::Exposure, Chain::Merge, Chain::Blur];
+fn tuning(kind: &NodeKind) -> Tuning {
+    match kind {
+        NodeKind::Blur => Tuning {
+            // One Size summed directly on the GPU and one by blocks, either side of `DIRECT_T`, so
+            // that the drag's pipelines are built.
+            warm_up: &[3.0, 30.0],
+            // Blur's CPU evaluation takes about as long as the gap between slider events, so
+            // edits wait behind the one running; its budget is set from that, measured.
+            cpu_budget: Duration::from_millis(70),
+        },
+        _ => Tuning {
+            warm_up: &[],
+            cpu_budget: Duration::from_millis(50),
+        },
+    }
+}
 
-impl Chain {
-    /// The chain named on the command line by its node type.
-    pub fn from_name(name: &str) -> Option<Chain> {
-        CHAINS.into_iter().find(|chain| chain.type_name() == name)
+/// What the check drags: a slider in the panel of a node of `kind`, or of the Exposure feeding it.
+#[derive(Clone, Debug)]
+pub struct Drag {
+    kind: NodeKind,
+    dragged: Dragged,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Dragged {
+    /// One of the node's own Float parameters.
+    Own(&'static Parameter),
+    /// The Stops of an Exposure between the Reader and the node, which has no Float parameter.
+    UpstreamStops,
+}
+
+impl Drag {
+    /// The drag named on the command line: a type that takes an image, by its name, and one of
+    /// its Float parameters, by default its first. Refused with the choices.
+    pub fn parse(type_name: &str, parameter: Option<&str>) -> Result<Drag, String> {
+        let Some(kind) = (draggable_kinds()).find(|kind| kind.node_type().name == type_name) else {
+            let names: Vec<&str> = draggable_kinds()
+                .map(|kind| kind.node_type().name)
+                .collect();
+            return Err(format!(
+                "no type {type_name:?} takes an image; the types: {}",
+                names.join(", ")
+            ));
+        };
+        let Some(name) = parameter else {
+            return Ok(Drag::of(kind.clone()));
+        };
+        let Some(parameter) = floats(kind).find(|parameter| parameter.name == name) else {
+            let names: Vec<&str> = floats(kind).map(|parameter| parameter.name).collect();
+            return Err(format!(
+                "{} has no Float parameter {name:?}; its Float parameters: {}",
+                kind.node_type().label,
+                if names.is_empty() {
+                    "none".to_owned()
+                } else {
+                    names.join(", ")
+                }
+            ));
+        };
+        Ok(Drag {
+            kind: kind.clone(),
+            dragged: Dragged::Own(parameter),
+        })
     }
 
-    fn type_name(self) -> &'static str {
-        match self {
-            Chain::Exposure => "exposure",
-            Chain::Merge => "merge",
-            Chain::Blur => "blur",
+    /// The default drag on `kind`: its first Float parameter, or without one the Exposure's Stops.
+    fn of(kind: NodeKind) -> Drag {
+        let dragged = floats(&kind)
+            .next()
+            .map_or(Dragged::UpstreamStops, Dragged::Own);
+        Drag { kind, dragged }
+    }
+
+    /// The parameter whose slider is dragged, whose label names the edit's step.
+    fn parameter(&self) -> &'static Parameter {
+        match self.dragged {
+            Dragged::Own(parameter) => parameter,
+            Dragged::UpstreamStops => floats(&NodeKind::Exposure)
+                .next()
+                .expect("Exposure has its Stops"),
         }
     }
 
-    /// The parameter dragged, and its label, which names the edit's step.
-    fn parameter(self) -> (&'static str, &'static str) {
-        match self {
-            Chain::Exposure => ("stops", "Stops"),
-            Chain::Merge => ("mix", "Mix"),
-            Chain::Blur => ("size", "Size"),
+    fn float(&self) -> &'static FloatParameter {
+        match &self.parameter().kind {
+            ParameterKind::Float(float) => float,
+            _ => unreachable!("a drag is of a Float parameter"),
         }
     }
 
-    /// What the latencies' p95 and the final edit's must meet on the workstation. In a CPU
-    /// session Blur's evaluation takes about as long as the gap between slider events, so edits
-    /// wait behind the one running; its budget is set from that, measured.
-    fn budget(self, device: EvaluationDevice, refresh: Duration) -> Duration {
-        match (device, self) {
-            (EvaluationDevice::Cpu, Chain::Exposure | Chain::Merge) => Duration::from_millis(50),
-            (EvaluationDevice::Cpu, Chain::Blur) => Duration::from_millis(70),
-            (EvaluationDevice::Gpu, _) => refresh * 2,
+    /// What the latencies' p95 and the final edit's must meet on the workstation.
+    fn budget(&self, device: EvaluationDevice, refresh: Duration) -> Duration {
+        match device {
+            EvaluationDevice::Cpu => tuning(&self.kind).cpu_budget,
+            EvaluationDevice::Gpu => refresh * 2,
         }
     }
+}
+
+/// As the reports name it: "Merge, Mix", or "Premult, Exposure's Stops".
+impl fmt::Display for Drag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let node = self.kind.node_type().label;
+        let parameter = self.parameter().label;
+        match self.dragged {
+            Dragged::Own(_) => write!(f, "{node}, {parameter}"),
+            Dragged::UpstreamStops => write!(f, "{node}, Exposure's {parameter}"),
+        }
+    }
+}
+
+/// The kinds a drag can be on, in menu order: every one that takes an image.
+fn draggable_kinds() -> impl Iterator<Item = &'static NodeKind> {
+    (node_kinds().iter()).filter(|kind| !kind.node_type().inputs.is_empty())
+}
+
+fn floats(kind: &NodeKind) -> impl Iterator<Item = &'static Parameter> {
+    (kind.node_type().parameters.iter())
+        .filter(|parameter| matches!(parameter.kind, ParameterKind::Float(_)))
 }
 
 struct Check {
     image: PathBuf,
-    chain: Chain,
+    drag: Drag,
     /// Whether the dragged parameter has keys, so that the drag sets one at the frame.
     keyed: bool,
     device: EvaluationDevice,
-    /// The chain's nodes: the Reader and the node whose slider is dragged.
+    /// The chain's nodes, from the Reader, the last the node whose slider is dragged.
     nodes: Vec<NodeId>,
     /// The dragged parameter's authored value before the drag, or keyed its value at the frame,
     /// which one undo restores.
@@ -102,7 +187,9 @@ struct Check {
     /// The request marking the chain's node made, which the viewer must show before the drag.
     marked: u64,
     marked_at: Option<Instant>,
-    blur_sizes_shown: usize,
+    /// How many images of the chain the viewer has shown before the drag: the first, then one
+    /// for each warm-up value after the first.
+    warmed_up: usize,
     first_frame: Option<FrameTiming>,
     /// The panel's slider, and how many pixels its drag covers.
     slider: *mut ffi::QSlider,
@@ -162,13 +249,14 @@ thread_local! {
     static CHECK: RefCell<Option<Check>> = const { RefCell::new(None) };
 }
 
-/// Runs each chain in a child process of its own, and exits 1 if any failed, else 0. A chain run
-/// after another in the same process stages several times slower (hypothesis: the recreated
-/// staging buffer lands in a slower heap), so chains are only comparable from equal starts.
-pub fn run_chains(image: &Path, device: EvaluationDevice, keyed: bool) -> ! {
+/// Runs each draggable kind's default drag in a child process of its own, named on its command
+/// line so that the command reruns it, and exits 1 if any failed, else 0. A chain run after
+/// another in the same process stages several times slower (hypothesis: the recreated staging
+/// buffer lands in a slower heap), so chains are only comparable from equal starts.
+pub fn run_all(image: &Path, device: EvaluationDevice, keyed: bool) -> ! {
     let binary = std::env::current_exe().expect("the binary knows its own path");
     let mut failed = false;
-    for chain in CHAINS {
+    for drag in draggable_kinds().cloned().map(Drag::of) {
         let mut command = std::process::Command::new(&binary);
         if device == EvaluationDevice::Cpu {
             command.arg("--cpu");
@@ -176,7 +264,10 @@ pub fn run_chains(image: &Path, device: EvaluationDevice, keyed: bool) -> ! {
         command
             .arg("--drag-check")
             .arg(image)
-            .arg(chain.type_name());
+            .arg(drag.kind.node_type().name);
+        if let Dragged::Own(parameter) = drag.dragged {
+            command.arg(parameter.name);
+        }
         if keyed {
             command.arg("keyed");
         }
@@ -184,12 +275,12 @@ pub fn run_chains(image: &Path, device: EvaluationDevice, keyed: bool) -> ! {
         match status {
             Ok(status) if status.success() => {}
             Ok(status) => {
-                eprintln!("drag check ({chain:?}): exited with {status}");
+                eprintln!("drag check ({drag}): exited with {status}");
                 failed = true;
             }
             Err(error) => {
                 eprintln!(
-                    "drag check ({chain:?}): could not run {}: {error}",
+                    "drag check ({drag}): could not run {}: {error}",
                     binary.display()
                 );
                 failed = true;
@@ -199,19 +290,19 @@ pub fn run_chains(image: &Path, device: EvaluationDevice, keyed: bool) -> ! {
     std::process::exit(i32::from(failed))
 }
 
-pub fn start(image: PathBuf, chain: Chain, keyed: bool) {
+pub fn start(image: PathBuf, drag: Drag, keyed: bool) {
     let device = crate::evaluation_device();
     CHECK.with(|cell| {
         *cell.borrow_mut() = Some(Check {
             image,
-            chain,
+            drag,
             keyed,
             device,
             nodes: Vec::new(),
             before: None,
             marked: 0,
             marked_at: None,
-            blur_sizes_shown: 0,
+            warmed_up: 0,
             first_frame: None,
             slider: std::ptr::null_mut(),
             span: 0,
@@ -307,45 +398,58 @@ fn poll_in(tries: usize) -> i32 {
     POLL.as_millis() as i32 * tries as i32
 }
 
-/// Makes the chain, which selects its last node for the panel, and marks that node in the
-/// viewer's slot.
+/// Makes the chain, the dragged node last so that its creation selects it for the panel, and
+/// marks that node in the viewer's slot.
 fn setup(_: usize) {
-    let (image, chain, keyed) = with(|check| (check.image.clone(), check.chain, check.keyed));
+    let (image, drag, keyed) = with(|check| (check.image.clone(), check.drag.clone(), check.keyed));
     let nodes = crate::edit(|session| {
         let reader = created(session.create_readers(vec![image], Point::default(), None));
+        let node_type = drag.kind.node_type();
         let node = created(
-            (session.create_node(chain.type_name(), Point::default(), Some(reader)))
+            (session.create_node(node_type.name, Point::default(), Some(reader)))
                 .expect("the type exists and the Reader exists"),
         );
-        if chain == Chain::Blur {
+        // Creation connected the first input.
+        for input in &node_type.inputs[1..] {
             session
-                .set_value(node, "size", Value::Float(BLUR_SIZES[0]))
-                .expect("a Blur has a Size");
+                .connect(node, input.first_slot(), reader)
+                .expect("the node takes the input");
         }
-        if chain == Chain::Merge {
-            session
-                .connect(node, ("layer", 1), reader)
-                .expect("a Merge takes a layer");
+        let mut nodes = vec![reader, node];
+        if let Dragged::UpstreamStops = drag.dragged {
+            // Inserted after the Reader, it takes over every input the Reader fed.
+            let exposure = NodeKind::Exposure.node_type().name;
+            nodes.push(created(
+                (session.create_node(exposure, Point::default(), Some(reader)))
+                    .expect("the type exists and the Reader exists"),
+            ));
         }
+        let dragged = *nodes.last().expect("the chain has nodes");
+        let parameter = drag.parameter().name;
         if keyed {
+            // From the slider's middle, since the drag ends at its maximum, and a drag back to
+            // the key's value is no step.
+            let slider = &drag.float().slider;
+            let middle = (slider.start() + slider.end()) / 2.0;
+            session
+                .set_value(dragged, parameter, Value::Float(middle))
+                .expect("the slider is within the limits");
             // A key here and one ten frames on, so that the drag keys this frame.
-            let (parameter, _) = chain.parameter();
-            if chain == Chain::Merge {
-                // Away from 1, where the drag ends: a drag back to the key's value is no step.
-                session
-                    .set_value(node, parameter, Value::Float(0.5))
-                    .expect("a Merge has a Mix");
-            }
             let frame = session.frame();
             for at in [frame + 10.0, frame] {
                 session.set_frame(at).expect("the frame is finite");
-                (session.toggle_key(node, parameter)).expect("the parameter takes keys");
+                (session.toggle_key(dragged, parameter)).expect("the parameter takes keys");
             }
         }
+        if let Some(&first) = tuning(&drag.kind).warm_up.first() {
+            session
+                .set_value(dragged, parameter, Value::Float(first))
+                .expect("the warm-up is within the limits");
+        }
         session
-            .set_mark(Slot::new(1).expect("1 is a slot"), Some(node))
+            .set_mark(Slot::new(1).expect("1 is a slot"), Some(dragged))
             .expect("the node exists");
-        vec![reader, node]
+        nodes
     });
     let marked = crate::latest_job();
     with(|check| {
@@ -374,24 +478,23 @@ fn created(changes: Changes) -> NodeId {
 fn wait_for_image(tries: usize) {
     let marked = with(|check| check.marked);
     if crate::presented_job().is_some_and(|shown| shown >= marked) {
-        let (chain, node, shown) = with(|check| {
-            if check.chain == Chain::Blur {
-                check.blur_sizes_shown += 1;
-            }
-            (check.chain, check.nodes[1], check.blur_sizes_shown)
+        let (drag, node, keyed, shown) = with(|check| {
+            check.warmed_up += 1;
+            let node = *check.nodes.last().expect("set up");
+            (check.drag.clone(), node, check.keyed, check.warmed_up)
         });
-        if chain == Chain::Blur && shown < BLUR_SIZES.len() {
+        let parameter = drag.parameter().name;
+        let warm_up = tuning(&drag.kind).warm_up;
+        if shown < warm_up.len() {
             crate::edit(|session| {
                 session
-                    .set_value(node, "size", Value::Float(BLUR_SIZES[shown]))
-                    .expect("a Blur has a Size")
+                    .set_value(node, parameter, Value::Float(warm_up[shown]))
+                    .expect("the warm-up is within the limits")
             });
             with(|check| check.marked = crate::latest_job());
             ffi::single_shot(poll_in(1), wait_for_image, 1);
             return;
         }
-        let (parameter, _) = chain.parameter();
-        let keyed = with(|check| check.keyed);
         let before = crate::read_app(|app| value(app.session(), node, parameter, keyed));
         with(|check| check.before = before);
         begin();
@@ -406,7 +509,8 @@ fn wait_for_image(tries: usize) {
 }
 
 fn begin() {
-    let (parameter, label) = with(|check| check.chain.parameter());
+    let dragged = with(|check| check.drag.parameter());
+    let (parameter, label) = (dragged.name, dragged.label);
     // SAFETY: the panel lives as long as its dock, until the main window is destroyed after the
     // event loop; the slider until the panel shows another node, which nothing selects here.
     let slider = unsafe { ffi::panel_slider(crate::widgets().panel, &QString::from(parameter)) };
@@ -507,7 +611,7 @@ fn wait_for_final(tries: usize) {
 
 /// Checks that one undo removes the drag and that a drag cancelled with Escape changes nothing.
 fn check_steps() -> Vec<String> {
-    let (node, before, slider, span, (parameter, label), keyed) = with(|check| {
+    let (node, before, slider, span, dragged, keyed) = with(|check| {
         let node = *check.nodes.last().expect("set up");
         let before = check.before.clone();
         (
@@ -515,10 +619,11 @@ fn check_steps() -> Vec<String> {
             before,
             check.slider,
             check.span,
-            check.chain.parameter(),
+            check.drag.parameter(),
             check.keyed,
         )
     });
+    let (parameter, label) = (dragged.name, dragged.label);
     let state = || {
         crate::read_app(|app| {
             let session = app.session();
@@ -590,9 +695,9 @@ fn report(mut failures: Vec<String>) {
         .with(|cell| cell.borrow_mut().take())
         .expect("the check has started");
     let keyed = if check.keyed { ", keyed" } else { "" };
-    let name = format!("drag check ({:?}{keyed})", check.chain);
+    let name = format!("drag check ({}{keyed})", check.drag);
     let gpu = check.device == EvaluationDevice::Gpu;
-    let budget = check.chain.budget(check.device, check.refresh);
+    let budget = check.drag.budget(check.device, check.refresh);
     let edits = &check.edits;
     let latency = |edit: &Edit| check.latency(edit);
     // Every edit once the final one is framed, since that frame answers them all.
