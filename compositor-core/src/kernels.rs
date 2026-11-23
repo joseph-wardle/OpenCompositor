@@ -343,11 +343,7 @@ impl Pipeline {
         outputs: &[&wgpu::Texture],
         groups: [u32; 2],
     ) {
-        // SAFETY: `Params` is implemented only for `#[repr(C)]` structs of four-byte values,
-        // which have no padding, so all `size_of::<P>()` bytes are initialised.
-        let bytes = unsafe {
-            std::slice::from_raw_parts((params as *const P).cast::<u8>(), size_of::<P>())
-        };
+        let bytes = params.bytes();
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(self.label),
             size: bytes.len() as u64,

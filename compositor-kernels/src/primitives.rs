@@ -14,7 +14,17 @@ use core::ops::{Add, Mul};
 /// Only for `#[repr(C)]` structs whose fields are four-byte values, or arrays or such structs
 /// of them: they have no padding, so every byte is initialised, and a storage buffer's offsets
 /// are the struct's.
-pub unsafe trait Params: Copy + Sync {}
+pub unsafe trait Params: Copy + Sync {
+    /// What the host writes: every byte of the value, in memory order. Two values with equal
+    /// bytes are the same operation, which equal numbers need not be: `-0` and `0` are equal.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the trait's contract leaves no padding, so all `size_of::<Self>()` bytes are
+        // initialised, and they live as long as `self`.
+        unsafe {
+            core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>())
+        }
+    }
+}
 
 /// Where an input's plane lies in the output's, in the output's texels: zero outside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
