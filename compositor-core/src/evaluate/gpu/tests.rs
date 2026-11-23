@@ -1,13 +1,16 @@
 use std::path::Path;
 
-use opencompositor_kernels::{BoxPass, ulp_distance};
+use opencompositor_kernels::{BoxPass, Exposure, ulp_distance};
 
 use super::*;
-use crate::evaluate::tests::{blur, chain, exposure, graph, key, merge, reader, write_png};
+use crate::evaluate::tests::{
+    blur, chain, exposure, finite_plane, gain, graph, image, key, merge, reader, write_png,
+};
 use crate::fixtures::{directory, write_exr};
 use crate::kernels::headless;
 use crate::network::{InputSlot, Node};
 use crate::nodes::NodeKind;
+use crate::nodes::pointwise::{self, ChannelMap};
 
 /// Tests' stand-in for the device running out of memory, which lavapipe never reports: with a
 /// cap, an attempt that ends with the planes alive over it is refused, as a failed creation's
@@ -172,6 +175,97 @@ fn exposure_on_the_gpu_shares_alpha_and_keeps_a_grey_image_one_plane() {
     assert_eq!(texture(&exposed, Channel::R), texture(&exposed, Channel::G));
     assert_eq!(texture(&exposed, Channel::R), texture(&exposed, Channel::B));
     assert_ne!(texture(&exposed, Channel::R), texture(&read, Channel::R));
+}
+
+/// `image` uploaded, then through `maps` on the GPU, submitted: the upload and the result.
+fn through(
+    gpu: &mut GpuEvaluation,
+    image: &Image,
+    maps: &[ChannelMap<Exposure, 1, 1>],
+) -> (GpuImage, GpuImage) {
+    let origin = key(&chain([reader("a.png")]), 1);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    let mut released = Planes::default();
+    let source = (gpu.upload(&mut encoder, &origin, image, &mut released))
+        .expect("an image the device can hold");
+    let result = pointwise::record(gpu, &mut encoder, &source, maps, &mut released);
+    gpu.queue.submit([encoder.finish()]);
+    (source, result)
+}
+
+#[test]
+fn equal_maps_of_one_plane_give_one_texture_on_the_gpu_and_a_zero_gain_is_not_a_negative_one() {
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
+    let plane = finite_plane(12, 3);
+    let grey = image(4, 3, [(); 4].map(|()| plane.clone()));
+    let colour = [Channel::R, Channel::G, Channel::B];
+
+    let (_, equal) = through(
+        &mut gpu,
+        &grey,
+        &colour.map(|channel| gain(2.0, channel, channel)),
+    );
+    let (source, zeros) = through(
+        &mut gpu,
+        &grey,
+        &[
+            gain(0.0, Channel::R, Channel::R),
+            gain(-0.0, Channel::G, Channel::G),
+        ],
+    );
+
+    let [r, g, b, _] = equal.planes().unwrap();
+    assert!(GpuPlane::ptr_eq(r, g) && GpuPlane::ptr_eq(r, b));
+    let [r, g, ..] = zeros.planes().unwrap();
+    assert!(!GpuPlane::ptr_eq(r, g));
+    assert!(!GpuPlane::ptr_eq(r, &source.planes().unwrap()[0]));
+    let [r, g] = [Channel::R, Channel::G].map(|channel| read_back(&gpu, &zeros, channel));
+    for ((r, g), v) in r.iter().zip(&g).zip(plane.iter()) {
+        assert_eq!(r.to_bits(), (v * 0.0).to_bits());
+        assert_eq!(g.to_bits(), (v * -0.0).to_bits());
+    }
+}
+
+#[test]
+fn a_map_on_the_gpu_reads_the_source_and_an_unwritten_channel_is_the_sources_texture() {
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
+    let image = image(4, 3, [0, 1, 2, 3].map(|seed| finite_plane(12, seed)));
+
+    let (source, swapped) = through(
+        &mut gpu,
+        &image,
+        &[
+            gain(2.0, Channel::G, Channel::R),
+            gain(2.0, Channel::R, Channel::G),
+        ],
+    );
+
+    for (into, from) in [(Channel::R, Channel::G), (Channel::G, Channel::R)] {
+        let expected: Vec<f32> = image.plane(from).iter().map(|v| v * 2.0).collect();
+        assert_eq!(read_back(&gpu, &swapped, into), expected);
+    }
+    for channel in [Channel::B, Channel::A] {
+        assert_eq!(swapped.texture(channel), source.texture(channel));
+    }
+    assert_eq!(swapped.info().data_window, source.info().data_window);
+}
+
+#[test]
+#[should_panic(expected = "two maps write R")]
+fn two_maps_writing_one_channel_fail_the_node_on_the_gpu() {
+    let (device, queue) = headless::device();
+    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
+    let image = image(4, 3, [0, 1, 2, 3].map(|seed| finite_plane(12, seed)));
+    through(
+        &mut gpu,
+        &image,
+        &[
+            gain(2.0, Channel::R, Channel::R),
+            gain(2.0, Channel::G, Channel::R),
+        ],
+    );
 }
 
 #[test]

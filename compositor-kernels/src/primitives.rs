@@ -14,7 +14,17 @@ use core::ops::{Add, Mul};
 /// Only for `#[repr(C)]` structs whose fields are four-byte values, or arrays or such structs
 /// of them: they have no padding, so every byte is initialised, and a storage buffer's offsets
 /// are the struct's.
-pub unsafe trait Params: Copy + Sync {}
+pub unsafe trait Params: Copy + Sync {
+    /// What the host writes: every byte of the value, in memory order. Two values with equal
+    /// bytes are the same operation, which equal numbers need not be: `-0` and `0` are equal.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the trait's contract leaves no padding, so all `size_of::<Self>()` bytes are
+        // initialised, and they live as long as `self`.
+        unsafe {
+            core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>())
+        }
+    }
+}
 
 /// Where an input's plane lies in the output's, in the output's texels: zero outside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +71,38 @@ pub struct MapParams<M, const I: usize> {
 
 // SAFETY: `#[repr(C)]`, four-byte fields, `Placement`s and an operation that is `Params`.
 unsafe impl<M: Params, const I: usize> Params for MapParams<M, I> {}
+
+/// A map's GPU entry point, `map`, written in its operation's module, with `ENTRY`, the name
+/// rust-gpu gives it: its path within the crate. One map per module, so the name is always
+/// `map`, and its impl says `const ENTRY: &'static str = ENTRY;`. The module must be public:
+/// rust-gpu leaves out an entry point the crate does not export, without an error.
+macro_rules! map_entry {
+    (1 => 1, $op:ty) => {
+        pub const ENTRY: &str = $crate::primitives::within_crate(concat!(module_path!(), "::map"));
+
+        #[cfg(target_arch = "spirv")]
+        #[spirv_std::spirv(compute(threads(16, 16)))] // WORKGROUP
+        pub fn map(
+            #[spirv(global_invocation_id)] id: spirv_std::glam::UVec3,
+            #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] params: &$crate::MapParams<
+                $op,
+                1,
+            >,
+            #[spirv(descriptor_set = 0, binding = 1)] input: &$crate::gpu::Input,
+            #[spirv(descriptor_set = 0, binding = 2)] output: &$crate::gpu::Output,
+        ) {
+            $crate::gpu::map_1_1(id, params, input, output);
+        }
+    };
+}
+
+pub(crate) use map_entry;
+
+/// A path from `module_path!` without the crate's name: `opencompositor_kernels::exposure::map`
+/// as `exposure::map`.
+pub(crate) const fn within_crate(path: &'static str) -> &'static str {
+    path.split_at(env!("CARGO_CRATE_NAME").len() + "::".len()).1
+}
 
 /// A map over a stack: at each position, the base's `O` samples folded through the samples of
 /// each layer that covers it, a layer being `G` planes over one window, then finished against

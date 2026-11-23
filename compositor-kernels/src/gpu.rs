@@ -1,5 +1,6 @@
-//! The primitives' GPU halves and the entry points, one per operation, that instantiate them:
-//! rust-gpu needs a `#[spirv]` function for each entry and cannot generate them generically.
+//! The primitives' GPU halves, and the entry points of the folds and line reductions that
+//! instantiate them; a map's is in its operation's module, from `map_entry!`. rust-gpu needs a
+//! `#[spirv]` function for each entry and cannot generate them generically.
 //! Every plane is an R32Float texture; invocations past an output's edge return, since an
 //! image store outside the texture is discarded only under robust image access.
 
@@ -9,8 +10,8 @@ use spirv_std::{Image, spirv};
 
 use crate::{Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Placement};
 
-type Input = Image!(2D, type = f32, sampled);
-type Output = Image!(2D, format = r32f, sampled = false);
+pub(crate) type Input = Image!(2D, type = f32, sampled);
+pub(crate) type Output = Image!(2D, format = r32f, sampled = false);
 
 fn texel(image: &Input, at: IVec2) -> f32 {
     let texel: Vec4 = image.fetch(at);
@@ -29,7 +30,12 @@ fn placed(image: &Input, at: IVec2, place: &Placement) -> (f32, bool) {
 }
 
 /// A map of one input to one output, one invocation per texel.
-fn map_1_1<M: Map<1, 1>>(id: UVec3, params: &MapParams<M, 1>, a: &Input, output: &Output) {
+pub(crate) fn map_1_1<M: Map<1, 1>>(
+    id: UVec3,
+    params: &MapParams<M, 1>,
+    a: &Input,
+    output: &Output,
+) {
     if id.x >= params.width || id.y >= params.height {
         return;
     }
@@ -360,19 +366,6 @@ fn line_scan<L: LineReduce>(
         }
         from += span;
     }
-}
-
-#[spirv(compute(threads(16, 16)))] // WORKGROUP
-pub fn exposure(
-    #[spirv(global_invocation_id)] id: UVec3,
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] params: &MapParams<
-        crate::Exposure,
-        1,
-    >,
-    #[spirv(descriptor_set = 0, binding = 1)] input: &Input,
-    #[spirv(descriptor_set = 0, binding = 2)] output: &Output,
-) {
-    map_1_1(id, params, input, output);
 }
 
 #[spirv(compute(threads(16, 16)))] // WORKGROUP

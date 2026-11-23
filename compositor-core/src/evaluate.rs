@@ -15,7 +15,7 @@ use crate::files::{Files, reading, unanchored};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::Level;
 use crate::network::{Network, Node, NodeId};
-use crate::nodes::{NodeKind, blur, exposure, merge};
+use crate::nodes::{NodeKind, blur, exposure, merge, pointwise};
 use crate::parameter::{Resolved, resolve};
 use crate::read::{ReadError, read_image_until};
 
@@ -672,10 +672,10 @@ impl Evaluator {
             Recipe::Reader { .. } => read_file(key, stop),
             Recipe::Operation { kind, values, .. } => match kind {
                 NodeKind::Reader => unreachable!("a Reader's recipe is its file"),
-                NodeKind::Exposure => Ok(Some(exposure::compute(
+                NodeKind::Exposure => Ok(Some(pointwise::compute(
                     &self.pool,
                     source(),
-                    values,
+                    &exposure::maps(values),
                     released,
                 ))),
                 NodeKind::Merge => {
