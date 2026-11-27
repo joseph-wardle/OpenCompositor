@@ -1,8 +1,9 @@
 //! The CPU primitives' throughput on this machine, as `cargo bench -p opencompositor-core` runs
 //! them, each through an operation over the evaluator's pool. Exposure through the map: its
-//! kernel alone on one thread, and over the pool with reused and with fresh outputs, and a copy
-//! of the same planes through the same pool and chunking, the reference a pointwise kernel is
-//! held to. Merge through the fold, one layer over a background dissolved by Mix, held to the
+//! kernel alone on one thread, over the pool with fresh outputs, and a copy of the same planes
+//! through the same pool and chunking, the reference a pointwise kernel is held to; then its
+//! line, over the pool into reused outputs as its node calls it, held to the copy by the bytes it
+//! moves. Each pointwise node's op gets such a line, and Exposure's alone a gate. Merge through the fold, one layer over a background dissolved by Mix, held to the
 //! copy by the bytes it moves. Blur through the line reduction, its passes along rows and along
 //! columns, each over three planes, held to the copy by the bytes it moves at the fraction a
 //! window sum reaches. It runs on the workstation before each PR to `main`, never in CI: each
@@ -13,13 +14,20 @@ use std::time::{Duration, Instant};
 
 use opencompositor_core::Window;
 use opencompositor_core::bench::{Pool, fold, line, map, map_span};
-use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, Merge};
+use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, Map, Merge};
 
 /// A 4K plate. Its three colour planes go through; alpha is shared unchanged, so neither
 /// Exposure nor the copy touches one.
 const WIDTH: usize = 4096;
 const HEIGHT: usize = 2160;
 const PLANES: usize = 3;
+/// The plate's window, every plane's.
+const PLATE: Window = Window {
+    x: 0,
+    y: 0,
+    width: WIDTH as u32,
+    height: HEIGHT as u32,
+};
 /// Timed runs per column; the median is reported.
 const RUNS: usize = 21;
 /// The least of the copy's throughput Exposure over the pool with reused outputs must reach. A
@@ -49,12 +57,6 @@ fn main() {
     let op = Exposure {
         gain: 0.5f64.exp2() as f32,
     };
-    let plate_window = Window {
-        x: 0,
-        y: 0,
-        width: WIDTH as u32,
-        height: HEIGHT as u32,
-    };
     let inputs: Vec<Vec<f32>> = (1..=PLANES as u32).map(|seed| plate(seed, area)).collect();
     let mut outputs: Vec<Vec<f32>> = (0..PLANES).map(|_| vec![0.0; area]).collect();
 
@@ -63,11 +65,9 @@ fn main() {
             map_span(level, &op, [src], [dst]);
         }
     });
-    let reused = median(|| {
-        for (src, dst) in inputs.iter().zip(&mut outputs) {
-            map(&pool, &op, [(src, plate_window)], plate_window, [dst]);
-        }
-    });
+    for (src, dst) in inputs.iter().zip(&mut outputs) {
+        map(&pool, &op, [(src, PLATE)], PLATE, [dst]);
+    }
     for (src, dst) in inputs.iter().zip(&outputs) {
         let expected = src
             .iter()
@@ -81,7 +81,7 @@ fn main() {
         for src in &inputs {
             // Allocated as the evaluator allocates a plane and dropped as one it did not reuse.
             let mut dst = vec![0.0; area];
-            map(&pool, &op, [(src, plate_window)], plate_window, [&mut dst]);
+            map(&pool, &op, [(src, PLATE)], PLATE, [&mut dst]);
         }
     });
     let copy = median(|| {
@@ -100,7 +100,6 @@ fn main() {
     );
     for (what, time) in [
         ("kernel alone, one thread", alone),
-        ("pool, reused outputs", reused),
         ("pool, fresh outputs", fresh),
         ("copy, reused outputs", copy),
     ] {
@@ -108,7 +107,9 @@ fn main() {
         let throughput = bytes / time.as_secs_f64() / 1e9;
         println!("  {what:<26}{ms:>8.2} ms{throughput:>8.1} GB/s");
     }
-    let ratio = copy.as_secs_f64() / reused.as_secs_f64();
+    let copy_throughput = bytes / copy.as_secs_f64() / 1e9;
+    let calls: Vec<[&[f32]; 1]> = inputs.iter().map(|src| [&src[..]]).collect();
+    let ratio = map_line(&pool, "pool, reused outputs", &op, &calls, copy_throughput);
     let verdict = if ratio >= GATE { "pass" } else { "FAIL" };
     println!("  Exposure at {ratio:.2} of the copy's throughput, gate {GATE}: {verdict}");
     let mut failed = ratio < GATE;
@@ -128,13 +129,12 @@ fn main() {
         fold(
             &pool,
             &Merge { mix: 0.5 },
-            (base_planes, plate_window),
-            &[(layer_planes, plate_window)],
-            plate_window,
+            (base_planes, PLATE),
+            &[(layer_planes, PLATE)],
+            PLATE,
             [r, g, b, a],
         );
     });
-    let copy_throughput = bytes / copy.as_secs_f64() / 1e9;
     let merge_bytes = (12 * area * size_of::<f32>()) as f64;
     println!("Merge on {WIDTH}x{HEIGHT} RGBA, one layer at Mix 0.5, median of {RUNS} runs");
     let ms = merge.as_secs_f64() * 1e3;
@@ -202,6 +202,36 @@ fn main() {
     if failed {
         std::process::exit(1);
     }
+}
+
+/// Times a pointwise node's op over the pool into reused outputs, once for each of `calls`, the
+/// planes each map of the node reads, and prints its line by the bytes moved: every plane each
+/// call reads and writes. Returns its fraction of the copy's throughput.
+fn map_line<M: Map<I, O>, const I: usize, const O: usize>(
+    pool: &Pool,
+    name: &str,
+    op: &M,
+    calls: &[[&[f32]; I]],
+    copy_throughput: f64,
+) -> f64 {
+    let area = WIDTH * HEIGHT;
+    let mut outputs: Vec<[Vec<f32>; O]> = (calls.iter())
+        .map(|_| std::array::from_fn(|_| vec![0.0; area]))
+        .collect();
+    let time = median(|| {
+        for (srcs, dsts) in calls.iter().zip(&mut outputs) {
+            let dsts = dsts.each_mut().map(|dst| &mut dst[..]);
+            map(pool, op, srcs.map(|src| (src, PLATE)), PLATE, dsts);
+        }
+    });
+    let bytes = (calls.len() * (I + O) * area * size_of::<f32>()) as f64;
+    let ms = time.as_secs_f64() * 1e3;
+    let throughput = bytes / time.as_secs_f64() / 1e9;
+    let ratio = throughput / copy_throughput;
+    println!(
+        "  {name:<26}{ms:>8.2} ms{throughput:>8.1} GB/s, {ratio:.2} of the copy by bytes moved"
+    );
+    ratio
 }
 
 /// The median over [`RUNS`] of what `run` takes, after one run to warm up.

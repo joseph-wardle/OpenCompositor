@@ -1,6 +1,6 @@
 [package]
 name = "opencompositor"
-version = "0.1.9"
+version = "0.1.10"
 description = "A node-based compositor."
 edition.workspace = true
 license.workspace = true

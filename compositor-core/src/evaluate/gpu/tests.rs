@@ -123,37 +123,68 @@ fn special_exr(path: &Path) {
     );
 }
 
+/// One GPU's evaluation and an evaluator on each device, for tests holding the GPU's result to
+/// the CPU's.
+struct Devices {
+    gpu: GpuEvaluation,
+    on_gpu: Evaluator,
+    on_cpu: Evaluator,
+}
+
+impl Devices {
+    fn new() -> Devices {
+        let (device, queue) = headless::device();
+        Devices {
+            gpu: GpuEvaluation::new(&device, &queue, Arc::default()),
+            on_gpu: Evaluator::new(),
+            on_cpu: Evaluator::new(),
+        }
+    }
+
+    /// Evaluates `key` on both devices and asserts that the GPU's image is the CPU's: the same
+    /// windows, every sample within `ulps` of the CPU's, and where both are zero the same sign,
+    /// which the distance does not tell apart. `what` names the case in a failure.
+    fn assert_agree(&mut self, key: &ResultKey, ulps: u32, what: &str) {
+        let expected = self.on_cpu.evaluate(key, || false).unwrap().unwrap();
+        let image = run(&mut self.on_gpu, &mut self.gpu, key);
+        assert_eq!(image.info().data_window, expected.data_window(), "{what}");
+        assert_eq!(
+            image.info().display_window,
+            expected.display_window(),
+            "{what}"
+        );
+        for channel in Channel::ALL {
+            let actual = read_back(&self.gpu, &image, channel);
+            let expected = expected.plane(channel);
+            assert_eq!(actual.len(), expected.len());
+            for (i, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                let what = format!("{what}, {channel:?} sample {i}");
+                let distance = ulp_distance(actual, expected);
+                assert!(
+                    distance <= ulps,
+                    "{what}: {actual:?}, not {expected:?}, {distance} ULP apart"
+                );
+                if actual == 0.0 && expected == 0.0 {
+                    assert_eq!(
+                        actual.is_sign_negative(),
+                        expected.is_sign_negative(),
+                        "{what}: {actual:?}, not {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn exposure_on_the_gpu_is_the_cpu_result_over_whole_images() {
     let path = directory("exposure").join("special.exr");
     special_exr(&path);
-    let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
-    let mut evaluator = Evaluator::new();
-    let mut cpu = Evaluator::new();
+    let mut devices = Devices::new();
     // Whole and fractional stops, and one that flushes the smallest values to zero.
     for stops in [1.0, -2.5, 0.75, -20.0] {
         let key = key(&chain([reader(&path), exposure(Some(stops))]), 2);
-        let expected = cpu.evaluate(&key, || false).unwrap().unwrap();
-        let image = run(&mut evaluator, &mut gpu, &key);
-        assert_eq!(image.info().data_window, expected.data_window());
-        assert_eq!(image.info().display_window, expected.display_window());
-        for channel in Channel::ALL {
-            let actual = read_back(&gpu, &image, channel);
-            let expected = expected.plane(channel);
-            assert_eq!(actual.len(), expected.len());
-            for (i, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
-                let what = format!("{stops} stops, {channel:?} sample {i}");
-                assert_eq!(
-                    ulp_distance(actual, expected),
-                    0,
-                    "{what}: {actual:?}, not {expected:?}"
-                );
-                if expected == 0.0 {
-                    assert_eq!(actual.to_bits(), expected.to_bits(), "{what}: zero sign");
-                }
-            }
-        }
+        devices.assert_agree(&key, 0, &format!("{stops} stops"));
     }
 }
 
@@ -408,10 +439,7 @@ fn merge_on_the_gpu_is_the_cpu_result_over_whole_images() {
     merge_exr(&background, (-3, -2), (37, 19), 0);
     merge_exr(&first, (5, 4), (23, 29), 3);
     merge_exr(&second, (-9, 10), (17, 6), 5);
-    let (device, queue) = headless::device();
-    let mut gpu = GpuEvaluation::new(&device, &queue, Arc::default());
-    let mut evaluator = Evaluator::new();
-    let mut cpu = Evaluator::new();
+    let mut devices = Devices::new();
     // Nodes 1 to 3 read the files, 4 reads nothing and 5 merges.
     let layer = |slot| ("layer", slot).into();
     let stacks: [&[(u64, InputSlot<'static>, u64)]; 4] = [
@@ -434,26 +462,7 @@ fn merge_on_the_gpu_is_the_cpu_result_over_whole_images() {
                 merge(Some(mix)),
             ];
             let key = key(&graph(nodes, wires), 5);
-            let expected = cpu.evaluate(&key, || false).unwrap().unwrap();
-            let image = run(&mut evaluator, &mut gpu, &key);
-            assert_eq!(image.info().data_window, expected.data_window());
-            assert_eq!(image.info().display_window, expected.display_window());
-            for channel in Channel::ALL {
-                let actual = read_back(&gpu, &image, channel);
-                let expected = expected.plane(channel);
-                assert_eq!(actual.len(), expected.len());
-                for (i, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
-                    let what = format!("stack {stack} at Mix {mix}, {channel:?} sample {i}");
-                    assert_eq!(
-                        ulp_distance(actual, expected),
-                        0,
-                        "{what}: {actual:?}, not {expected:?}"
-                    );
-                    if expected == 0.0 {
-                        assert_eq!(actual.to_bits(), expected.to_bits(), "{what}: zero sign");
-                    }
-                }
-            }
+            devices.assert_agree(&key, 0, &format!("stack {stack} at Mix {mix}"));
         }
     }
 }
