@@ -332,7 +332,7 @@ fn fold_samples<F: Fold<G, O>, const G: usize, const O: usize>(
 
 #[cfg(test)]
 mod tests {
-    use opencompositor_kernels::{Exposure, Merge, Premult};
+    use opencompositor_kernels::{Exposure, Merge, Premult, Unpremult};
 
     use super::*;
 
@@ -405,18 +405,26 @@ mod tests {
         }
     }
 
-    /// Premult through the map, one span of every length over a colour plane and an alpha
-    /// plane, against the kernel crate's function bit for bit.
-    fn premult_matches_the_kernel_crate(level: Level) {
+    /// A colour-by-alpha op through the map, one span of every length over a colour plane and
+    /// an alpha plane, against its function from the kernel crate bit for bit.
+    fn by_alpha_matches_the_kernel_crate<M: Map<2, 1>>(
+        level: Level,
+        op: &M,
+        function: fn(f32, f32) -> f32,
+    ) {
         let unwritten = f32::from_bits(0x7f80_0001);
         for len in (0..=70).chain([255, 1000, 4097]) {
             let colour = samples(len);
-            // The same classes against each other at every offset.
-            let alpha = samples(len + 5)[5..].to_vec();
+            // The same classes against each other at every offset, and zeros of both signs on
+            // every third sample, where Unpremult leaves the colour.
+            let mut alpha = samples(len + 5)[5..].to_vec();
+            for (i, a) in alpha.iter_mut().enumerate().step_by(3) {
+                *a = if i % 2 == 0 { 0.0 } else { -0.0 };
+            }
             let mut dst = vec![unwritten; len];
-            map_span(level, &Premult, [&colour, &alpha], [&mut dst]);
+            map_span(level, op, [&colour, &alpha], [&mut dst]);
             for (i, ((&v, &a), &d)) in colour.iter().zip(&alpha).zip(&dst).enumerate() {
-                let expected = opencompositor_kernels::premult(v, a);
+                let expected = function(v, a);
                 assert_eq!(
                     d.to_bits(),
                     expected.to_bits(),
@@ -491,7 +499,8 @@ mod tests {
     fn baseline_matches_the_kernel_crate() {
         let level = Level(Kind::Baseline);
         exposure_matches_the_kernel_crate(level);
-        premult_matches_the_kernel_crate(level);
+        by_alpha_matches_the_kernel_crate(level, &Premult, opencompositor_kernels::premult);
+        by_alpha_matches_the_kernel_crate(level, &Unpremult, opencompositor_kernels::unpremult);
         merge_matches_the_kernel_crate(level);
     }
 
@@ -501,7 +510,8 @@ mod tests {
         let level = Level(Kind::V3);
         if supported(level) {
             exposure_matches_the_kernel_crate(level);
-            premult_matches_the_kernel_crate(level);
+            by_alpha_matches_the_kernel_crate(level, &Premult, opencompositor_kernels::premult);
+            by_alpha_matches_the_kernel_crate(level, &Unpremult, opencompositor_kernels::unpremult);
             merge_matches_the_kernel_crate(level);
         }
     }
@@ -512,7 +522,8 @@ mod tests {
         let level = Level(Kind::V4);
         if supported(level) {
             exposure_matches_the_kernel_crate(level);
-            premult_matches_the_kernel_crate(level);
+            by_alpha_matches_the_kernel_crate(level, &Premult, opencompositor_kernels::premult);
+            by_alpha_matches_the_kernel_crate(level, &Unpremult, opencompositor_kernels::unpremult);
             merge_matches_the_kernel_crate(level);
         }
     }

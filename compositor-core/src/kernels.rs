@@ -743,7 +743,9 @@ pub(crate) mod headless {
 mod tests {
     use std::collections::HashSet;
 
-    use opencompositor_kernels::{BoxPass, BoxSum, Exposure, Merge, Premult, ulp_distance};
+    use opencompositor_kernels::{
+        BoxPass, BoxSum, Exposure, Merge, Premult, Unpremult, ulp_distance,
+    };
 
     use super::*;
     use crate::gpu::noop_parts;
@@ -784,6 +786,15 @@ mod tests {
             .map(
                 &mut encoder,
                 &Premult,
+                [(&input, size), (&input, size)],
+                size,
+                [&output],
+            )
+            .expect("planes of one size");
+        kernels
+            .map(
+                &mut encoder,
+                &Unpremult,
                 [(&input, size), (&input, size)],
                 size,
                 [&output],
@@ -1061,11 +1072,31 @@ mod tests {
             .collect()
     }
 
-    /// Premult on the GPU against the CPU's map at 0 ULP, the zeros' signs included: colour of
-    /// every class over the output, and alphas offset from it, reaching past one corner and
-    /// short of the opposite one, so that each of the two inputs is placed on its own.
-    #[test]
-    fn premult_on_the_gpu_is_the_cpu_definition() {
+    /// Divisors for the GPU's division, within Vulkan's range for its bound: zeros of either
+    /// sign, the usual range and beyond it, and magnitudes from 2⁻¹²⁶ to just below 2¹²⁶.
+    fn divisors(count: usize) -> Vec<f32> {
+        const DIVISORS: [f32; 10] = [
+            0.0,
+            0.5,
+            1.0,
+            0.25,
+            -0.75,
+            1.5,
+            -0.0,
+            f32::MIN_POSITIVE,
+            2.0e-20,
+            8.0e37,
+        ];
+        (0..count)
+            .map(|i| DIVISORS[(i * 7 + i / 10) % DIVISORS.len()])
+            .collect()
+    }
+
+    /// `op` of a colour plane and an alpha plane on the GPU against the CPU's map, within `ulps`
+    /// and, where both are zero, of the same sign: colour of every class over the output, and
+    /// `alphas` offset from it, reaching past one corner and short of the opposite one, so that
+    /// each of the two inputs is placed on its own.
+    fn assert_by_alpha_agrees<M: Map<2, 1>>(op: &M, alphas: fn(usize) -> Vec<f32>, ulps: u32) {
         let (device, queue) = headless::device();
         let mut kernels = Kernels::new(&device);
         let pool = crate::evaluate::Pool::new();
@@ -1077,7 +1108,7 @@ mod tests {
             let mut expected = vec![0.0; output.area() as usize];
             cpu::map(
                 &pool,
-                &Premult,
+                op,
                 [(&colour, output), (&alpha, alpha_window)],
                 output,
                 [&mut expected],
@@ -1089,7 +1120,7 @@ mod tests {
             kernels
                 .map(
                     &mut encoder,
-                    &Premult,
+                    op,
                     [(&colour_plane, output), (&alpha_plane, alpha_window)],
                     output,
                     [&result_plane],
@@ -1099,12 +1130,12 @@ mod tests {
             let result = headless::readback(&device, &queue, &result_plane);
             assert_eq!(result.len(), expected.len());
             for (i, (&actual, &expected)) in result.iter().zip(&expected).enumerate() {
-                assert_eq!(
-                    ulp_distance(actual, expected),
-                    0,
-                    "{width}x{height} texel {i}: {actual:?}, not {expected:?}"
+                let distance = ulp_distance(actual, expected);
+                assert!(
+                    distance <= ulps,
+                    "{width}x{height} texel {i}: {actual:?}, not {expected:?}, {distance} ULP"
                 );
-                if expected == 0.0 {
+                if actual == 0.0 && expected == 0.0 {
                     assert_eq!(
                         actual.to_bits(),
                         expected.to_bits(),
@@ -1113,6 +1144,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn premult_on_the_gpu_is_the_cpu_definition() {
+        assert_by_alpha_agrees(&Premult, alphas, 0);
+    }
+
+    /// Within 3 ULP, for the 2.5 Vulkan allows the division.
+    #[test]
+    fn unpremult_on_the_gpu_is_within_3_ulp_of_the_cpu_definition() {
+        assert_by_alpha_agrees(&Unpremult, divisors, 3);
     }
 
     /// Merge of one layer at Mix 1, over alone, on the GPU against the CPU definition: within

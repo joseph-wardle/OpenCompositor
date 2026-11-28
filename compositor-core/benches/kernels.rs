@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use opencompositor_core::Window;
 use opencompositor_core::bench::{Pool, fold, line, map, map_span};
-use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, Map, Merge, Premult};
+use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, Map, Merge, Premult, Unpremult};
 
 /// A 4K plate. Its three colour planes go through; alpha is shared unchanged, so neither
 /// Exposure nor the copy touches one.
@@ -114,7 +114,7 @@ fn main() {
     println!("  Exposure at {ratio:.2} of the copy's throughput, gate {GATE}: {verdict}");
     let mut failed = ratio < GATE;
 
-    // Premult
+    // Premult and Unpremult, each colour plane with A
     let alpha = plate(PLANES as u32 + 1, area);
     let calls: Vec<[&[f32]; 2]> = inputs.iter().map(|src| [&src[..], &alpha[..]]).collect();
     println!("Premult on {WIDTH}x{HEIGHT} RGB by A, median of {RUNS} runs");
@@ -122,6 +122,14 @@ fn main() {
         &pool,
         "pool, reused outputs",
         &Premult,
+        &calls,
+        copy_throughput,
+    );
+    println!("Unpremult on {WIDTH}x{HEIGHT} RGB by A, median of {RUNS} runs");
+    map_line(
+        &pool,
+        "pool, reused outputs",
+        &Unpremult,
         &calls,
         copy_throughput,
     );

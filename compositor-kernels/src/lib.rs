@@ -21,6 +21,7 @@ pub mod gpu;
 pub mod merge;
 pub mod premult;
 pub mod primitives;
+pub mod unpremult;
 
 pub use blur::{BoxPass, BoxSum};
 pub use exposure::{Exposure, exposure};
@@ -30,6 +31,7 @@ pub use primitives::{
     Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, MapPlaces, Params,
     Placement, Real, SCAN_BLOCK, SCAN_MIN_LINES, SCAN_THREADS, WORKGROUP, scan_lines, scan_segment,
 };
+pub use unpremult::{Unpremult, unpremult};
 
 /// `a * b + c` with one rounding: std's `mul_add` on the host, and on SPIR-V libm's `fmaf`,
 /// which rust-gpu lowers to the GLSL `Fma` instruction. The host result is always fused, so the

@@ -17,7 +17,7 @@ use super::{
 };
 use crate::image::{Channel, Image, ImageInfo, Plane, Window};
 use crate::kernels::{Kernels, Planes};
-use crate::nodes::{NodeKind, blur, exposure, merge, pointwise, premult};
+use crate::nodes::{NodeKind, blur, exposure, merge, pointwise, premult, unpremult};
 use crate::viewer_cache::{GpuCopier, GpuCopy};
 
 /// The most bytes of textures evaluation retains on one device. A default, sized for a GPU of
@@ -676,6 +676,13 @@ impl Evaluator {
                         &mut encoder,
                         source,
                         &premult::MAPS,
+                        &mut released,
+                    )),
+                    NodeKind::Unpremult => Ok(pointwise::record(
+                        gpu,
+                        &mut encoder,
+                        source,
+                        &unpremult::MAPS,
                         &mut released,
                     )),
                     NodeKind::Merge => {

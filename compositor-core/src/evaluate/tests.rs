@@ -38,6 +38,10 @@ pub(crate) fn premult() -> Node {
     Node::new(NodeKind::Premult, "Premult", ORIGIN)
 }
 
+pub(crate) fn unpremult() -> Node {
+    Node::new(NodeKind::Unpremult, "Unpremult", ORIGIN)
+}
+
 /// A 2 × 1 opaque PNG whose red is one 8-bit code and green and blue lower ones, replacing any
 /// file at `path`.
 pub(crate) fn write_png(path: &Path, code: u8) {
@@ -95,14 +99,16 @@ pub(crate) fn graph(
     network.assign_inputs(&assignments).unwrap()
 }
 
-/// A network of these nodes, with IDs from 1, each Exposure and Premult taking the image of the
-/// node before it.
+/// A network of these nodes, with IDs from 1, each Exposure, Premult and Unpremult taking the
+/// image of the node before it.
 pub(crate) fn chain(nodes: impl IntoIterator<Item = Node>) -> Network {
     let mut network = Network::default();
     let mut previous = None;
     let mut assignments = Vec::new();
     for (id, node) in (1..).map(NodeId).zip(nodes) {
-        if let (NodeKind::Exposure | NodeKind::Premult, Some(source)) = (&node.kind, previous) {
+        if let (NodeKind::Exposure | NodeKind::Premult | NodeKind::Unpremult, Some(source)) =
+            (&node.kind, previous)
+        {
             assignments.push(Assignment {
                 consumer: id,
                 input: "source".into(),
@@ -203,22 +209,15 @@ fn an_unconnected_input_keys_apart_from_any_connection() {
     assert_ne!(key(&unconnected, 1), key(&connected, 2));
 }
 
-/// Built from recipes, as no two kinds resolve to equal values through a network.
+/// Premult and Unpremult over one source: no parameters, so equal values and inputs.
 #[test]
 fn operations_of_different_kinds_with_equal_values_have_different_keys() {
-    let values = Arc::new(resolve(&exposure(None), 1.0));
-    let operation = |kind: NodeKind| {
-        ResultKey::new(Recipe::Operation {
-            kind,
-            values: values.clone(),
-            inputs: vec![None],
-        })
-    };
-    let exposure = operation(NodeKind::Exposure);
-    assert_eq!(exposure, operation(NodeKind::Exposure));
-    assert_ne!(exposure, operation(NodeKind::Blur));
+    let over_source = |node| key(&chain([reader("a.exr"), node]), 2);
+    assert_eq!(over_source(premult()), over_source(premult()));
+    let (premult, unpremult) = (over_source(premult()), over_source(unpremult()));
+    assert_ne!(premult, unpremult);
     // The planner compares recipes without their fingerprints.
-    assert!(!exposure.0.same_as(&operation(NodeKind::Blur).0));
+    assert!(!premult.0.same_as(&unpremult.0));
 }
 
 #[test]
@@ -603,13 +602,12 @@ fn exposure_on_the_pool_writes_every_sample_as_the_shared_function_does() {
     }
 }
 
-/// Premult through its key, on an image whose colour planes differ and on a grey one, with
-/// alphas below 0, between and above 1: R, G and B each times A bit for bit, A the source's
-/// plane, and the grey image's colour still one plane.
-#[test]
-fn premult_multiplies_colour_by_alpha_and_shares_alpha() {
+/// A colour-by-alpha node through its key, on an image whose colour planes differ and on a grey
+/// one, with alphas below 0, of 0, between and above 1: R, G and B each through `function` with
+/// A bit for bit, A the source's plane, and the grey image's colour still one plane.
+fn assert_colour_by_alpha(node: Node, function: fn(f32, f32) -> f32) {
     let evaluator = Evaluator::new();
-    let premult = key(&chain([reader("a.png"), premult()]), 2);
+    let key = key(&chain([reader("a.png"), node]), 2);
     let alpha: Plane = (0..12).map(|i| i as f32 / 8.0 - 0.25).collect();
     let [r, g, b] = [1, 2, 3].map(|seed| finite_plane(12, seed));
     let grey = finite_plane(12, 4);
@@ -620,7 +618,7 @@ fn premult_multiplies_colour_by_alpha_and_shares_alpha() {
 
     for source in sources {
         let output = evaluator
-            .compute_unstopped(&premult, &[&source], &mut Vec::new())
+            .compute_unstopped(&key, &[&source], &mut Vec::new())
             .unwrap();
 
         for channel in [Channel::R, Channel::G, Channel::B] {
@@ -628,7 +626,7 @@ fn premult_multiplies_colour_by_alpha_and_shares_alpha() {
             for (index, (&d, (&v, &a))) in
                 zip(dst.iter(), zip(src.iter(), alpha.iter())).enumerate()
             {
-                let expected = opencompositor_kernels::premult(v, a);
+                let expected = function(v, a);
                 assert_eq!(d.to_bits(), expected.to_bits(), "{channel:?} at {index}");
             }
         }
@@ -638,6 +636,16 @@ fn premult_multiplies_colour_by_alpha_and_shares_alpha() {
             Plane::ptr_eq(source.plane(Channel::R), source.plane(Channel::G)),
         );
     }
+}
+
+#[test]
+fn premult_multiplies_colour_by_alpha_and_shares_alpha() {
+    assert_colour_by_alpha(premult(), opencompositor_kernels::premult);
+}
+
+#[test]
+fn unpremult_divides_colour_by_alpha_and_shares_alpha() {
+    assert_colour_by_alpha(unpremult(), opencompositor_kernels::unpremult);
 }
 
 #[test]
