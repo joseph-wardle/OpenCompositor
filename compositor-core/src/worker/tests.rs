@@ -523,7 +523,8 @@ fn a_request_reaching_an_idle_worker_starts_the_feedback_interval_again() {
     connect(&worker, noop_device(None), 1);
     worker.request(Some(on(1, key(&first))));
     let held = staged(receive(&deliveries));
-    wait_until_done_after_evaluating(&worker);
+    // Past its GPU phase, the worker may not yet have looked for more to do.
+    wait_until(&worker, "waited idle", |state| state.idle);
 
     let asked = Instant::now();
     worker.request(Some(on(1, key(&second))));

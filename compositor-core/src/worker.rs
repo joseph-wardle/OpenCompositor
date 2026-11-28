@@ -265,6 +265,9 @@ struct MailboxState {
     /// Including keys that failed.
     prepared: Vec<ResultKey>,
     preparing: Option<ResultKey>,
+    /// Whether the worker found nothing to do and waits, or prepares a frame: a request reaching
+    /// it so starts the feedback interval again.
+    idle: bool,
     /// The worker's last delivery, or a request reaching it idle.
     caught_up: Instant,
     /// Whether the started request, or the key being prepared, was found superseded. It stays so
@@ -355,6 +358,7 @@ impl Worker {
                 ahead: Vec::new(),
                 prepared: Vec::new(),
                 preparing: None,
+                idle: false,
                 caught_up: Instant::now(),
                 found_superseded: false,
                 shutting_down: false,
@@ -557,15 +561,18 @@ impl Mailbox {
     /// Waits for a request, or with none for a frame to prepare, and where to evaluate it, or
     /// `None` once the worker is shutting down. A pause only stops the started request.
     fn next(&self) -> Option<(Work, EvaluationDevice)> {
-        // Preparing counts as idle: a request stops it.
-        let mut idle = self.lock().preparing.take().is_some();
+        {
+            // Preparing counts as idle: a request stops it.
+            let mut state = self.lock();
+            state.idle = state.preparing.take().is_some();
+        }
         let next = self.wait_for(|state| {
             state.found_superseded = false;
             if let Some(ask) = state.request.take() {
-                if idle {
+                if state.idle {
                     state.caught_up = Instant::now();
                 }
-                idle = false;
+                state.idle = false;
                 state.started = None;
                 match ask {
                     Ask::Show(job) => {
@@ -587,7 +594,10 @@ impl Mailbox {
                     Take::Taken((Work::Evaluate(job, Purpose::Prepare), state.device))
                 }
                 None => {
-                    idle = true;
+                    state.idle = true;
+                    // For waits until a request would reach the worker idle, which only tests
+                    // make.
+                    self.changed.notify_all();
                     Take::Wait
                 }
             }
