@@ -4,7 +4,8 @@ use opencompositor_kernels::{BoxPass, Exposure, ulp_distance};
 
 use super::*;
 use crate::evaluate::tests::{
-    blur, chain, exposure, finite_plane, gain, graph, image, key, merge, reader, write_png,
+    blur, chain, exposure, finite_plane, gain, graph, image, key, merge, premult, reader,
+    unpremult, write_png,
 };
 use crate::fixtures::{directory, write_exr};
 use crate::kernels::headless;
@@ -103,17 +104,32 @@ fn special_values(count: usize, seed: usize) -> Vec<f32> {
         })
         .collect()
 }
-
 /// An EXR whose data window is offset from its display window to negative coordinates and
 /// whose rows are no multiple of the copy alignment, holding the special values in every
 /// channel.
 fn special_exr(path: &Path) {
+    exr_with_alpha(path, |alpha| alpha);
+}
+
+/// As [`special_exr`], with each alpha outside the divisors Vulkan bounds the GPU's division
+/// for, of magnitude 2⁻¹²⁶ to 2¹²⁶, made zero: the alphas a GPU test of Unpremult can hold.
+fn divisor_exr(path: &Path) {
+    exr_with_alpha(path, |alpha| {
+        alpha
+            .into_iter()
+            .map(|a| if a.abs() < 2.0f32.powi(126) { a } else { 0.0 })
+            .collect()
+    });
+}
+
+fn exr_with_alpha(path: &Path, alpha: fn(Vec<f32>) -> Vec<f32>) {
     let (width, height) = (37, 19);
-    let channels = ["R", "G", "B", "A"]
+    let mut channels: Vec<_> = ["R", "G", "B", "A"]
         .into_iter()
         .zip(0..)
         .map(|(name, seed)| (name, special_values(width * height, seed)))
         .collect();
+    channels[3].1 = alpha(std::mem::take(&mut channels[3].1));
     write_exr(
         path,
         ((0, 0), (32, 16)),
@@ -186,6 +202,25 @@ fn exposure_on_the_gpu_is_the_cpu_result_over_whole_images() {
         let key = key(&chain([reader(&path), exposure(Some(stops))]), 2);
         devices.assert_agree(&key, 0, &format!("{stops} stops"));
     }
+}
+
+#[test]
+fn premult_on_the_gpu_is_the_cpu_result_over_whole_images() {
+    let path = directory("premult").join("special.exr");
+    special_exr(&path);
+    let mut devices = Devices::new();
+    let key = key(&chain([reader(&path), premult()]), 2);
+    devices.assert_agree(&key, 0, "Premult");
+}
+
+/// Within 3 ULP, for the 2.5 Vulkan allows the division.
+#[test]
+fn unpremult_on_the_gpu_is_within_3_ulp_of_the_cpu_result_over_whole_images() {
+    let path = directory("unpremult").join("divisors.exr");
+    divisor_exr(&path);
+    let mut devices = Devices::new();
+    let key = key(&chain([reader(&path), unpremult()]), 2);
+    devices.assert_agree(&key, 3, "Unpremult");
 }
 
 #[test]

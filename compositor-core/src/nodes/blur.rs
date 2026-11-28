@@ -12,7 +12,7 @@ use crate::evaluate::{
 use crate::image::{Image, ImageInfo, Plane, Window};
 use crate::kernels::cpu::{self, Stopped};
 use crate::kernels::{Planes, plane_bytes};
-use crate::nodes::{NodeInput, NodeType};
+use crate::nodes::{Expects, Makes, NodeInput, NodeType};
 use crate::parameter::{FloatParameter, Parameter, ParameterKind, Resolved};
 
 pub(super) const NODE_TYPE: NodeType = NodeType {
@@ -40,7 +40,9 @@ pub(super) const NODE_TYPE: NodeType = NodeType {
         label: "Source",
         repeating: false,
         required: true,
+        expects: Expects::Premultiplied,
     }],
+    makes: Makes::AsInputs,
 };
 
 /// Blur's image: its source blurred by `size`, every channel through the same passes, over the

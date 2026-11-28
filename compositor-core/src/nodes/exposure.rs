@@ -6,7 +6,7 @@ use opencompositor_kernels::Exposure;
 
 use crate::image::Channel;
 use crate::nodes::pointwise::ChannelMap;
-use crate::nodes::{NodeInput, NodeType};
+use crate::nodes::{Expects, Makes, NodeInput, NodeType};
 use crate::parameter::{FloatParameter, Parameter, ParameterKind, Resolved};
 
 pub(super) const NODE_TYPE: NodeType = NodeType {
@@ -34,7 +34,9 @@ pub(super) const NODE_TYPE: NodeType = NodeType {
         label: "Source",
         repeating: false,
         required: true,
+        expects: Expects::Either,
     }],
+    makes: Makes::AsInputs,
 };
 
 /// R, G and B each through the gain, computed here, on the host, so that both devices agree on

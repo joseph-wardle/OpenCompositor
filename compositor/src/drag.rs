@@ -399,7 +399,7 @@ fn poll_in(tries: usize) -> i32 {
 }
 
 /// Makes the chain, the dragged node last so that its creation selects it for the panel, and
-/// marks that node in the viewer's slot.
+/// marks the node of the checked type in the viewer's slot.
 fn setup(_: usize) {
     let (image, drag, keyed) = with(|check| (check.image.clone(), check.drag.clone(), check.keyed));
     let nodes = crate::edit(|session| {
@@ -418,11 +418,14 @@ fn setup(_: usize) {
         let mut nodes = vec![reader, node];
         if let Dragged::UpstreamStops = drag.dragged {
             // Inserted after the Reader, it takes over every input the Reader fed.
+            // The changes also name the nodes it rewired.
             let exposure = NodeKind::Exposure.node_type().name;
-            nodes.push(created(
-                (session.create_node(exposure, Point::default(), Some(reader)))
-                    .expect("the type exists and the Reader exists"),
-            ));
+            let changes = (session.create_node(exposure, Point::default(), Some(reader)))
+                .expect("the type exists and the Reader exists");
+            let exposure = (changes.nodes.iter())
+                .find(|id| !nodes.contains(id))
+                .expect("one node was created");
+            nodes.push(*exposure);
         }
         let dragged = *nodes.last().expect("the chain has nodes");
         let parameter = drag.parameter().name;
@@ -447,7 +450,7 @@ fn setup(_: usize) {
                 .expect("the warm-up is within the limits");
         }
         session
-            .set_mark(Slot::new(1).expect("1 is a slot"), Some(dragged))
+            .set_mark(Slot::new(1).expect("1 is a slot"), Some(node))
             .expect("the node exists");
         nodes
     });

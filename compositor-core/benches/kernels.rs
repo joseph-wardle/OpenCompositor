@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use opencompositor_core::Window;
 use opencompositor_core::bench::{Pool, fold, line, map, map_span};
-use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, Map, Merge};
+use opencompositor_kernels::{Axis, BoxPass, BoxSum, Exposure, Map, Merge, Premult, Unpremult};
 
 /// A 4K plate. Its three colour planes go through; alpha is shared unchanged, so neither
 /// Exposure nor the copy touches one.
@@ -113,6 +113,26 @@ fn main() {
     let verdict = if ratio >= GATE { "pass" } else { "FAIL" };
     println!("  Exposure at {ratio:.2} of the copy's throughput, gate {GATE}: {verdict}");
     let mut failed = ratio < GATE;
+
+    // Premult and Unpremult, each colour plane with A
+    let alpha = plate(PLANES as u32 + 1, area);
+    let calls: Vec<[&[f32]; 2]> = inputs.iter().map(|src| [&src[..], &alpha[..]]).collect();
+    println!("Premult on {WIDTH}x{HEIGHT} RGB by A, median of {RUNS} runs");
+    map_line(
+        &pool,
+        "pool, reused outputs",
+        &Premult,
+        &calls,
+        copy_throughput,
+    );
+    println!("Unpremult on {WIDTH}x{HEIGHT} RGB by A, median of {RUNS} runs");
+    map_line(
+        &pool,
+        "pool, reused outputs",
+        &Unpremult,
+        &calls,
+        copy_throughput,
+    );
 
     // Merge through the fold: one layer over a background, dissolved by Mix into four planes,
     // reads the layer's four planes and the background's and writes four, twelve planes' bytes

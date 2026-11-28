@@ -15,7 +15,7 @@ use crate::files::{Files, reading, unanchored};
 use crate::image::{Image, Oversize, Plane, Window};
 use crate::kernels::cpu::Level;
 use crate::network::{Network, Node, NodeId};
-use crate::nodes::{NodeKind, blur, exposure, merge, pointwise};
+use crate::nodes::{NodeKind, blur, exposure, merge, pointwise, premult, unpremult};
 use crate::parameter::{Resolved, resolve};
 use crate::read::{ReadError, read_image_until};
 
@@ -676,6 +676,18 @@ impl Evaluator {
                     &self.pool,
                     source(),
                     &exposure::maps(values),
+                    released,
+                ))),
+                NodeKind::Premult => Ok(Some(pointwise::compute(
+                    &self.pool,
+                    source(),
+                    &premult::MAPS,
+                    released,
+                ))),
+                NodeKind::Unpremult => Ok(Some(pointwise::compute(
+                    &self.pool,
+                    source(),
+                    &unpremult::MAPS,
                     released,
                 ))),
                 NodeKind::Merge => {

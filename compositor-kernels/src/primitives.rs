@@ -58,24 +58,41 @@ pub trait Map<const I: usize, const O: usize>: Params {
     fn apply(&self, samples: [f32; I]) -> [f32; O];
 }
 
-/// A map's parameters: where each input lies in the output, the output's size and the
-/// operation's own. The placements come first, which keeps every field four-byte aligned.
+/// Where each of a map's `I` inputs lies in its output, and the output's size: a map's
+/// parameters other than its operation's, and all of them for an operation that has none. The
+/// placements come first, which keeps every field four-byte aligned.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct MapParams<M, const I: usize> {
+pub struct MapPlaces<const I: usize> {
     pub places: [Placement; I],
     pub width: u32,
     pub height: u32,
+}
+
+// SAFETY: `#[repr(C)]`, four-byte fields and `Placement`s.
+unsafe impl<const I: usize> Params for MapPlaces<I> {}
+
+/// A map's parameters: its places and the operation's own, after them. An operation without
+/// parameters adds no bytes, and its entry point reads only the places.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct MapParams<M, const I: usize> {
+    pub map: MapPlaces<I>,
     pub op: M,
 }
 
-// SAFETY: `#[repr(C)]`, four-byte fields, `Placement`s and an operation that is `Params`.
+// SAFETY: `#[repr(C)]`, `MapPlaces` and an operation that is `Params`, both without padding;
+// the places' four-byte alignment leaves none between them.
 unsafe impl<M: Params, const I: usize> Params for MapParams<M, I> {}
 
 /// A map's GPU entry point, `map`, written in its operation's module, with `ENTRY`, the name
 /// rust-gpu gives it: its path within the crate. One map per module, so the name is always
 /// `map`, and its impl says `const ENTRY: &'static str = ENTRY;`. The module must be public:
 /// rust-gpu leaves out an entry point the crate does not export, without an error.
+///
+/// An operation without parameters is named `const`, a unit struct: its entry point binds the
+/// places alone and makes the operation itself, since rust-gpu would give the struct no
+/// members, and naga refuses a module with an empty struct anywhere in it.
 macro_rules! map_entry {
     (1 => 1, $op:ty) => {
         pub const ENTRY: &str = $crate::primitives::within_crate(concat!(module_path!(), "::map"));
@@ -91,7 +108,24 @@ macro_rules! map_entry {
             #[spirv(descriptor_set = 0, binding = 1)] input: &$crate::gpu::Input,
             #[spirv(descriptor_set = 0, binding = 2)] output: &$crate::gpu::Output,
         ) {
-            $crate::gpu::map_1_1(id, params, input, output);
+            $crate::gpu::map_1_1(id, &params.map, params.op, input, output);
+        }
+    };
+    (2 => 1, const $op:ident) => {
+        pub const ENTRY: &str = $crate::primitives::within_crate(concat!(module_path!(), "::map"));
+
+        const _: () = assert!(size_of::<$op>() == 0, "a const operation has no parameters");
+
+        #[cfg(target_arch = "spirv")]
+        #[spirv_std::spirv(compute(threads(16, 16)))] // WORKGROUP
+        pub fn map(
+            #[spirv(global_invocation_id)] id: spirv_std::glam::UVec3,
+            #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] places: &$crate::MapPlaces<2>,
+            #[spirv(descriptor_set = 0, binding = 1)] a: &$crate::gpu::Input,
+            #[spirv(descriptor_set = 0, binding = 2)] b: &$crate::gpu::Input,
+            #[spirv(descriptor_set = 0, binding = 3)] output: &$crate::gpu::Output,
+        ) {
+            $crate::gpu::map_2_1(id, places, $op, (a, b), output);
         }
     };
 }

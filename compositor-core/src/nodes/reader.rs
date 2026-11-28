@@ -4,7 +4,7 @@
 
 use open_ng::Color;
 
-use crate::nodes::NodeType;
+use crate::nodes::{Makes, NodeType};
 use crate::parameter::{Parameter, ParameterKind};
 
 pub(super) const NODE_TYPE: NodeType = NodeType {
@@ -43,4 +43,5 @@ pub(super) const NODE_TYPE: NodeType = NodeType {
         },
     ],
     inputs: &[],
+    makes: Makes::Premultiplied,
 };
