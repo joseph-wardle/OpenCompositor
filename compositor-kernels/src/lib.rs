@@ -19,14 +19,16 @@ pub mod exposure;
 #[cfg(target_arch = "spirv")]
 pub mod gpu;
 pub mod merge;
+pub mod premult;
 pub mod primitives;
 
 pub use blur::{BoxPass, BoxSum};
 pub use exposure::{Exposure, exposure};
 pub use merge::{Merge, mix, over};
+pub use premult::{Premult, premult};
 pub use primitives::{
-    Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Params, Placement,
-    Real, SCAN_BLOCK, SCAN_MIN_LINES, SCAN_THREADS, WORKGROUP, scan_lines, scan_segment,
+    Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, MapPlaces, Params,
+    Placement, Real, SCAN_BLOCK, SCAN_MIN_LINES, SCAN_THREADS, WORKGROUP, scan_lines, scan_segment,
 };
 
 /// `a * b + c` with one rounding: std's `mul_add` on the host, and on SPIR-V libm's `fmaf`,

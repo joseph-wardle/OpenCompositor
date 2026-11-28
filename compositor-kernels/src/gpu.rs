@@ -8,7 +8,7 @@ use spirv_std::arch::workgroup_memory_barrier_with_group_sync;
 use spirv_std::glam::{IVec2, UVec3, Vec4};
 use spirv_std::{Image, spirv};
 
-use crate::{Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Placement};
+use crate::{Fold, FoldParams, LineParams, LineReduce, Map, MapPlaces, Placement};
 
 pub(crate) type Input = Image!(2D, type = f32, sampled);
 pub(crate) type Output = Image!(2D, format = r32f, sampled = false);
@@ -32,18 +32,38 @@ fn placed(image: &Input, at: IVec2, place: &Placement) -> (f32, bool) {
 /// A map of one input to one output, one invocation per texel.
 pub(crate) fn map_1_1<M: Map<1, 1>>(
     id: UVec3,
-    params: &MapParams<M, 1>,
+    places: &MapPlaces<1>,
+    op: M,
     a: &Input,
     output: &Output,
 ) {
-    if id.x >= params.width || id.y >= params.height {
+    if id.x >= places.width || id.y >= places.height {
         return;
     }
     let at = IVec2::new(id.x as i32, id.y as i32);
-    let (a, _) = placed(a, at, &params.places[0]);
-    let [v] = params.op.apply([a]);
-    // SAFETY: `at` is inside the output, which covers the params' size, and the output is
+    let (a, _) = placed(a, at, &places.places[0]);
+    let [v] = op.apply([a]);
+    // SAFETY: `at` is inside the output, which covers the places' size, and the output is
     // bound as R32Float, the format this image type declares.
+    unsafe { output.write(at, v) };
+}
+
+/// A map of two inputs to one output, one invocation per texel.
+pub(crate) fn map_2_1<M: Map<2, 1>>(
+    id: UVec3,
+    places: &MapPlaces<2>,
+    op: M,
+    (a, b): (&Input, &Input),
+    output: &Output,
+) {
+    if id.x >= places.width || id.y >= places.height {
+        return;
+    }
+    let at = IVec2::new(id.x as i32, id.y as i32);
+    let (a, _) = placed(a, at, &places.places[0]);
+    let (b, _) = placed(b, at, &places.places[1]);
+    let [v] = op.apply([a, b]);
+    // SAFETY: as for `map_1_1`.
     unsafe { output.write(at, v) };
 }
 

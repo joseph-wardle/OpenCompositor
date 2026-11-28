@@ -332,7 +332,7 @@ fn fold_samples<F: Fold<G, O>, const G: usize, const O: usize>(
 
 #[cfg(test)]
 mod tests {
-    use opencompositor_kernels::{Exposure, Merge};
+    use opencompositor_kernels::{Exposure, Merge, Premult};
 
     use super::*;
 
@@ -405,6 +405,28 @@ mod tests {
         }
     }
 
+    /// Premult through the map, one span of every length over a colour plane and an alpha
+    /// plane, against the kernel crate's function bit for bit.
+    fn premult_matches_the_kernel_crate(level: Level) {
+        let unwritten = f32::from_bits(0x7f80_0001);
+        for len in (0..=70).chain([255, 1000, 4097]) {
+            let colour = samples(len);
+            // The same classes against each other at every offset.
+            let alpha = samples(len + 5)[5..].to_vec();
+            let mut dst = vec![unwritten; len];
+            map_span(level, &Premult, [&colour, &alpha], [&mut dst]);
+            for (i, ((&v, &a), &d)) in colour.iter().zip(&alpha).zip(&dst).enumerate() {
+                let expected = opencompositor_kernels::premult(v, a);
+                assert_eq!(
+                    d.to_bits(),
+                    expected.to_bits(),
+                    "{level:?}, {len} samples: sample {i} ({v:e}) by alpha {a:e} gave {d:e}, \
+                     not {expected:e}"
+                );
+            }
+        }
+    }
+
     /// Merge through the fold, one span of four planes of every length with one layer and with
     /// two, against over and then mix from the kernel crate bit for bit, and Mix 1 as the
     /// stack itself.
@@ -469,6 +491,7 @@ mod tests {
     fn baseline_matches_the_kernel_crate() {
         let level = Level(Kind::Baseline);
         exposure_matches_the_kernel_crate(level);
+        premult_matches_the_kernel_crate(level);
         merge_matches_the_kernel_crate(level);
     }
 
@@ -478,6 +501,7 @@ mod tests {
         let level = Level(Kind::V3);
         if supported(level) {
             exposure_matches_the_kernel_crate(level);
+            premult_matches_the_kernel_crate(level);
             merge_matches_the_kernel_crate(level);
         }
     }
@@ -488,6 +512,7 @@ mod tests {
         let level = Level(Kind::V4);
         if supported(level) {
             exposure_matches_the_kernel_crate(level);
+            premult_matches_the_kernel_crate(level);
             merge_matches_the_kernel_crate(level);
         }
     }
@@ -527,6 +552,47 @@ mod tests {
                     0.0
                 };
                 assert_eq!(dst[(y * 10 + x) as usize], expected, "({x}, {y})");
+            }
+        }
+    }
+
+    /// The map of two inputs over the pool, each offset differently in the output and reaching
+    /// past it: each output sample is Premult of both inputs' samples at its position, each
+    /// zero where its input is not.
+    #[test]
+    fn a_map_of_two_inputs_places_each() {
+        let pool = Pool::new();
+        let colour = window(3, -2, 9, 6);
+        let alpha = window(-1, 1, 6, 8);
+        let output = window(0, 0, 10, 7);
+        let src = |window: Window, from: f32| -> Vec<f32> {
+            (0..window.area()).map(|i| i as f32 + from).collect()
+        };
+        let (colour_src, alpha_src) = (src(colour, 1.0), src(alpha, 0.5));
+        let mut dst = vec![f32::NAN; output.area() as usize];
+        map(
+            &pool,
+            &Premult,
+            [(&colour_src, colour), (&alpha_src, alpha)],
+            output,
+            [&mut dst],
+        );
+        let sample = |window: Window, src: &[f32], x: i32, y: i32| {
+            if window.contains(x, y) {
+                let at = (y - window.y) as u32 * window.width + (x - window.x) as u32;
+                src[at as usize]
+            } else {
+                0.0
+            }
+        };
+        for y in 0..7 {
+            for x in 0..10 {
+                let expected = opencompositor_kernels::premult(
+                    sample(colour, &colour_src, x, y),
+                    sample(alpha, &alpha_src, x, y),
+                );
+                let actual = dst[(y * 10 + x) as usize];
+                assert_eq!(actual.to_bits(), expected.to_bits(), "({x}, {y})");
             }
         }
     }

@@ -34,6 +34,10 @@ pub(crate) fn exposure(stops: Option<f64>) -> Node {
     node
 }
 
+pub(crate) fn premult() -> Node {
+    Node::new(NodeKind::Premult, "Premult", ORIGIN)
+}
+
 /// A 2 × 1 opaque PNG whose red is one 8-bit code and green and blue lower ones, replacing any
 /// file at `path`.
 pub(crate) fn write_png(path: &Path, code: u8) {
@@ -91,14 +95,14 @@ pub(crate) fn graph(
     network.assign_inputs(&assignments).unwrap()
 }
 
-/// A network of these nodes, with IDs from 1, each Exposure taking the image of the node before
-/// it.
+/// A network of these nodes, with IDs from 1, each Exposure and Premult taking the image of the
+/// node before it.
 pub(crate) fn chain(nodes: impl IntoIterator<Item = Node>) -> Network {
     let mut network = Network::default();
     let mut previous = None;
     let mut assignments = Vec::new();
     for (id, node) in (1..).map(NodeId).zip(nodes) {
-        if let (NodeKind::Exposure, Some(source)) = (&node.kind, previous) {
+        if let (NodeKind::Exposure | NodeKind::Premult, Some(source)) = (&node.kind, previous) {
             assignments.push(Assignment {
                 consumer: id,
                 input: "source".into(),
@@ -596,6 +600,43 @@ fn exposure_on_the_pool_writes_every_sample_as_the_shared_function_does() {
                 input.plane(Channel::A)
             ));
         }
+    }
+}
+
+/// Premult through its key, on an image whose colour planes differ and on a grey one, with
+/// alphas below 0, between and above 1: R, G and B each times A bit for bit, A the source's
+/// plane, and the grey image's colour still one plane.
+#[test]
+fn premult_multiplies_colour_by_alpha_and_shares_alpha() {
+    let evaluator = Evaluator::new();
+    let premult = key(&chain([reader("a.png"), premult()]), 2);
+    let alpha: Plane = (0..12).map(|i| i as f32 / 8.0 - 0.25).collect();
+    let [r, g, b] = [1, 2, 3].map(|seed| finite_plane(12, seed));
+    let grey = finite_plane(12, 4);
+    let sources = [
+        image(4, 3, [r, g, b, alpha.clone()]),
+        image(4, 3, [grey.clone(), grey.clone(), grey, alpha.clone()]),
+    ];
+
+    for source in sources {
+        let output = evaluator
+            .compute_unstopped(&premult, &[&source], &mut Vec::new())
+            .unwrap();
+
+        for channel in [Channel::R, Channel::G, Channel::B] {
+            let (src, dst) = (source.plane(channel), output.plane(channel));
+            for (index, (&d, (&v, &a))) in
+                zip(dst.iter(), zip(src.iter(), alpha.iter())).enumerate()
+            {
+                let expected = opencompositor_kernels::premult(v, a);
+                assert_eq!(d.to_bits(), expected.to_bits(), "{channel:?} at {index}");
+            }
+        }
+        assert!(Plane::ptr_eq(output.plane(Channel::A), &alpha));
+        assert_eq!(
+            Plane::ptr_eq(output.plane(Channel::R), output.plane(Channel::G)),
+            Plane::ptr_eq(source.plane(Channel::R), source.plane(Channel::G)),
+        );
     }
 }
 

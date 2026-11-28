@@ -11,8 +11,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use opencompositor_kernels::{
-    Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, Params, Placement,
-    SCAN_BLOCK, SPIRV, WORKGROUP, scan_lines,
+    Axis, DIRECT_T, Fold, FoldParams, LineParams, LineReduce, Map, MapParams, MapPlaces, Params,
+    Placement, SCAN_BLOCK, SPIRV, WORKGROUP, scan_lines,
 };
 
 use crate::image::Window;
@@ -69,9 +69,11 @@ impl Kernels {
             check_output(plane, output)?;
         }
         let params = MapParams {
-            places: inputs.map(|(_, window)| place(window, output)),
-            width: output.width,
-            height: output.height,
+            map: MapPlaces {
+                places: inputs.map(|(_, window)| place(window, output)),
+                width: output.width,
+                height: output.height,
+            },
             op: *op,
         };
         let textures = inputs.map(|(plane, _)| plane);
@@ -741,7 +743,7 @@ pub(crate) mod headless {
 mod tests {
     use std::collections::HashSet;
 
-    use opencompositor_kernels::{BoxPass, BoxSum, Exposure, Merge, ulp_distance};
+    use opencompositor_kernels::{BoxPass, BoxSum, Exposure, Merge, Premult, ulp_distance};
 
     use super::*;
     use crate::gpu::noop_parts;
@@ -777,6 +779,15 @@ mod tests {
         let op = Exposure { gain: 1.0 };
         kernels
             .map(&mut encoder, &op, [(&input, size)], size, [&output])
+            .expect("planes of one size");
+        kernels
+            .map(
+                &mut encoder,
+                &Premult,
+                [(&input, size), (&input, size)],
+                size,
+                [&output],
+            )
             .expect("planes of one size");
         let four = [(); 4].map(|()| plane(4, 4));
         let four = four.each_ref();
@@ -1048,6 +1059,60 @@ mod tests {
         (0..count)
             .map(|i| ALPHAS[(i * 7 + i / 9) % ALPHAS.len()])
             .collect()
+    }
+
+    /// Premult on the GPU against the CPU's map at 0 ULP, the zeros' signs included: colour of
+    /// every class over the output, and alphas offset from it, reaching past one corner and
+    /// short of the opposite one, so that each of the two inputs is placed on its own.
+    #[test]
+    fn premult_on_the_gpu_is_the_cpu_definition() {
+        let (device, queue) = headless::device();
+        let mut kernels = Kernels::new(&device);
+        let pool = crate::evaluate::Pool::new();
+        for (width, height) in SIZES {
+            let output = at_origin(width, height);
+            let alpha_window = window(-1, 1, width, height);
+            let colour = texels(output.area() as usize);
+            let alpha = alphas(alpha_window.area() as usize);
+            let mut expected = vec![0.0; output.area() as usize];
+            cpu::map(
+                &pool,
+                &Premult,
+                [(&colour, output), (&alpha, alpha_window)],
+                output,
+                [&mut expected],
+            );
+            let colour_plane = headless::upload(&device, &queue, width, height, &colour);
+            let alpha_plane = headless::upload(&device, &queue, width, height, &alpha);
+            let result_plane = headless::output(&device, width, height);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            kernels
+                .map(
+                    &mut encoder,
+                    &Premult,
+                    [(&colour_plane, output), (&alpha_plane, alpha_window)],
+                    output,
+                    [&result_plane],
+                )
+                .expect("planes over their windows");
+            queue.submit([encoder.finish()]);
+            let result = headless::readback(&device, &queue, &result_plane);
+            assert_eq!(result.len(), expected.len());
+            for (i, (&actual, &expected)) in result.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    ulp_distance(actual, expected),
+                    0,
+                    "{width}x{height} texel {i}: {actual:?}, not {expected:?}"
+                );
+                if expected == 0.0 {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{width}x{height} texel {i}: zero sign"
+                    );
+                }
+            }
+        }
     }
 
     /// Merge of one layer at Mix 1, over alone, on the GPU against the CPU definition: within

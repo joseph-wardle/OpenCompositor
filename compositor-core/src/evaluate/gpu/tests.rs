@@ -4,7 +4,7 @@ use opencompositor_kernels::{BoxPass, Exposure, ulp_distance};
 
 use super::*;
 use crate::evaluate::tests::{
-    blur, chain, exposure, finite_plane, gain, graph, image, key, merge, reader, write_png,
+    blur, chain, exposure, finite_plane, gain, graph, image, key, merge, premult, reader, write_png,
 };
 use crate::fixtures::{directory, write_exr};
 use crate::kernels::headless;
@@ -186,6 +186,15 @@ fn exposure_on_the_gpu_is_the_cpu_result_over_whole_images() {
         let key = key(&chain([reader(&path), exposure(Some(stops))]), 2);
         devices.assert_agree(&key, 0, &format!("{stops} stops"));
     }
+}
+
+#[test]
+fn premult_on_the_gpu_is_the_cpu_result_over_whole_images() {
+    let path = directory("premult").join("special.exr");
+    special_exr(&path);
+    let mut devices = Devices::new();
+    let key = key(&chain([reader(&path), premult()]), 2);
+    devices.assert_agree(&key, 0, "Premult");
 }
 
 #[test]

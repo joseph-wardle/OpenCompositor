@@ -5,6 +5,7 @@ pub(crate) mod blur;
 pub(crate) mod exposure;
 pub(crate) mod merge;
 pub(crate) mod pointwise;
+pub(crate) mod premult;
 mod reader;
 
 use open_ng::Color;
@@ -16,6 +17,7 @@ use crate::parameter::Parameter;
 pub enum NodeKind {
     Reader,
     Exposure,
+    Premult,
     Merge,
     Blur,
 }
@@ -26,6 +28,7 @@ impl NodeKind {
         match self {
             NodeKind::Reader => &reader::NODE_TYPE,
             NodeKind::Exposure => &exposure::NODE_TYPE,
+            NodeKind::Premult => &premult::NODE_TYPE,
             NodeKind::Merge => &merge::NODE_TYPE,
             NodeKind::Blur => &blur::NODE_TYPE,
         }
@@ -61,6 +64,7 @@ pub struct NodeType {
 const NODE_KINDS: &[NodeKind] = &[
     NodeKind::Reader,
     NodeKind::Exposure,
+    NodeKind::Premult,
     NodeKind::Merge,
     NodeKind::Blur,
 ];
