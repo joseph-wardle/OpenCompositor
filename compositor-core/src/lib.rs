@@ -46,9 +46,9 @@ pub use gpu::{FrameCheck, FrameTiming, GpuMemory, NativeWindow, PaneSize};
 pub use image::{Channel, Chromaticities, Image, ImageInfo, Oversize, Plane, Warning, Window};
 pub use network::{
     Assignment, Changes, ConnectionError, InputSlot, MAX_SLOTS, Marks, Missing, Network, Node,
-    NodeId, Slot, Timeline, TimelineError, missing,
+    NodeId, Slot, Timeline, TimelineError, alpha_mismatches, missing,
 };
-pub use nodes::{NodeInput, NodeKind, NodeType, node_kinds};
+pub use nodes::{Expects, Makes, NodeInput, NodeKind, NodeType, node_kinds};
 pub use panel::{Panel, Row, ValueState};
 pub use parameter::{
     FRAME_LIMIT, FloatParameter, Parameter, ParameterKind, Resolved, Value, ValueError, resolve,

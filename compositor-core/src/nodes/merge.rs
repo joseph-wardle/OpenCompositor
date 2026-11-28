@@ -10,7 +10,7 @@ use crate::evaluate::{
 };
 use crate::image::{Image, ImageInfo, Plane, Warning, Window};
 use crate::kernels::{Planes, cpu, plane_bytes};
-use crate::nodes::{NodeInput, NodeType};
+use crate::nodes::{Expects, Makes, NodeInput, NodeType};
 use crate::parameter::{FloatParameter, Parameter, ParameterKind, Resolved};
 
 pub(super) const NODE_TYPE: NodeType = NodeType {
@@ -40,14 +40,17 @@ pub(super) const NODE_TYPE: NodeType = NodeType {
             label: "Background",
             repeating: false,
             required: false,
+            expects: Expects::Premultiplied,
         },
         NodeInput {
             name: "layer",
             label: "Layer",
             repeating: true,
             required: false,
+            expects: Expects::Premultiplied,
         },
     ],
+    makes: Makes::AsInputs,
 };
 
 /// Merge's image from its connected inputs: the background if connected, then the layers in

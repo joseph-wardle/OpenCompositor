@@ -149,6 +149,114 @@ fn what_is_missing_is_found_up_the_chain() {
 }
 
 /// A network of two Readers, with IDs 0 and 1, and a Merge with ID 2.
+/// The Reader of [`network_of`], with ID 0, and nodes of these kinds with IDs from 1, joined by
+/// these wires, each a consumer, its input's slot and the source.
+fn network_of_kinds(kinds: &[NodeKind], wires: &[(u64, InputSlot<'static>, u64)]) -> Network {
+    let mut network = network_of(0);
+    for (id, kind) in (1..).zip(kinds) {
+        let node = Node::new(kind.clone(), kind.node_type().label, ORIGIN);
+        network.nodes.insert(NodeId(id), Arc::new(node));
+    }
+    let assignments: Vec<Assignment> = (wires.iter())
+        .map(|&(consumer, input, source)| Assignment {
+            consumer: NodeId(consumer),
+            input,
+            source: Some(NodeId(source)),
+        })
+        .collect();
+    network.assign_inputs(&assignments).unwrap()
+}
+
+fn mismatches(network: &Network, id: u64) -> Vec<(u64, String, Expects)> {
+    (alpha_mismatches(network, NodeId(id)).into_iter())
+        .map(|(node, slot, expects)| (node.0, slot.to_string(), expects))
+        .collect()
+}
+
+#[test]
+fn alpha_mismatches_report_each_input_whose_source_is_in_the_other_state() {
+    use Expects::{Premultiplied, Straight};
+    use NodeKind::{Blur, Exposure, Merge, Premult, Unpremult};
+    let source = InputSlot::from("source");
+    let network = network_of_kinds(
+        &[Premult, Unpremult, Blur, Exposure, Merge, Blur, Premult],
+        &[
+            (1, source, 0),
+            (2, source, 0),
+            (3, source, 2),
+            (4, source, 2),
+            (5, "background".into(), 0),
+            (5, ("layer", 2).into(), 4),
+            (6, source, 5),
+            (7, source, 2),
+        ],
+    );
+
+    assert_eq!(mismatches(&network, 1), [(1, "source".into(), Straight)]);
+    assert_eq!(
+        mismatches(&network, 3),
+        [(3, "source".into(), Premultiplied)]
+    );
+    // Exposure takes either and carries the straight state on; the Merge is straight as one
+    // layer is, so the Blur after it is reported too.
+    assert_eq!(mismatches(&network, 4), []);
+    assert_eq!(
+        mismatches(&network, 6),
+        [
+            (6, "source".into(), Premultiplied),
+            (5, "layer 2".into(), Premultiplied),
+        ]
+    );
+    // Premult after Unpremult, and the Reader alone.
+    assert_eq!(mismatches(&network, 7), []);
+    assert_eq!(mismatches(&network, 0), []);
+    assert_eq!(mismatches(&network, 99), []);
+}
+
+#[test]
+fn alpha_mismatches_report_each_input_a_branch_rejoins_and_the_empty_image_meets_every_input() {
+    use Expects::Premultiplied;
+    use NodeKind::{Blur, Exposure, Merge, Unpremult};
+    let source = InputSlot::from("source");
+    let mut network = network_of_kinds(
+        &[
+            Unpremult, Merge, Blur, Exposure, Blur, Merge, Blur, Unpremult, Blur,
+        ],
+        &[
+            (1, source, 0),
+            (2, "background".into(), 1),
+            (2, ("layer", 1).into(), 1),
+            (3, source, 2),
+            // An Exposure without a source, under a Blur and with the Reader in a Merge.
+            (5, source, 4),
+            (6, "background".into(), 4),
+            (6, ("layer", 1).into(), 0),
+            (7, source, 6),
+            // A refused Unpremult under a Blur.
+            (9, source, 8),
+        ],
+    );
+    let unpremult = network.nodes.get_mut(&NodeId(8)).unwrap();
+    Arc::make_mut(unpremult).refuse("refused");
+
+    assert_eq!(
+        mismatches(&network, 3),
+        [
+            (3, "source".into(), Premultiplied),
+            (2, "background".into(), Premultiplied),
+            (2, "layer 1".into(), Premultiplied),
+        ]
+    );
+    assert_eq!(mismatches(&network, 5), []);
+    assert_eq!(mismatches(&network, 7), []);
+    assert_eq!(mismatches(&network, 9), []);
+
+    // A refused consumer reports nothing of its own.
+    let blur = network.nodes.get_mut(&NodeId(3)).unwrap();
+    Arc::make_mut(blur).refuse("refused");
+    assert_eq!(mismatches(&network, 3), []);
+}
+
 fn network_with_merge() -> Network {
     let mut network = network_of(0);
     let mut reader = Node::new(NodeKind::Reader, "Reader", ORIGIN);

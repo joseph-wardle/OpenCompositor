@@ -9,7 +9,7 @@ use imbl::OrdMap;
 use imbl::ordmap::DiffItem;
 use open_ng::Point;
 
-use crate::nodes::{NodeInput, NodeKind};
+use crate::nodes::{Expects, Makes, NodeInput, NodeKind};
 use crate::parameter::{
     Parameter, ParameterKind, Samples, Value, ValueError, describe, resolve, validate,
 };
@@ -285,6 +285,99 @@ pub fn missing(network: &Network, node: NodeId, frame: f64) -> Vec<(NodeId, Miss
         }
     }
     missing
+}
+
+/// Every input on the node and upstream of it whose source's image is not in the alpha state it
+/// expects, with what it expects, in [`missing`]'s order: each upstream node once, its inputs in
+/// declaration order and a repeating input's slots in slot order. A state carried on downstream
+/// is reported at every input it fails to meet. Empty if the network has no such node.
+///
+/// A source's state is what its type [`Makes`]. An unconnected input and a refused node give the
+/// empty image, which is in no state: it meets every expectation and leaves `AsInputs` to the
+/// other inputs.
+pub fn alpha_mismatches(
+    network: &Network,
+    node: NodeId,
+) -> Vec<(NodeId, InputSlot<'static>, Expects)> {
+    let mut states = BTreeMap::new();
+    let mut mismatches = Vec::new();
+    for id in network.upstream(node) {
+        let current = network.node(id).expect("upstream nodes exist");
+        if current.problem.is_some() {
+            continue;
+        }
+        for input in current.kind.node_type().inputs {
+            let connected: Vec<(InputSlot<'static>, NodeId)> = if input.repeating {
+                let slots = current.slots(input.name);
+                (slots.map(|(slot, source)| ((input.name, slot).into(), source))).collect()
+            } else {
+                let slot = input.first_slot();
+                current
+                    .input(slot)
+                    .map(|source| (slot, source))
+                    .into_iter()
+                    .collect()
+            };
+            for (slot, source) in connected {
+                if matches!(
+                    (input.expects, alpha(network, source, &mut states)),
+                    (Expects::Premultiplied, Some(Alpha::Straight))
+                        | (Expects::Straight, Some(Alpha::Premultiplied))
+                ) {
+                    mismatches.push((id, slot, input.expects));
+                }
+            }
+        }
+    }
+    mismatches
+}
+
+/// A node's image's alpha state as the network derives it; `None` for the empty image.
+/// Ordered so that the greatest of several is straight if any is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Alpha {
+    Premultiplied,
+    Straight,
+}
+
+/// The alpha state of `node`'s image, memoised in `states` for it and every node it depends on:
+/// [`Network::upstream`] is a depth-first preorder, so a branch that rejoins is reached again.
+/// It keeps its own stack, since a chain may be deeper than the thread's.
+fn alpha(
+    network: &Network,
+    node: NodeId,
+    states: &mut BTreeMap<NodeId, Option<Alpha>>,
+) -> Option<Alpha> {
+    let mut pending = vec![node];
+    while let Some(&id) = pending.last() {
+        if states.contains_key(&id) {
+            pending.pop();
+            continue;
+        }
+        let Some(current) = network.node(id).filter(|node| node.problem.is_none()) else {
+            states.insert(id, None);
+            continue;
+        };
+        let state = match current.kind.node_type().makes {
+            Makes::Premultiplied => Some(Alpha::Premultiplied),
+            Makes::Straight => Some(Alpha::Straight),
+            Makes::AsInputs => {
+                let unknown: Vec<NodeId> = (current.inputs())
+                    .map(|(_, source)| source)
+                    .filter(|source| !states.contains_key(source))
+                    .collect();
+                if !unknown.is_empty() {
+                    pending.extend(unknown);
+                    continue;
+                }
+                (current.inputs())
+                    .filter_map(|(_, source)| states[&source])
+                    .max()
+            }
+        };
+        states.insert(id, state);
+    }
+    states[&node]
 }
 
 /// The frames a project spans and the rate it plays at; with USD, a stage's `startTimeCode`,

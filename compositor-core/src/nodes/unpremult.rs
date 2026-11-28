@@ -6,7 +6,7 @@ use opencompositor_kernels::Unpremult;
 
 use crate::image::Channel;
 use crate::nodes::pointwise::ChannelMap;
-use crate::nodes::{NodeInput, NodeType};
+use crate::nodes::{Expects, Makes, NodeInput, NodeType};
 
 pub(super) const NODE_TYPE: NodeType = NodeType {
     name: "unpremult",
@@ -24,7 +24,9 @@ pub(super) const NODE_TYPE: NodeType = NodeType {
         label: "Source",
         repeating: false,
         required: true,
+        expects: Expects::Premultiplied,
     }],
+    makes: Makes::Straight,
 };
 
 /// R, G and B each with A through the quotient; A is the source's.

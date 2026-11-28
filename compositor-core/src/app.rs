@@ -16,7 +16,8 @@ use crate::gpu::{
     ViewerFrame,
 };
 use crate::image::Window;
-use crate::network::{Missing, NodeId, Slot, missing};
+use crate::network::{Missing, NodeId, Slot, alpha_mismatches, missing};
+use crate::nodes::Expects;
 use crate::panel::Panel;
 use crate::parameter::{Value, ValueError};
 use crate::playback::{
@@ -2004,6 +2005,26 @@ impl App {
                 format!("{label} {lack}")
             } else {
                 format!("{label} of {} {lack}", name(id))
+            });
+        }
+        for (id, slot, expects) in alpha_mismatches(network, viewed) {
+            let consumer = network.node(id).expect("upstream nodes exist");
+            let input = (consumer.kind.node_type().inputs.iter())
+                .find(|input| input.name == slot.input)
+                .expect("a mismatch is on one of the type's inputs");
+            let label = match slot.slot {
+                0 => input.label.to_owned(),
+                slot => format!("{} {slot}", input.label),
+            };
+            let state = match expects {
+                Expects::Premultiplied => "is straight",
+                Expects::Straight => "is already premultiplied",
+                Expects::Either => unreachable!("an input taking either state meets it"),
+            };
+            details.push(if id == viewed {
+                format!("{label} {state}")
+            } else {
+                format!("{label} of {} {state}", name(id))
             });
         }
         for (id, reading) in readings(network, files, viewed, frame) {

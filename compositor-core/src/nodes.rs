@@ -62,6 +62,27 @@ pub struct NodeType {
     pub parameters: &'static [Parameter],
     /// The images the node takes.
     pub inputs: &'static [NodeInput],
+    /// The alpha state of the node's image.
+    pub makes: Makes,
+}
+
+/// The alpha state an input takes its image in. A source in the other state is reported by
+/// [`alpha_mismatches`](crate::alpha_mismatches), never converted: arithmetic stays literal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expects {
+    Premultiplied,
+    Straight,
+    Either,
+}
+
+/// The alpha state of a node type's image. A state is the network's, not the image's: both
+/// readers make premultiplied planes, so every state follows from the nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Makes {
+    Premultiplied,
+    Straight,
+    /// Straight if any connected input's image is, else premultiplied.
+    AsInputs,
 }
 
 const NODE_KINDS: &[NodeKind] = &[
@@ -116,6 +137,8 @@ pub struct NodeInput {
     /// Whether the node reports the input as missing while it takes no image, rather than making
     /// do without it. Never set on a repeating input: no node type asks for at least one slot.
     pub required: bool,
+    /// The alpha state the input takes its image in.
+    pub expects: Expects,
 }
 
 impl NodeInput {

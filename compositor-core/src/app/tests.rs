@@ -921,6 +921,37 @@ fn a_viewed_reader_without_a_file_says_so_where_it_is() {
     );
 }
 
+#[test]
+fn a_viewed_node_says_which_inputs_take_an_image_in_the_other_alpha_state() {
+    let (mut app, _deliveries) = app();
+    let reader = create(&mut app, "/nonexistent/a.exr");
+    let node = |app: &mut App, type_name| {
+        let changes = (app.session)
+            .create_node(type_name, Point::default(), None)
+            .unwrap();
+        *changes.nodes.first().unwrap()
+    };
+    let premult = node(&mut app, "premult");
+    app.session.connect(premult, "source", reader).unwrap();
+    app.dispatch(slot_key(1, CTRL));
+    assert_eq!(
+        app.shell.caption,
+        "Slot 1 · Premult · updating…; Source is already premultiplied · CPU"
+    );
+
+    let unpremult = node(&mut app, "unpremult");
+    let merge = node(&mut app, "merge");
+    let blur = node(&mut app, "blur");
+    app.session.connect(unpremult, "source", reader).unwrap();
+    app.session.connect(merge, ("layer", 2), unpremult).unwrap();
+    app.session.connect(blur, "source", merge).unwrap();
+    app.dispatch(slot_key(2, CTRL));
+    assert_eq!(
+        app.shell.caption,
+        "Slot 2 · Blur · updating…; Source is straight; Layer 2 of Merge is straight · CPU"
+    );
+}
+
 /// Presses Tab over the graph and chooses the type in the menu it opens.
 fn choose_in_menu(app: &mut App, type_name: &'static str) -> Vec<Request> {
     app.dispatch(input(Pane::Graph, Input::PointerEntered));
